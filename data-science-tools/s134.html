@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>34.2 Dask task graph és partíció – Data Scientist munkaeszközök
+és futtatókörnyezetek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#sch34">34 Nagyobb adat: Dask, Spark és elosztott végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="s133.html">← 34.1 Nagyobb mint RAM: előbb adatfolyam</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s135.html">34.3 Spark DataFrame és végrehajtási terv →</a></div>
+</nav>
+<h2 data-number="34.2" id="s134"><span
+class="header-section-number">34.2</span> Dask task graph és
+partíció</h2>
+<h3 data-number="34.2.1" id="cél-és-konkrét-helyzet"><span
+class="header-section-number">34.2.1</span> Cél és konkrét helyzet</h3>
+<p>Egy elemző csapat a Northstar <code>orders.csv</code> állományán
+szeretné kiszámolni a teljes kosárösszeget és a szegmensenkénti
+összeget. Az állomány kicsi, de a csapat olyan számítást készít elő,
+amelyet később több fájlra, illetve RAM-nál nagyobb adatra is futtatni
+szeretne. A megfigyelési egység egy rendelés (<code>order_id</code>). A
+bemenet a <code>lab/data/orders.csv</code>; a cél annak megértése, hogy
+a Dask mikor tud partíción belül dolgozni, és mikor kell partíciók
+közötti adatmozgatás, azaz <em>shuffle</em>. Előzetes becslésként az
+összeg (<code>sum</code>) partíciónkénti részösszegekből előállítható,
+ezért költsége nagyjából a beolvasott sorok számával arányos; a
+csoportos összeg viszont kulcs szerinti átrendezést igényelhet.</p>
+<p>Ez az alfejezet a bővítő tanulási úthoz tartozik. A labor
+alapértelmezett <code>pyproject.toml</code>-ja nem tartalmazza a Daskot,
+ezért ha a kódot futtatni szeretnéd, előbb külön opcionális környezetben
+telepítsd a <code>dask[dataframe]</code> extrát, és őrizd meg a lockot
+az <a href="s010.html">uv projekt és ténylegesen rögzített
+függőségek</a> alfejezetben tanult módon. A példa helyi CPU-n, külső
+szolgáltatás nélkül futtatható. A könyvgenerálás ebben a módban nem
+futtat kódot, ezért a kimeneteket „elméletileg várt” jelzővel adjuk meg;
+a valódi ellenőrzés a helyi futás után a kontroll-assertben
+történik.</p>
+<h3 data-number="34.2.2"
+id="lusta-task-graph-és-a-partíció-fogalma"><span
+class="header-section-number">34.2.2</span> Lusta task graph és a
+partíció fogalma</h3>
+<p>A Dask gyűjtemények, például a Dask DataFrame, <em>lusta task
+graph</em>-ot (<em>lazy task graph</em>) építenek. A gráf csúcsai
+feladatok (<em>task</em>), élei pedig függőségek: egy task kimenete egy
+másik task bemenete. Az alábbi egyszerűsített gráf egy kétrészes
+<code>basket_minor</code> összegzést ír le:</p>
+<pre class="text"><code>read[csv, 0] --&gt; partial_sum[0] --\
+                                    --&gt; total = add(partial_sum[0], partial_sum[1])
+read[csv, 1] --&gt; partial_sum[1] --/</code></pre>
+<p>Amíg nem hívod a <code>compute()</code> metódust, addig csak ez a
+gráf létezik. A <a href="s133.html">Nagyobb mint RAM: előbb
+adatfolyam</a> alfejezetben megismert chunk és projection itt is
+megjelenik: a CSV-blokkokból Dask-partíciók lesznek, és a vetített
+oszlopokon kívüli adatot jobb nem behúzni. A <em>partition</em> a
+DataFrame egymástól függetlenül feldolgozható szelete: minden partíció
+egy pandas DataFrame, amelyet egy-egy task olvas vagy állít elő.
+Partícióméretként hüvelykujjszabály szerint néhány tíz–néhány száz MiB
+szokott észszerű lenni, de ez a konkrét munkamenettől függ; a kis
+tanulófájlra kényszerből mesterséges
+<code>repartition(npartitions=4)</code> lépést alkalmazunk.</p>
+<p>A gráfot a <em>scheduler</em> ütemezi. Helyi gépen az alapértelmezett
+szálalapú (<em>threaded</em>) scheduler egy folyamatban futtat taskokat;
+ez sok pandas–NumPy műveletnél működik, de a <a href="s130.html">Thread,
+process és könyvtári szálak</a> alfejezetben tárgyalt GIL- és
+oversubscription-kérdés itt is érvényes. Nagyobb helyi munkához
+használható process-alapú vagy <code>distributed</code> scheduler, amely
+már külön munkásokat és diagnosztikai felületet ad. A
+<code>compute()</code> a gráf kiértékelésének és az eredmény
+pandas/NumPy objektummá alakításának pillanata; ekkor a közbülső gráf a
+memóriában tartott végeredmény után felszabadulhat.</p>
+<p>A <code>persist()</code> ezzel szemben a gráfot kiértékeli, de a
+Dask-gyűjteményt megtartja a memóriában, hogy több későbbi
+<code>compute()</code> újrahasználhassa ugyanazt a közbülső eredményt.
+Ha ugyanazt a beolvasott és újrapartícionált DataFrame-et többféle
+aggregátumhoz használod, a <code>base = ddf.persist()</code> utáni
+számítások elkerülhetik a beolvasás ismétlését, cserébe viszont a base
+partíciói memóriát foglalnak.</p>
+<h3 data-number="34.2.3"
+id="összegezhető-és-nem-összegezhető-aggregátumok"><span
+class="header-section-number">34.2.3</span> Összegezhető és nem
+összegezhető aggregátumok</h3>
+<p>A partíciók közötti műveletköltség matematikailag azon múlik, hogy a
+célaggregátum előáll-e részeredmények kombinációjából. Legyen a teljes
+adathalmaz (D) felbontva (P) diszjunkt partícióra:
+(D=D_1\sqcup\dots\sqcup D_P). Az (x) mérőszám esetén vezessük be a
+(p)-edik partícióra:</p>
+<p>[ s_p=\sum_{x\in D_p}x,\qquad n_p=|D_p|,\qquad q_p=\sum_{x\in
+D_p}x^2. ]</p>
+<p>Az (x) érték itt az EUR minor unit, tehát (s_p) és (q_p)
+mértékegysége rendre minor unit, illetve minor unit a négyzeten; (n_p)
+dimenzió nélküli darabszám. A teljes összeg, darabszám és átlag:</p>
+<p>[ s=\sum_{p=1}^P s_p,\qquad n=\sum_{p=1}^P n_p,\qquad
+\bar{x}=\frac{s}{n}. ]</p>
+<p>Az átlag tehát két összegezhető részaggregátum hányadosa. A szóráshoz
+az (s_p), (n_p), (q_p) hármas is elegendő:</p>
+<p>[ S<sup>2=\frac{1}{n-1}\left(q-\frac{s</sup>2}{n}\right), ]</p>
+<p>ahol (q=\sum_p q_p). Numerikusan ez a képlet nagy értékeknél kivonási
+kioltásra lehet érzékeny; komoly mérési célra használj stabil
+Welford-féle frissítést, de a szerkezet akkor is additív marad.</p>
+<p>A medián, kvantilis, módusz és a distinct count ezzel szemben nem
+összegezhető pusztán partíciónkénti részértékekből. Kézzel ellenőrizhető
+ellenpélda: legyen (D_1=[1,10,7]) és (D_2=[3,4,2]). Az összegek (18) és
+(9), a teljes összeg (27), a darabszám (3+3=6), az átlag (27/6=4{,}5). A
+partícionkénti mediánok (7) és (3), ezek átlaga (5{,}0), a teljes
+rendezett sorozat ([1,2,3,4,7,10]) mediánja viszont ((3+4)/2=3{,}5). A
+részmediánok átlaga tehát nem a teljes medián.</p>
+<p>A Dask az ilyen aggregátumokat általában a kulcs vagy a rendezés
+szerinti <em>shuffle</em> segítségével tudja kiszámolni, vagy közelítő
+algoritmussal. A <code>sum</code>, <code>count</code>, <code>min</code>,
+<code>max</code> redukálható partíción belül és fölött is. A
+<code>mean</code> Dask szinten a <code>sum</code> és <code>count</code>
+hányadosa. A <code>median</code> default módon rendezést és partíciók
+közötti adatmozgatást igényelhet.</p>
+<h3 data-number="34.2.4" id="teljes-minimális-munkapélda"><span
+class="header-section-number">34.2.4</span> Teljes minimális
+munkapélda</h3>
+<p>A példa először a kis Northstar-fájlt olvassa be, mesterségesen négy
+partícióra osztja, majd pandas-kontrollal hasonlítja össze. A
+<code>df</code> és a <code>ddf</code> shape/típus-invariánsát is
+ellenőrizzük.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> pathlib <span class="im">import</span> Path</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pandas <span class="im">as</span> pd</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> dask.dataframe <span class="im">as</span> dd</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>ORDERS <span class="op">=</span> Path(<span class="st">&quot;lab/data/orders.csv&quot;</span>)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Teljes, kis méretű kontrollbeolvasás.</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>pdf <span class="op">=</span> pd.read_csv(ORDERS)</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Lusta Dask-gráf: blokkrészletes olvasás, majd 4 partíció.</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># A blocksize csak szemléltető egység; a kis fájlon a Dask overhead számottevő.</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>ddf <span class="op">=</span> dd.read_csv(ORDERS, blocksize<span class="op">=</span><span class="dv">256_000</span>).repartition(npartitions<span class="op">=</span><span class="dv">4</span>)</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;partíciók:&quot;</span>, ddf.npartitions)  <span class="co"># elméletileg várt: 4</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Partíción belüli részösszeg és részcount, majd additív összegzés.</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>meta <span class="op">=</span> pd.DataFrame({<span class="st">&quot;partial_sum&quot;</span>: pd.Series(dtype<span class="op">=</span><span class="st">&quot;int64&quot;</span>),</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>                     <span class="st">&quot;partial_n&quot;</span>: pd.Series(dtype<span class="op">=</span><span class="st">&quot;int64&quot;</span>)})</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>partial <span class="op">=</span> (</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    ddf[<span class="st">&quot;basket_minor&quot;</span>]</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    .map_partitions(</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        <span class="kw">lambda</span> s: pd.DataFrame(</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>            {<span class="st">&quot;partial_sum&quot;</span>: [s.<span class="bu">sum</span>()], <span class="st">&quot;partial_n&quot;</span>: [s.count()]}</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        ),</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        meta<span class="op">=</span>meta,</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    .compute()</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(partial.shape)  <span class="co"># elméletileg várt: (4, 2), minden partícióhoz egy sor</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>dask_sum <span class="op">=</span> partial[<span class="st">&quot;partial_sum&quot;</span>].<span class="bu">sum</span>()</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>dask_count <span class="op">=</span> partial[<span class="st">&quot;partial_n&quot;</span>].<span class="bu">sum</span>()</span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>dask_mean <span class="op">=</span> dask_sum <span class="op">/</span> dask_count</span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;sum:&quot;</span>, dask_sum, <span class="st">&quot;count:&quot;</span>, dask_count, <span class="st">&quot;mean:&quot;</span>, dask_mean)</span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a><span class="co"># Kézi/pandas kontroll, toleranciával.</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="bu">abs</span>(dask_sum <span class="op">-</span> pdf[<span class="st">&quot;basket_minor&quot;</span>].<span class="bu">sum</span>()) <span class="op">&lt;</span> <span class="fl">1e-6</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> dask_count <span class="op">==</span> <span class="bu">len</span>(pdf)</span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="bu">abs</span>(dask_mean <span class="op">-</span> pdf[<span class="st">&quot;basket_minor&quot;</span>].mean()) <span class="op">&lt;</span> <span class="fl">1e-6</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;pandas-kontroll: OK&quot;</span>)</span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a><span class="co"># Shuffle-t igénylő csoportos aggregátum.</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>by_segment <span class="op">=</span> (</span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    ddf.groupby(<span class="st">&quot;segment&quot;</span>)[<span class="st">&quot;basket_minor&quot;</span>]</span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    .agg([<span class="st">&quot;sum&quot;</span>, <span class="st">&quot;count&quot;</span>])</span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    .compute()</span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    .sort_index()</span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(by_segment)</span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>ground <span class="op">=</span> pdf.groupby(<span class="st">&quot;segment&quot;</span>)[<span class="st">&quot;basket_minor&quot;</span>].agg([<span class="st">&quot;sum&quot;</span>, <span class="st">&quot;count&quot;</span>])</span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>pd.testing.assert_frame_equal(by_segment, ground, check_dtype<span class="op">=</span><span class="va">False</span>)</span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;csoportos kontroll: OK&quot;</span>)</span></code></pre></div>
+<p>A <code>by_segment</code> soronként egy <code>segment</code> értéket
+ad, oszlopai <code>sum</code> és <code>count</code>. Az output pontos
+számai a helyi lab aktuális seedjéből adódnak; a kódot még nem
+ellenőrizte automatizált teszt, ezért itt nem közlünk „mért” táblázatot.
+A felhasználónak a <code>print</code> után a pandas-kontroll a tényleges
+ellenőrzés.</p>
+<p>A <code>groupby("segment")</code> aggregációt a Dask partíción belüli
+részösszegekkel és ezek összefésülésével is elvégezheti; <strong>nem
+szükségszerű a teljes sorszintű shuffle</strong>. Általánosabb
+<code>groupby</code>-transzformációknál vagy bizonyos joinoknál viszont
+kulcs szerinti adatátrendezésre lehet szükség. Kis adaton az eredmény
+gyors lesz, de a művelet jellege élesen eltér a
+<code>map_partitions</code>-tól: az utóbbi garantáltan nem kever
+partíciók között.</p>
+<h3 data-number="34.2.5" id="eredmény-értelmezése"><span
+class="header-section-number">34.2.5</span> Eredmény értelmezése</h3>
+<p>A <code>partial</code> DataFrame shape-je <code>(4, 2)</code>: a négy
+partíció mindegyike egy-egy <code>partial_sum</code> és
+<code>partial_n</code> sort adott. A <code>dask_sum</code> értéke a
+<code>basket_minor</code> oszlop teljes összege, a
+<code>dask_mean</code> ennek és a sorok számának hányadosa. A
+pandas-kontroll ellenőrzi, hogy a Dask partíciós redukció ugyanoda jut,
+mint az egyben beolvasott adat; toleranciát azért érdemes adni, mert bár
+a <code>basket_minor</code> egész minor unit, a későbbi osztás és
+esetleges float-dtype ilyen apró eltérést hozhat.</p>
+<p>A csoportos tábla invariánsa: a <code>business</code> és
+<code>consumer</code> összegének külön-külön meg kell egyeznie a pandas
+<code>groupby</code> eredményével, és mindkét csoport <code>count</code>
+értéke pozitív. A <code>groupby</code> eredménye önmagában nem mutatja a
+shuffle tényét; a shuffle-t a task gráf belső szerkezete okozza. A
+<code>persist</code> ebben a példában csak akkor éri meg, ha a
+beolvasott <code>ddf</code>-re több külön <code>groupby</code> vagy
+<code>merge</code> is épül; itt egyszeri kontrollhoz felesleges.</p>
+<p>A Dask lazy gráf nem jelenti azt, hogy bármely transzformáció
+konstans memóriával értékelhető ki: shuffle és join esetén adatmozgatási
+költség keletkezhet.</p>
+<h3 data-number="34.2.6" id="feladatok"><span
+class="header-section-number">34.2.6</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Értelmezés.</strong> Az alábbi mutatók közül melyek
+állnak elő kizárólag partíción belüli részaggregátumokból:
+<code>count</code>, <code>mean</code>, <code>median</code>,
+<code>min</code>, <code>count(distinct product_id)</code>? Mindegyikhez
+indokold meg a választ.</p></li>
+<li><p><strong>Megvalósítás.</strong> Hozz létre egy hat soros pandas
+DataFrame-et <code>x = [1, 10, 7, 3, 4, 2]</code> értékekkel, majd
+<code>dd.from_pandas(..., npartitions=2)</code> segítségével két
+partíciót. Olvasd ki a két partíciót <code>to_delayed()</code>
+segítségével, számold ki a partíciónkénti összeget és mediánt, majd a
+teljes összeget és teljes mediánt. Ellenőrizd, hogy a részmediánok
+átlaga nem egyenlő a teljes mediánnal.</p></li>
+<li><p><strong>Hibadiagnózis.</strong> Egy kolléga egy 64 MiB-os CSV-t
+<code>blocksize=4096</code> értékkel olvas be, ezért több ezer apró
+partíciója lesz. A <code>sum()</code> nagyon lassú. Mi a hiba, és milyen
+<code>blocksize</code>, illetve
+<code>repartition(partition_size=...)</code> értékre cserélnéd? A
+válaszban ne állíts mért futásidőt, hanem a task overhead és a hasznos
+munka arányáról érvelj.</p></li>
+<li><p><strong>Megváltozott feltétel.</strong> A Northstar
+<code>order_items.csv</code> fájlból rendelésenkénti
+<code>line_total_minor</code> összeget akarsz készíteni, majd
+összekapcsolni az <code>orders</code> <code>basket_minor</code>
+oszlopával. Melyik lépés igényel shuffle-t: a rendelésenkénti összegzés,
+a join, vagy mindkettő? Írj Dask-vázlatot, amely az egyezőséget
+ellenőrzi, és indokold a sorazonosító szemcsézettségét a <a
+href="s026.html">Join-kardinalitás és duplázódó célváltozó</a>
+alfejezetben tanult join-kardinalitással.</p></li>
+<li><p><strong>Persist transzfer.</strong> Az 1. feladatban szereplő
+felhasználó egymás után hívja meg ugyanazon <code>ddf</code>-re a
+<code>sum()</code> és a <code>count()</code> <code>compute()</code>-ot.
+Milyen ismétlődő munkát végez a scheduler? Hogyan kerülhető el
+<code>persist()</code> segítségével, és milyen memóriaköltség lép
+fel?</p></li>
+</ol>
+<h3 data-number="34.2.7" id="megoldások-és-indoklás"><span
+class="header-section-number">34.2.7</span> Megoldások és indoklás</h3>
+<ol type="1">
+<li><p>A <code>count</code>, <code>mean</code>, <code>min</code> additív
+jellegű. A <code>mean</code> a <code>sum</code> és <code>count</code>
+hányadosa, ezért a két összegezhető részletből áll elő; a
+<code>min</code> a partíciónkénti minimumok minimuma. A
+<code>median</code> nem ilyen: rendezés kell, amint a 2. feladat
+mutatja. A <code>count(distinct product_id)</code> azért nem additív,
+mert ugyanaz a <code>product_id</code> több partícióban is előfordulhat,
+így a részleges egyedi számok összege felülszámolhat; globális egyedi
+halmaz kell.</p></li>
+<li><p>Egy lehetséges megoldás:</p></li>
+</ol>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pandas <span class="im">as</span> pd</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> dask.dataframe <span class="im">as</span> dd</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>pdf <span class="op">=</span> pd.DataFrame({<span class="st">&quot;x&quot;</span>: [<span class="dv">1</span>, <span class="dv">10</span>, <span class="dv">7</span>, <span class="dv">3</span>, <span class="dv">4</span>, <span class="dv">2</span>]})</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>ddf <span class="op">=</span> dd.from_pandas(pdf, npartitions<span class="op">=</span><span class="dv">2</span>)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>parts <span class="op">=</span> ddf.to_delayed()</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>part_frames <span class="op">=</span> [p.compute() <span class="cf">for</span> p <span class="kw">in</span> parts]</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>([<span class="bu">list</span>(f[<span class="st">&quot;x&quot;</span>]) <span class="cf">for</span> f <span class="kw">in</span> part_frames])  <span class="co"># elméletileg [[1,10,7],[3,4,2]]</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>partial_sums <span class="op">=</span> [f[<span class="st">&quot;x&quot;</span>].<span class="bu">sum</span>() <span class="cf">for</span> f <span class="kw">in</span> part_frames]</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>partial_medians <span class="op">=</span> [f[<span class="st">&quot;x&quot;</span>].median() <span class="cf">for</span> f <span class="kw">in</span> part_frames]</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(partial_sums, partial_medians)  <span class="co"># [18, 9], [7.0, 3.0]</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(ddf.x.<span class="bu">sum</span>().compute(), ddf.x.median().compute())  <span class="co"># 27, 3.5</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="bu">sum</span>(partial_sums) <span class="op">==</span> ddf.x.<span class="bu">sum</span>().compute()</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="bu">sum</span>(partial_medians) <span class="op">/</span> <span class="dv">2</span> <span class="op">!=</span> ddf.x.median().compute()</span></code></pre></div>
+<p>A feladat kontrollja tehát kézzel is kijön: a teljes medián (3{,}5),
+a részmediánok átlaga (5{,}0).</p>
+<ol start="3" type="1">
+<li><p>A <code>blocksize=4096</code> túl sok apró partíciót hoz létre.
+Ha a teljes munka közelítőleg (T \approx P,t_{\text{task}} +
+N,t_{\text{row}}), akkor nagy (P) mellett a task ütemezési, sorosítási
+és eredmény-összesítési költsége dominálhat a hasznos soronkénti
+munkához képest. A 64 MiB-os bemenethez például
+<code>blocksize=32_000_000</code> vagy
+<code>repartition(partition_size="32 MiB")</code> nagyságrend észszerű,
+ami két partíciót ad; többnyire a CPU-magok számához közeli partíciószám
+jó kiindulás. Pontos számot csak helyi mérés alapján szabad
+mondani.</p></li>
+<li><p>A rendelésenkénti <code>line_total_minor</code> összegzés
+<code>groupby("order_id").sum()</code>, ami shuffle-t igényelhet, mert
+az azonos rendeléshez tartozó tételek akár külön partícióban vannak. A
+join szintén shuffle, hacsak mindkét oldal nincs azonos partíciós kulcs
+szerint indexelve. Egy ellenőrző vázlat:</p></li>
+</ol>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>items <span class="op">=</span> dd.read_csv(<span class="st">&quot;lab/data/order_items.csv&quot;</span>)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>items_by_order <span class="op">=</span> items.groupby(<span class="st">&quot;order_id&quot;</span>)[<span class="st">&quot;line_total_minor&quot;</span>].<span class="bu">sum</span>().to_frame(<span class="st">&quot;items_total&quot;</span>)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>orders <span class="op">=</span> dd.read_csv(<span class="st">&quot;lab/data/orders.csv&quot;</span>)</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>recon <span class="op">=</span> orders.merge(items_by_order, on<span class="op">=</span><span class="st">&quot;order_id&quot;</span>, how<span class="op">=</span><span class="st">&quot;left&quot;</span>).compute()</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> (recon[<span class="st">&quot;basket_minor&quot;</span>] <span class="op">==</span> recon[<span class="st">&quot;items_total&quot;</span>]).<span class="bu">all</span>()</span></code></pre></div>
+<p>A <code>merge</code> után a sorazonosító továbbra is egy rendelés,
+nem tétel; ha véletlenül a tételfájl nyers sorait is összekapcsolnád
+<code>on="order_id"</code>, akkor one-to-many sorduplikáció lépne
+fel.</p>
+<ol start="5" type="1">
+<li><code>persist()</code> nélkül a gráf a <code>compute()</code>
+hívások között megsemmisülhet, így a CSV-olvasás és a
+<code>repartition</code> mindkét aggregátumhoz újra lefut. A
+<code>sum()</code> és <code>count()</code> után a harmadik művelet ismét
+olvasna. A <code>base = ddf.persist()</code> kiértékeli a beolvasott,
+partícionált gyűjteményt, majd ebből a megtartott memóriabeli állapotból
+számolhat mindkét aggregátum; a költség a négy partíció memóriában
+tartása.</li>
+</ol>
+<h3 data-number="34.2.8"
+id="gyakori-tévedés-minél-több-partíció-annál-gyorsabb"><span
+class="header-section-number">34.2.8</span> Gyakori tévedés: minél több
+partíció, annál gyorsabb</h3>
+<p>Az a feltételezés, hogy a nagyon finom particionálás mindig nagyobb
+párhuzamosságot és ezért gyorsabb futást ad, gyakran téves. Az alábbi
+ábra az előbbi egyszerű (T=P,t_{\text{task}}+N,t_{\text{row}}) modellt
+mutatja (N=1,000,000) sorra, (t_{\text{task}}=0{,}002) s,
+(t_{\text{row}}=10^{-6}) s feltételezéssel; ezek szemléltető konstansok,
+nem mért Dask-értékek.</p>
+<figure>
+<img src="assets/s134-plot-1.png"
+alt="Túl sok partíció szemléltető összköltsége - Számított modell szemléltető konstansokkal, nem Dask-mérés." />
+<figcaption aria-hidden="true">Túl sok partíció szemléltető összköltsége
+- Számított modell szemléltető konstansokkal, nem
+Dask-mérés.</figcaption>
+</figure>
+<p>A jelenség a <a href="s133.html">Nagyobb mint RAM: előbb
+adatfolyam</a> alfejezetben tárgyalt stream-elésből is következik: a túl
+kicsi chunk sokszoros feladatindítást okoz, miközben a tényleges hasznos
+munka változatlan. Az ideális partíciószám a gépen ténylegesen elérhető
+párhuzamossághoz igazodik, és a konkrét művelet shuffle-igényétől is
+függ. Csak annyi partíció kell, amennyi elég nagy ahhoz, hogy a task
+overhead eltörpüljön az adatfeldolgozási idő mellett.</p>
+<h3 data-number="34.2.9" id="önellenőrzés"><span
+class="header-section-number">34.2.9</span> Önellenőrzés</h3>
+<p>Tudod-e saját szavaddal megmondani, mikor lesz tényleges számítás a
+<code>.map_partitions</code>, a <code>.groupby</code> és a
+<code>.persist</code> után? El tudod-e választani, hogy az
+<code>mean</code> miért összegezhető, míg a <code>median</code> miért
+nem? Fel tudsz-e írni egy olyan műveletet, amely garantáltan nem mozgat
+adatot partíciók között, és egy olyat, amely tipikusan shuffle-t okoz?
+Ha a <code>ddf.groupby("segment").sum().compute()</code> eredménye
+megegyezik a pandaséval, az nem jelenti azt, hogy a Dask nem végzett
+shuffle-t: a helyes kérdés az, hogy a scheduler milyen gráfot futtatott.
+A minőségi kapukat <a href="s118.html">Adatminőségi kapu és hibás sorok
+kezelése</a> szerint érdemes a Dask-feldolgozás előtt futtatni, mert a
+lusta gráf attól még ugyanazt a hibás inputot aggregálja.</p>
+<h3 data-number="34.2.10" id="rövid-összefoglaló"><span
+class="header-section-number">34.2.10</span> Rövid összefoglaló</h3>
+<p>A Dask lusta task gráfja a compute hívásáig csak terv: a partíciók
+független pandas-szeletek, a scheduler pedig taskokat ütemez. A compute
+kiértékeli a gráfot, a persist megtartja a közbülső állapotot a későbbi
+ágak számára. Az összeg, darabszám, átlag és pillanatnyi statisztikák
+partíciónkénti részeredményekből kombinálhatók; a pontos medián,
+kvantilis és egyediérték-számítás nem állítható elő pusztán egyetlen
+részösszeg és darabszám kombinálásával. A megvalósítás típustól és
+algoritmustól függően használhat rendezést, részhalmazokat, közelítő
+vázlatokat vagy adatmozgatást; <strong>nem minden esetben szükséges
+shuffle</strong>. A nyers shuffle költség a mozgatott adattól és a
+kulcseloszlástól függ, és kis adaton a sok apró task overheadje nagyobb
+lehet a hasznos munkánál. A következő <a href="s135.html">Spark
+DataFrame és végrehajtási terv</a> alfejezet a Spark DataFrame
+végrehajtási terv párhuzamos fogalmait tárgyalja.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s133.html">← 34.1 Nagyobb mint RAM: előbb adatfolyam</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s135.html">34.3 Spark DataFrame és végrehajtási terv →</a></div>
+</nav>
+</body>
+</html>

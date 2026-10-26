@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>36.1 Névtorzítás, layout és C++ runtime ABI – C és modern C++
+rendszerszemléletben DevOps szakembereknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. rész: Modern C++</a> › <a href="index.html#ch36">36 C++ ABI, C interfész és FFI</a></p>
+<div class="links"><a class="prev" rel="prev" href="s180.html">← 35.5 Aszinkron I/O adapter és coroutine-labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s182.html">36.2 extern C és két nyelvű header →</a></div>
+</nav>
+<h2 data-number="36.1" id="s181"><span
+class="header-section-number">36.1</span> Névtorzítás, layout és C++
+runtime ABI</h2>
+<p>Egy natív program linkelési felülete nem ismeri a C++ nyelvet: a
+szerelő (assembler) és a linker szintjén csak szimbólumok, szakaszok és
+relokációk léteznek. Amikor két, különböző fordítóval vagy különböző
+könyvtárverzióval épített objektum találkozik, a találkozás helyét az
+ABI (Application Binary Interface) szabályai rögzítik. A C nyelvben ezt
+viszonylag kevés dolog terheli: a hívási konvenció, a struct-layout és a
+szimbólumnév. A C++ ezt a szerződést kibővíti — névtorzítással,
+osztályelrendezéssel, virtuális dispatch-csel, RTTI-vel és
+kivételkezeléssel —, de a bővítés nem a nyelvi szabvány része, hanem egy
+konkrét ABI implementációé. Ezért ebben az alfejezetben minden állítást
+konkrét toolchainprofilhoz kötünk: Linux x86-64 System V, GCC 13 vagy
+Clang 17, <code>-std=c++20</code>, Itanium C++ ABI. Ahol a részlet
+implementációfüggő vagy verziófüggő, jelöljük.</p>
+<p>A korábbi részekből építkezünk: a többszörös öröklés és a virtuális
+bázis eseteit a <a href="s121.html">Többszörös öröklés és virtuális
+bázis (24.5)</a> tárgyalta, az ODR és az <code>inline</code> több
+fordítási egységen átnyúló hatását az <a href="s167.html">ODR, inline és
+több fordítási egység (33.3)</a>, a hívási konvenciót és a stack frame
+szerkezetét pedig a <a href="s068.html">Hívási konvenció, stack frame és
+visszatérés (14.2)</a>. Ezek ismeretében most a C++ ABI három pillérét —
+névtorzítás, layout, runtime-támogatás — vesszük sorra, és megmutatjuk,
+mit lehet ezekből a linkelési felületen megfigyelni.</p>
+<h3 data-number="36.1.1"
+id="névtorzítás-nyelvi-név-és-szimbólumnév"><span
+class="header-section-number">36.1.1</span> Névtorzítás: nyelvi név és
+szimbólumnév</h3>
+<p>A <strong>névtorzítás</strong> (name mangling) az a fordítási lépés,
+amely egy C++ entitás — függvény, változó, típus, sablon-instantiation —
+deklarációját egyedi, karakterlánc-alapú szimbólumnévvé kódolja. A C++
+nyelv a túlterhelést, a névtereket, a tagfüggvényeket és a sablonokat
+egyetlen névtérben kell hogy kifejezze a linker számára; a linker
+viszont csak <code>char*</code>-összehasonlítást ismer. A torzítás tehát
+kényszerű: a nyelvi információk egy részét (paramétertípusok,
+hozzáférés, osztálykörnyezet) a szimbólumnév hordozza.</p>
+<p>Az Itanium C++ ABI mangling-sémája elterjedt Linuxon, macOS-en
+(Clang), ARM-en és sok más platformon. Fontos, hogy az „Itanium” itt
+<strong>történelmi elnevezés</strong>, nem az Intel Itanium ISA-ra utal:
+a séma egy The SCO Group és mások által kezdeményezett, ISA-független
+ABI-specifikáció neve, amelyet x86-64-en, AArch64-en, RISC-V-n egyaránt
+használnak. A Microsoft Visual C++ más sémát használ, ezért MSVC és GCC
+objektumai nem linkelhetők össze C++-szinten.</p>
+<p>Az alapséma: <code>_Z</code>, majd a név hossza és a név, majd a
+paramétertípusok kódolása. Néhány példa, amelyeket
+<code>c++filt</code>-tel vissza lehet fejteni:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Forrás</th>
+<th>Torzított szimbólum</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>int foo(int)</code></td>
+<td><code>_Z3fooi</code></td>
+</tr>
+<tr class="even">
+<td><code>double foo(double)</code></td>
+<td><code>_Z3food</code></td>
+</tr>
+<tr class="odd">
+<td><code>void ns::foo()</code></td>
+<td><code>_ZN2ns3fooEv</code></td>
+</tr>
+<tr class="even">
+<td><code>void Foo::bar() const</code></td>
+<td><code>_ZNK3Foo3barEv</code></td>
+</tr>
+<tr class="odd">
+<td><code>Foo::Foo()</code> (teljes objektum)</td>
+<td><code>_ZN3FooC1Ev</code></td>
+</tr>
+<tr class="even">
+<td><code>Foo::~Foo()</code> (teljes objektum)</td>
+<td><code>_ZN3FooD1Ev</code></td>
+</tr>
+<tr class="odd">
+<td><code>Foo</code> típus vtable-je</td>
+<td><code>_ZTV3Foo</code></td>
+</tr>
+<tr class="even">
+<td><code>Foo</code> típus RTTI-ja</td>
+<td><code>_ZTI3Foo</code></td>
+</tr>
+<tr class="odd">
+<td><code>Foo</code> típus neve</td>
+<td><code>_ZTS3Foo</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <code>K</code> a const tagfüggvényt jelöli, a
+<code>C1</code>/<code>C2</code> a konstruktort (teljes
+vs. bázis-változat), a <code>D0</code>/<code>D1</code>/<code>D2</code> a
+destruktort (deleting, complete, base). A <code>V</code>,
+<code>I</code>, <code>S</code> prefixek rendre vtable, typeinfo,
+typeinfo-name string. A <code>c++filt</code> visszafejti ezeket, a
+<code>nm -C</code> a binárison belüli szimbólumokat már demangle-özve
+listázza.</p>
+<p>Fontos hangsúlyozni: a mangling <strong>nem</strong> része az ISO C++
+szabványnak. Két standard-konform fordító ugyanarra a függvényre más
+szimbólumot generálhat, és ez önmagában megakadályozza az
+összelinkelést. Az <code>inline</code> és sablon-instantiation esetén az
+ODR még szigorúbb: ha két TU-ban ugyanarra a szimbólumra eltérő
+definíció kerül, a viselkedés nem definiált, és a linker gyakran
+észrevétlenül választ egy példányt.</p>
+<h3 data-number="36.1.2"
+id="osztályelrendezés-vptr-vtable-és-rtti"><span
+class="header-section-number">36.1.2</span> Osztályelrendezés, vptr,
+vtable és RTTI</h3>
+<p>A <strong>nem polimorf</strong> osztály elrendezése nagyjából követi
+a C struct szabályait: a nem statikus adattagok deklarációs sorrendben,
+természetes igazítással, a köztes réseket kitöltve (padding)
+helyezkednek el. Az <code>sizeof</code>, <code>offsetof</code> és az
+igazítás ebben az esetben a szokásos C-beli számítással követhető,
+feltéve, hogy ismerjük a cél-ABI-t.</p>
+<p>A <strong>polimorf</strong> osztály (amelynek van legalább egy
+virtuális függvénye vagy virtuális bázisa) elrendezése gyökeresen más:
+az Itanium ABI egy rejtett <code>vptr</code>-t illeszt be, amely a
+<strong>virtuális táblára</strong> (vtable) mutat. Ez az ABI adta
+reprezentáció — a nyelv csak annyit mond, hogy a virtuális hívás a
+dinamikus típus függvényét hívja, arról nem rendelkezik, hogy ez
+vtable-lekérdezéssel történik. A vtable tartalma az Itanium ABI
+szerint:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Index</th>
+<th>Tartalom</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>−2</td>
+<td>offset-to-top (a legfelső objektumhoz mért eltolás)</td>
+</tr>
+<tr class="even">
+<td>−1</td>
+<td><code>_ZTI&lt;Osztály&gt;</code> pointer, az RTTI leírás</td>
+</tr>
+<tr class="odd">
+<td>0…n</td>
+<td>virtuális függvények címei deklarációs sorrendben, öröklési
+szabályok szerint</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>vptr</code> a 0. indexre mutat; a negatív indexek elérését a
+fordulónak kell biztosítania (a <code>dynamic_cast</code> és
+<code>typeid</code> erre támaszkodik). A <code>vtable</code> nem
+garantáltan olvasható adat a programból — a hozzáférés az ABI belső
+szerződése.</p>
+<p>Az <strong>RTTI</strong> (Run-Time Type Information) ezen a felületen
+egy <code>std::type_info</code>-szerű objektum, amelynek szimbólumneve
+<code>_ZTI&lt;Osztály&gt;</code>, és amely egy
+<code>_ZTS&lt;Osztály&gt;</code> névkarakterláncra mutat. A
+<code>typeid</code> és <code>dynamic_cast</code> ezt használja. Két
+dinamikusan linkelt modul között a típusazonosság-ellenőrzés attól függ,
+hogy a <code>typeinfo</code> pointereket egyesíti-e a dynamic linker;
+ezért DSO-határon a <code>typeid</code>-alapú azonosítás törékeny lehet,
+és verziófüggő. Ezt a részletet a gyakorlatban ne tekintsük stabil
+szerződésnek.</p>
+<h3 data-number="36.1.3"
+id="thunkok-pointer-igazítás-és-tag-függvény-pointer"><span
+class="header-section-number">36.1.3</span> Thunkok, pointer-igazítás és
+tag-függvény pointer</h3>
+<p>Többszörös öröklésnél a bázis-részobjektum nem feltétlenül a legális
+<code>this</code> pointerrel esik egybe. Tekintsük:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> BaseA <span class="op">{</span> <span class="kw">virtual</span> <span class="op">~</span>BaseA<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span> <span class="kw">virtual</span> <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span><span class="op">;</span> <span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> BaseB <span class="op">{</span> <span class="kw">virtual</span> <span class="op">~</span>BaseB<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span> <span class="kw">virtual</span> <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span><span class="op">;</span> <span class="op">};</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Widget <span class="op">:</span> BaseA<span class="op">,</span> BaseB <span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span> <span class="kw">override</span><span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>Widget</code>-en belül a <code>BaseA</code> részobjektum a 0.
+offseten, a <code>BaseB</code> részobjektum később helyezkedik el.
+Amikor egy <code>BaseB*</code>-en keresztül hívjuk a
+<code>render</code>-t, a hívott függvénynek a <code>Widget</code>-re
+mutató pointerre van szüksége, nem a <code>BaseB</code> részobjektumra.
+Ezt egy <strong>thunk</strong> oldja meg: egy rövid, fordító által
+generált stub, amely a <code>this</code> pointert a megfelelő eltolással
+korrigálja, majd a valódi implementációra ugrik. Az Itanium ABI
+<strong>non-virtual thunk</strong>-nak nevezi a nem virtuális bázisra
+vonatkozó korrekciót, és <strong>virtual thunk</strong>-nak a virtuális
+bázisért végzett korrekciót.</p>
+<p>A thunk nem jelenik meg a forrásban, de a szimbólumtáblában igen:
+<code>nm</code> csillagozott bejegyzésként vagy
+<code>non-virtual thunk to Widget::render()</code> alakban mutatja. A
+<code>BaseB</code> részobjektum saját vtable-je a thunkra mutat, nem
+közvetlenül a <code>Widget::render</code>-re.</p>
+<p>A <strong>tag-függvény pointer</strong>
+(<code>int (Widget::*)()</code>) reprezentációja szintén ABI-kérdés. Az
+Itanium ABI-ban egy nem virtuális tag-függvény pointer egy
+<code>{ptr, adj}</code> pár, ahol <code>adj</code> az esetleges
+<code>this</code>-korrekció; virtuális tagfüggvénynél a <code>ptr</code>
+egy vtable-indexre mutató segédfüggvény (az úgynevezett „virtual member
+function pointer”), és az <code>adj</code> az öröklési eltolás. Ennek
+pontos mérete és szemantikája implementációfüggő, és nem hordozható két
+különböző ABI között — ezért shared library határon tag-függvény pointer
+átadása nem javasolt.</p>
+<h3 data-number="36.1.4" id="kivételkezelés-mint-abi-szolgáltatás"><span
+class="header-section-number">36.1.4</span> Kivételkezelés mint
+ABI-szolgáltatás</h3>
+<p>A <code>throw</code> és a stack unwinding (veremtakarítás)
+együttműködést igényel a fordító, a runtime és a dinamikus linker
+között. A <code>throw</code> egy runtime-függvényt hív
+(<code>__cxa_throw</code> az Itanium ABI-ban), amely elindítja a
+kétszakaszos unwindingot. A fordító minden olyan függvényhez, amely
+kivételt dobhat vagy kezel, két extra szakaszt generál:</p>
+<ul>
+<li><code>.eh_frame</code> (és <code>.eh_frame_hdr</code>) — a CFI (Call
+Frame Information), amely leírja, hogy az unwinder hogyan állítsa vissza
+a regisztereket lépésenként.</li>
+<li><code>.gcc_except_table</code> — az LSDA (Language-Specific Data
+Area), amely megmondja, hogy az adott programszámlálás-tartományban
+melyik <code>catch</code> blokk illetékes, és milyen típushoz.</li>
+</ul>
+<p>A tényleges unwindingot a <code>libgcc_s</code> (vagy
+<code>libunwind</code>) biztosítja: <code>_Unwind_RaiseException</code>,
+<code>_Unwind_Resume</code>, <code>_Unwind_DeleteException</code>. A
+personality routine — GCC-nél <code>__gxx_personality_v0</code> — dönti
+el lépésenként, hogy az adott frame hogyan viselkedjen. Ezek a
+szimbólumok a <code>libstdc++</code> és <code>libgcc_s</code> közös
+felületén élnek.</p>
+<p>Következmény a gyakorlatra: egy <code>extern "C"</code> felületen
+átjutó kivétel nem definiált viselkedés, mert a C-fordító által generált
+frame-ekhez nincs LSDA, így az unwinder nem tudja őket helyesen átlépni.
+(A gyakorlatban egyes implementációk „átengedik”, de garantált
+viselkedés nincs.) Ezért az FFI-határon a kivételt a C++ oldalon el kell
+kapni, és hibakód, <code>std::error_code</code> vagy
+<code>expected</code> formájában átadni. Ezt a mintát részletesen a <a
+href="s183.html">Stabil shared library határ és verziózás (36.3)</a>
+tárgyalja.</p>
+<p>Kiegészítő runtime-szimbólumok, amelyeket érdemes ismerni:
+<code>__cxa_atexit</code> (globális destruktor regisztrálása),
+<code>__cxa_guard_acquire</code>/<code>__cxa_guard_release</code>
+(függvény-lokális statikus inicializáció, C++11 óta szálbiztos),
+<code>__cxa_pure_virtual</code> (tiszta virtuális hívás esetén hívott
+függvény),
+<code>__cxa_allocate_exception</code>/<code>__cxa_free_exception</code>.
+Ha egy binárison <code>nm -D | grep __cxa</code> futtatunk, ezek jól
+látszanak — de a konkrét készlet a fordító és a standard library
+verziójától függ.</p>
+<h3 data-number="36.1.5"
+id="standard-layout-és-triviálisság-mit-garantál-és-mit-nem"><span
+class="header-section-number">36.1.5</span> Standard layout és
+triviálisság: mit garantál és mit nem</h3>
+<p>A <code>std::is_standard_layout&lt;T&gt;</code> és
+<code>std::is_trivial&lt;T&gt;</code> nyelvi tulajdonságok. A
+<strong>standard layout</strong> azt jelenti, hogy az osztály megfelel a
+C-kompatibilis elrendezés bizonyos nyelvi kritériumainak (pl. legfeljebb
+egy nem statikus adattaggal rendelkező bázis, minden nem statikus tag
+azonos hozzáférés-szinttel, nincs virtuális tag). A
+<strong>triviálisság</strong> azt jelenti, hogy a default constructor, a
+másoló/mozgató konstruktor, a másoló/mozgató értékadás és a destruktor
+mind „triviális” (a fordító által generált, szemantikailag üres). Egy
+triviális, standard layout típus nagyon közel áll egy C structhoz, és
+gyakran ugyanazzal a calling convention-nel adható át.</p>
+<p>Azonban <strong>ezek a tulajdonságok önmagukban nem jelentenek
+ABI-stabilitást</strong>. Három okból:</p>
+<ol type="1">
+<li>A <strong>padding és alignment</strong> a cél-ABI-tól függ. Két
+azonos mezőkkel rendelkező standard layout struct két architektúrán
+eltérő <code>sizeof</code>-szal rendelkezhet.</li>
+<li>A <strong>calling convention</strong> struct visszaadásnál vagy
+paraméter-átadásnál külön szabályokat használhat (System V: kis struct
+register-ben, nagy memóriában). Ezek a szabályok nem a nyelvi típusból,
+hanem az ABI-ból következnek.</li>
+<li>Az <strong>empty base optimization (EBO)</strong> és a
+<code>[[no_unique_address]]</code> olyan elrendezéseket eredményez,
+amelyek nem esnek egybe a naiv számítással, és nem minden fordító
+alkalmazza ugyanúgy.</li>
+</ol>
+<p>Gyakorlati következmény: shared library határon akkor is érdemes
+kerülni a C++ típusok közvetlen átadását, ha <code>is_trivial</code> és
+<code>is_standard_layout</code> igaz. A stabil minta az <strong>opaque
+handle</strong> — átlátszatlan mutató vagy egész azonosító, amelyet a
+könyvtár belső típusra kovácsol —, amit a <a href="s183.html">Stabil
+shared library határ és verziózás (36.3)</a> részletez. Egy tanulságos
+eset a libstdc++ <code>_GLIBCXX_USE_CXX11_ABI</code> váltása (GCC 5):
+két különböző értékkel épített modul ugyanarra a szimbólumra más
+<code>std::string</code> layout-ot használ, ezért a keveredés linkelési
+hibát vagy csendes memóriahibát okoz. Ez nem szabványkérdés, hanem egy
+konkrét standard library ABI-döntése.</p>
+<h3 data-number="36.1.6"
+id="kidolgozott-példa-ugyanaz-a-program-két-nézetben"><span
+class="header-section-number">36.1.6</span> Kidolgozott példa: ugyanaz a
+program két nézetben</h3>
+<p>Fordítsuk le a fenti <code>Widget</code>-példát egy önálló fájlba, és
+figyeljük meg a szimbólumokat.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// shapes.cpp — GCC 13 / Clang 17, Linux x86-64, Itanium ABI</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> BaseA <span class="op">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">virtual</span> <span class="op">~</span>BaseA<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">virtual</span> <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span> <span class="op">{</span> <span class="bu">std::</span>puts<span class="op">(</span><span class="st">&quot;A::render&quot;</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ax <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> BaseB <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">virtual</span> <span class="op">~</span>BaseB<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">virtual</span> <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span> <span class="op">{</span> <span class="bu">std::</span>puts<span class="op">(</span><span class="st">&quot;B::render&quot;</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> bx <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Widget <span class="op">:</span> BaseA<span class="op">,</span> BaseB <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>Widget<span class="op">()</span> <span class="kw">override</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> render<span class="op">()</span> <span class="at">const</span> <span class="kw">override</span> <span class="op">{</span> <span class="bu">std::</span>puts<span class="op">(</span><span class="st">&quot;Widget::render&quot;</span><span class="op">);</span> <span class="op">}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> w <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    Widget w<span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    BaseB<span class="op">*</span> b <span class="op">=</span> <span class="op">&amp;</span>w<span class="op">;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    b<span class="op">-&gt;</span>render<span class="op">();</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;sizeof(Widget)=</span><span class="sc">%zu\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>Widget<span class="op">));</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;offsets: A=</span><span class="sc">%td</span><span class="st"> B=</span><span class="sc">%td\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(</span><span class="kw">static_cast</span><span class="op">&lt;</span>BaseA<span class="op">*&gt;(&amp;</span>w<span class="op">))</span> <span class="op">-</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(&amp;</span>w<span class="op">),</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(</span>b<span class="op">)</span> <span class="op">-</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(&amp;</span>w<span class="op">));</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás és megfigyelés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O0</span> <span class="at">-g</span> <span class="at">-o</span> shapes shapes.cpp</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">nm</span> shapes <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;ZTV|ZTI|ZTS|render&#39;</span> <span class="kw">|</span> <span class="ex">c++filt</span>   <span class="co"># demangle-özött lista</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">readelf</span> <span class="at">-Ws</span> shapes <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;_ZTV|_ZTI&#39;</span>             <span class="co"># nyers szimbólumok</span></span></code></pre></div>
+<p>A megfigyelhető jelenségek (konkrét értékek a fenti profilon, más
+cél-ABI-n eltérhetnek):</p>
+<ul>
+<li><code>_ZTV6Widget</code> három bejegyzést tartalmaz:
+<code>offset-to-top</code>, <code>typeinfo</code>, majd a
+<code>BaseB</code>-részobjektumban a <code>render</code>-re mutató
+thunk.</li>
+<li><code>_ZTI6Widget</code> az RTTI-leíró, <code>_ZTS6Widget</code> a
+típusnév.</li>
+<li><code>nm -C</code> listájában megjelenik a
+<code>non-virtual thunk to Widget::render() const</code> bejegyzés — ez
+a <code>this</code>-korrekciót végző stub, amely a <code>BaseB</code>
+vtable-jében szerepel.</li>
+<li>A <code>sizeof(Widget)</code> és az offsetek a fenti elrendezés
+szerintiek, de ezeket a konkrét cél-ABI és a <code>-O0</code> mellett
+kell értelmezni; <code>-O2</code> nem változtatja meg a layoutot, de
+befolyásolhatja a thunk jelenlétét vagy a hívások inline-olását.</li>
+</ul>
+<p>Ez a kísérlet jól mutatja, hogy a nyelvi objektum és az
+ABI-reprezentáció két külön szint: a forrásban egy <code>render</code>
+függvény van, a binárison belül viszont két-három szimbólum (valódi,
+thunk, vtable-bejegyzés) írja le ugyanazt a viselkedést.</p>
+<h3 data-number="36.1.7" id="tipikus-hibák"><span
+class="header-section-number">36.1.7</span> Tipikus hibák</h3>
+<ul>
+<li><strong>A mangling-séma nyelvi tulajdonságnak tekintése.</strong>
+Két eltérő ABI-jű fordító által generált bináris összeillesztése nem
+„C++ kompatibilitási” kérdés, hanem egyszerűen nem fog linkelni.</li>
+<li><strong>Kivétel átengedése <code>extern "C"</code> határon.</strong>
+Még ha egy adott napon működik is, nincs szerződés mögötte, és a
+viselkedés a következő libgcc-verzióval megváltozhat.</li>
+<li><strong><code>typeid</code>-re épülő DSO-azonosítás.</strong> A
+típusegyesítés a dynamic linker konfigurációjától függ;
+<code>-fvisibility=hidden</code> és explicit
+<code>__attribute__((visibility("default")))</code> nélkül a határ nem
+kontrollált.</li>
+<li><strong>Standard layout struct közvetlen átadása két fordítási
+egység között.</strong> Ez rendszerint működik, de nem garantált, ha a
+két TU eltérő <code>-fpack-struct</code>, <code>-mabi=</code>,
+<code>-D_GLIBCXX_USE_CXX11_ABI=</code> vagy cél-ABI-t használ.</li>
+<li><strong>Tag-függvény pointer átadása FFI-határon.</strong> A
+reprezentáció implementációfüggő; használjunk <code>extern "C"</code>
+callback-et kísérő <code>void*</code> context pointerrel.</li>
+</ul>
+<h3 data-number="36.1.8" id="feladatok"><span
+class="header-section-number">36.1.8</span> Feladatok</h3>
+<p><strong>1. (magyarázó)</strong> Adott a
+<code>_ZNK4Data5mergeERKS_</code> szimbólum. Fejtse vissza a mangling
+sémát kézzel, és nevezze meg, milyen szintaktikai elemeknek felelnek meg
+az egyes karakterek.</p>
+<p><strong>2. (kódolási)</strong> Fordítson le egy három bázisú öröklést
+(<code>class D : public A, public B, public C</code>) használó programot
+a fenti profillal, és <code>nm -C</code> kimenetéből azonosítsa, mely
+<code>render</code>-szerű hívásoknál jelenik meg thunk. Módosítsa úgy a
+bázisokat, hogy az egyik virtuális bázis legyen
+(<code>virtual public A</code>), és hasonlítsa össze a thunkok számát és
+típusát.</p>
+<p><strong>3. (diagnosztikai)</strong> Adott egy bináris, amely
+<code>undefined reference to __cxa_throw</code> hibát ad egy tiszta C
+program linkelésekor. Mi a hiba oka, és hogyan orvosolható a build (a
+<code>-fno-exceptions</code> és a <code>-static</code> kapcsolókhoz
+kapcsolódó viselkedést is érintve)?</p>
+<h3 data-number="36.1.9" id="megoldások"><span
+class="header-section-number">36.1.9</span> Megoldások</h3>
+<p><strong>1.</strong> A <code>_ZNK4Data5mergeERKS_</code> bontása:
+<code>_Z</code> a mangling prefix; <code>N</code> „nested name” (a név
+névtérben/osztályban van); <code>K</code> const tagfüggvény;
+<code>4Data</code> a <code>Data</code> osztály neve (hossz +
+karakterek); <code>5merge</code> a tagfüggvény neve; <code>E</code> a
+nested name lezárása; <code>R</code> referencia (<code>T&amp;</code>);
+<code>K</code> a hivatkozott típus const; <code>S_</code> a korábbi
+helyettesítő (<code>S_</code> az első helyettesítő elemre utal, itt
+magára a <code>Data</code>-ra). A függvény tehát:
+<code>void vagy egyéb visszatérési típusú Data::merge(const Data&amp;) const</code>.
+Fontos, hogy a visszatérési típus nincs a manglingben (kivéve
+sablon-függvényeket és operátorokat), mert a túlterhelést csak a
+paraméterek és a tagfüggvény-jelleg különbözteti meg.</p>
+<p><strong>2.</strong> A megoldás kulcsa, hogy a <code>D</code> első
+bázis-részobjektuma 0. offseten van, a második és harmadik bázisé nem.
+Minden olyan virtuális függvény, amelyet a <code>B</code> vagy
+<code>C</code> részobjektumon keresztül hívunk, thunkot generál
+(legalább <code>non-virtual thunk to D::render</code>). Ha az
+<code>A</code>-t virtuális bázissá tesszük, a thunkok <strong>virtual
+thunk</strong>-ká alakulnak, mert a <code>this</code>-korrekció nem egy
+statikus offset, hanem a virtuális bázis vptr-jéből nyert adat alapján
+történik. Ennek megfelelően a vtable szerkezete bonyolultabb (VTT —
+virtual table table), és a thunkok száma nő. Ellenőrzési feltétel: az
+<code>nm -C</code> kimenetében a <code>thunk</code> szót tartalmazó
+bejegyzések kiírandók, és a két változat között a módosítás kimutatható
+különbséget ad. (Konkrét darabszám erősen függ a fordító verziójától és
+a <code>-O</code> szinttől.)</p>
+<p><strong>3.</strong> A <code>__cxa_throw</code> (és társai,
+<code>__gxx_personality_v0</code>) a <code>libstdc++</code>-ban él. Ha C
+programot <code>-static</code>-kal vagy
+<code>-fno-exceptions</code>-szel linkelünk, de a program — például egy
+headerben lévő <code>inline</code> C++ kód vagy egy
+<code>#include &lt;stdexcept&gt;</code> — mégis hivatkozik ezekre, a
+linker nem találja a szimbólumot. Javítás: (a) a C++ kódot izoláljuk, és
+<code>extern "C"</code> wrapperben tartsuk, vagy (b) kapcsoljuk be a
+<code>libstdc++</code>-t (<code>g++</code>-vel linkeljük a vegyes
+programot), vagy (c) <code>-fno-exceptions</code> esetén biztosítsuk,
+hogy semmilyen C++ komponens ne dobjon kivételt, és a standard library
+fejléceit se hívjuk olyan útvonalon, amely throw-t igényel.
+<code>-static</code> esetén a <code>--gc-sections</code> segíthet, de a
+<code>libgcc_eh.a</code>-t és <code>libstdc++.a</code>-t is be kell
+vonni. Ellenőrzési feltétel: <code>nm -D a.out | grep __cxa_</code> a
+linkelés után vagy üres, vagy a bináris statikusan tartalmazza a
+szükséges szimbólumokat; <code>ldd a.out</code>-ból kiderül, hogy melyik
+runtime-ra támaszkodik.</p>
+<h3 data-number="36.1.10" id="összefoglaló"><span
+class="header-section-number">36.1.10</span> Összefoglaló</h3>
+<p>A C++ ABI — konkrét profilon: Itanium C++ ABI Linux x86-64-en, GCC
+13/Clang 17, <code>-std=c++20</code> — három rétegben terjeszti ki a
+C-szerződést. A <strong>névtorzítás</strong> a nyelvi entitást egyedi
+szimbólumnévvé kódolja; a séma nem szabvány, hanem ABI-döntés, és a
+<code>c++filt</code>/<code>nm -C</code> segítségével olvasható. A
+<strong>layout</strong> a nem polimorf osztályoknál közel C-struct, a
+polimorfaknál viszont rejtett <code>vptr</code>-t és vtable-t vezet be,
+benne <code>offset-to-top</code>, RTTI-pointer és függvénypointerek; a
+többszörös (és virtuális) öröklés thunkokat generál a
+<code>this</code>-korrekcióhoz. A <strong>runtime-támogatás</strong>
+(<code>.eh_frame</code>, <code>.gcc_except_table</code>,
+<code>__cxa_*</code>, <code>_Unwind_*</code>) biztosítja a
+kivételkezelést és a statikus inicializációt — ezek nem átjárhatók
+szabadon <code>extern "C"</code> határon. Végül a
+<code>is_standard_layout</code>/<code>is_trivial</code> nyelvi
+tulajdonságok hasznos közelítések, de nem ABI-stabilitási garanciák;
+stabil shared library határhoz opaque handle és C-kompatibilis interfész
+kell, amit a következő alfejezetek (<a href="s182.html">extern C és két
+nyelvű header (36.2)</a>, <a href="s183.html">Stabil shared library
+határ és verziózás (36.3)</a>, <a href="s184.html">Python és más nyelvek
+FFI-kapcsolata (36.4)</a>) részleteznek. A laborban a <code>nm</code>,
+<code>readelf</code> és <code>c++filt</code> együttes használata adja a
+megfigyelés eszközét — a konkrét kimenet azonban mindig a rögzített
+toolchainprofilhoz kötendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s180.html">← 35.5 Aszinkron I/O adapter és coroutine-labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s182.html">36.2 extern C és két nyelvű header →</a></div>
+</nav>
+</body>
+</html>

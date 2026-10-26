@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>34.3 Spark DataFrame és végrehajtási terv – Data Scientist
+munkaeszközök és futtatókörnyezetek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#sch34">34 Nagyobb adat: Dask, Spark és elosztott végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="s134.html">← 34.2 Dask task graph és partíció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s136.html">34.4 Elosztott kísérlet és adatelhelyezés →</a></div>
+</nav>
+<h2 data-number="34.3" id="s135"><span
+class="header-section-number">34.3</span> Spark DataFrame és
+végrehajtási terv</h2>
+<h3 data-number="34.3.1" id="cél-és-konkrét-helyzet"><span
+class="header-section-number">34.3.1</span> Cél és konkrét helyzet</h3>
+<p>A <a href="s134.html">Dask task graph és partíció</a> Dask-példában
+már láttunk lusta feladatgráfot és partíciók közötti műveletet. Itt a
+Spark ugyanazt a kérdést más futásidejű szerződéssel oldja meg: egy
+vezérlő folyamat felépíti a végrehajtási tervet, a végrehajtók pedig
+partíciókonként dolgoznak. A tanulási helyzet nem valódi klaszter, hanem
+helyi, CPU-s mód, a cél az aggregálás tervezése és korrekt, kis
+előnézetű futtatása.</p>
+<p>Bemenet: a Northstar <code>lab/orders.csv</code>, 2400 rendelés,
+minden sor egy megfigyelési egység, <code>order_id</code> kulccsal. A
+használt oszlopok: <code>priority_flag</code> (0/1, expressz jelzés),
+<code>basket_minor</code> (egész EUR-cent kosárérték),
+<code>quantity_sum</code>, <code>distance_km</code>. Cél:
+<code>priority_flag</code> szerint rendelésszám, kosárösszeg és
+átlagkosár. Elvárt ellenőrzés: a kimenet két csoportot tartalmaz, a két
+<code>basket_minor</code>-összeg összege a teljes fájl kosárösszegét
+adja, és a rendelésszámok összege 2400. Előzetes becslés: a kimenet 2
+sor, 4 oszloppal; a futás helyi módban a 2400 soros fájlon gyors, de
+ennek mért idejét itt nem állítjuk.</p>
+<h3 data-number="34.3.2"
+id="fogalmi-magyarázat-driver-executor-terv-shuffle"><span
+class="header-section-number">34.3.2</span> Fogalmi magyarázat: driver,
+executor, terv, shuffle</h3>
+<p>A Spark-folyamatnak két fő szereplője van:</p>
+<ul>
+<li><strong>driver</strong>: a vezérlő folyamat. Lefuttatja a
+programodat, minden lusta transzformációból felépíti a tervet, ütemezi a
+munkát, koordinálja a végrehajtókat, és az akciók kis eredményét
+visszagyűjti.</li>
+<li><strong>executor</strong>: a végrehajtó folyamat. Partíciókat tárol,
+oszloparányosan olvas, számol, és a shuffle során adatot küld más
+végrehajtóknak.</li>
+</ul>
+<p>A Spark <strong>DataFrame</strong> elosztott, oszlopos, lusta
+reláció. Ugyanúgy van sémája, sora és oszlopa, mint egy pandas vagy
+Polars táblának, de a sorok partíciókra osztva élnek az executorokon.
+<strong>Transzformáció</strong> (transformation) minden olyan művelet,
+amely új DataFrame-et ad vissza, de nem indít azonnal számítást:
+<code>select</code>, <code>filter</code>, <code>withColumn</code>,
+<code>groupBy</code>, <code>agg</code>, <code>join</code>,
+<code>orderBy</code> stb. <strong>Akció</strong> (action) az, ami
+tényleges számítást indít, és eredményt hoz vissza a driverre vagy külső
+tárolóba ír: <code>count</code>, <code>collect</code>,
+<code>show</code>, <code>take</code>, <code>write</code>.</p>
+<p>Az <code>explain</code> ezért nem futtató parancs: kiíratja a
+strukturált tervet, hogy az áthelyezések előtt átgondolhasd az
+adatmozgást. Például:</p>
+<pre class="text"><code>HashAggregate(keys=[priority_flag], functions=[finalmerge_sum, finalmerge_count])
++- Exchange hashpartitioning(priority_flag, 200)
+   +- HashAggregate(keys=[priority_flag], functions=[partial_sum, partial_count])
+      +- FileScan csv [...] [priority_flag,basket_minor]</code></pre>
+<p>A tervet alulról felfelé olvasom: először a CSV beolvasása, utána
+partíción belüli részleges összegzés, majd <strong>shuffle</strong>,
+végül a kulcs szerinti végleges összegzés.</p>
+<p>A <strong>partition</strong> a párhuzamosság fizikai egysége: az adat
+egy darabja, amelyet egy executor-mag dolgoz fel. A
+<strong>shuffle</strong> partíciók közötti adatáthelyezés kulcs szerint.
+Az aggregálásnál a Spark hash particionálást használ: minden
+<code>(priority_flag)</code> kulcs a hash alapján kiválasztott
+partícióba kerül, hogy minden csoport egyetlen helyen legyen. A shuffle
+drága, mert lemezre és hálózatra is kerülhet adat, ezért a Spark először
+lokális részösszegeket számít.</p>
+<p>A <strong>collect limit</strong> a biztonságos előnézet mintája: a
+<code>.limit(2).show()</code> vagy <code>.take(2)</code> azt mondja,
+hogy a driverre legfeljebb két sor érkezzen. A teljes nagy táblát
+<code>.collect()</code>-elni tilos, mert a driver memóriájába gyűjtöd a
+teljes elosztott adatot, ami tipikus OOM-hiba.</p>
+<p>A relációs aggregáció matematikája ugyanaz, mint <a
+href="s025.html">Reláció, NULL és elemzési szemcsézettség</a>
+alfejezetben. Legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mi>k</mi></msub><annotation encoding="application/x-tex">P_k</annotation></semantics></math>
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>-adik
+partíció sorhalmaza,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mi>i</mi></msub><annotation encoding="application/x-tex">x_i</annotation></semantics></math>
+a <code>basket_minor</code> érték az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>.
+rendelésben. Az aggregálás előtti részösszeg:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mi>k</mi></msub><mo>=</mo><munder><mo>∑</mo><mrow><mi>i</mi><mo>∈</mo><msub><mi>P</mi><mi>k</mi></msub></mrow></munder><msub><mi>x</mi><mi>i</mi></msub><mo>,</mo><mspace width="2.0em"></mspace><msub><mi>N</mi><mi>k</mi></msub><mo>=</mo><munder><mo>∑</mo><mrow><mi>i</mi><mo>∈</mo><msub><mi>P</mi><mi>k</mi></msub></mrow></munder><mn>1</mn><mo>,</mo></mrow><annotation encoding="application/x-tex">
+S_k = \sum_{i \in P_k} x_i, \qquad N_k = \sum_{i \in P_k} 1,
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mi>k</mi></msub><annotation encoding="application/x-tex">S_k</annotation></semantics></math>
+a partíció kosárösszege EUR-centben,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>N</mi><mi>k</mi></msub><annotation encoding="application/x-tex">N_k</annotation></semantics></math>
+a rendelésszám a partíción. A shuffle kulcs szerint összegyűjti a
+részösszegeket, a végleges csoportösszeg:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mi>g</mi></msub><mo>=</mo><munder><mo>∑</mo><mi>k</mi></munder><msub><mi>S</mi><mrow><mi>k</mi><mo>,</mo><mi>g</mi></mrow></msub><mo>,</mo><mspace width="2.0em"></mspace><msub><mi>N</mi><mi>g</mi></msub><mo>=</mo><munder><mo>∑</mo><mi>k</mi></munder><msub><mi>N</mi><mrow><mi>k</mi><mo>,</mo><mi>g</mi></mrow></msub><mo>,</mo></mrow><annotation encoding="application/x-tex">
+S_g = \sum_{k} S_{k,g}, \qquad N_g = \sum_{k} N_{k,g},
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>g</mi><annotation encoding="application/x-tex">g</annotation></semantics></math>
+a csoportkulcs (0 vagy 1),
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>S</mi><mrow><mi>k</mi><mo>,</mo><mi>g</mi></mrow></msub><annotation encoding="application/x-tex">S_{k,g}</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>N</mi><mrow><mi>k</mi><mo>,</mo><mi>g</mi></mrow></msub><annotation encoding="application/x-tex">N_{k,g}</annotation></semantics></math>
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+partícióban a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>g</mi><annotation encoding="application/x-tex">g</annotation></semantics></math>
+csoporthoz tartozó részösszeg. Az átlag csak ezután osztás:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mi>g</mi></msub><mo>=</mo><mfrac><msub><mi>S</mi><mi>g</mi></msub><msub><mi>N</mi><mi>g</mi></msub></mfrac><mspace width="1.0em"></mspace><mrow><mtext mathvariant="normal">EUR-cent/rendelés, ha </mtext><mspace width="0.333em"></mspace></mrow><msub><mi>N</mi><mi>g</mi></msub><mo>&gt;</mo><mn>0</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\bar{x}_g = \frac{S_g}{N_g} \quad \text{EUR-cent/rendelés, ha } N_g &gt; 0.
+</annotation></semantics></math></p>
+<p>Kézi kontroll három soron:
+<code>[(0, 500), (1, 700), (0, 300)]</code>. Ekkor két partícióra bontva
+például az elsőben <code>(0, 500), (1, 700)</code>, a másodikban
+<code>(0, 300)</code>: az egyes csoportra
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mrow><mn>0</mn><mo>,</mo><mn>1</mn></mrow></msub><mo>=</mo><mn>500</mn></mrow><annotation encoding="application/x-tex">S_{0,1}=500</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mrow><mn>0</mn><mo>,</mo><mn>1</mn></mrow></msub><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">N_{0,1}=1</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mrow><mn>0</mn><mo>,</mo><mn>2</mn></mrow></msub><mo>=</mo><mn>300</mn></mrow><annotation encoding="application/x-tex">S_{0,2}=300</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mrow><mn>0</mn><mo>,</mo><mn>2</mn></mrow></msub><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">N_{0,2}=1</annotation></semantics></math>,
+így
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mn>0</mn></msub><mo>=</mo><mn>800</mn></mrow><annotation encoding="application/x-tex">S_0=800</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mn>0</mn></msub><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">N_0=2</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mn>0</mn></msub><mo>=</mo><mn>400</mn></mrow><annotation encoding="application/x-tex">\bar{x}_0=400</annotation></semantics></math>;
+az egyes csoportra
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mn>1</mn></msub><mo>=</mo><mn>700</mn></mrow><annotation encoding="application/x-tex">S_1=700</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mn>1</mn></msub><mo>=</mo><mn>700</mn></mrow><annotation encoding="application/x-tex">\bar{x}_1=700</annotation></semantics></math>.
+Az invariáns
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mn>0</mn></msub><mo>+</mo><msub><mi>S</mi><mn>1</mn></msub><mo>=</mo><mn>1500</mn></mrow><annotation encoding="application/x-tex">S_0 + S_1 = 1500</annotation></semantics></math>,
+ami a teljes összeg.</p>
+<h3 data-number="34.3.3" id="minimális-munkapélda"><span
+class="header-section-number">34.3.3</span> Minimális munkapélda</h3>
+<p>Platform: Linux, munkakönyvtár <code>~/northstar-lab</code>, külön
+bővítő Python-környezet, mert PySpark nincs a kezdő
+<code>lab/pyproject.toml</code> alapfüggőségei között. A pontos
+telepített verziót a <code>pip show pyspark</code> paranccsal
+ellenőrizd; az alábbi kódrészlet a PySpark 3.5.x API-ját szemlélteti.
+Ennek a kódrészletnek a futtatását e könyvfejezet generálásakor nem
+végeztük el: ahol kimenetet írunk, az elméletileg várt vagy a tervből
+következő szemléltetés, nem mért futási jegyzék.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Linux, ~/northstar-lab</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-m</span> venv .spark-venv</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="bu">source</span> .spark-venv/bin/activate</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">python</span> <span class="at">-m</span> pip install pyspark  <span class="co"># a pontos verzió rögzítését a projekt lockjában végezd el</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> pyspark.sql <span class="im">import</span> SparkSession, functions <span class="im">as</span> F</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>spark <span class="op">=</span> (</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    SparkSession.builder</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    .appName(<span class="st">&quot;s135-region-aggregation&quot;</span>)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    .master(<span class="st">&quot;local[2]&quot;</span>)          <span class="co"># helyi, 2 szálú mód csak tanulásra</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    .getOrCreate()</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>spark.sparkContext.setLogLevel(<span class="st">&quot;WARN&quot;</span>)</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Explicit séma: a Northstar orders.csv teljes adatszerződése.</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>orders <span class="op">=</span> spark.read.schema(<span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="st">    customer_id string,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="st">    order_id string,</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="st">    order_ts string,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="st">    promised_days int,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="st">    quantity_sum int,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="st">    item_rows int,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="st">    basket_minor long,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="st">    shipping_fee_minor long,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="st">    currency string,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="st">    distance_km double,</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="st">    priority_flag int,</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="st">    delivery_days int,</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="st">    actual_delivery_at string,</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="st">    label_available_at string,</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="st">    target_late int</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;&quot;&quot;</span>).option(<span class="st">&quot;header&quot;</span>, <span class="va">True</span>).csv(<span class="st">&quot;lab/orders.csv&quot;</span>)</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="co"># Lusta transzformációk: semmi nem számolódik itt.</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>grouped <span class="op">=</span> (</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    orders</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    .groupBy(<span class="st">&quot;priority_flag&quot;</span>)</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    .agg(</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        F.count(<span class="st">&quot;*&quot;</span>).alias(<span class="st">&quot;order_count&quot;</span>),</span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>        F.<span class="bu">sum</span>(<span class="st">&quot;basket_minor&quot;</span>).alias(<span class="st">&quot;basket_sum_minor&quot;</span>),</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        F.avg(<span class="st">&quot;basket_minor&quot;</span>).alias(<span class="st">&quot;avg_basket_minor&quot;</span>),</span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="co"># Nem futtat, csak kiíratja a fizikai tervet.</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>grouped.explain(<span class="st">&quot;formatted&quot;</span>)</span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="co"># Biztonságos előnézet: a driverre legfeljebb két sor kerül.</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>preview <span class="op">=</span> grouped.orderBy(<span class="st">&quot;priority_flag&quot;</span>).limit(<span class="dv">2</span>)</span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>preview.show()</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="co"># Helytelen minta nagy adatra; itt 2400 sorral még elfutna, de a szokást ne építsd be:</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="co"># all_rows = orders.collect()</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>spark.stop()</span></code></pre></div>
+<p>A <code>.groupBy().agg()</code> három új oszlopot ad:
+<code>order_count</code> hosszú egész, <code>basket_sum_minor</code>
+hosszú egész, <code>avg_basket_minor</code> dupla lebegőpontos. A
+<code>grouped.explain("formatted")</code> nem indít munkát; a tényleges
+számítást a <code>preview.show()</code> akciója indítja el. A
+<code>local[2]</code> mester két executor-szálat enged ugyanabban a
+JVM-ben, ezért a shuffle nem valódi hálózati út, hanem folyamaton belüli
+adatáthelyezés.</p>
+<h3 data-number="34.3.4" id="eredmény-értelmezése"><span
+class="header-section-number">34.3.4</span> Eredmény értelmezése</h3>
+<p>A várt kimeneti séma: <code>priority_flag int</code>,
+<code>order_count long</code>, <code>basket_sum_minor long</code>,
+<code>avg_basket_minor double</code>; sorok száma legfeljebb kettő, mert
+ennyi különböző csoport van. A <code>show()</code> nem garantálja a
+rendezést, ezért a determinista előnézethez
+<code>orderBy("priority_flag")</code>-et adtunk.</p>
+<p>A fizikai terv elvárt kulcsai: <code>FileScan csv</code> a
+beolvasáshoz; részleges <code>HashAggregate</code> csoportonként;
+<code>Exchange hashpartitioning(priority_flag)</code> a shuffle-höz;
+végleges <code>HashAggregate</code> a csoportösszegek összefésüléséhez.
+A <code>limit(2)</code> a tervben <code>CollectLimit</code> vagy
+<code>TakeOrderedAndProject</code> jellegű lépésként jelenhet meg, és
+garantálja, hogy a driverre csak két sor érkezik.</p>
+<p>Ellenőrző invariánsok:</p>
+<ol type="1">
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>g</mi></msub><msub><mtext mathvariant="normal">order_count</mtext><mi>g</mi></msub><mo>=</mo><mn>2400</mn></mrow><annotation encoding="application/x-tex">\sum_g \text{order\_count}_g = 2400</annotation></semantics></math>,
+mert minden rendelés pontosan egy csoportban van.</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>∑</mo><mi>g</mi></msub><msub><mtext mathvariant="normal">basket_sum_minor</mtext><mi>g</mi></msub><mo>=</mo><msub><mo>∑</mo><mi>i</mi></msub><msub><mtext mathvariant="normal">basket_minor</mtext><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">\sum_g \text{basket\_sum\_minor}_g = \sum_i \text{basket\_minor}_i</annotation></semantics></math>,
+egész centben pontosan, ennek minden adatsorban nullának kell
+lennie.</li>
+<li>A súlyozott átlag az egész táblára:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mtext mathvariant="normal">össz</mtext></msub><mo>=</mo><mfrac><mrow><munder><mo>∑</mo><mi>g</mi></munder><msub><mi>N</mi><mi>g</mi></msub><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mi>g</mi></msub></mrow><mrow><munder><mo>∑</mo><mi>g</mi></munder><msub><mi>N</mi><mi>g</mi></msub></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\bar{x}_{\text{össz}} =
+\frac{\sum_g N_g \bar{x}_g}{\sum_g N_g},
+</annotation></semantics></math> ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>N</mi><mi>g</mi></msub><annotation encoding="application/x-tex">N_g</annotation></semantics></math>
+a <code>order_count</code>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mover><mi>x</mi><mo accent="true">‾</mo></mover><mi>g</mi></msub><annotation encoding="application/x-tex">\bar{x}_g</annotation></semantics></math>
+az <code>avg_basket_minor</code>. Lebegőpontos osztás miatt a két oldal
+közötti eltérésnek
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><annotation encoding="application/x-tex">10^{-6}</annotation></semantics></math>
+cent/rendelés relatív tűrésen belül kell lennie.</li>
+</ol>
+<p>Mivel az <code>avg_basket_minor</code> lebegőpontos, az összegző
+ellenőrzést ne abból, hanem a <code>basket_sum_minor</code>-ból számold:
+a <code>sum * count</code> szorzat összege nem feltétlenül adja vissza
+az egész összeget kerekítési hiba nélkül. A pontos, egész centes
+ellenőrzés mindig a <code>basket_sum_minor</code> oszlopból
+származzon.</p>
+<p>A Spark <code>explain</code> logikai és fizikai tervet mutat; a
+tényleges futási terv és a shuffle mennyisége eltérhet az előzetes
+becsléstől.</p>
+<h3 data-number="34.3.5" id="feladatok"><span
+class="header-section-number">34.3.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Tervértelmezés.</strong> A fenti
+<code>grouped.explain("formatted")</code> kimenetében azonosítsd a
+részleges aggregálást, a shuffle-t és a végleges aggregálást! Melyik
+lépés igényel partíciók közötti kulcs szerinti adatáthelyezést, és miért
+van szükség rá?</p></li>
+<li><p><strong>Megvalósítás.</strong> Írj PySpark local feladatot, amely
+a <code>priority_flag</code> szerint számol
+<code>quantity_sum</code>-összeget és <code>distance_km</code>-átlagot a
+<code>lab/orders.csv</code>-ből, és <code>take(2)</code>-vel jeleníti
+meg az eredményt! Ne olvasd be a teljes táblát a driverre! Add meg a
+várt shape-et és dtype-ot!</p></li>
+<li><p><strong>Hibadiagnózis.</strong> Egy kolléga nagy, több millió
+soros táblán ezt futtatja:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> orders.groupBy(<span class="st">&quot;priority_flag&quot;</span>).count().collect()</span></code></pre></div>
+<p>Mi a hiba? Miért nem jelent megoldást, ha az adat kicsi, ezért nálad
+még lefutott? Adj biztonságos előnézetet!</p></li>
+<li><p><strong>Megváltozott feltétel.</strong> A
+<code>orders.csv</code>-t 32 Parquet-fájlra bontották object storage-on.
+Hogyan változik a beolvasási és aggregálási terv? Mely részek olcsóbbak
+vagy drágábbak? Miért nem elég a helyi gépen mért futásidő a klaszteres
+várható idő becsléséhez?</p></li>
+<li><p><strong>Erőforrásbecslés.</strong> A <a
+href="s131.html">Párhuzamos modellkeresés erőforráskerettel</a>
+alfejezetben tanult szorzatszabályhoz hasonlóan gondold át: ha egy
+aggregálás 10 millió soron, 4 kulcsoszlop, összesen 1000 csoport mellett
+200 partícióra shuffle-öl, milyen lépésekben nőhet a költség a 2400
+soros helyi próbához képest, és miért nem arányos pusztán a sorok
+számával?</p></li>
+</ol>
+<h3 data-number="34.3.6" id="megoldások-és-indoklás"><span
+class="header-section-number">34.3.6</span> Megoldások és indoklás</h3>
+<p><strong>1. megoldás.</strong> A <code>FileScan</code> beolvassa a
+CSV-partíciókat. A részleges <code>HashAggregate</code> minden partíción
+külön-külön számítja a csoportonkénti részösszeget és darabszámot. Az
+<code>Exchange hashpartitioning(priority_flag)</code> a shuffle: minden
+részsor a <code>priority_flag</code> hash-alapú partíciójába kerül, hogy
+az azonos kulcsú részösszegek ugyanazon a helyen találkozzanak. A
+végleges <code>HashAggregate</code> a részösszegekből csoportösszeget és
+átlagot készít. A shuffle azért kell, mert egy csoport kulcsa több
+bemeneti partícióban is előfordulhat.</p>
+<p><strong>2. megoldás.</strong> Egy lehetséges változat:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>orders <span class="op">=</span> spark.read.schema(<span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="st">    customer_id string, order_id string, order_ts string,</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="st">    promised_days int, quantity_sum int, item_rows int,</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="st">    basket_minor long, shipping_fee_minor long, currency string,</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="st">    distance_km double, priority_flag int, delivery_days int,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="st">    actual_delivery_at string, label_available_at string, target_late int</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;&quot;&quot;</span>).option(<span class="st">&quot;header&quot;</span>, <span class="va">True</span>).csv(<span class="st">&quot;lab/orders.csv&quot;</span>)</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>summary <span class="op">=</span> (</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    orders</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    .groupBy(<span class="st">&quot;priority_flag&quot;</span>)</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    .agg(</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        F.<span class="bu">sum</span>(<span class="st">&quot;quantity_sum&quot;</span>).alias(<span class="st">&quot;total_quantity&quot;</span>),</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>        F.avg(<span class="st">&quot;distance_km&quot;</span>).alias(<span class="st">&quot;avg_distance_km&quot;</span>),</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(summary.take(<span class="dv">2</span>))  <span class="co"># legfeljebb két sor; az egész tábla nem kerül a driverre</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>spark.stop()</span></code></pre></div>
+<p>Várt shape: <code>(2, 3)</code>, oszlopok:
+<code>priority_flag int</code>, <code>total_quantity long</code>,
+<code>avg_distance_km double</code>. Ellenőrzés: a két
+<code>total_quantity</code> összege a teljes <code>quantity_sum</code>
+összege; a <code>avg_distance_km</code> mértékegysége km/rendelés.</p>
+<p><strong>3. megoldás.</strong> A <code>.collect()</code> a teljes
+csoportosított eredményt a driver memóriájába teszi. Kis adaton ez
+eltűnik, ezért a hiba nem jelentkezik, de a művelet szemantikája nagy
+adatra is ugyanaz: az elosztott eredményt egyetlen gép memóriájába
+gyűjti. A kolléga általában csak meg akarja nézni a táblát, tehát
+<code>result.limit(5).show()</code> vagy <code>take(5)</code> a helyes.
+A <code>count()</code>-ból amúgy is csak két sor jönne, tehát ebben a
+konkrét példában kisebb a veszély, mint az egész <code>orders</code>
+táblára hívott <code>collect()</code>-nél; a gondolatmenet akkor is
+ugyanaz: előbb a művelet kimenetének méretét, aztán a driverre kerülő
+sorok számát kell becsülni.</p>
+<p><strong>4. megoldás.</strong> Parquet-fájloknál a beolvasás
+oszloposan és predikátum-leszúrással hatékonyabb lehet, a CSV-nél nem
+kell sémát fejteni. A 32 fájl akár 32 vagy több bemeneti partícióra
+bomlik, ezért a részleges aggregálás párhuzamosabb. A shuffle viszont
+akkor is adatmozgást jelent, ha a fájlok object storage-on vannak: a
+kulcsok szerinti áthelyezést a hálózat és az executorok közötti
+kapcsolat korlátozza. A helyi gépen minden egy JVM-ben fut, ezért nincs
+hálózati késés, nincs storage API-hívás, és a memória is más. A
+klaszteres időt ugyanazon hardveren, méreten, partíciószámon,
+ismétléssel kell mérni; a helyi próba csak a terv helyességét
+ellenőrzi.</p>
+<p><strong>5. megoldás.</strong> A költség a beolvasott bájtokban, a
+csoportkulcsok szerializációjában, a shuffle partíciók számában, a
+hálózatban és a végleges aggregáció memóriaigényében nőhet. A 10 millió
+soros esetben a shuffle-re kerülő részösszegek mérete a csoportok és
+partíciók szorzatával nőhet, nem lineárisan a bemenettel. A 200 partíció
+túl kevés lehet, ha az executorok száma nagy, túl sok, ha kicsi; a
+becsléshez a <a href="s131.html">Párhuzamos modellkeresés
+erőforráskerettel</a> erőforrás-szorzóját és a <a
+href="s087.html">Távolság, kernel és méretkorlát</a>
+méretkorlát-gondolkodását kell alkalmazni.</p>
+<h3 data-number="34.3.7" id="gyakori-tévedés-ellenpéldával"><span
+class="header-section-number">34.3.7</span> Gyakori tévedés
+ellenpéldával</h3>
+<p>A leggyakoribb tévedés: <em>„A local módban mért 2,1 másodperc, tehát
+a klaszteren is körülbelül ennyi lesz.”</em> A local mód egyetlen
+JVM-ben futtatja a drivert és az executorokat; a shuffle nem hálózati,
+hanem folyamaton belüli másolás, az object storage-hívások helyett helyi
+fájl van, és a partíciók nem mennek át sorosításon ugyanúgy. Ezért a kis
+helyi próba csak a terv szemantikáját és az eredmény invariánsait
+ellenőrzi, nem a klaszteres teljesítményt. A <a href="s134.html">Dask
+task graph és partíció</a> Dask-tapasztalat is ugyanezt mutatta: a
+scheduler és a partíciók közötti művelet költsége csak a tényleges
+végrehajtó környezetben értelmezhető. A korrekt méréshez gép, adatméret,
+partíciószám, ismétlésszám és hibahatár kell, ahogyan a <a
+href="s087.html">Távolság, kernel és méretkorlát</a> alfejezetben a
+futásidő-állításoknál már rögzítettük. Önellenőrzés: ha a Spark-feladat
+csak <code>.show()</code>-t hív, akkor még nem mérted a teljes
+aggregációt; ha <code>.collect()</code>-et hívsz, akkor a drivert méred,
+nem a klasztert.</p>
+<h3 data-number="34.3.8" id="rövid-összefoglaló"><span
+class="header-section-number">34.3.8</span> Rövid összefoglaló</h3>
+<p>A Spark DataFrame lusta, oszlopos, partíciókra osztott reláció. A
+transzformációk tervet építenek, az akciók indítanak számítást. Az
+<code>explain</code> a tervet mutatja, a <code>groupBy().agg()</code>
+részleges aggregálást, kulcs szerinti shuffle-t és végleges aggregálást
+hoz létre. A részösszeg-képlet invariánsa: a csoportösszegek összege a
+teljes összeg. Nagy adatot nem gyűjtünk a driverre; <code>take</code>,
+<code>limit</code>, <code>show</code> a biztonságos előnézet. A local
+módos próba a helyességet ellenőrizheti, de nem klaszteres
+teljesítménymérés. A következő alkalmazás <a href="s136.html">Elosztott
+kísérlet és adatelhelyezés</a>: elosztott kísérletek futtatása és az
+adatelhelyezés tervezése, ahol ezt a tervszemléletet kell
+adatparticionálással összekötni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="s134.html">← 34.2 Dask task graph és partíció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="s136.html">34.4 Elosztott kísérlet és adatelhelyezés →</a></div>
+</nav>
+</body>
+</html>
