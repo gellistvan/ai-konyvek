@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>52.3 Platform secrets, federation és rotation – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch52">52 DevSecOps, supply chain és policy</a></p>
+<div class="links"><a class="prev" rel="prev" href="d257.html">← 52.2 Vulnerability triage és patch SLA</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d259.html">52.4 Policy-as-code, audit és security operation →</a></div>
+</nav>
+<h2 data-number="52.3" id="d258"><span
+class="header-section-number">52.3</span> Platform secrets, federation
+és rotation</h2>
+<h3 data-number="52.3.1" id="motiváció"><span
+class="header-section-number">52.3.1</span> Motiváció</h3>
+<p>A DevOps platformon a titkok koncentrált hatalmat képviselnek: aki
+birtokolja a CI service account credentialját, a cluster admin tokenjét
+vagy a DB jelszót, az átlépi a réteg határát és capability-t szerez. A
+szenior C++ fejlesztő számára ez hasonló ahhoz, amikor egy pointer vagy
+egy capability túlél egy olyan határt, ahol már nem kellene: a hívó
+hirtelen jogosultságot nyer. A korábbi alfejezetekben láttuk a cloud IAM
+trust policy-t (<a href="d217.html">d217</a>) és a Kubernetes
+Secret/Workload Identity-t (<a href="d208.html">d208</a>). Most ezeket
+egy platform secret managerbe integráljuk: a forrástól a runtime-ig egy
+explicit credential láncot építünk, amelynek minden lépése rövid
+lejáratú, minimális scope-ú és auditálható. A cél nem csupán a titok
+elrejtése, hanem a teljes életciklus kontrollálása: kiadás,
+felhasználás, megújítás, rotáció, visszavonás és helyreállítás.</p>
+<h3 data-number="52.3.2" id="definíció-és-működés"><span
+class="header-section-number">52.3.2</span> Definíció és működés</h3>
+<p>A platform secret a platformon belüli authentication és authorization
+során használt érzékeny adat: password, API key, private key, database
+credential, token. A secret manager ezeket a titkokat verziózva tárolja,
+hozzáférést vezérel, rotációt futtat és audit logot ad. A
+<strong>KMS</strong> (Key Management Service) a titkosítási kulcsok
+életciklus-kezelője; a secret manager a KMS mesterkulcsával titkosítja
+az adatkulcsot, ez az <em>envelope encryption</em>. A
+<strong>HSM</strong> (Hardware Security Module) dedikált,
+tamper-resistant hardver, amelyben a privát kulcsok nem exportálhatók,
+és minden kriptográfiai művelet a modulon belül fut. A KMS/HSM tehát a
+tárolás trust anchorját adja, de a hozzáférési trustot a federation
+adja.</p>
+<p>Az <strong>OIDC federation</strong> a hosszú életű statikus
+hitelesítő helyett rövid lejáratú, identity provider (IdP) által
+kiállított JWT assertiont használ. A secret manager trust policy a JWT
+<code>iss</code>, <code>sub</code>, <code>aud</code> és <code>exp</code>
+claimjeit szűri, és csak a megfelelő principal számára ad belső, rövid
+életű tokent. A human, a CI runner és a workload ugyanazt a modellt
+követi:</p>
+<ul>
+<li><strong>Human</strong>: SSO/OIDC login, majd rövid életű platform
+token.</li>
+<li><strong>CI</strong>: a runner az adott projekt/job audience-hez
+kötött ID tokent kap, és ezt federálja a secret managerbe.</li>
+<li><strong>Workload</strong>: a pod a projected service account
+tokenjét mutatja be, amelyet a kubelet a megadott audience-re állít
+ki.</li>
+</ul>
+<p>A <strong>short-lived token/lease</strong> a titokhoz kötött,
+megújítható hozzáférés. A lease lejártakor a secret manager
+automatikusan visszavonja a target rendszeren az adott credentialt. A
+<strong>dynamic secret</strong> (például dynamic DB credential) a secret
+manager és a célrendszer API-ján keresztül jön létre: a secret manager
+ideiglenes DB-user-t hoz létre, <code>valid_until</code> korláttal, és a
+TTL lejártakor törli. Ezzel megszűnik a statikus credential rotációjának
+problémája: a credential maga a rövid életű erőforrás.</p>
+<p>A <strong>secret scanning</strong> a forráskódban, image layerben,
+artifactban és logokban keresi az ismert titokmintákat (például AWS key,
+private key header, JWT). A <strong>log/artifact exposure</strong> ellen
+log redaction és artifact signing szükséges. A
+<strong>rotation/revoke/recovery/audit</strong> pedig a titok
+életciklusának operatív része: a rotáció új verziót vezet be grace
+perioddal, a revoke azonnali, a recovery break-glass hozzáférés, az
+audit pedig immutable eseménynapló.</p>
+<h3 data-number="52.3.3" id="kidolgozott-példa"><span
+class="header-section-number">52.3.3</span> Kidolgozott példa</h3>
+<p>A példa egy lab környezetben mutatja be a teljes credential láncot. A
+lab hostok:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Név</th>
+<th>Cím</th>
+<th>Szerep</th>
+<th>UID/Privilege</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>lab-vault</td>
+<td>203.0.113.10</td>
+<td>Vault dev server</td>
+<td>vault</td>
+</tr>
+<tr class="even">
+<td>lab-db</td>
+<td>203.0.113.11</td>
+<td>PostgreSQL 16</td>
+<td>postgres</td>
+</tr>
+<tr class="odd">
+<td>lab-eks</td>
+<td>cluster context</td>
+<td>Kubernetes 1.31</td>
+<td>cluster-admin</td>
+</tr>
+</tbody>
+</table>
+<p>A Vault dev mode hipotetikus 1.18.3, nem production; a root token
+dummy <code>lab-root</code>, a TLS kikapcsolva. A lab-eks OIDC issuer:
+<code>https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D463</code>
+(dummy). A namespace <code>lab-app</code>, service account
+<code>lab-api-sa</code>.</p>
+<p><strong>Target</strong>: lab-vault, UID vault.
+<strong>Előfeltétel</strong>: Vault dev mode fut a 8200 porton, a
+<code>VAULT_ADDR</code> és <code>VAULT_TOKEN</code> beállítva.</p>
+<ol type="1">
+<li><strong>Database dynamic secret engine bekapcsolása és
+konfigurálása</strong></li>
+</ol>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> secrets enable database</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write database/config/postgresql <span class="dt">\</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  plugin_name=postgresql-database-plugin <span class="dt">\</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  allowed_roles=lab-db-reader <span class="dt">\</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  connection_url=<span class="st">&quot;postgresql://{{username}}:{{password}}@lab-db.lab.internal:5432/postgres&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  username=<span class="st">&quot;vault_admin&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  password=<span class="st">&quot;lab-vault-admin-password&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  tls_skip_verify=true</span></code></pre></div>
+<p>A <code>tls_skip_verify</code> csak lab, productionben nem
+engedhető.</p>
+<ol start="2" type="1">
+<li><strong>Dynamic credential role létrehozása</strong></li>
+</ol>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write database/roles/lab-db-reader <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  db_name=postgresql <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  creation_statements=<span class="st">&quot;CREATE ROLE </span><span class="dt">\&quot;</span><span class="st">{{name}}</span><span class="dt">\&quot;</span><span class="st"> WITH LOGIN PASSWORD &#39;{{password}}&#39; VALID UNTIL &#39;{{expiration}}&#39;; GRANT SELECT ON ALL TABLES IN SCHEMA public TO </span><span class="dt">\&quot;</span><span class="st">{{name}}</span><span class="dt">\&quot;</span><span class="st">;&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  default_ttl=1h <span class="dt">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  max_ttl=4h</span></code></pre></div>
+<p>A role <code>default_ttl=1h</code>, tehát a kiadott DB credential egy
+óra múlva automatikusan revokálódik.</p>
+<ol start="3" type="1">
+<li><strong>JWT/OIDC auth method bekapcsolása</strong></li>
+</ol>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> auth enable jwt</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write auth/jwt/config <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  oidc_discovery_url=<span class="st">&quot;https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D463&quot;</span> <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  bound_issuer=<span class="st">&quot;https://oidc.eks.eu-central-1.amazonaws.com/id/EXAMPLED539D463&quot;</span></span></code></pre></div>
+<ol start="4" type="1">
+<li><strong>Workload role mapping szűk audience-szel</strong></li>
+</ol>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write auth/jwt/role/lab-db-reader <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  role_type=jwt <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  bound_audiences=<span class="st">&quot;vault.lab.internal&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  user_claim=<span class="st">&quot;sub&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  bound_subject=<span class="st">&quot;system:serviceaccount:lab-app:lab-api-sa&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  policies=lab-db-reader-policy <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  ttl=1h</span></code></pre></div>
+<p>A <code>bound_subject</code> kizárólag a <code>lab-app</code>
+namespace <code>lab-api-sa</code> service accountját engedi; az
+<code>bound_audiences</code> a pod projected tokenjének audience-ét
+<code>vault.lab.internal</code>-re szűkíti.</p>
+<ol start="5" type="1">
+<li><strong>Policy a minimális scope-hoz</strong></li>
+</ol>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> policy write lab-db-reader-policy <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="st">path &quot;database/creds/lab-db-reader&quot; {</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="st">  capabilities = [&quot;read&quot;]</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span></code></pre></div>
+<p>A policy csak a <code>database/creds/lab-db-reader</code> path
+olvasását engedi, a Vault token ettől nem fér hozzá más secret
+pathhez.</p>
+<ol start="6" type="1">
+<li><strong>Workload bejelentkezés és dynamic credential
+kérése</strong></li>
+</ol>
+<p>A podban a projected token audience <code>vault.lab.internal</code>.
+A pod a tokenjét bemutatja:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="va">TOKEN</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /var/run/secrets/kubernetes.io/serviceaccount/token<span class="va">)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write auth/jwt/login role=lab-db-reader jwt=<span class="st">&quot;</span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">tee</span> /tmp/vault-response.json</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="va">VAULT_TOKEN</span><span class="op">=</span><span class="va">$(</span><span class="ex">jq</span> <span class="at">-r</span> .auth.client_token /tmp/vault-response.json<span class="va">)</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> read <span class="at">-format</span><span class="op">=</span>json database/creds/lab-db-reader</span></code></pre></div>
+<p><strong>Várt kimenet</strong> (hipotetikus, nem tényleges
+futtatás):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;request_id&quot;</span><span class="fu">:</span> <span class="st">&quot;dummy-request-id&quot;</span><span class="fu">,</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;lease_id&quot;</span><span class="fu">:</span> <span class="st">&quot;database/creds/lab-db-reader/9fK8...&quot;</span><span class="fu">,</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;lease_duration&quot;</span><span class="fu">:</span> <span class="dv">3600</span><span class="fu">,</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;renewable&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;data&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;username&quot;</span><span class="fu">:</span> <span class="st">&quot;v-root-lab-db-XYZ&quot;</span><span class="fu">,</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;password&quot;</span><span class="fu">:</span> <span class="st">&quot;dummy-generated-password&quot;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A <code>lease_duration</code> 3600 másodperc; a DB user
+<code>v-root-lab-db-XYZ</code> a PostgreSQL-ben <code>valid_until</code>
+korláttal létezik. A Vault a TTL lejártakor automatikusan revokálja.</p>
+<ol start="7" type="1">
+<li><strong>Leak/rotation response – revoke és audit</strong></li>
+</ol>
+<p>Ha a password megjelenik egy CI logban vagy rossz helyen, a
+kontrollált válasz:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># A kiszivárgott lease azonnali revoke-ja</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> lease revoke <span class="op">&lt;</span>lease_id_from_response<span class="op">&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># A Vault token revoke-ja</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> token revoke <span class="op">&lt;</span>vault_token<span class="op">&gt;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés a DB oldalon, hogy a dynamic user megszűnt</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">psql</span> <span class="at">-h</span> lab-db.lab.internal <span class="at">-U</span> vault_admin <span class="at">-d</span> postgres <span class="dt">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-c</span> <span class="st">&quot;SELECT rolname FROM pg_roles WHERE rolname LIKE &#39;v-root-lab-db-%&#39;;&quot;</span></span></code></pre></div>
+<p>A <code>psql</code> várt kimenete a revoke után üres, mert a Vault
+eltávolítja a role-t. Az audit logban a revoke esemény rögzül:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> audit list</span></code></pre></div>
+<p>A rotáció a dynamic credential esetében nem kézi: a TTL lejárat és a
+<code>vault lease renew</code> adja a megújítást. Ha statikus secretet
+használnánk (KV v2), a rotáció külön új verzió kiadásával és a régi
+eltávolításával történik. A recovery break-glass hozzáférést a DB
+<code>vault_admin</code> user jelent, de annak credentialját is a secret
+managerben, erősebb policy-vel és saját rotation ablakkal kell
+tárolni.</p>
+<p><strong>Rollback</strong>: a wrong role mapping vagy policy esetén a
+Vault write/delete parancsokkal, a lab state a
+<code>vault policy delete</code>, <code>vault auth disable</code>,
+<code>vault secrets disable</code> lépésekkel visszaállítható. A lab-eks
+service account token audience beállítása a pod specben
+ellenőrzendő.</p>
+<h3 data-number="52.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">52.3.4</span> Hibák és ellenpróbák</h3>
+<ul>
+<li><strong>Túl hosszú életű token</strong>: a federation nélküli CI
+token a configban napokig él. Tünet: a leakelt token a revoke előtt is
+használható marad. Diagnosztika: a Vault token <code>ttl</code> értéke 0
+vagy nagyon magas. Helyes megoldás: JWT auth rövid TTL-lel, renew csak a
+lease-re.</li>
+<li><strong>Túl tág policy</strong>: a
+<code>path "database/creds/*"</code> enged minden dynamic role-t. Hiba:
+egy másik SA is kaphat DB creds-et. A scope mindig exact path + role +
+audience.</li>
+<li><strong>Hiányzó <code>bound_audiences</code></strong>: a JWT role
+audience nélkül elfogadja a Kubernetes <code>kubernetes</code> audience
+tokenjét is, ami más rendszer céljára készült. Az ellenpróba: a Vault
+role <code>bound_audiences</code> nélkül a <code>default</code> audience
+token is bejelentkezhet. A javítás a role explicit audience-re
+szűkítése.</li>
+<li><strong>Password a CI logban</strong>: a <code>vault read</code>
+outputja véletlenül a logba kerül. A válasz: azonnali revoke, audit,
+majd a CI pipelineban a titkosító output redaction bevezetése. A podnak
+nem szabad a secretet a fájlrendszerre írni.</li>
+<li><strong>Rotációs outage</strong>: az alkalmazás cacheli a régi
+credentialt, és a revoke után a lekérés meghiúsul. A megoldás: grace
+period a rotációban, valamint az alkalmazás oldali reload ablak a lease
+durationön belül.</li>
+</ul>
+<h3 data-number="52.3.5" id="feladatok"><span
+class="header-section-number">52.3.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat</strong>: Rajzolja fel a credential
+láncot a <code>lab-app</code> podtól a PostgreSQL-ig: projected service
+account token, OIDC issuer, Vault JWT auth, Vault token, database
+dynamic credential, DB user. Jelölje a trust boundary-ket és az egyes
+tokenek TTL-jét. Nevezze meg, hol történik a revoke, ha a podot
+törlik.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat</strong>: A lab
+Vaulton hozzon létre egy új JWT role-t <code>lab-db-writer</code> néven,
+amely a <code>lab-app</code> namespace <code>lab-api-sa</code> service
+accountját engedi <code>vault.lab.internal</code> audience-szel, és a
+<code>lab-db-writer-policy</code> policy-t kapja. A dynamic DB role
+legyen <code>lab-db-writer</code>, <code>default_ttl=30m</code>,
+<code>max_ttl=1h</code>, a <code>creation_statements</code> adjon
+<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code> jogot.
+Konfigurálja a policy-t úgy, hogy a
+<code>database/creds/lab-db-writer</code> pathra <code>read</code>, a
+<code>database/roles/lab-db-writer</code> pathra <code>read</code>
+capability legyen. Ellenőrizze a scope-ot: a <code>lab-db-reader</code>
+role tokenje nem férhet hozzá a writer pathhoz.</p></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat</strong>: A
+<code>lab-app</code> pod nem kap database credentialt; a logban
+<code>permission denied</code> hiba jelenik meg a Vault hívásánál.
+Hipotéziseket állítson fel, és vizsgálja meg:</p>
+<ul>
+<li>A JWT role <code>bound_subject</code> megegyezik-e a pod service
+accountjával?</li>
+<li>A <code>bound_audiences</code> megfelelő-e?</li>
+<li>A policy path írásmódja helyes-e?</li>
+<li>A Vault token TTL-je nem járt-e le? Javítsa a hibát, és ha a
+database password kiszivárgott egy CI logba, írja le a leak response
+lépéssorát (revoke, audit, rotation, recovery postcondition).</li>
+</ul></li>
+</ol>
+<h3 data-number="52.3.6" id="megoldások"><span
+class="header-section-number">52.3.6</span> Megoldások</h3>
+<ol type="1">
+<li><p>A lánc: pod SA → projected token
+(<code>audience=vault.lab.internal</code>, <code>exp</code> 1h) → Vault
+JWT auth → Vault token (policy <code>lab-db-reader-policy</code>,
+<code>ttl=1h</code>) → Vault database engine → PostgreSQL dynamic
+credential (<code>valid_until</code> 1h) → DB user
+<code>v-root-...</code>. Trust boundary-k: Kubernetes token kiállítás,
+Vault JWT verifikáció, Vault policy, DB role létrehozás. A pod
+törlésekor a Vault token nem feltétlenül szűnik meg, de a lease a TTL
+lejártával vagy explicit revoke-kal szűnik.</p></li>
+<li><p>A Vault parancsok:</p></li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write database/roles/lab-db-writer <span class="dt">\</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  db_name=postgresql <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  creation_statements=<span class="st">&quot;CREATE ROLE </span><span class="dt">\&quot;</span><span class="st">{{name}}</span><span class="dt">\&quot;</span><span class="st"> WITH LOGIN PASSWORD &#39;{{password}}&#39; VALID UNTIL &#39;{{expiration}}&#39;; GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO </span><span class="dt">\&quot;</span><span class="st">{{name}}</span><span class="dt">\&quot;</span><span class="st">;&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  default_ttl=30m <span class="dt">\</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  max_ttl=1h</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> policy write lab-db-writer-policy <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="st">path &quot;database/creds/lab-db-writer&quot; {</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="st">  capabilities = [&quot;read&quot;]</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="st">path &quot;database/roles/lab-db-writer&quot; {</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="st">  capabilities = [&quot;read&quot;]</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="ex">vault</span> write auth/jwt/role/lab-db-writer <span class="dt">\</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>  role_type=jwt <span class="dt">\</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>  bound_audiences=<span class="st">&quot;vault.lab.internal&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>  user_claim=<span class="st">&quot;sub&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>  bound_subject=<span class="st">&quot;system:serviceaccount:lab-app:lab-api-sa&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>  policies=lab-db-writer-policy <span class="dt">\</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>  ttl=30m</span></code></pre></div>
+<p>Ellenőrzés: a <code>lab-db-reader</code> tokenjével
+<code>vault read database/creds/lab-db-writer</code> kell, hogy
+<code>permission denied</code>-et adjon. A reader role tokenje nem fér
+hozzá a writer pathhoz, mert a reader policy nem tartalmazza.</p>
+<ol start="3" type="1">
+<li>Diagnosztikai lépések:
+<ul>
+<li><code>kubectl get pod &lt;pod&gt; -n lab-app -o jsonpath='{.spec.serviceAccountName}'</code>
+– a SA legyen <code>lab-api-sa</code>.</li>
+<li>A podban a
+<code>cat /var/run/secrets/kubernetes.io/serviceaccount/token</code>
+token claimjét dekódolva ellenőrizni a <code>sub</code> értéket és az
+<code>aud</code> claimet.</li>
+<li>A Vault oldalon <code>vault read auth/jwt/role/lab-db-reader</code>
+kiírja a role bindingokat.</li>
+<li>Ha a <code>bound_subject</code> eltér, javítsd
+<code>vault write auth/jwt/role/lab-db-reader ...</code> parancs
+újrafuttatásával.</li>
+<li>Ha a policy path rossz, javítsd a policy-t, majd ellenőrizd
+<code>vault token capabilities &lt;token&gt; database/creds/lab-db-reader</code>.</li>
+<li>A leak response: <code>vault lease revoke &lt;lease_id&gt;</code>,
+<code>vault token revoke &lt;vault_token&gt;</code>, audit log
+ellenőrzés, a CI logban redaction vagy secret scanning, új credential
+kiadása a pod újraindításával. Postcondition: a kiszivárgott credential
+nem használható, a pod újból sikeresen kapja a credentialt, az audit log
+tartalmazza a revoke eseményt.</li>
+</ul></li>
+</ol>
+<h3 data-number="52.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">52.3.7</span> Rövid összefoglaló</h3>
+<p>A platform secret management nem csupán tárolás, hanem életciklus: a
+secret manager KMS/HSM trust anchor-ra épít, az OIDC federation rövid
+lejáratú identity-t ad a human/CI/workload entitásoknak, a dynamic
+secret pedig a célrendszeren generált, automatikusan lejáró credential.
+A hozzáférést minél kisebb scope-ú policy és audience/subject feltétel
+korlátozza. A leak response kontrollált: revoke, audit, rotation,
+recovery. A titok-scanning a forrástól a runtime-ig detektálja a
+kiszivárgást. Az egész modell lényege, hogy a hitelesítő adat ne éljen
+tovább, mint a felhasználási ablak.</p>
+<p><strong>Továbbhasznált definíciók</strong>: <strong>Secret
+manager</strong> – titkokat verziózó, policy-vel védő, auditáló
+szolgáltatás; <strong>Dynamic secret</strong> – rövid életű,
+automatikusan visszavont, célrendszeren generált credential;
+<strong>OIDC federation</strong> – rövid életű JWT assertion cseréje
+korlátozott trust policy-vel.</p>
+<h3 data-number="52.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">52.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>A felsorolt hivatkozások kiindulópontok, nem olvasott, ellenőrzött
+bizonyítékok. Ebben a kérésben nincs webes kereső, ezért a linkeket nem
+nyitottam meg. A Vault, PostgreSQL, Kubernetes OIDC, AWS STS/IAM,
+valamint a secret scanning eszközök pontos verziói, szintaxisai és
+viselkedése a lab profilban és a hivatalos dokumentációban
+ellenőrizendők. A példa account ID, issuer, thumbprint, Vault token és
+db user mind hipotetikus labfixture, nem valós erőforrás. A Vault dev
+mode nem production; a <code>tls_skip_verify</code> és a root token
+lab-only konfiguráció.</p>
+<ul>
+<li><a href="https://slsa.dev/spec/">SLSA specification</a></li>
+<li><a href="https://docs.sigstore.dev/">Sigstore documentation</a></li>
+<li><a href="https://docs.github.com/en/actions">GitHub Actions
+documentation</a></li>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+documentation</a></li>
+<li><a href="https://developer.hashicorp.com/vault/docs">HashiCorp Vault
+documentation</a></li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d257.html">← 52.2 Vulnerability triage és patch SLA</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d259.html">52.4 Policy-as-code, audit és security operation →</a></div>
+</nav>
+</body>
+</html>

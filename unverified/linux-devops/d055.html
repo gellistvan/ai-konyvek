@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>11.5 Filesystem szemantika és döntési labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch11">11 Fájlrendszer-elmélet és Linux filesystem típusok</a></p>
+<div class="links"><a class="prev" rel="prev" href="d054.html">← 11.4 Btrfs és OpenZFS</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d056.html">12.1 Kernel, distribution és támogatási életciklus →</a></div>
+</nav>
+<h2 data-number="11.5" id="d055"><span
+class="header-section-number">11.5</span> Filesystem szemantika és
+döntési labor</h2>
+<h3 data-number="11.5.1" id="motiváció"><span
+class="header-section-number">11.5.1</span> Motiváció</h3>
+<p>Egy hosztot üzemeltető szenior fejlesztő számára a leggyakoribb és
+legfélrevezetőbb hibajelenség, amikor a <code>df -h</code> szabad helyet
+mutat, egy fájl létrehozása mégis „No space left on device” hibával tér
+vissza, vagy amikor a lemezhasználat 90%-ot jelez, de a
+<code>du -sh /data</code> összege csak 50%. A különbség oka a
+fájlrendszer-szemantikában rejlik: a pathnév, az inode és a
+blokkfoglalás más-más erőforrást képvisel. Ez a labor ezeket a
+réteghatárokat teszi mérhetővé, és bemutatja, hogy a fájlrendszer nem
+csupán egy névtér, hanem memória-, CPU- és adattartóssági szerződés is.
+A döntés, hogy ext4, XFS, Btrfs vagy tmpfs legyen-e egy adott mount, nem
+ízlés kérdése, hanem a workload latency-, durability- és
+metadata-igényének következménye.</p>
+<h3 data-number="11.5.2" id="definíció-és-működés"><span
+class="header-section-number">11.5.2</span> Definíció és működés</h3>
+<h4 data-number="11.5.2.1"
+id="sparse-file-open-deleted-file-és-inode-exhaustion"><span
+class="header-section-number">11.5.2.1</span> Sparse file, open-deleted
+file és inode exhaustion</h4>
+<p>A <strong>sparse file</strong> (ritka fájl) olyan fájl, amelynek
+logikai mérete nagyobb, mint a ténylegesen lefoglalt blokkok összege. A
+lyukak (<code>hole</code>) nullának olvashatók, de nem foglalnak fizikai
+blokkot a háttértáron. A <code>ls -l</code> a logikai méretet mutatja, a
+<code>du</code> (alapértelmezés szerint) a lefoglalt blokkokat. Például
+egy 1 GiB-os <code>truncate</code>-tel létrehozott fájl logikai mérete 1
+GiB, de gyakorlatilag nulla blokkot foglal. A C++ program is létrehozhat
+ilyet <code>pwrite</code>-tel vagy <code>fallocate</code>-cal (utóbbi
+garantáltan lefoglalja a blokkokat, előbbi nem).</p>
+<p>Az <strong>open-deleted file</strong> (megnyitott, majd törölt fájl)
+az a fájl, amelyet egy processz megnyit, majd a fájlrendszerből
+<code>unlink</code>-kel eltávolítanak. A fájl a processz fájlleíróján
+(FD) keresztül továbbra is elérhető, és a blokkjai foglaltak maradnak,
+amíg minden FD nem záródik be. A <code>df</code> ezért továbbra is
+foglaltnak mutatja a blokkokat, míg a <code>du</code> nem látja, mert a
+fájlnak már nincs neve a könyvtárhierarchiában. A diagnózishoz
+<code>lsof +L1</code> vagy <code>/proc/PID/fd</code> szükséges.</p>
+<p>Az <strong>inode exhaustion</strong> (inode-kimerülés) akkor
+következik be, amikor a fájlrendszerben az összes inode lefoglalásra
+került, de a blokkterület még szabad. A <code>df -h</code> alacsony
+kihasználtságot mutat, a <code>df -i</code> viszont 100%-ot. Az ext4-ben
+az inode-ok számát a formázáskor rögzítik (alapértelmezés: kb. 1 inode
+per 16 KiB), XFS-ben dinamikus, de a fájlrendszer méretétől függően
+limit lehet; Btrfs-ben gyakorlatilag nem fogy el külön inode-tábla. Sok
+kis fájl (például cache, session, build artifact) gyorsan kimeríti az
+inode-okat.</p>
+<h4 data-number="11.5.2.2" id="tmpfsramfs-és-memória-accounting"><span
+class="header-section-number">11.5.2.2</span> tmpfs/ramfs és memória
+accounting</h4>
+<p>A <strong>tmpfs</strong> egy memóriaalapú fájlrendszer, amely a page
+cache-t használja háttértárként: a fájl tartalma a RAM-ban él, és
+swappelhető, ha van swap. A <code>size=</code> mount opcióval felső
+korlát adható meg; ezen felül írni <code>ENOSPC</code> hibát ad. A
+<strong>ramfs</strong> egy régebbi, egyszerűbb implementáció, amely nem
+swappelhető, és nincs méretkorlátja – ha betelik a RAM, a kernel
+OOM-killerhez nyúl. A modern Linuxon ezért tmpfs ajánlott. A tmpfs
+fájlok a cgroup v2 <code>memory.current</code> számlálójában is
+megjelennek, tehát a konténer memórialimitjét terhelik. A
+<code>df</code> a tmpfs méretét a mount opcióból és a felhasznált
+memóriából számolja, nem egy lemezblokk-táblából.</p>
+<h4 data-number="11.5.2.3" id="overlayfs-előkép"><span
+class="header-section-number">11.5.2.3</span> overlayfs előkép</h4>
+<p>Az <strong>overlayfs</strong> egy virtuális fájlrendszer, amely két
+(vagy több) könyvtárat rétegez: a <code>lowerdir</code> read-only alsó
+réteg, az <code>upperdir</code> írható felső réteg, a
+<code>workdir</code> pedig a copy-up művelet ideiglenes munkakönyvtára.
+Amikor egy alsó rétegbeli fájlt módosítanak vagy törölnek, a rendszer a
+fájlt előbb a felső rétegbe másolja (<strong>copy-up</strong>), majd ott
+hajtja végre a változást. Az alsó réteg érintetlen marad. Ez az alapja a
+konténer image rétegeknek: az image rétegek lowerdir-ként, a konténer
+írható rétege upperdir-ként szolgál. A d055-ben csak a szemantikát
+mutatjuk be, a részletes konténerintegráció a <a
+href="d181.html">konténer image, build, registry és artifact</a>
+alfejezetben következik.</p>
+<h4 data-number="11.5.2.4"
+id="latency-durability-és-metadata-workload"><span
+class="header-section-number">11.5.2.4</span> Latency, durability és
+metadata workload</h4>
+<p>A fájlrendszer tradeoffjait a workload típusa határozza meg. A
+<strong>metadata workload</strong> sok kis fájl létrehozása, törlése,
+átnevezése és jogosultságváltása; ez az inode-műveleteket, a journalt és
+a könyvtárbejegyzéseket terheli. A <strong>durability</strong> azt
+fejezi ki, hogy egy <code>fsync</code> vagy power loss után mennyi adat
+van garantáltan visszaállítható állapotban. A journaling módok
+(writeback, ordered, data=journal) különböző latency-durability
+kompromisszumot adnak: az ordered mód alapértelmezett, a data=journal a
+legbiztonságosabb, de a leglassabb. Az ext4/XFS inkább a szekvenciális
+és alacsony latency, a Btrfs/OpenZFS a snapshot, checksum és
+adatintegritás irányába optimalizál.</p>
+<p>Az alábbi táblázat a d053 és d054 alapján összegzi a főbb Linux
+fájlrendszereket.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>ext4</th>
+<th>XFS</th>
+<th>Btrfs</th>
+<th>OpenZFS</th>
+<th>tmpfs</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Journaling / CoW</td>
+<td>Journaling (ordered default)</td>
+<td>Journaling (metadata)</td>
+<td>CoW</td>
+<td>CoW (transakciós)</td>
+<td>nincs</td>
+</tr>
+<tr class="even">
+<td>Checksum adatra</td>
+<td>Nem</td>
+<td>Nem</td>
+<td>Igen</td>
+<td>Igen</td>
+<td>Nem szükséges (RAM)</td>
+</tr>
+<tr class="odd">
+<td>Snapshot</td>
+<td>Nem</td>
+<td>Nem</td>
+<td>Igen</td>
+<td>Igen</td>
+<td>Nem</td>
+</tr>
+<tr class="even">
+<td>Online resize</td>
+<td>Növelés és (újabban) csökkentés</td>
+<td>Növelés</td>
+<td>Növelés és csökkentés</td>
+<td>Növelés</td>
+<td>Méret mount opcióval</td>
+</tr>
+<tr class="odd">
+<td>Metadata skálázódás</td>
+<td>Erős, de fix inode-limit</td>
+<td>Erős, dinamikus inode</td>
+<td>Erős</td>
+<td>Erős</td>
+<td>Erős</td>
+</tr>
+<tr class="even">
+<td>Durability</td>
+<td>Jó (ordered)</td>
+<td>Jó (metadata journal)</td>
+<td>Jó CoW + checksum</td>
+<td>Kiváló</td>
+<td>Volatilis</td>
+</tr>
+<tr class="odd">
+<td>Fő használat</td>
+<td>Általános cél, /home, /</td>
+<td>Nagy fájlok, adatbázis, nagy fs</td>
+<td>Snapshot, konténer storage</td>
+<td>Adatintegritás, RAID-Z</td>
+<td>/tmp, /dev/shm</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="11.5.3" id="kidolgozott-példa"><span
+class="header-section-number">11.5.3</span> Kidolgozott példa</h3>
+<p>A példában minden módosító parancs a <code>labhost1</code> hoszton
+fut, <code>labadmin</code> felhasználóval, <code>sudo</code>
+jogosultsággal. A létrehozott objektumok mind <code>lab-</code> prefixet
+kapnak, és a végén teljes cleanup történik. A lemezfoglalás egy loopback
+fájl, nem fizikai eszköz.</p>
+<h4 data-number="11.5.3.1" id="disposable-mount-és-sparse-file"><span
+class="header-section-number">11.5.3.1</span> 1. Disposable mount és
+sparse file</h4>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin, privilege: sudo</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: /var/tmp írható, loop modul elérhető</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> truncate <span class="at">-s</span> 1G /var/tmp/lab-fs.img</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-L</span> lab-fs /var/tmp/lab-fs.img</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-fs</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /var/tmp/lab-fs.img /mnt/lab-fs</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span> <span class="at">-o</span> NAME,SIZE,FSTYPE,LABEL /dev/loop0</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/lab-fs</span></code></pre></div>
+<p>A <code>truncate</code>-tel létrehozott fájl logikai mérete 1 GiB, de
+a <code>du -h /var/tmp/lab-fs.img</code> csak néhány KiB-ot mutat, mert
+a blokkok még nincsenek lefoglalva. A <code>mkfs.ext4</code> lefoglalja
+a szükséges metadata blokkokat.</p>
+<h4 data-number="11.5.3.2" id="sparse-file-és-open-deleted-file"><span
+class="header-section-number">11.5.3.2</span> 2. Sparse file és
+open-deleted file</h4>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Sparse file a mountponton belül</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/mnt/lab-fs/sparse bs=1M count=0 seek=1024</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-lh</span> /mnt/lab-fs/sparse   <span class="co"># 1.0G logikai méret</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-h</span> /mnt/lab-fs/sparse    <span class="co"># 0K tényleges blokk</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Open-deleted file</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/mnt/lab-fs/deleteme bs=1M count=100</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Háttérfolyamat nyitja a fájlt, és megtartja az FD-t</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> labadmin bash <span class="at">-c</span> <span class="st">&#39;exec 3&lt;&gt;/mnt/lab-fs/deleteme; echo $$ &gt; /tmp/lab-fd.pid; sleep 1000&#39;</span> <span class="kw">&amp;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sleep</span> 1</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /mnt/lab-fs/deleteme</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># A df még mindig foglaltnak mutatja a 100M-ot, a du nem látja</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/lab-fs <span class="kw">|</span> <span class="fu">grep</span> lab-fs</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="fu">du</span> <span class="at">-sh</span> /mnt/lab-fs</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co"># A processz FD-je megmutatja a törölt fájlt</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /tmp/lab-fd.pid<span class="va">)</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ls <span class="at">-l</span> /proc/<span class="va">$PID</span>/fd/3   <span class="co"># &#39;deleted&#39; jelzés</span></span></code></pre></div>
+<p>Várható kimenet: a <code>df -h</code> 100M-mel nagyobb használatot
+mutat, mint a <code>du -sh /mnt/lab-fs</code>. A
+<code>/proc/PID/fd/3</code> szimbolikus link célja
+<code>/mnt/lab-fs/deleteme (deleted)</code>. A processz leállítása után
+(<code>kill $PID</code>) a blokkok felszabadulnak.</p>
+<h4 data-number="11.5.3.3" id="inode-exhaustion"><span
+class="header-section-number">11.5.3.3</span> 3. Inode exhaustion</h4>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Kisméretű, alacsony inode-számú fájlrendszer</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> truncate <span class="at">-s</span> 20M /var/tmp/lab-inode.img</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-N</span> 1000 /var/tmp/lab-inode.img   <span class="co"># 1000 inode</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-inode</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /var/tmp/lab-inode.img /mnt/lab-inode</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Sok üres fájl létrehozása</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 2000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span> <span class="fu">sudo</span> touch /mnt/lab-inode/file<span class="va">$i</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Az inode-tábla betelik, a blokkterület alig használt</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /mnt/lab-inode   <span class="co"># IUse% 100%</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/lab-inode   <span class="co"># Use% néhány százalék</span></span></code></pre></div>
+<p>A <code>touch</code> parancs az 1000. fájl után
+<code>No space left on device</code> hibát ad, miközben a
+<code>df -h</code> még sok szabad blokkot mutat.</p>
+<h4 data-number="11.5.3.4" id="tmpfs-memória-accounting"><span
+class="header-section-number">11.5.3.4</span> 4. tmpfs memória
+accounting</h4>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-tmpfs</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-t</span> tmpfs <span class="at">-o</span> size=512M tmpfs /mnt/lab-tmpfs</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/mnt/lab-tmpfs/testfile bs=1M count=100</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># A memória használat növekszik; a free -h a buff/cache sorban mutatja</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Ha van cgroup v2 a shell alatt, a memory.current is növekszik</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/memory.current</span></code></pre></div>
+<p>Várható kimenet: a <code>free -h</code> <code>buff/cache</code>
+oszlopa ~100M-rel nő. A <code>cat /sys/fs/cgroup/memory.current</code>
+értéke is nő, ha a shell egy cgroupba tartozik. A
+<code>df -h /mnt/lab-tmpfs</code> a tmpfs aktuális használatát
+mutatja.</p>
+<h4 data-number="11.5.3.5" id="overlayfs-copy-up"><span
+class="header-section-number">11.5.3.5</span> 5. overlayfs copy-up</h4>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-overlay/<span class="dt">{lower</span><span class="op">,</span><span class="dt">upper</span><span class="op">,</span><span class="dt">work</span><span class="op">,</span><span class="dt">merged}</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;original&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /mnt/lab-overlay/lower/file.txt</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-t</span> overlay overlay <span class="at">-o</span> lowerdir=/mnt/lab-overlay/lower,upperdir=/mnt/lab-overlay/upper,workdir=/mnt/lab-overlay/work /mnt/lab-overlay/merged</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /mnt/lab-overlay/merged/file.txt   <span class="co"># original</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;modified&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /mnt/lab-overlay/merged/file.txt</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Az alsó réteg érintetlen, a felsőben megjelenik a másolat</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /mnt/lab-overlay/lower/file.txt    <span class="co"># original</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /mnt/lab-overlay/upper/file.txt    <span class="co"># modified</span></span></code></pre></div>
+<h4 data-number="11.5.3.6" id="teljes-cleanup"><span
+class="header-section-number">11.5.3.6</span> 6. Teljes cleanup</h4>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Háttérfolyamat leállítása, ha fut</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">[</span> <span class="ot">-f</span> /tmp/lab-fd.pid <span class="bu">]</span><span class="kw">;</span> <span class="cf">then</span> <span class="bu">kill</span> <span class="va">$(</span><span class="fu">cat</span> /tmp/lab-fd.pid<span class="va">)</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span><span class="kw">;</span> <span class="cf">fi</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Unmount minden lab mountpont</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-fs /mnt/lab-inode /mnt/lab-tmpfs /mnt/lab-overlay/merged <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Fájlok törlése</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /var/tmp/lab-fs.img /var/tmp/lab-inode.img /tmp/lab-fd.pid</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-rf</span> /mnt/lab-fs /mnt/lab-inode /mnt/lab-tmpfs /mnt/lab-overlay</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés:</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;lab-(fs|inode|tmpfs|overlay)&#39;</span>   <span class="co"># üres kimenet</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /var/tmp/lab-<span class="pp">*</span>.img   <span class="co"># nincs ilyen fájl</span></span></code></pre></div>
+<p>A cleanup csak a <code>lab-</code> prefixű objektumokat érinti, más
+mountpont vagy fájl nem sérül.</p>
+<h3 data-number="11.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">11.5.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Tünet:</strong> <code>df -h</code> 90%-ot mutat, de
+<code>du -sh /data</code> csak 50%. <strong>Hipotézis:</strong>
+open-deleted fájl foglalja a blokkokat. <strong>Adatgyűjtés:</strong>
+<code>lsof +L1 | grep /data</code> megmutatja a törölt, de nyitott
+fájlokat. <strong>Egy változtatás:</strong> a folyamat újraindítása vagy
+az FD bezárása felszabadítja a blokkokat. <strong>Verification:</strong>
+<code>df -h</code> csökkenése.</p>
+<p><strong>Tünet:</strong> <code>touch /mnt/lab-inode/file1001</code>
+hibát ad, de <code>df -h</code> sok szabad helyet mutat.
+<strong>Hipotézis:</strong> inode kimerülés.
+<strong>Adatgyűjtés:</strong> <code>df -i /mnt/lab-inode</code> 100%-ot
+mutat. <strong>Egy változtatás:</strong> felesleges fájlok törlése, vagy
+a fájlrendszer újraformázása nagyobb <code>-N</code> értékkel.
+<strong>Verification:</strong> <code>df -i</code> csökken, új fájl
+létrehozható.</p>
+<p><strong>Gyakori hiba:</strong> a tmpfs <code>size=</code> elhagyása.
+Ha nincs méretkorlát, a tmpfs akár a teljes RAM-ot és swapet
+elfogyaszthatja, ami OOM killhez vezet. A <code>free -h</code> és a
+cgroup <code>memory.current</code> figyelése nélkül a tmpfs használata
+rejtett memóriaszivárgást okozhat. Az overlayfs esetében a
+<code>workdir</code> hiánya vagy a <code>lowerdir</code> és
+<code>upperdir</code> azonos fájlrendszeren kívülisége mount hibát ad; a
+copy-up művelet pedig többlet I/O-t generál, ezért nagy fájlok
+módosítása lassú lehet.</p>
+<h3 data-number="11.5.5" id="feladatok"><span
+class="header-section-number">11.5.5</span> Feladatok</h3>
+<h4 data-number="11.5.5.1" id="magyarázó-feladat"><span
+class="header-section-number">11.5.5.1</span> 1. Magyarázó feladat</h4>
+<p>Egy Linux hoszton a <code>/var</code> fájlrendszer <code>df -h</code>
+szerint 85%-ban tele van, de a <code>du -sh /var</code> összege a teljes
+kapacitásnak csak 40%-át adja. Sorold fel a lehetséges okokat, és
+mindegyikhez adj egy parancsot vagy eljárást, amellyel igazolható a
+hipotézis. Ne futtass semmit, csak a diagnosztikai tervet írd le.</p>
+<h4 data-number="11.5.5.2"
+id="adminisztrációskonfigurációs-feladat"><span
+class="header-section-number">11.5.5.2</span> 2.
+Adminisztrációs/konfigurációs feladat</h4>
+<p>Hozz létre egy 256 MiB méretű tmpfs mountot
+<code>/mnt/lab-tmpfs-task</code> néven. Írj bele pontosan 200 MiB adatot
+egyetlen fájlba, majd ellenőrizd a memóriahasználatot
+<code>free -h</code> és a cgroup <code>memory.current</code>
+segítségével. Ezután csökkentsd a tmpfs méretét 128 MiB-re remounttal,
+és figyeld meg, mi történik a meglévő fájllal. A feladat végén teljes
+cleanup szükséges.</p>
+<h4 data-number="11.5.5.3"
+id="diagnosztikaifailurerecovery-feladat"><span
+class="header-section-number">11.5.5.3</span> 3.
+Diagnosztikai/failure/recovery feladat</h4>
+<p>Egy 30 MiB-os ext4 fájlrendszerben
+(<code>/var/tmp/lab-task3.img</code>) hozz létre annyi üres fájlt, hogy
+a fájlok létrehozása <code>No space left on device</code> hibát adjon. A
+<code>df -h</code> szerint van szabad hely, de a <code>df -i</code>
+100%-ot mutat. Diagnosztizáld a hibát, majd oldd meg a problémát: töröld
+a felesleges fájlokat, és igazold, hogy új fájl létrehozható. A végén
+teljes cleanup.</p>
+<h3 data-number="11.5.6" id="megoldások"><span
+class="header-section-number">11.5.6</span> Megoldások</h3>
+<h4 data-number="11.5.6.1" id="megoldás"><span
+class="header-section-number">11.5.6.1</span> 1. Megoldás</h4>
+<p>Lehetséges okok és diagnózisuk: - <strong>Open-deleted
+fájlok:</strong> <code>lsof +L1 | grep /var</code> vagy
+<code>for p in /proc/[0-9]*/fd/*; do ls -l $p 2&gt;/dev/null | grep deleted | grep /var; done</code>
+– a törölt, de nyitott fájlok blokkjai foglaltak maradnak. -
+<strong>Sparse file:</strong> <code>du --apparent-size -sh /var</code>
+és <code>du -sh /var</code> összehasonlítása; a logikai méret nagyobb,
+mint a lefoglalt blokk. - <strong>Mount shadowing:</strong> egy másik
+mountpont elrejtheti az alatta lévő könyvtár tartalmát;
+<code>mount | grep /var</code> ellenőrzi, hogy van-e nested mount. -
+<strong>Inode kimerülés:</strong> <code>df -i /var</code> – ha 100%,
+akkor sok kis fájl foglalja az inode-okat, de a blokkterület szabad.
+Postcondition: minden hipotézishez tartozik egy konkrét ellenőrző
+parancs, amely eldönti, melyik ok áll fenn.</p>
+<h4 data-number="11.5.6.2" id="megoldás-1"><span
+class="header-section-number">11.5.6.2</span> 2. Megoldás</h4>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin, privilege: sudo</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-tmpfs-task</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-t</span> tmpfs <span class="at">-o</span> size=256M tmpfs /mnt/lab-tmpfs-task</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/mnt/lab-tmpfs-task/testfile bs=1M count=200</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">free</span> <span class="at">-h</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/memory.current</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Remount kisebb mérettel</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> remount,size=128M /mnt/lab-tmpfs-task</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co"># A meglévő fájl megmarad, de a tmpfs mérete 128M-re csökken; ha a fájl nagyobb, a kernel nem törli, de a df 128M-t mutat, és további írás ENOSPC-t adhat.</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/lab-tmpfs-task</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleanup</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-tmpfs-task</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-rf</span> /mnt/lab-tmpfs-task</span></code></pre></div>
+<p>Indoklás: a tmpfs <code>remount</code> méretcsökkentése nem törli a
+meglévő adatokat, de a fájlrendszer felső határa csökken. A
+<code>free -h</code> <code>buff/cache</code> oszlopa a 200 MiB íráskor
+növekszik, a <code>memory.current</code> a cgroup teljes
+memóriahasználatát mutatja. Postcondition: a mount megszűnt, a memória
+felszabadult, nincs <code>lab-tmpfs-task</code> könyvtár.</p>
+<h4 data-number="11.5.6.3" id="megoldás-2"><span
+class="header-section-number">11.5.6.3</span> 3. Megoldás</h4>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin, privilege: sudo</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> truncate <span class="at">-s</span> 30M /var/tmp/lab-task3.img</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 <span class="at">-N</span> 2000 /var/tmp/lab-task3.img</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /mnt/lab-task3</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /var/tmp/lab-task3.img /mnt/lab-task3</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Inode kimerülés előidézése</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 5000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span> <span class="fu">sudo</span> touch /mnt/lab-task3/file<span class="va">$i</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="cf">break</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Diagnózis</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /mnt/lab-task3   <span class="co"># kevés blokk használt</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /mnt/lab-task3   <span class="co"># 100% inode</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="co"># Recovery: felesleges fájlok törlése (pl. a páros sorszámúak)</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> find /mnt/lab-task3 <span class="at">-type</span> f <span class="at">-name</span> <span class="st">&#39;file*&#39;</span> <span class="at">-delete</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés: új fájl létrehozható</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> touch /mnt/lab-task3/newfile</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleanup</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /mnt/lab-task3</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-f</span> /var/tmp/lab-task3.img</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-rf</span> /mnt/lab-task3</span></code></pre></div>
+<p>Indoklás: a <code>-N 2000</code> korlátozza az inode-ok számát. A
+<code>touch</code> sorozat a 2000. fájl után meghiúsul. A törlés
+felszabadítja az inode-okat, így az új fájl sikeres. Postcondition: a
+fájlrendszer újra használható, a cleanup után nincs
+<code>lab-task3</code> objektum.</p>
+<h3 data-number="11.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">11.5.7</span> Rövid összefoglaló</h3>
+<p>A fájlrendszer-szemantika három erőforrást különböztet meg:
+blokkterület, inode-tábla és path névtér. A sparse file logikai mérete
+nagyobb, mint a lefoglalt blokkok; az open-deleted fájl a pathból
+törölve is foglalja a blokkokat, amíg az FD él; az inode exhaustion
+akkor jelentkezik, ha sok kis fájl van, miközben a blokkterület szabad.
+A tmpfs a memóriát használja háttértárként, és a cgroup memóriába
+számít; az overlayfs a copy-up mechanizmussal rétegezi a read-only alsó
+és írható felső réteget. A fájlrendszer-választást a workload latency-,
+durability- és metadata-igénye határozza meg. A laborban minden objektum
+<code>lab-</code> prefixszel jött létre, és a cleanup teljes volt.</p>
+<p>Továbbhasznált definíciók: <strong>sparse file</strong> – nagy
+logikai méret, kevés lefoglalt blokk; <strong>open-deleted file</strong>
+– törölt, de nyitott FD-vel továbbra is foglalt fájl; <strong>inode
+exhaustion</strong> – az inode-tábla kimerülése, miközben blokkterület
+marad.</p>
+<h3 data-number="11.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">11.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások kiindulópontok, nem olvasott bizonyítékok
+ebben a kérésben:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Kernel filesystem
+dokumentáció</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man pages</a></li>
+<li><a href="https://openzfs.github.io/openzfs-docs/">OpenZFS
+dokumentáció</a></li>
+<li><a href="https://btrfs.readthedocs.io/">Btrfs dokumentáció</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a <code>labhost1</code> aktuális
+kernelverzióját, az ext4/XFS/Btrfs pontos verzióját, a tmpfs swappelési
+viselkedését az adott rendszeren, valamint az overlayfs mount opciók
+pontos szintaxisát nem ellenőriztem. A példák feltételezik, hogy a loop
+eszköz, az <code>mkfs.ext4</code> és a szükséges kernelmodulok
+elérhetők.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d054.html">← 11.4 Btrfs és OpenZFS</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d056.html">12.1 Kernel, distribution és támogatási életciklus →</a></div>
+</nav>
+</body>
+</html>

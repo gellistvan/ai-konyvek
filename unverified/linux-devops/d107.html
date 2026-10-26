@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>22.2 CPU, scheduler és natív profilozás – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch22">22 Linux teljesítmény- és incidensdiagnosztika</a></p>
+<div class="links"><a class="prev" rel="prev" href="d106.html">← 22.1 USE módszer és rendszerbaseline</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d108.html">22.3 strace, ftrace, eBPF és dinamikus megfigyelés →</a></div>
+</nav>
+<h2 data-number="22.2" id="d107"><span
+class="header-section-number">22.2</span> CPU, scheduler és natív
+profilozás</h2>
+<h3 data-number="22.2.1" id="motiváció"><span
+class="header-section-number">22.2.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő számára a CPU-profilozás gyakran a saját
+kód forró pontjainak keresését jelenti. Linux-üzemeltetési és
+DevOps-nézőpontból azonban a kérdés ennél rétegzettebb: a
+<code>top</code> 100%-os CPU-t mutathat, de nem mondja meg, hogy a
+process a saját utasításait futtatja-e, syscallban van-e, a scheduler
+állította-e meg, a cgroup-kvóta fojtotta-e meg, vagy a hypervisor lopta
+el a CPU-időt. A <code>perf</code> PMU-alapú sampling profilozó e
+rétegeket egyaránt elérhetővé teszi, ha a build, a szimbólumok és a
+mérési feltételek egyértelműek. Ez az alfejezet a CPU-tünetek
+hipotézisvezérelt vizsgálatához ad eszközválasztást és értelmezési
+keretet.</p>
+<h3 data-number="22.2.2" id="definíció-és-működés"><span
+class="header-section-number">22.2.2</span> Definíció és működés</h3>
+<p><strong>CPU-idő dimenziók.</strong> Egy Linux process CPU-ideje két
+fő kategóriára bomlik: user CPU (ring 3-ban futó saját utasítások) és
+kernel CPU (syscall, interrupt, page fault, I/O hívás). A
+<code>time(1)</code> <code>user</code> és <code>sys</code> értéke ezeket
+mutatja. A <code>%Cpu(s)</code> sor a teljes CPU vagy vCPU aggregátumát
+mutatja: <code>us</code> (user), <code>sy</code> (system),
+<code>id</code> (idle), <code>wa</code> (iowait) és <code>st</code>
+(steal). A <code>wa</code> nem process-szintű blokkolt I/O, hanem a CPU
+inaktív állapota, miközben legalább egy process disk I/O-ra vár. A
+<code>st</code> (steal) az a CPU-idő, amelyet a hypervisor másik
+guestnek adott; ez a process <code>user</code>/<code>sys</code> idejében
+nem jelenik meg, mert a process nem futott, csak runnable volt.</p>
+<p><strong>Sampling profiler és PMU.</strong> A Linux <code>perf</code>
+a <code>perf_event_open(2)</code> syscallon keresztül hardveres PMU
+(Performance Monitoring Unit) eseményeket kér. Counting módban
+(<code>perf stat</code>) az eseményeket számlálja, sampling módban
+(<code>perf record</code>) gyakoriság-alapú interruptot generál, és a
+futó process IP-jét a stackkel együtt menti a <code>perf.data</code>
+fájlba. A PMU hozzáférést a <code>kernel.perf_event_paranoid</code>
+sysctl szabályozza. A <code>-F 99</code> frekvencia a véletlenszerű
+ütemező-interferencia elkerülésére bevett kiindulópont, de a mérési
+céltól függően növelhető vagy csökkenthető. A <code>perf</code> csomagok
+kernelverzióhoz kötöttek: Ubuntu 24.04 LTS-en a
+<code>linux-tools-common</code>, <code>linux-tools-generic</code> és a
+konkrét <code>linux-tools-$(uname -r)</code> csomagot kell telepíteni; a
+pontos elérhetőséget a labban ellenőrizni kell.</p>
+<p><strong>Stack symbolication.</strong> A sampling csak akkor hasznos,
+ha a program counter és a stack visszaalakítható függvénynevekké. Ehhez
+a binárisnak rendelkeznie kell szimbólummal/debuginfóval, a stacknek
+unwindolhatónak kell lennie, és a <code>perf.data</code> build-id-jének
+egyeznie kell a binárissal. A
+<code>-g -O2 -fno-omit-frame-pointer</code> build explicit frame
+pointert hagy, amely a <code>--call-graph fp</code> stackvisszafejtést
+gyorssá és robusztussá teszi. A <code>-fomit-frame-pointer</code> esetén
+a <code>--call-graph dwarf</code> használható, de lassabb, és a libc
+debuginfókat is igényelheti. A saját bináris <code>build-id</code>-ját a
+<code>readelf -n</code> adja; a <code>perf buildid-list</code> ugyanazt
+az azonosítót mutatja a rögzített mintákhoz. C++-ban a demoduláció
+alapértelmezett, de a <code>--no-demangle</code> kapcsolóval a nyers
+szimbólum is ellenőrizhető.</p>
+<p><strong>Scheduler, context switch és lock trace.</strong> A
+CPU-probléma tünete lehet a scheduler által okozott késleltetés is: a
+task runnable, de nem fut, mert preemptálták, NUMA-node-ot váltott, vagy
+futexen vár. A <code>perf sched record</code> a
+<code>sched:sched_switch</code>, <code>sched:sched_wakeup</code>
+tracepointokat gyűjti; a <code>perf sched latency</code> és
+<code>perf sched script</code> a task scheduler késleltetését és az
+átváltási okokat mutatja. A <code>pidstat -w</code> a
+voluntary/involuntary context switch per másodperc értéket adja: a magas
+involuntary arány preemptálásra vagy CPU-quota-ra utal. Lock-verseny
+esetén a <code>perf lock</code> (újabb verziókban
+<code>perf lock contention</code>) a futex, mutex és rwlock eseményeket
+aggregálja.</p>
+<p><strong>Cgroup CPU throttling és steal.</strong> A cgroup v2
+<code>cpu.max</code> két értékből áll: <code>quota period</code>. Ha a
+task a periodban eléri a quota-t, a scheduler leállítja; a task runnable
+marad, de nem fut. A <code>cpu.stat</code> <code>nr_throttled</code> és
+<code>throttled_usec</code> mezői ezt mutatják. A throttling a process
+user/kernel CPU-ját nem növeli, csak a runnable időt nyújtja, ezért a
+<code>top</code> CPU% alacsony lehet, miközben a latency magas. A steal
+hasonló tünetet ad, de a <code>cpu.stat</code> nem jelzi; a
+disztingváláshoz a <code>mpstat</code> <code>%st</code> oszlopát és a
+hypervisor oldali CPU ready/idle mérését kell használni.</p>
+<p><strong>NUMA/cache miss hipotézis.</strong> A <a
+href="d013.html">NUMA, affinity és memóriaelhelyezés</a> alapján a
+remote memory access lassabb. A
+<code>perf stat -e node-loads,node-load-misses,LLC-loads,LLC-load-misses</code>
+a cache- és NUMA-szintű miss arányt méri. A magas
+<code>node-load-misses</code> remote node-ból való memóriaolvasást
+jelez; ilyenkor a fix gyakran a memóriaelhelyezés és az affinity, nem a
+C++ kód optimalizálása. A hipotézist <code>numastat -p PID</code> és a
+<code>hwloc</code> topológia egybevetésével kell igazolni.</p>
+<p><strong>Profiler overhead és sampling torzítás.</strong> A sampling
+mintavételes, nem teljes lefedettségű mérés. A nagyon rövid életű hot
+ciklusok alulreprezentáltak lehetnek. A mintavételi frekvencia növelése
+növeli az overheadet, mert az interruptok kernel CPU-t fogyasztanak. Az
+ajánlott gyakorlat a <code>-F 99</code> kiindulópont, amely nem esik
+egybe a tipikus ütemező-frekvenciákkal. A skid jelenség miatt a
+mintavételi IP pár utasítással eltérhet a valódi forró ponttól; ez a
+<code>perf annotate</code> használatakor látszik. A mérést mindig
+workload, build-verzió és mintavételi paraméterek mellett kell
+rögzíteni, és a tényleges értéket csak labban futtatott adatból szabad
+„mértnek” nevezni.</p>
+<h3 data-number="22.2.3" id="kidolgozott-példa"><span
+class="header-section-number">22.2.3</span> Kidolgozott példa</h3>
+<p>A labhost neve <code>labvm01</code>, a labterület
+<code>/home/labuser/lab/d107</code>, a folyamat saját UID
+<code>1000</code> alatt fut, a rendszer-szintű perf-parancsok
+<code>sudo</code>-t igényelnek. A workload egy rövid C++ program, amely
+négy szálon CPU-intensive ciklust futtat, időnként syscallt
+(<code>getpid</code>) és memóriafoglalást
+(<code>new</code>/<code>memset</code>) végez, hogy kernel CPU és cache
+miss is legyen.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// lab_cpu_workload.cpp</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstring&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">volatile</span> <span class="dt">unsigned</span> <span class="dt">long</span> sink <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> work_loop<span class="op">(</span><span class="dt">int</span> id<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="kw">auto</span> start <span class="op">=</span> <span class="bu">std::</span>chrono::steady_clock::now<span class="op">();</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="bu">std::</span>chrono::steady_clock::now<span class="op">()</span> <span class="op">-</span> start <span class="op">&lt;</span> <span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">8</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>            sink <span class="op">+=</span> i <span class="op">*</span> id<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">((</span>sink <span class="op">%</span> <span class="dv">100</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">(</span><span class="dt">void</span><span class="op">)</span>getpid<span class="op">();</span>                 <span class="co">// syscall: kernel CPU</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>            <span class="kw">auto</span><span class="op">*</span> p <span class="op">=</span> <span class="kw">new</span> <span class="dt">char</span><span class="op">[</span><span class="dv">4096</span><span class="op">];</span>       <span class="co">// allocation + memset</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>memset<span class="op">(</span>p<span class="op">,</span> id<span class="op">,</span> <span class="dv">4096</span><span class="op">);</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>            <span class="kw">delete</span><span class="op">[]</span> p<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>thread<span class="op">&gt;</span> threads<span class="op">;</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">4</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>        threads<span class="op">.</span>emplace_back<span class="op">(</span>work_loop<span class="op">,</span> i<span class="op">);</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> t <span class="op">:</span> threads<span class="op">)</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Build és build-id ellenőrzés:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user labuser, UID 1000</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /home/labuser/lab/d107</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> /home/labuser/lab/d107</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-O2</span> <span class="at">-g</span> <span class="at">-fno-omit-frame-pointer</span> <span class="at">-pthread</span> <span class="at">-o</span> lab_cpu_workload lab_cpu_workload.cpp</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">readelf</span> <span class="at">-n</span> lab_cpu_workload <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&quot;Build ID&quot;</span></span></code></pre></div>
+<p>Várható ellenőrzési feltétel: a <code>readelf</code> hex build-id-t
+ír ki, amely később egyezik a <code>perf buildid-list</code>
+kimenetével.</p>
+<p>Futtatás és counting mérés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user labuser, UID 1000</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./lab_cpu_workload</span> <span class="kw">&amp;</span> <span class="va">pid</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf stat <span class="at">-e</span> cycles,instructions,LLC-loads,LLC-load-misses,node-loads,node-load-misses <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> <span class="va">$pid</span> <span class="at">--</span> sleep 5</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span> <span class="va">$pid</span></span></code></pre></div>
+<p>Az illusztratív, nem mért kimenet magas <code>cycles</code> és
+<code>instructions</code> értéket, 10–30% közötti
+<code>LLC-load-misses</code> arányt és nullához közeli
+<code>node-load-misses</code> arányt mutat, ha a VM egyetlen NUMA
+node-on van. A user/kernel CPU arányt a <code>time</code> eszközzel is
+rögzítjük:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">/usr/bin/time</span> <span class="at">-v</span> ./lab_cpu_workload</span></code></pre></div>
+<p>Itt a <code>User time (seconds)</code> körülbelül 32 másodperc (4
+szál × 8 másodperc), a <code>System time</code> kicsi, de mérhető.</p>
+<p>Sampling profil készítése:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user labuser, UID 1000, perf root joggal</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf record <span class="at">-F</span> 99 <span class="at">-g</span> <span class="at">--call-graph</span> fp <span class="at">-o</span> lab_cpu_perf.data <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  ./lab_cpu_workload</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf report <span class="at">--stdio</span> <span class="at">-i</span> lab_cpu_perf.data <span class="at">--sort</span><span class="op">=</span>dso,sym</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf buildid-list <span class="at">-i</span> lab_cpu_perf.data <span class="kw">|</span> <span class="fu">head</span></span></code></pre></div>
+<p>A <code>--sort=dso,sym</code> a DSO-t (Dynamic Shared Object) és a
+szimbólumot mutatja. Várható, hogy a <code>work_loop</code> a
+<code>lab_cpu_workload</code> DSO-ban adja a legtöbb mintát; a
+<code>getpid</code> és <code>memset</code> a libc DSO-ban, a
+kernel-réteg pedig a kernelben jelenik meg. A flame graph generálásához
+külső scriptek szükségesek (például <code>stackcollapse-perf.pl</code>
+és <code>flamegraph.pl</code>):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf script <span class="at">-i</span> lab_cpu_perf.data <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="ex">stackcollapse-perf.pl</span> <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="ex">flamegraph.pl</span> <span class="op">&gt;</span> lab_cpu_flame.svg</span></code></pre></div>
+<p>A postcondition: a <code>lab_cpu_flame.svg</code> létezik, és a
+<code>work_loop</code> széles lángja a saját DSO-ban látható; a
+<code>__getpid</code> keskenyebb; a user/kernel arány a lángok méretéből
+és színéből leolvasható.</p>
+<h3 data-number="22.2.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">22.2.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Permission denied a perf record-nál.</strong> Az
+<code>ls -l /proc/sys/kernel/perf_event_paranoid</code> és a
+<code>cat /proc/sys/kernel/perf_event_paranoid</code> mutatja a tiltás
+szintjét. Ha az érték 3 vagy 4, a nem root felhasználó nem fér hozzá a
+PMU-hoz. A labban a <code>sudo perf record</code> a bevált megoldás; a
+<code>sysctl kernel.perf_event_paranoid=1</code> globális csökkentés
+csak dokumentáltan, rollbackkel és a host security policyjával
+összhangban végezhető. A tünet ellenpróbája: ha
+<code>sudo perf record</code> is <code>Permission denied</code>-t ad,
+akkor nem sysctl, hanem a csomag- vagy kernelverzió mismatch (például
+hiányzó <code>linux-tools-$(uname -r)</code>).</p>
+<p><strong>Hiányzó szimbólumok, [unknown] a stackben.</strong> A
+<code>perf report</code> <code>[unknown]</code>-t mutat. Hipotézis: a
+bináris <code>-fno-omit-frame-pointer</code> nélkül készült, vagy a libc
+debuginfo hiányzik. Adatgyűjtés: <code>file lab_cpu_workload</code>,
+<code>readelf -S lab_cpu_workload | grep debug</code>,
+<code>sudo perf buildid-list -i lab_cpu_perf.data</code>. Verification:
+ha a build-id egyezik, a saját függvény neve megjelenik; a
+libc-szimbólumokhoz a <code>libc6-dbg</code> csomag vagy a debuginfod
+hálózati elérése kell. A hibát ne a <code>--call-graph fp</code>
+elhagyásával keressük, hanem a build flag javításával.</p>
+<p><strong>A flame graph nem jelenik meg.</strong> A
+<code>command -v stackcollapse-perf.pl flamegraph.pl</code> hibája a
+script hiányát mutatja. Hipotézis: a külső eszközök nincsenek telepítve,
+vagy nincsenek a <code>PATH</code>-ban. Ellenpróba: ha a
+<code>perf script</code> kimenete üres, akkor a <code>perf.data</code>
+nem tartalmaz mintát; ilyenkor a <code>-F</code> frekvencia, a
+<code>--duration</code> vagy a futtatási idő ellenőrzése.</p>
+<p><strong>Throttling látszólagos CPU-hiány.</strong> A process
+<code>%CPU</code> alacsony, de a kód CPU-kötött. A
+<code>cat /sys/fs/cgroup/system.slice/lab-cpu.service/cpu.stat</code>
+<code>nr_throttled</code> és <code>throttled_usec</code> értékei
+növekedést mutatnak. Hipotézis: a <code>cpu.max</code> kvóta túl
+alacsony. A <code>mpstat</code> <code>%st</code> alacsony, így a steal
+kizárható. A javítás a quota növelése vagy a szerződés újratárgyalása,
+nem a kód optimalizálása.</p>
+<p><strong>NUMA/cache miss félreértése.</strong> Ha a
+<code>node-load-misses</code> magas, de a <code>numastat</code> local
+arány, akkor a perf eseményt hardver vagy virtualizáció nem támogatja
+megbízhatóan. Ilyenkor <code>perf mem record</code> vagy
+<code>numastat</code> használatos; a hipotézist a tényleges NUMA-node
+topológiával kell egybevetni.</p>
+<h3 data-number="22.2.5" id="feladatok"><span
+class="header-section-number">22.2.5</span> Feladatok</h3>
+<h4 data-number="22.2.5.1" id="feladat-userkernel-cpu-értelmezése"><span
+class="header-section-number">22.2.5.1</span> 1. Feladat: user/kernel
+CPU értelmezése</h4>
+<p>Egy CPU-bound program <code>time</code> kimenete:
+<code>real 10.0s</code>, <code>user 9.8s</code>, <code>sys 0.1s</code>.
+A <code>top</code> <code>%Cpu(s)</code> sorában
+<code>us 4.7, sy 0.5, id 92.0, wa 0.0, st 2.8</code> látszik. Magyarázd
+meg, miért lehetséges, hogy a process user ideje 9,8 másodperc, mégis a
+<code>%Cpu(s)</code> <code>us</code> csak 4,7%? Mi a <code>st</code>
+jelentése, és miért nem jelenik meg a process user idejében?</p>
+<h4 data-number="22.2.5.2" id="feladat-flame-graph-készítése"><span
+class="header-section-number">22.2.5.2</span> 2. Feladat: flame graph
+készítése</h4>
+<p>Készítsd el a fenti <code>lab_cpu_workload</code> példát a labhoston.
+Fordítsd <code>-g -O2 -fno-omit-frame-pointer</code>-rel. Rögzíts
+<code>perf record</code>-ot <code>-F 99 -g --call-graph fp</code>-vel.
+Generálj flame graphot, és igazold, hogy a <code>work_loop</code> a
+legforróbb saját függvény. A postcondition: a
+<code>lab_cpu_flame.svg</code> létezik, és a
+<code>perf report --stdio</code> <code>work_loop</code> mintaaránya a
+legnagyobb a saját DSO-ban.</p>
+<h4 data-number="22.2.5.3"
+id="feladat-throttling-kontra-steal-diagnosztika"><span
+class="header-section-number">22.2.5.3</span> 3. Feladat: throttling
+kontra steal diagnosztika</h4>
+<p>Egy systemd service <code>lab-cpu.service</code> a cgroup
+<code>cpu.max = 200000 100000</code> alatt fut (100 ms periodusban 200
+ms CPU-idő, azaz 2 CPU-nak felel meg). A <code>pidstat -t 1</code> ~100%
+CPU-t mutat, de a válaszidő kétszeresére romlott. Gyűjts adatot a
+<code>cpu.stat</code>-ból, az <code>mpstat</code> <code>%st</code>-ből
+és a <code>perf stat -e sched:sched_switch</code>-ből. Döntsd el, hogy a
+szolgáltatás CPU throttlingot szenved-e, vagy a virt-gazda steal-jét. A
+postcondition: a <code>nr_throttled</code> érték alapján megérkezik a
+válasz, és a <code>cpu.max</code> növelése után a
+<code>throttled_usec</code> nem nő.</p>
+<h3 data-number="22.2.6" id="megoldások"><span
+class="header-section-number">22.2.6</span> Megoldások</h3>
+<h4 data-number="22.2.6.1" id="megoldás"><span
+class="header-section-number">22.2.6.1</span> 1. Megoldás</h4>
+<p>A <code>%Cpu(s)</code> a teljes CPU vagy vCPU kihasználtságot mutatja
+az adott mintavételi intervallumban. A <code>user 9.8s</code> a process
+által fogyasztott teljes CPU-másodperc a 10 másodperc alatt, de a CPU-k
+száma (a példában 8) elosztja: 9,8 s / 10 s / 8 CPU ≈ 12,25% lenne, ha
+folyamatosan egy CPU-n futna; a <code>top</code> <code>us 4,7%</code>
+azt jelzi, hogy a process átlagosan a teljes kapacitás 4,7%-át használta
+az adott időablakban, mert más processek is futottak, illetve a program
+nem volt folyamatosan runnable. A <code>st</code> (steal) 2,8% azt
+mutatja, hogy a hypervisor más VM futtatása miatt a vCPU nem kapott
+futási időt; ez az idő nem a process <code>user</code> vagy
+<code>sys</code> idejét növeli, hanem a runnable időt nyújtja. A
+<code>time</code> user/system értéke a processre elszámolt CPU-t, nem a
+fal-időt mutatja.</p>
+<h4 data-number="22.2.6.2" id="megoldás-1"><span
+class="header-section-number">22.2.6.2</span> 2. Megoldás</h4>
+<p>A kidolgozott példa parancsai használhatók. A
+<code>perf report</code>-ban a <code>work_loop</code> a
+<code>lab_cpu_workload</code> DSO-ban van, és a minták többségét adja. A
+<code>lab_cpu_flame.svg</code> széles lángja a <code>work_loop</code>-ot
+mutatja. Ellenőrzés: <code>ls -l lab_cpu_flame.svg</code> és
+<code>sudo perf report --stdio -i lab_cpu_perf.data | grep work_loop</code>.
+A postcondition teljesül, ha a saját függvény neve megjelenik, és a
+<code>Samples</code> oszlop a legnagyobb. A build-id egyezés a
+<code>sudo perf buildid-list -i lab_cpu_perf.data</code> és a
+<code>readelf -n lab_cpu_workload</code> kimenetén ellenőrizhető.</p>
+<h4 data-number="22.2.6.3" id="megoldás-2"><span
+class="header-section-number">22.2.6.3</span> 3. Megoldás</h4>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labvm01, user root</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> cat lab-cpu.service</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/system.slice/lab-cpu.service/cpu.stat</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">mpstat</span> <span class="at">-P</span> ALL 1 3</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> perf stat <span class="at">-e</span> sched:sched_switch <span class="at">-p</span> <span class="va">$(</span><span class="fu">pidof</span> lab_cpu_workload<span class="va">)</span> <span class="at">--</span> sleep 3</span></code></pre></div>
+<p>A <code>cpu.stat</code> <code>nr_throttled</code> &gt; 0 és
+<code>throttled_usec</code> növekvő értéke throttlingot mutat. A
+<code>mpstat</code> <code>%st</code> alacsony, így kizárható a
+steal-dominancia. A context switch arány magas, de ez lehet a throttling
+következménye: a process futna, de a periodonként leállítják. A
+<code>cpu.max</code> megemelése után a <code>throttled_usec</code> nem
+nő. A diagnózis: erőforrásszerződés, nem kódoptimalizálás.</p>
+<h3 data-number="22.2.7" id="rövid-összefoglaló"><span
+class="header-section-number">22.2.7</span> Rövid összefoglaló</h3>
+<p>A CPU-probléma diagnosztikája rétegzett: a <code>perf</code>
+PMU-alapú sampling profilozás a hot függvényt, a scheduler trace a
+késleltetést, a cgroup <code>cpu.stat</code> a throttle-t, a
+<code>%st</code> a virt-gazda steal-jét, a NUMA/cache counterek a
+memória-affinity hibát mutatják. A szimbólumok csak a build-id és
+debuginfo egyezésével értelmesek; a frame pointer és a DWARF unwind
+közötti választás a buildtől függ. A mintavétel statisztikai, overheadje
+és skidje van, ezért az eredményt mindig workload, build és mérési
+feltétel mellett kell rögzíteni. A C++ fejlesztő a saját binárisát
+<code>-g -O2 -fno-omit-frame-pointer</code>-rel építve közvetlenül
+használhatja a perfet.</p>
+<p><em>Továbbhasznált definíciók:</em> <strong>sampling
+profiler</strong> – periodikus PMU interrupttal gyűjtött stack minták
+statisztikai profilozója; <strong>CPU throttling</strong> – a cgroup
+<code>cpu.max</code> quota elérése miatti scheduler leállítás;
+<strong>steal</strong> – virtualizált környezetben a hypervisor által
+más guestnek adott CPU-idő, amely a VM-en belül nem elszámolt CPU.</p>
+<h3 data-number="22.2.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">22.2.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások kiindulópontok, nem olvasott bizonyítékok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel documentation –
+perf</a></li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man-pages –
+perf_event_open, perf</a></li>
+<li><a href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a fejezetben szereplő parancsok és kimenetek
+illusztratívak, nem tényleges laboreredmények. A jelen alfejezet nem
+webes kutatásra épül; az Ubuntu 24.04 LTS pontos
+<code>linux-tools</code> csomagverzióját, a kernel
+<code>perf_event_paranoid</code> defaultját, a
+<code>perf sched</code>/<code>perf lock</code> szintaxisát és a PMU
+események elérhetőségét a labhardver/vCPU modellhez kell ellenőrizni. A
+flame graph scriptek hivatalos forrását és verzióját a labban validálni
+kell.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d106.html">← 22.1 USE módszer és rendszerbaseline</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d108.html">22.3 strace, ftrace, eBPF és dinamikus megfigyelés →</a></div>
+</nav>
+</body>
+</html>

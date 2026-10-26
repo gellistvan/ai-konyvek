@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.1 Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika – IoT-rendszerek és szoftverkomponensek – az eszköztől a
+felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Backend és enterprise integráció</a> › <a href="index.html#ich15">16 Streamfeldolgozás és integrációs minták</a></p>
+<div class="links"><a class="prev" rel="prev" href="i046.html">← 15.3 Megőrzés, ritkítás és tárolási költség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i048.html">16.2 Enterprise integrációs minták IoT-ban →</a></div>
+</nav>
+<h2 data-number="16.1" id="i047"><span
+class="header-section-number">16.1</span> Eseményvezérelt feldolgozás:
+Kafka és a kézbesítési szemantika</h2>
+<h3 data-number="16.1.1" id="motiváció"><span
+class="header-section-number">16.1.1</span> Motiváció</h3>
+<p>A TerraSense eddigi adatútja lineáris: a <code>ts-node</code>
+BLE/UDP-n küld a <code>ts-gw</code>-nek, a gateway MQTT-n publikál a
+Mosquitto brokerre, a <code>ts-backend</code> pedig feliratkozik a
+<code>terrasense/...</code> topicokra. Ez a felépítés jól működik egy
+üvegház, néhány tíz node és egyetlen backend esetén. A következő igények
+azonban gyorsan szűkössé teszik:</p>
+<ul>
+<li><strong>Visszajátszás:</strong> ha a <code>ts-backend</code> órákra
+leáll, az MQTT retained üzenetek nem tartalmazzák a múltbeli
+adatfolyamot; a leállás alatt elveszett telemetriát nem lehet utólag
+visszaolvasni.</li>
+<li><strong>Több, független fogyasztó:</strong> a riasztási modul (<a
+href="i052.html">Riasztás: szabályok, értesítés, riasztási
+fáradtság</a>), az idősoros betöltő (<a href="i045.html">Idősoros
+adatbázisok és adatmodellezés</a>) és egy későbbi analitikai modul
+ugyanazt az adatfolyamot akarja feldolgozni anélkül, hogy egymást
+zavarnák.</li>
+<li><strong>Tartós puffer:</strong> a gateway store-and-forwardja (<a
+href="i037.html">Store-and-forward: offline működés és visszatöltés</a>)
+megoldja a peremhálózati kiesést, de a felhőben is hasznos, ha a
+fogyasztó sebessége időszakosan elmarad a termeléstől.</li>
+</ul>
+<p>Ezekre a problémákra az MQTT broker nem elosztott napló, hanem
+üzenetközvetítő. A megoldás egy elosztott napló, például Apache Kafka
+bevezetése az MQTT mögé, amely pufferként és újraolvasható
+eseményfolyamként szolgál. Ebben az alfejezetben megtervezzük a hidat,
+és tisztázzuk a kézbesítési szemantikát.</p>
+<h3 data-number="16.1.2" id="fogalmak-és-működés"><span
+class="header-section-number">16.1.2</span> Fogalmak és működés</h3>
+<h4 data-number="16.1.2.1" id="a-kafka-alapfogalmai"><span
+class="header-section-number">16.1.2.1</span> A Kafka alapfogalmai</h4>
+<p><strong>Definíció.</strong> A <strong>Kafka topic</strong> egy
+elnevezett, append-only log, amelybe a producerek üzeneteket
+(rekordokat) írnak, és amelyből a fogyasztók olvasnak. Minden rekord egy
+kulcs-érték párt, időbélyeget és metaadatokat tartalmaz; a sorrend a
+topic szintjén nem garantált, csak partíción belül.</p>
+<p><strong>Definíció.</strong> A <strong>partíció</strong> a topic
+fizikai felosztása: egy topic egy vagy több partícióból áll. A producer
+által megadott kulcs (vagy annak hiányában egy round-robin algoritmus)
+határozza meg, melyik partícióba kerül a rekord. Azonos kulcsú rekordok
+mindig ugyanabba a partícióba íródnak, így ott a beérkezési sorrend
+megőrződik.</p>
+<p><strong>Definíció.</strong> Az <strong>offset</strong> egy monoton
+növekvő, partíción belüli pozíció azonosító, amely a rekord helyét
+jelöli. A fogyasztó az offset segítségével tudja, hol tart, és
+újrainduláskor a legutóbb elkötelezett (committed) offsettől
+folytathatja.</p>
+<p><strong>Definíció.</strong> A <strong>consumer group</strong>
+fogyasztók halmaza, amely közösen dolgozza fel a topic partícióit. Kafka
+garantálja, hogy egy partíciót egy adott pillanatban a csoporton belül
+legfeljebb egy fogyasztó olvas, így a feldolgozási terhelés
+párhuzamosítható, miközben elkerülhető a duplikált olvasás.</p>
+<p>Az MQTT és a Kafka szerepe gyakran összemosódik, pedig alapvetően
+különbözik:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>MQTT (broker)</th>
+<th>Kafka (napló)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Elsődleges cél</td>
+<td>üzenetközvetítés eszközöknek</td>
+<td>tartós, visszajátszható eseményfolyam</td>
+</tr>
+<tr class="even">
+<td>Olvasási modell</td>
+<td>előfizetők push alapon kapják az üzenetet</td>
+<td>fogyasztók pull alapon kérnek rekordokat</td>
+</tr>
+<tr class="odd">
+<td>Tárolás</td>
+<td>retained üzenetek kivételével rövid életű</td>
+<td>konfigurálható megőrzés (napok, hetek)</td>
+</tr>
+<tr class="even">
+<td>Sorrend</td>
+<td>topic szinten általában nincs garancia</td>
+<td>partíción belül erős garancia</td>
+</tr>
+<tr class="odd">
+<td>Visszajátszás</td>
+<td>nem jellemző</td>
+<td>alapvető képesség offset alapján</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="16.1.2.2" id="mqtt-kafka-híd"><span
+class="header-section-number">16.1.2.2</span> MQTT → Kafka híd</h4>
+<p>A TerraSense-ben a Mosquitto brokerre érkező telemetriát továbbítani
+kell a Kafka topicba. Erre két általános megoldás létezik:</p>
+<ol type="1">
+<li><p><strong>Kafka Connect forrás-konnektor:</strong> például egy
+MQTT-forrás konnektor (a pontos elérhetőségét ellenőrizni kell), amely
+feliratkozik az MQTT topicokra, és minden üzenetet a konfigurált Kafka
+topicba ír. Előnye a konfigurációalapú üzemeltetés, hátránya a
+korlátozott rugalmasság.</p></li>
+<li><p><strong>Saját híd:</strong> a <code>ts-backend</code> vagy egy
+külön szolgáltatás, például <code>ts-ingest</code>, MQTT-klienssel
+feliratkozik, majd Kafka-producerként publikál. Ez teljes kontrollt ad a
+séma, a particionálási kulcs és a hibakezelés felett; ezt a mintát
+követjük a laborban.</p></li>
+</ol>
+<p>A híd legfontosabb tervezési döntése a <strong>particionálási
+kulcs</strong>. A TerraSense üzeneteiben a <code>node_id</code> az
+azonosító, amely alapján az összes node-hoz tartozó rekordnak időrendben
+kell feldolgozhatónak lennie. Ha a kulcs a <code>node_id</code>, akkor
+minden node adata ugyanabba a partícióba kerül, és a fogyasztó oldalon a
+<code>seq</code> mező monotonitása ellenőrizhető. Ha nem adnánk meg
+kulcsot, a rekordok véletlenszerű partícióba kerülnének, és a node-ra
+vonatkozó sorrend felborulna.</p>
+<h4 data-number="16.1.2.3"
+id="at-least-once-és-idempotens-fogyasztó"><span
+class="header-section-number">16.1.2.3</span> At-least-once és
+idempotens fogyasztó</h4>
+<p>A Kafka alapértelmezett feldolgozási szemantikája
+<strong>at-least-once</strong>: a fogyasztó poll-ozza a rekordokat,
+feldolgozza őket, majd elkötelezi az offsetet. Ha a feldolgozás és a
+commit között a fogyasztó összeomlik, akkor újraindulás után a legutóbbi
+commitnál folytatja, így a már feldolgozott, de nem commit-olt
+rekordokat újraolvassa. Ez duplikátumokat eredményezhet.</p>
+<p>A duplikátumok kezelésére <strong>idempotens fogyasztót</strong>
+építünk: a feldolgozás során minden rekordhoz egy egyedi kulcsot
+rendelünk, és egy perzisztens vagy memóriabeli halmazban nyilvántartjuk
+a már feldolgozott kulcsokat. Ha egy kulcs másodszor érkezik, a rekordot
+eldobjuk. A TerraSense-ben erre természetes kulcs a <code>node_id</code>
+és a <code>seq</code> páros, kiegészítve a <code>boot_id</code>-vel,
+mert újraindulás után a <code>seq</code> nulláról indulhat (lásd <a
+href="i034.html">Idő az IoT-ban: időbélyeg, időszinkron, sorrend</a>).
+Így a deduplikálási kulcs: <code>(node_id, boot_id, seq)</code>.</p>
+<p>Az offset-kezelésnél két hibás stratégia létezik:</p>
+<ul>
+<li><strong>Commit a feldolgozás előtt</strong> → at-most-once: ha a
+feldolgozás meghiúsul, a rekord elveszik, mert a fogyasztó
+újrainduláskor már a következő offsettől olvas.</li>
+<li><strong>Nem commit-olunk</strong> → a fogyasztói csoport nem tudja
+nyomon követni az állapotot, és újrainduláskor a topic elejéről kell
+olvasni.</li>
+</ul>
+<p>A helyes stratégia: <strong>feldolgozás után commit</strong>, vagyis
+at-least-once + idempotens feldolgozás. Ez a kombináció gyakorlatilag
+exactly-once hatást ad, ha a feldolgozás mellékhatása (pl.
+adatbázis-írás) is idempotens.</p>
+<h4 data-number="16.1.2.4"
+id="ablakok-watermark-késve-érkező-adat"><span
+class="header-section-number">16.1.2.4</span> Ablakok, watermark, késve
+érkező adat</h4>
+<p>A valós idejű feldolgozásban az <strong>ablak</strong> (window) az
+események időalapú csoportosítása. A <a href="i039.html">Helyi
+feldolgozás: szűrés, aggregálás, eseménydetektálás</a> alfejezetben a
+gateway percenkénti tumbling ablakot állít elő; itt ugyanezt a fogalmat
+a Kafka-fogyasztó oldalán is alkalmazhatjuk. A tumbling ablak rögzített
+hosszúságú (pl. 60 s), és az ablakok nem fedik át egymást.</p>
+<p><strong>Definíció.</strong> A <strong>watermark</strong> az a
+pillanat az eseményidő-tengelyen, amelynél korábbi időbélyegű
+eseményeket a feldolgozó már nem vár. Más szóval a watermark a
+maximálisan megengedett késés mértékét rögzíti: ha a legutóbb látott
+esemény időbélyege <code>T</code>, és a watermark késleltetése
+<code>W</code>, akkor a <code>T - W</code>-nél korábbi eseményeket késve
+érkezettnek tekintjük, és vagy eldobjuk, vagy oldalági kimenetre
+irányítjuk.</p>
+<p>A TerraSense-ben a késés forrása lehet a gateway store-and-forward
+üzemmódja: hálózati kiesés után órákkal később érkezik egy köteg régi
+telemetriai üzenet. Ha a fogyasztó ablakos aggregálást végez, és nincs
+watermark, akkor a késve érkező adat beszámít a már lezárt ablakba, ami
+utólagos korrekciót igényel. A watermark beállítása kompromisszum: túl
+kicsi érték adatvesztést okoz, túl nagy érték pedig növeli a kimenet
+késleltetését, mert az ablak csak a watermark átlépése után zárul
+le.</p>
+<h4 data-number="16.1.2.5" id="mikor-nem-kell-kafka"><span
+class="header-section-number">16.1.2.5</span> Mikor nem kell Kafka</h4>
+<p>Kis rendszerekben, ahol:</p>
+<ul>
+<li>egyetlen backend fogyasztó van,</li>
+<li>az adatmennyiség percenként néhány tíz üzenet,</li>
+<li>a fogyasztó leállásának időtartama alatt keletkező adatok elvesztése
+elfogadható,</li>
+<li>nincs szükség visszajátszásra vagy több, független fogyasztóra,</li>
+</ul>
+<p>a Kafka üzemeltetése (Zookeeper vagy KRaft, replikáció, monitoring)
+aránytalan komplexitást jelent. Ilyenkor a Mosquitto retain üzenetek és
+a gateway store-and-forward elegendő puffert ad. A TerraSense oktatási
+célú, egy üvegházas példájában ez a helyzet, ezért a Kafka bevezetését
+ebben a könyvben csak a nagyobb, több telephelyes kiterjesztésben
+indokoljuk.</p>
+<h3 data-number="16.1.3" id="döntési-szempontok"><span
+class="header-section-number">16.1.3</span> Döntési szempontok</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Kritérium</th>
+<th>MQTT önmagában</th>
+<th>MQTT + Kafka</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Fogyasztók száma</td>
+<td>kevés, ismert</td>
+<td>sok, dinamikusan változó</td>
+</tr>
+<tr class="even">
+<td>Visszajátszás igénye</td>
+<td>nincs</td>
+<td>van (hibakeresés, újraindexelés)</td>
+</tr>
+<tr class="odd">
+<td>Adatmennyiség</td>
+<td>alacsony</td>
+<td>magas, terhelési csúcsok</td>
+</tr>
+<tr class="even">
+<td>Sorrendi garancia</td>
+<td>topiconként nem garantált</td>
+<td>partíción belül erős</td>
+</tr>
+<tr class="odd">
+<td>Üzemeltetési komplexitás</td>
+<td>alacsony</td>
+<td>közepes/magas</td>
+</tr>
+<tr class="even">
+<td>Költség</td>
+<td>broker csak</td>
+<td>broker + Kafka klaszter</td>
+</tr>
+</tbody>
+</table>
+<p>A TerraSense alapváltozatában az MQTT elegendő. Ha a rendszer több
+üvegházra, több ezer node-ra és több backend szolgáltatásra nő, akkor a
+Kafka bevezetése indokolt.</p>
+<h3 data-number="16.1.4" id="kidolgozott-példa-és-labor"><span
+class="header-section-number">16.1.4</span> Kidolgozott példa és
+labor</h3>
+<h4 data-number="16.1.4.1"
+id="példa-particionálási-terv-és-adatmennyiség"><span
+class="header-section-number">16.1.4.1</span> Példa: particionálási terv
+és adatmennyiség</h4>
+<p>Tegyük fel, hogy 1000 node percenként 1 telemetriai üzenetet küld.
+Egy üzenet JSON mérete körülbelül 200 B (a mezők: <code>node_id</code>,
+<code>seq</code>, <code>ts</code>, hőmérséklet, páratartalom,
+talajnedvesség, <code>agg</code> blokk). Napi adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>60</mn><mo>⋅</mo><mn>24</mn><mo>⋅</mo><mn>200</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>=</mo><mn>288</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>≈</mo><mn>274</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">1000 \cdot 60 \cdot 24 \cdot 200\ \mathrm{B} = 288\,000\,000\ \mathrm{B} \approx 274\ \mathrm{MiB}.</annotation></semantics></math></p>
+<p>Ha a Kafka topicot 4 partícióra osztjuk, minden node a
+<code>node_id</code> hash alapján kerül partícióba, így egy partícióra
+naponta körülbelül 68 MiB jut. Ez a mennyiség egyetlen fogyasztóval is
+kezelhető, de a partíciók lehetővé teszik a párhuzamos feldolgozást, ha
+több fogyasztót indítunk ugyanabban a consumer groupban.</p>
+<p>A labor egy <strong>szimulált</strong> Kafka-fogyasztót valósít meg
+Pythonban, mert a teljes Kafka-stack telepítése meghaladja ennek az
+alfejezetnek a kereteit. A szimuláció a következőket mutatja be:</p>
+<ol type="1">
+<li><strong>Offset-kezelés:</strong> a fogyasztó a beolvasott rekordok
+után commit-ol, és ha újraindul, a legutóbb commit-olt pozíciótól
+folytatja (ezt a <code>state.txt</code> fájl tárolja).</li>
+<li><strong>Idempotens feldolgozás:</strong> a
+<code>(node_id, boot_id, seq)</code> kulcsot használja a duplikátumok
+eldobására.</li>
+<li><strong>Eseményidő szerinti tumbling ablak:</strong> 60 másodperces
+ablakokat számol, és az eredményt az ablak lezárásakor írja ki.</li>
+</ol>
+<h4 data-number="16.1.4.2" id="labor-mqtt-kafka-híd-szimulációja"><span
+class="header-section-number">16.1.4.2</span> Labor: MQTT → Kafka híd
+szimulációja</h4>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i047 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i047</span></code></pre></div>
+<p>Hozd létre az <code>events.json</code> fájlt, amely a bridge-ből a
+Kafka topicba kerülő rekordokat szimulálja:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000000000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.5</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n002&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b02&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000000000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.1</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000030000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.8</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">3</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000060000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.2</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n002&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b02&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000040000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.5</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000030000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">23.8</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span> <span class="dt">&quot;boot_id&quot;</span><span class="fu">:</span> <span class="st">&quot;b01&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1700000090000</span><span class="fu">,</span> <span class="dt">&quot;temperature&quot;</span><span class="fu">:</span> <span class="fl">24.6</span><span class="fu">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<p>A negyedik elemtől kezdve az események <code>ts</code> mezője 3
+másodpercenként növekszik. A hatodik elem a harmadik duplikátuma. A
+<code>boot_id</code> az egyszerűség kedvéért állandó.</p>
+<p>Hozd létre a <code>consumer.py</code> fájlt:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> collections <span class="im">import</span> defaultdict</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>WINDOW_SIZE_MS <span class="op">=</span> <span class="dv">60_000</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>STATE_FILE <span class="op">=</span> <span class="st">&quot;state.txt&quot;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>DEDUP_FILE <span class="op">=</span> <span class="st">&quot;seen.json&quot;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_events(path):</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(path) <span class="im">as</span> f:</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> json.load(f)</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_state():</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> os.path.exists(STATE_FILE):</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(STATE_FILE) <span class="im">as</span> f:</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="bu">int</span>(f.read().strip())</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> save_state(offset):</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(STATE_FILE, <span class="st">&quot;w&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        f.write(<span class="bu">str</span>(offset))</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> load_seen():</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> os.path.exists(DEDUP_FILE):</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(DEDUP_FILE) <span class="im">as</span> f:</span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="bu">set</span>(<span class="bu">tuple</span>(x) <span class="cf">for</span> x <span class="kw">in</span> json.load(f))</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="bu">set</span>()</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> save_seen(seen):</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(DEDUP_FILE, <span class="st">&quot;w&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        json.dump([<span class="bu">list</span>(x) <span class="cf">for</span> x <span class="kw">in</span> seen], f)</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> process(events):</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    seen <span class="op">=</span> load_seen()</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    committed_offset <span class="op">=</span> load_state()</span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Indulás offset=</span><span class="sc">{</span>committed_offset<span class="sc">}</span><span class="ss">, dedup kulcsok: </span><span class="sc">{</span><span class="bu">len</span>(seen)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    current_window_start <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    window_agg <span class="op">=</span> defaultdict(<span class="kw">lambda</span>: {<span class="st">&quot;min&quot;</span>: <span class="va">None</span>, <span class="st">&quot;max&quot;</span>: <span class="va">None</span>, <span class="st">&quot;sum&quot;</span>: <span class="fl">0.0</span>, <span class="st">&quot;count&quot;</span>: <span class="dv">0</span>})</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i, e <span class="kw">in</span> <span class="bu">enumerate</span>(events):</span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> i <span class="op">&lt;</span> committed_offset:</span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [kihagyva, már commit-olva] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>e[<span class="st">&#39;node_id&#39;</span>]<span class="sc">}</span><span class="ss">/</span><span class="sc">{</span>e[<span class="st">&#39;seq&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>        key <span class="op">=</span> (e[<span class="st">&quot;node_id&quot;</span>], e[<span class="st">&quot;boot_id&quot;</span>], e[<span class="st">&quot;seq&quot;</span>])</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> key <span class="kw">in</span> seen:</span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [duplikátum] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Feldolgozás: idempotens beszúrás egy adatbázisba (szimulált)</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>        seen.add(key)</span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&quot;  [feldolgozva] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss"> ts=</span><span class="sc">{</span>e[<span class="st">&#39;ts&#39;</span>]<span class="sc">}</span><span class="ss"> temp=</span><span class="sc">{</span>e[<span class="st">&#39;temperature&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Ablakos aggregálás</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>        ts <span class="op">=</span> e[<span class="st">&quot;ts&quot;</span>]</span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>        window_start <span class="op">=</span> (ts <span class="op">//</span> WINDOW_SIZE_MS) <span class="op">*</span> WINDOW_SIZE_MS</span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> current_window_start <span class="kw">is</span> <span class="va">None</span>:</span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>            current_window_start <span class="op">=</span> window_start</span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>        <span class="cf">elif</span> window_start <span class="op">!=</span> current_window_start:</span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>            <span class="co"># Előző ablak lezárása</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> node, agg <span class="kw">in</span> <span class="bu">sorted</span>(window_agg.items()):</span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> agg[<span class="st">&quot;count&quot;</span>] <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>                    avg <span class="op">=</span> agg[<span class="st">&quot;sum&quot;</span>] <span class="op">/</span> agg[<span class="st">&quot;count&quot;</span>]</span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>                    <span class="bu">print</span>(<span class="ss">f&quot;  [ablak] start=</span><span class="sc">{</span>current_window_start<span class="sc">}</span><span class="ss"> node=</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>                          <span class="ss">f&quot;min=</span><span class="sc">{</span>agg[<span class="st">&#39;min&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> max=</span><span class="sc">{</span>agg[<span class="st">&#39;max&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> avg=</span><span class="sc">{</span>avg<span class="sc">:.1f}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>                          <span class="ss">f&quot;count=</span><span class="sc">{</span>agg[<span class="st">&#39;count&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>            window_agg.clear()</span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>            current_window_start <span class="op">=</span> window_start</span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>        node <span class="op">=</span> e[<span class="st">&quot;node_id&quot;</span>]</span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>        value <span class="op">=</span> e[<span class="st">&quot;temperature&quot;</span>]</span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>        agg <span class="op">=</span> window_agg[node]</span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> agg[<span class="st">&quot;count&quot;</span>] <span class="op">==</span> <span class="dv">0</span>:</span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>            agg[<span class="st">&quot;min&quot;</span>] <span class="op">=</span> agg[<span class="st">&quot;max&quot;</span>] <span class="op">=</span> value</span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span>:</span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>            agg[<span class="st">&quot;min&quot;</span>] <span class="op">=</span> <span class="bu">min</span>(agg[<span class="st">&quot;min&quot;</span>], value)</span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>            agg[<span class="st">&quot;max&quot;</span>] <span class="op">=</span> <span class="bu">max</span>(agg[<span class="st">&quot;max&quot;</span>], value)</span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>        agg[<span class="st">&quot;sum&quot;</span>] <span class="op">+=</span> value</span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>        agg[<span class="st">&quot;count&quot;</span>] <span class="op">+=</span> <span class="dv">1</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>        <span class="co"># Feldolgozás sikeres, commit</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>        committed_offset <span class="op">=</span> i <span class="op">+</span> <span class="dv">1</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>        save_state(committed_offset)</span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>        save_seen(seen)</span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Utolsó ablak lezárása</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> node, agg <span class="kw">in</span> <span class="bu">sorted</span>(window_agg.items()):</span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> agg[<span class="st">&quot;count&quot;</span>] <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>            avg <span class="op">=</span> agg[<span class="st">&quot;sum&quot;</span>] <span class="op">/</span> agg[<span class="st">&quot;count&quot;</span>]</span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>            <span class="bu">print</span>(<span class="ss">f&quot;  [ablak] start=</span><span class="sc">{</span>current_window_start<span class="sc">}</span><span class="ss"> node=</span><span class="sc">{</span>node<span class="sc">}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>                  <span class="ss">f&quot;min=</span><span class="sc">{</span>agg[<span class="st">&#39;min&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> max=</span><span class="sc">{</span>agg[<span class="st">&#39;max&#39;</span>]<span class="sc">:.1f}</span><span class="ss"> avg=</span><span class="sc">{</span>avg<span class="sc">:.1f}</span><span class="ss"> &quot;</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>                  <span class="ss">f&quot;count=</span><span class="sc">{</span>agg[<span class="st">&#39;count&#39;</span>]<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Végső commit offset=</span><span class="sc">{</span>committed_offset<span class="sc">}</span><span class="ss">, feldolgozott kulcsok: </span><span class="sc">{</span><span class="bu">len</span>(seen)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>    process(load_events(<span class="st">&quot;events.json&quot;</span>))</span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> consumer.py</span></code></pre></div>
+<p>Várt kimenet (rövidítve):</p>
+<pre class="text"><code>Indulás offset=0, dedup kulcsok: 0
+  [feldolgozva] offset=0 key=(&#39;n001&#39;, &#39;b01&#39;, 1) ts=1700000000000 temp=23.5
+  [feldolgozva] offset=1 key=(&#39;n002&#39;, &#39;b02&#39;, 1) ts=1700000000000 temp=24.1
+  [feldolgozva] offset=2 key=(&#39;n001&#39;, &#39;b01&#39;, 2) ts=1700000030000 temp=23.8
+  [feldolgozva] offset=3 key=(&#39;n001&#39;, &#39;b01&#39;, 3) ts=1700000060000 temp=24.2
+  [ablak] start=1700000040000 node=n001 min=23.8 max=24.2 avg=24.0 count=2
+  [feldolgozva] offset=4 key=(&#39;n002&#39;, &#39;b02&#39;, 2) ts=1700000040000 temp=24.5
+  [duplikátum] offset=5 key=(&#39;n001&#39;, &#39;b01&#39;, 2)
+  [feldolgozva] offset=6 key=(&#39;n001&#39;, &#39;b01&#39;, 4) ts=1700000090000 temp=24.6
+  [ablak] start=1700000040000 node=n001 min=24.2 max=24.6 avg=24.4 count=2
+  [ablak] start=1700000040000 node=n002 min=24.1 max=24.5 avg=24.3 count=2
+Végső commit offset=7, feldolgozott kulcsok: 7</code></pre>
+<p>Az ablakok <code>ts</code> alapján zárulnak, a duplikátumot a
+rendszer eldobta. Ha újraindítod a szkriptet, a <code>state.txt</code>
+miatt az összes rekordot kihagyja, mert már mind feldolgozott.</p>
+<p>Takarítás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> state.txt seen.json</span></code></pre></div>
+<h3 data-number="16.1.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">16.1.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A labor futtatása után ellenőrizd:</p>
+<ul>
+<li>a <code>state.txt</code> értéke a rekordok száma (7),</li>
+<li>a <code>seen.json</code> a 7 egyedi kulcsot tartalmazza,</li>
+<li>a duplikátum (az ötödik esemény) nem jelenik meg a kimenetben, csak
+a <code>[duplikátum]</code> sorban,</li>
+<li>az ablakokban a <code>count</code> értékek a várt elemszámot
+mutatják.</li>
+</ul>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hibatünet</th>
+<th>Ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A fogyasztó újrainduláskor mindent újra feldolgoz</td>
+<td>A <code>state.txt</code> nem jött létre, vagy a commit a feldolgozás
+előtt történt meg</td>
+<td>Ellenőrizd a <code>save_state</code> hívás helyét; a commit csak
+sikeres feldolgozás után menjen</td>
+</tr>
+<tr class="even">
+<td>Duplikátumok jelennek meg az adatbázisban</td>
+<td>A dedup kulcs nem tartalmazza a <code>boot_id</code> mezőt</td>
+<td>Egészítsd ki a kulcsot <code>(node_id, boot_id, seq)</code>
+formátumra</td>
+</tr>
+<tr class="odd">
+<td>Az ablakok rossz időponthoz tartoznak</td>
+<td>Az elemzés a feldolgozási időt használja az eseményidő helyett</td>
+<td>Mindig az üzenet <code>ts</code> mezőjét használd az ablakok
+számításához</td>
+</tr>
+<tr class="even">
+<td>Késve érkező adat beszámít a régi ablakba</td>
+<td>Nincs watermark, az ablak már lezárult</td>
+<td>Vezess be watermarkot, és a késlekedő eseményeket irányítsd oldalági
+kimenetre</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="16.1.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">16.1.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>At-most-once a feldolgozás előtti commit miatt.</strong>
+Ha a fogyasztó azonnal commit-ol a poll után, de a feldolgozás
+meghiúsul, az üzenet végleg elveszik. A TerraSense-ben ez
+elfogadhatatlan, mert a szenzoradatok nem pótolhatók. Mindig a
+feldolgozás után commit-olj, és gondoskodj idempotens
+feldolgozásról.</p></li>
+<li><p><strong>A particionálási kulcs elhagyása.</strong> Ha a híd nem
+ad meg kulcsot, a Kafka producere véletlenszerűen osztja el a rekordokat
+a partíciók között. Ekkor az azonos <code>node_id</code>-hez tartozó
+rekordok sorrendje felborul, és a <code>seq</code> mező alapján történő
+ellenőrzés hamis hibát jelez. A kulcs mindig a <code>node_id</code>
+legyen (vagy <code>site/node_id</code> kombináció).</p></li>
+<li><p><strong>A watermark túl szorosra állítása.</strong> Ha a
+watermark késleltetése kisebb, mint a valós késés (például 10 másodperc,
+miközben a gateway offline üzemmódban órákig pufferel), akkor a legtöbb
+késve érkező adat kiesik. A watermarkot a mért késés percentiliséhez
+kell igazítani, nem az átlaghoz.</p></li>
+<li><p><strong>Az MQTT és a Kafka fogalmainak keverése.</strong> Az
+MQTT-ben a topic hierarchikus és joker karakterekkel rendelkezik; a
+Kafka topic lapos, és a partíciók adják a párhuzamosságot. A kettőt nem
+lehet közvetlenül megfeleltetni egymásnak, a hídnak explicit módon kell
+leképeznie az MQTT topicstruktúrát a Kafka topicra és a
+kulcsra.</p></li>
+</ol>
+<h3 data-number="16.1.7" id="feladatok"><span
+class="header-section-number">16.1.7</span> Feladatok</h3>
+<h4 data-number="16.1.7.1" id="a-fogalmidöntési-kérdés"><span
+class="header-section-number">16.1.7.1</span> a) Fogalmi/döntési
+kérdés</h4>
+<p>Melyik esetben indokolt Kafka-t bevezetni a TerraSense-be, és
+melyikben elegendő a Mosquitto? Válaszodat a visszajátszás, a fogyasztók
+száma és az adatmennyiség szempontjából indokold.</p>
+<h4 data-number="16.1.7.2" id="b-számolásitervezési-feladat"><span
+class="header-section-number">16.1.7.2</span> b) Számolási/tervezési
+feladat</h4>
+<p>Tegyük fel, hogy 1000 node percenként 1 üzenetet küld, egy üzenet 150
+B. Hány partícióra osszuk a <code>ts-telemetry</code> topicot, ha a
+fogyasztói csoport 4 fogyasztót futtat, és a cél, hogy minden fogyasztó
+közel azonos terhelést kapjon? Mekkora a napi tárhelyigény 7 napos
+megőrzés mellett? (A replikációs faktor 2.)</p>
+<h4 data-number="16.1.7.3" id="c-implementációs-feladat"><span
+class="header-section-number">16.1.7.3</span> c) Implementációs
+feladat</h4>
+<p>Módosítsd a <code>consumer.py</code>-t, hogy kezelje a késve érkező
+adatokat: ha egy esemény <code>ts</code> értéke a legutóbb feldolgozott
+maximális <code>ts</code> értékénél több mint 5 perccel (300 000 ms)
+kisebb, akkor a fogyasztó dobja el, és írja ki <code>[késő]</code>
+jelzéssel. A labort futtatva ellenőrizd, hogy a korábbi ablakok nem
+változnak meg.</p>
+<h4 data-number="16.1.7.4"
+id="d-hibakeresésikiterjesztési-feladat"><span
+class="header-section-number">16.1.7.4</span> d)
+Hibakeresési/kiterjesztési feladat</h4>
+<p>A jelenlegi fogyasztó a <code>seen</code> halmazt memóriában tartja,
+és csak a futás végén menti ki. Hogyan kell módosítani ahhoz, hogy a
+fogyasztó bármikor történő összeomlása után is helyesen deduplikáljon?
+Tervezd meg a perzisztálás stratégiáját, és indokold, miért nem elegendő
+a <code>state.txt</code> egyedüli használata.</p>
+<h3 data-number="16.1.8" id="megoldások"><span
+class="header-section-number">16.1.8</span> Megoldások</h3>
+<h4 data-number="16.1.8.1" id="a-megoldás"><span
+class="header-section-number">16.1.8.1</span> a) Megoldás</h4>
+<p>Kafka akkor indokolt, ha: - a <code>ts-backend</code> leállása alatt
+keletkező adatok utólagos visszajátszása követelmény; - több, független
+fogyasztó (pl. riasztás, idősoros tárolás, analitika) dolgozza fel
+ugyanazt az adatfolyamot; - a bejövő adatmennyiség meghaladja az
+egyetlen fogyasztó feldolgozási sebességét, és a pufferelés
+elengedhetetlen.</p>
+<p>Egyetlen üvegház, néhány tíz node és egy backend esetén a Kafka
+üzemeltetése felesleges költséggel jár, a Mosquitto retained üzenetek és
+a gateway store-and-forward elegendő.</p>
+<h4 data-number="16.1.8.2" id="b-megoldás"><span
+class="header-section-number">16.1.8.2</span> b) Megoldás</h4>
+<p>A partíciók számának legalább a fogyasztók számával egyenlőnek kell
+lennie, hogy minden fogyasztó kapjon partíciót. 4 fogyasztó esetén a
+minimális partíciószám 4, de a terhelés kiegyensúlyozásához és a
+skálázhatósághoz érdemes 8 vagy 16 partíciót választani. A gyakorlatban
+a partíciószámot a csúcsterhelés és a fogyasztói párhuzamosság alapján
+választjuk; 8 partíció elegendő.</p>
+<p>Napi üzenetmennyiség:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>⋅</mo><mn>60</mn><mo>⋅</mo><mn>24</mn><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><annotation encoding="application/x-tex">1000 \cdot 60 \cdot 24 = 1\,440\,000</annotation></semantics></math>
+üzenet. Egy üzenet 150 B, tehát napi nyers adat
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn><mspace width="0.167em"></mspace><mn>000</mn><mo>⋅</mo><mn>150</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>=</mo><mn>216</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.167em"></mspace><mn>000</mn><mspace width="0.222em"></mspace><mi mathvariant="normal">B</mi><mo>≈</mo><mn>206</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow></mrow><annotation encoding="application/x-tex">1\,440\,000 \cdot 150 \ \mathrm{B} = 216\,000\,000 \ \mathrm{B} \approx 206 \ \mathrm{MiB}</annotation></semantics></math>.
+Replikációs faktor 2 miatt a tényleges tárigény kétszeres:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>412</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow></mrow><annotation encoding="application/x-tex">412 \ \mathrm{MiB}</annotation></semantics></math>.
+7 napos megőrzés:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>412</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">M</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow><mo>⋅</mo><mn>7</mn><mo>≈</mo><mn>2</mn><mo>,</mo><mn>8</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">G</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">B</mi></mrow></mrow><annotation encoding="application/x-tex">412 \ \mathrm{MiB} \cdot 7 \approx 2,8 \ \mathrm{GiB}</annotation></semantics></math>.
+Ez nem tartalmazza a Kafka belső indexeit, ezért a valós igény ennél
+10–20%-kal nagyobb lehet.</p>
+<h4 data-number="16.1.8.3" id="c-megoldás"><span
+class="header-section-number">16.1.8.3</span> c) Megoldás</h4>
+<p>A <code>consumer.py</code> módosítása: vezessünk be egy
+<code>max_seen_ts</code> változót, amelyet minden feldolgozott
+eseménynél frissítünk. A feldolgozás előtt ellenőrizzük:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>MAX_LATENESS_MS <span class="op">=</span> <span class="dv">300_000</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> max_seen_ts <span class="kw">is</span> <span class="kw">not</span> <span class="va">None</span> <span class="kw">and</span> e[<span class="st">&quot;ts&quot;</span>] <span class="op">&lt;</span> max_seen_ts <span class="op">-</span> MAX_LATENESS_MS:</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;  [késő] offset=</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss"> key=</span><span class="sc">{</span>key<span class="sc">}</span><span class="ss"> ts=</span><span class="sc">{</span>e[<span class="st">&#39;ts&#39;</span>]<span class="sc">}</span><span class="ss"> (max_ts=</span><span class="sc">{</span>max_seen_ts<span class="sc">}</span><span class="ss">)&quot;</span>)</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">continue</span></span></code></pre></div>
+<p>A <code>max_seen_ts</code> kezdetben <code>None</code>, az első
+esemény után az adott <code>ts</code> értékére áll. A késve érkező
+eseményt nem adjuk hozzá az ablakhoz, és nem is commit-oljuk (a commit
+az összes eddigi feldolgozott eseményre vonatkozik, de ez a példában nem
+változtat a helyzeten). A várt kimenetben a késő sor jelenik meg, és a
+korábbi ablakszámítások változatlanok maradnak.</p>
+<h4 data-number="16.1.8.4" id="d-megoldás"><span
+class="header-section-number">16.1.8.4</span> d) Megoldás</h4>
+<p>A <code>seen</code> halmazt minden új kulcs hozzáadása után azonnal
+perzisztálni kell, nem csak a futás végén. Ugyanez igaz a
+<code>state.txt</code>-re is: a commit-ot minden sikeres feldolgozás
+után írjuk. A <code>state.txt</code> önmagában nem elegendő, mert az
+offset csak az utolsó feldolgozott pozíciót rögzíti; ha a fogyasztó a
+commit után, de a dedup halmaz mentése előtt omlik össze, akkor
+újrainduláskor a <code>state.txt</code> már a következő rekordra mutat,
+de a korábbi kulcsok hiányoznak a <code>seen</code> halmazból, így a
+duplikátumok átszivároghatnak. A megoldás az, hogy a dedup kulcsok
+perzisztálása a commit előtt történjen, például egy tranzakcióban, vagy
+a dedup kulcsot az adatbázis elsődleges kulcsaként tároljuk, így a
+beszúrás idempotenssé válik.</p>
+<h3 data-number="16.1.9" id="rövid-összefoglaló"><span
+class="header-section-number">16.1.9</span> Rövid összefoglaló</h3>
+<p>Az MQTT broker üzenetközvetítő, a Kafka pedig elosztott,
+visszajátszható napló. A TerraSense-ben nagyobb rendszer esetén a
+Mosquitto mögé Kafka topic kerül, ahol a particionálási kulcs a
+<code>node_id</code>, így minden node üzenetei sorrendben maradnak. A
+híd a <code>ts-ingest</code> vagy a <code>ts-backend</code>
+MQTT-klienséből és Kafka-produceréből áll. A fogyasztó at-least-once
+szemantikát használ, commit-ot a feldolgozás után, és idempotens
+deduplikálást <code>(node_id, boot_id, seq)</code> kulccsal. Az
+eseményidő szerinti tumbling ablakok 60 másodpercesek, és watermark
+vezérli a késve érkező adatok kezelését. <strong>Továbbvitt
+eredmény.</strong> A Kafka topic neve <code>ts-telemetry</code>, a
+rekord kulcsa <code>node_id</code>, az érték a már ismert telemetria
+JSON. A fogyasztói csoport <code>ts-backend</code>. A deduplikálási
+kulcs <code>(node_id, boot_id, seq)</code>, amelyet az <a
+href="i048.html">Enterprise integrációs minták IoT-ban</a> alfejezet
+használ a kimenő integrációhoz, az <a href="i052.html">Riasztás:
+szabályok, értesítés, riasztási fáradtság</a> pedig a riasztási
+események feldolgozásához. A laborban létrejött a
+<code>consumer.py</code> szimuláció, amely bemutatja az offset-kezelést,
+az idempotens feldolgozást és az ablakos aggregálást.</p>
+<h3 data-number="16.1.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">16.1.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Apache Kafka dokumentáció: topicok, partíciók, consumer groupok és
+offset-kezelés (alapfogalmak, stabil).</li>
+<li><a href="https://www.enterpriseintegrationpatterns.com/">Enterprise
+Integration Patterns</a>: messaging minták, idempotens fogyasztó (a
+könyvben hivatkozott, de nem ellenőrzött forrás).</li>
+<li>MQTT 5 specifikáció: topicok és retain viselkedés (lásd <a
+href="i026.html">MQTT: publish/subscribe, broker, topicok</a>–<a
+href="i027.html">MQTT QoS, munkamenetek, retain, Last Will és MQTT
+5</a>).</li>
+<li>A laborban használt Python kód szimuláció, nem kapcsolódik tényleges
+Kafka-hoz. A valós Kafka-kliens API (pl. Java
+<code>KafkaConsumer</code>) és a Kafka Connect MQTT-konnektor pontos
+konfigurációja gyorsan változik; ellenőrizendő a telepített verzió
+dokumentációja. A particionálási kulcs hash algoritmusa a producer
+beállításától függ, ezt a TerraSense-ben explicit módon kell
+konfigurálni.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i046.html">← 15.3 Megőrzés, ritkítás és tárolási költség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i048.html">16.2 Enterprise integrációs minták IoT-ban →</a></div>
+</nav>
+</body>
+</html>

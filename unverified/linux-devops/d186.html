@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>38.1 Engine, runtime, shim és CRI – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch38">38 Docker, Podman, containerd és lokális deployment</a></p>
+<div class="links"><a class="prev" rel="prev" href="d185.html">← 37.5 C++ image build és artifact audit labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d187.html">38.2 Container lifecycle, config és shutdown →</a></div>
+</nav>
+<h2 data-number="38.1" id="d186"><span
+class="header-section-number">38.1</span> Engine, runtime, shim és
+CRI</h2>
+<p>A konténer-futtatási lánc rétegei gyakran egyetlen fekete doboznak
+tűnnek a fejlesztő számára: a <code>docker run</code> vagy
+<code>podman run</code> parancs után elindul egy processz, és ennyi. A
+szenior C++ fejlesztőként meglévő processz- és syscall-ismeret azonban
+lehetővé teszi, hogy ezt a láncot pontosan szétválasszuk. Ez azért
+fontos, mert a hibakeresés, a privilege policy és a
+Kubernetes-integráció mind más rétegben dől el. Ha például a
+<code>docker</code> CLI <code>permission denied</code> hibát ad, az nem
+a kernel namespaces, hanem a Unix socket authority határa. Ha a
+Kubernetes alatt a pod cgroup-jai nem jönnek létre, az a cgroup driver
+ownership hibája. Ebben az alfejezetben a CLI-től a runc-ig követjük az
+adatutat, és minden rétegre megadjuk, ki a tulajdonos, milyen
+jogosultsággal fut, és hogyan kell diagnosztizálni.</p>
+<h3 data-number="38.1.1" id="definíció-és-működés"><span
+class="header-section-number">38.1.1</span> Definíció és működés</h3>
+<p>A konténer-futtatási stacket három nagy csoportra bontjuk: a
+<strong>felhasználói CLI</strong> (command line interface), a
+<strong>daemon vagy high-level runtime</strong> (engine, containerd), és
+a <strong>low-level OCI runtime</strong> (runc). Ezen kívül két
+speciális elem: a <strong>shim</strong> processz és a
+<strong>CRI</strong> (Container Runtime Interface).</p>
+<p><strong>CLI (docker, podman):</strong> A <code>docker</code> parancs
+egy kliensprogram, amely REST API-kérést küld a Docker daemonnak. Maga a
+CLI nem végez semmilyen kernelműveletet a konténer számára; minden
+hatalom a daemon kezében van. A <code>podman</code> ezzel szemben
+<strong>daemon nélküli</strong> (fork-exec modell): a CLI processz
+közvetlenül hívja a low-level runtime-ot, és a CLI processz jogosultsága
+lesz a konténer jogosultsága. A <code>docker</code> CLI általában a
+<code>/var/run/docker.sock</code> Unix sockethez csatlakozik, míg a
+<code>podman</code> szükség esetén egy user-scope socketet is indíthat
+(például <code>$XDG_RUNTIME_DIR/podman/podman.sock</code>).</p>
+<p><strong>Daemon / engine:</strong> A <code>dockerd</code> egy rootful
+daemon, amely a host <code>root</code> jogosultságával fut. A CLI által
+küldött API-kéréseket ő hajtja végre: image pull, container create,
+start, stop, network, volume. A Docker daemon a containerd-et használja
+high-level runtime-ként. A Docker daemon és a containerd közötti
+kapcsolat gRPC alapú, és a daemon hosszú életű szolgáltatás. A Docker
+daemon szolgáltatás neve a systemd-ben <code>docker.service</code>, és a
+socketet a <code>docker.socket</code> unit aktiválhatja (socket
+activation).</p>
+<p><strong>Containerd:</strong> A <code>containerd</code> egy high-level
+container runtime daemon, amelyet a CNCF projektként fejlesztenek. A
+Docker mellett a Kubernetes is ezt használja, de a Kubernetes esetében a
+kubelet a <strong>CRI</strong> protokollon keresztül beszél hozzá. A
+containerd felelős a container lifecycle menedzseléséért, az image-ek
+tárolásáért, a container rootfs előkészítéséért, a snapshotterekért, a
+hálózati pluginekért és a CRI pluginért. A containerd rootful daemon, és
+a <code>/run/containerd/containerd.sock</code> socketen hallgat.</p>
+<p><strong>Shim:</strong> A containerd minden konténerhez egy
+<code>containerd-shim-runc-v2</code> processzt indít. A shim a tényleges
+parent processze a konténerben futó PID 1-nek. A shim három fontos
+dolgot old meg: (1) leválasztja a konténer életciklusát a containerd
+daemonról, így a daemon újraindítása nem öli meg a futó konténereket;
+(2) kezeli a container stdin/stdout/stderr streamjét; (3) visszaadja az
+exit status-t a daemonnak. A Podman esetében a shim-szerepet a
+<strong>conmon</strong> tölti be, amely egy kisebb, C-ben írt
+monitor.</p>
+<p><strong>Runc (low-level OCI runtime):</strong> A <code>runc</code> az
+OCI (Open Container Initiative) runtime specification
+referenciaimplementációja. A runc kap egy <strong>config.json</strong>
+fájlt és egy rootfs-t, majd létrehozza a Linux namespace-eket,
+cgroup-okat, seccomp szűrőt, capabilities bounding set-et, mountokat, és
+végül <code>exec</code>-eli a tényleges konténerprocesszt. A runc
+processz a konténer létrehozása után általában azonnal kilép; a futó
+konténernek a shim a parentje. A runc tehát a legalsó réteg, amelyik
+közvetlen kernel syscallokat hajt végre (clone, unshare, pivot_root,
+prctl stb.).</p>
+<p><strong>OCI runtime vs CRI interface:</strong> Az OCI runtime
+specifikáció a konténer <em>izolációját</em> írja le (namespaces,
+cgroups, mounts, hooks), és ezt a runc implementálja. A CRI egy
+<strong>Kubernetes-specifikus</strong> gRPC API, amelyet a kubelet hív a
+container runtime-tal való kommunikációhoz. A containerd a
+<code>io.containerd.grpc.v1.cri</code> pluginjával implementálja a
+CRI-t, és a CRI-kéréseket lefordítja OCI runtime hívásokká. A Docker
+daemon nem CRI-kompatibilis; a Kubernetes korábban a
+<code>dockershim</code> réteggel hidalt, de ezt eltávolították. Emiatt a
+modern Kubernetes cluster containerd-et használ. A Podman esetében nincs
+CRI implementáció a Kuberneteshez; a Podman-t inkább fejlesztői és
+lokális deployment eszközként használjuk, míg a Kubernetes alatt
+containerd-et.</p>
+<p><strong>Rootful/rootless daemon policy:</strong> A
+<code>dockerd</code> rootful daemon; a daemon processz a host
+<code>root</code> jogosultságával fut, és bármilyen privilégizált
+konténert indíthat. A Docker sockethez való hozzáférés tehát
+<strong>host authority</strong>. A rootless Docker (dockerd rootless) a
+daemon processzt a felhasználó UID-jén futtatja, és user namespace
+mappinget használ, de a daemon-jelleg megmarad. A Podman rootless by
+default: nincs daemon, a CLI a felhasználó jogosultságával fut, és
+minden konténer user namespace-ben, a felhasználó UID-jére mappelve jön
+létre. A containerd rootful daemon, és rootless módja nem az általános
+usage.</p>
+<p><strong>Socket access és host authority:</strong> A Docker daemon
+Unix socketje <code>/var/run/docker.sock</code>, tulajdonosa
+<code>root:docker</code>. A <code>docker</code> csoport tagság valójában
+root jogosultságot ad a hoston, mert a daemon API-ján keresztül
+<code>--privileged</code> konténert lehet indítani, ami bind
+mountolhatja a host fájlrendszert. A Podman rootless socketje a
+felhasználó saját runtime könyvtárában van, és csak az adott user fér
+hozzá. A containerd socketje
+<code>/run/containerd/containerd.sock</code>, szintén root tulajdonú. A
+management access tehát mindig privilege határ: aki a sockethez írhat,
+az irányíthatja a runtime-ot, amely host szintű műveleteket végez.</p>
+<p><strong>Systemd/cgroup driver ownership:</strong> A container runtime
+és a systemd közötti cgroup hierarchia tulajdonosa dönti el, hogy ki
+kezeli a cgroup tree-t. A <code>systemd</code> cgroup driver azt
+jelenti, hogy a systemd delegálja a cgroup scope-okat, és a runtime egy
+<code>systemd</code> scope-ba helyezi a konténert. A
+<code>cgroupfs</code> driver pedig közvetlenül a
+<code>/sys/fs/cgroup</code> alá ír. A kettő keverése duplikált cgroup
+fákat és hibás OOM killer viselkedést okoz. A Docker daemon a
+<code>exec-opts: ["native.cgroupdriver=systemd"]</code> beállítással, a
+containerd a <code>SystemdCgroup = true</code> konfigurációval használja
+a systemd drivert. A Podman alapértelmezetten systemd drivert használ,
+akár rootful, akár rootless.</p>
+<p><strong>Runtime verzió/config/plugin támogatás:</strong> A containerd
+<code>config.toml</code>-ja deklarálja a runtime-ok listáját, például
+<code>[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]</code>
+alatt a <code>runtime_type</code>, <code>binary_name</code> és
+<code>SystemdCgroup</code> mezőket. A Docker daemon
+<code>daemon.json</code>-ban a <code>runtimes</code> map segítségével
+adhatunk meg alternatív runtime-okat (pl. <code>nvidia</code>). A Podman
+a <code>--runtime</code> flaggel választ runtime-ot, de default a
+<code>crun</code> vagy <code>runc</code>. A verzió compatibility mindig
+ellenőrizendő: a containerd és a runc verzióskew API hibákat okozhat,
+például ha a runc túl régi a containerd által elvárt OCI
+specifikációhoz.</p>
+<h3 data-number="38.1.2" id="kidolgozott-példa"><span
+class="header-section-number">38.1.2</span> Kidolgozott példa</h3>
+<p>A példa egy Ubuntu Server 24.04 LTS labhoston fut, neve
+<code>lab-vm1</code>. A felhasználó <code>labuser</code>, aki nem tagja
+a <code>docker</code> csoportnak. A Docker CE és a containerd
+telepített, a verziók illusztratívak, a laborban ellenőrizendők.</p>
+<p><strong>Lépés 1: A daemon rétegek állapota.</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, sudo szükséges a systemctl ellenőrzéshez</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: Docker CE és containerd telepítve</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl status docker <span class="at">--no-pager</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl status containerd <span class="at">--no-pager</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> <span class="at">--version</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> runc <span class="at">--version</span></span></code></pre></div>
+<p>Várható kimenet: <code>docker.service</code> active (running),
+<code>containerd.service</code> active (running), Docker version 27.x,
+runc version 1.1.x. A pontos verzió a labhoston ellenőrizendő.</p>
+<p><strong>Lépés 2: A containerd CRI plugin konfigurációja.</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, sudo szükséges a config olvasásához</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cat /etc/containerd/config.toml</span></code></pre></div>
+<p>Várható, hogy a
+<code>[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]</code>
+szekcióban <code>runtime_type = "io.containerd.runc.v2"</code> és
+<code>SystemdCgroup = true</code> szerepel. Ez mutatja a CRI plugin és
+az OCI runtime kapcsolatát.</p>
+<p><strong>Lépés 3: Minimális konténer és a folyamatfa.</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, sudo szükséges a docker parancshoz (nincs docker csoport)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a daemonok futnak</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> docker run <span class="at">-d</span> <span class="at">--name</span> lab-d186-test <span class="at">--rm</span> nginx:1.27-alpine sleep 300</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> docker ps <span class="at">--filter</span> name=lab-d186-test</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> pstree <span class="at">-p</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A5</span> <span class="at">-B5</span> <span class="st">&#39;sleep 300&#39;</span></span></code></pre></div>
+<p>Várható folyamatfa (részlet): <code>dockerd</code> -&gt;
+<code>containerd</code> -&gt; <code>containerd-shim-runc-v2</code> -&gt;
+<code>sleep 300</code>. A <code>run</code> parancs <code>--rm</code>
+flagje biztosítja, hogy a kilépés után a konténer törlődik, tehát nincs
+külön rollback.</p>
+<p><strong>Lépés 4: A shim és a runc processzek
+azonosítása.</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, sudo szükséges</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ps <span class="at">-eo</span> pid,ppid,comm,args <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;containerd-shim|runc|sleep 300&#39;</span></span></code></pre></div>
+<p>Várható: a <code>containerd-shim-runc-v2</code> processz a
+<code>sleep 300</code> parentje, és a shim parentje a
+<code>containerd</code> daemon. A <code>runc</code> processz nem marad
+futva, mert a konténer indítása után kilép.</p>
+<p><strong>Lépés 5: Podman rootless futtatás.</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, nem root, rootless</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: podman telepítve</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> info <span class="at">--format</span> <span class="st">&#39;{{.Host.Security.Rootless}}&#39;</span>  <span class="co"># expected: true</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> run <span class="at">--rm</span> <span class="at">--name</span> lab-d186-podman-test alpine:3.20 echo <span class="st">&quot;rootless podman&quot;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">id</span> <span class="at">-u</span></span></code></pre></div>
+<p>Várható: <code>true</code>, majd a szöveg, és az <code>id -u</code> a
+<code>labuser</code> UID-jét mutatja (nem 0). A folyamatfa itt:
+<code>podman</code> -&gt; <code>conmon</code> -&gt; <code>runc</code>
+-&gt; <code>echo</code>, vagy a <code>podman</code> közvetlenül hívja a
+<code>runc</code>-ot. A <code>conmon</code> a Podman shim-szerepű
+processze.</p>
+<p><strong>Lépés 6: Socket hozzáférési határ teszt.</strong></p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-vm1, labuser, docker csoport nélkül</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> ps  <span class="co"># elvárt: permission denied</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> docker ps  <span class="co"># elvárt: működik</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /var/run/docker.sock</span></code></pre></div>
+<p>Várható: <code>Permission denied</code> a <code>labuser</code>
+számára, a socket <code>root:docker</code> tulajdonú. Ez demonstrálja a
+socket hozzáférés jelentette host authority-t.</p>
+<p><strong>Rollback:</strong> A <code>docker run --rm</code> és
+<code>podman run --rm</code> automatikusan törli a konténereket; a
+<code>sleep 300</code> megszakítása után nem marad állapot. A config
+megtekintése nem módosít.</p>
+<h3 data-number="38.1.3" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">38.1.3</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>Hiba: cgroup driver mismatch.</strong> Tünet: Kubernetes
+alatt a pod cgroup-jai nem találhatók, OOM killer hibák, vagy a
+<code>docker info</code> <code>Cgroup Driver: cgroupfs</code> értéket
+mutat. Hipotézis: a daemon nem systemd drivert használ, miközben a
+systemd és a kubelet systemd cgroup hierarchiát vár. Adatgyűjtés:
+<code>docker info --format '{{.CgroupDriver}}'</code>,
+<code>cat /etc/containerd/config.toml | grep -A2 runc</code>. Egy
+változtatás: a Docker <code>daemon.json</code>-ban
+<code>exec-opts: ["native.cgroupdriver=systemd"]</code>, a containerd
+config.toml-ban <code>SystemdCgroup = true</code>, majd
+<code>sudo systemctl restart docker containerd</code>. Verifikáció:
+<code>docker info --format '{{.CgroupDriver}}'</code> returns
+<code>systemd</code>.</p>
+<p><strong>Hiba: Docker socket permission denied.</strong> Tünet: a
+<code>docker ps</code> parancs <code>permission denied</code> hibát ad.
+Hipotézis: a felhasználó nincs a <code>docker</code> csoportban, vagy a
+socket tulajdonosa/jogosultsága hibás. Adatgyűjtés:
+<code>ls -l /var/run/docker.sock</code>, <code>id labuser</code>. Egy
+változtatás: ne adjuk a felhasználót a <code>docker</code> csoporthoz,
+mert ez host authority-t ad; helyette <code>sudo docker</code> vagy
+rootless Podman. Verifikáció: <code>sudo docker ps</code> működik, vagy
+<code>podman run --rm alpine echo ok</code> futtatható a
+labuser-rel.</p>
+<p><strong>Hiba: runtime version skew.</strong> Tünet: a containerd
+logban <code>runtime handler not supported</code> vagy shim crash.
+Hipotézis: a runc verzió nem kompatibilis a containerd által elvárt OCI
+specifikációval. Adatgyűjtés: <code>sudo runc --version</code>,
+<code>sudo containerd --version</code>, containerd log. Egy változtatás:
+a support matrix szerint frissíteni a runc-ot, majd
+<code>sudo systemctl restart containerd</code>. Verifikáció: a shim
+elindul, a konténer fut.</p>
+<p><strong>Hiba: rootless Podman indítása sikertelen.</strong> Tünet:
+<code>Error: could not get runtime: operation not permitted</code>.
+Hipotézis: a kernel <code>unprivileged_userns_clone</code> le van
+tiltva. Adatgyűjtés:
+<code>sysctl kernel.unprivileged_userns_clone</code>. Egy változtatás:
+engedélyezni a user namespace-eket
+(<code>sysctl kernel.unprivileged_userns_clone=1</code>) vagy rootful
+futtatás. Verifikáció: <code>podman run --rm alpine echo ok</code>
+működik.</p>
+<h3 data-number="38.1.4" id="feladatok"><span
+class="header-section-number">38.1.4</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> Írja le szövegesen a Docker
+és a Podman futtatási láncát a CLI-től a kernelig, és jelölje meg,
+melyik komponens rendelkezik root jogosultsággal. Indokolja, miért nem a
+CLI az authority határ.</p></li>
+<li><p><strong>Konfigurációs feladat.</strong> A labhoston
+(<code>lab-vm1</code>) állítsa be a containerd CRI pluginját systemd
+cgroup driverre, és a Docker daemon <code>daemon.json</code>-ját is
+systemd driverre. Ellenőrizze a <code>docker info</code> kimenetben a
+<code>Cgroup Driver</code> értékét. Adja meg a módosító parancsok
+targetjét, előfeltételét, ellenőrzését és rollbackjét.</p></li>
+<li><p><strong>Diagnosztikai feladat.</strong> A <code>lab-vm1</code>
+hoston a <code>labuser</code> a <code>docker ps</code> parancsra
+<code>permission denied</code> hibát kap. A felhasználó root jogosultság
+nélkül szeretne konténereket futtatni. Diagnosztizálja a socket
+hozzáférést, és válasszon biztonságos megoldást rootless Podman vagy
+sudo között. Indokolja a választást, és mutassa meg, hogy a futtatott
+konténer processz a <code>labuser</code> UID-jén fut.</p></li>
+</ol>
+<h3 data-number="38.1.5" id="megoldások"><span
+class="header-section-number">38.1.5</span> Megoldások</h3>
+<ol type="1">
+<li><p>A Docker lánc: <code>docker</code> CLI (user) →
+<code>/var/run/docker.sock</code> (root:docker tulajdon) →
+<code>dockerd</code> (root) → containerd (root) →
+<code>containerd-shim-runc-v2</code> (root) → <code>runc</code> (root) →
+konténerprocessz (root, ha nincs user namespace). A Podman:
+<code>podman</code> CLI (user) → <code>conmon</code> (user) →
+<code>runc</code> (user) → konténerprocessz (user, user namespace). Az
+authority határ a daemon socket vagy a daemon processz, mert a CLI csak
+egy klienst indít; a kernelprivilege-t a daemon/runtime gyakorolja. A
+sockethez való írási jog ugyanazt a hatalmat adja, mint a daemon root
+jogosultsága.</p></li>
+<li><p>A containerd config.toml-ban a CRI plugin runtime szekciójában
+<code>SystemdCgroup = true</code> beállítás szükséges. A Docker
+daemonhoz hozzon létre <code>/etc/docker/daemon.json</code>
+fájlt:</p></li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;exec-opts&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;native.cgroupdriver=systemd&quot;</span><span class="ot">]</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Módosító parancsok (target: <code>lab-vm1</code>, sudo
+szükséges):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /etc/docker</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;{&quot;exec-opts&quot;: [&quot;native.cgroupdriver=systemd&quot;]}&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/docker/daemon.json</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart docker</span></code></pre></div>
+<p>Ellenőrzés:
+<code>sudo docker info --format '{{.CgroupDriver}}'</code> →
+<code>systemd</code>. Rollback: a <code>daemon.json</code> törlése vagy
+visszaállítása, majd <code>sudo systemctl restart docker</code>.
+Postcondition: minden új konténer a systemd cgroup hierarchiában jön
+létre.</p>
+<ol start="3" type="1">
+<li>A <code>ls -l /var/run/docker.sock</code> kimenete
+<code>root:docker</code> tulajdonost mutat. A <code>labuser</code> nincs
+a <code>docker</code> csoportban, ezért <code>permission denied</code>.
+Adatgyűjtés: <code>id labuser</code> nem mutatja a docker csoportot.
+Biztonságos megoldás: rootless Podman, mert nem ad host root
+authority-t. Telepítés után (<code>sudo apt install podman</code>) a
+labuser futtathat: <code>podman run --rm alpine echo ok</code>. A
+processz ellenőrzése:
+<code>ps -o user,pid,comm -p $(pgrep -n -f 'echo ok')</code> a
+<code>labuser</code> UID-jét mutatja. Ha a Podman nem elérhető, a
+<code>sudo docker run</code> alternatíva, de a sudo jogot limitálni kell
+dedikált parancsokra. Az indoklás: a rootless Podman nem igényel
+daemon-socket hozzáférést, így nincs kitett host authority.</li>
+</ol>
+<h3 data-number="38.1.6" id="rövid-összefoglaló"><span
+class="header-section-number">38.1.6</span> Rövid összefoglaló</h3>
+<p>A konténer-futtatási lánc három fő rétegből áll: a felhasználói CLI,
+a daemon vagy high-level runtime (Docker daemon, containerd), és a
+low-level OCI runtime (runc). A Docker rootful daemonnal dolgozik a
+<code>/var/run/docker.sock</code> socketen keresztül, ahol a socket
+hozzáférés host authority-t jelent; a Podman daemon nélkül, rootless by
+default fut. A containerd CRI pluginja a Kubernetes runtime interface-t
+implementálja, és OCI runtime-ot hív. A shim (Docker esetén
+containerd-shim, Podman esetén conmon) leválasztja a konténer
+életciklusát a daemontól. A cgroup driver ownership a systemd és a
+runtime közötti megegyezésen múlik.</p>
+<p>Továbbhasznált definíciók: <strong>OCI runtime</strong> – a konténer
+izolációt megvalósító processz (például runc), amely a kernel
+namespaces/cgroups hívásokat végzi; <strong>CRI</strong> – gRPC alapú
+Kubernetes container runtime interface; <strong>shim</strong> – a
+konténer és a daemon közötti hosszú életű processz, amely lehetővé teszi
+a daemon újraindítását a konténer leállítása nélkül.</p>
+<h3 data-number="38.1.7" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">38.1.7</span> Források és ellenőrzési
+hiányok</h3>
+<p>A jelen kérésben nincs webes keresőeszköz, ezért a támogatott
+verziókat, a pontos config kulcsokat és a Docker/containerd/runc
+aktuális kompatibilitását nem ellenőriztem. A kiindulópontok:</p>
+<ul>
+<li><a href="https://docs.docker.com/">Docker documentation</a></li>
+<li><a href="https://docs.podman.io/">Podman documentation</a></li>
+<li><a href="https://containerd.io/docs/">containerd
+documentation</a></li>
+<li><a href="https://opencontainers.org/">Open Container
+Initiative</a></li>
+</ul>
+<p>Az Ubuntu 24.04 LTS csomagverziói, a containerd config.toml pontos
+pluginnevei és a Docker daemon.json <code>exec-opts</code> hatása a
+kiadott verzió függvénye; ezt a labhoston ellenőrizni kell.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d185.html">← 37.5 C++ image build és artifact audit labor</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d187.html">38.2 Container lifecycle, config és shutdown →</a></div>
+</nav>
+</body>
+</html>

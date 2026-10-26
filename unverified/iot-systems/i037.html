@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.3 Store-and-forward: offline működés és visszatöltés –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Edge és gateway</a> › <a href="index.html#ich11">12 A gateway</a></p>
+<div class="links"><a class="prev" rel="prev" href="i036.html">← 12.2 A ts-gw szolgáltatás C++-ban: protokollfordítás MQTT-re</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i038.html">12.4 A gateway üzemeltetése: systemd, konténerek, naplózás →</a></div>
+</nav>
+<h2 data-number="12.3" id="i037"><span
+class="header-section-number">12.3</span> Store-and-forward: offline
+működés és visszatöltés</h2>
+<p>A hálózatkiesés az IoT-edge rétegben nem ritka esemény, hanem
+tervezési feltétel. A TerraSense üvegházában a <code>ts-node</code>
+szenzorok továbbra is mérik a hőmérsékletet, páratartalmat és
+talajnedvességet, a <code>ts-gw</code> gateway viszont nem tudja az
+MQTT-üzeneteket a brokerhez eljuttatni, mert a helyi hálózat vagy a
+felhőkapcsolat megszakadt. Ha ilyenkor a gateway egyszerűen eldobná a
+beérkező telemetriát, értékes adatok vesznének el, és a későbbi
+elemzések, riasztások hiányosak lennének. A megoldás a
+<strong>store-and-forward</strong> (tárolás és továbbítás): az offline
+időszakban a gateway perzisztens puffert használ, majd a kapcsolat
+helyreállása után sorrendhelyesen visszatölti az adatokat, miközben
+jelzi az esetleges duplikációkat.</p>
+<h3 data-number="12.3.1" id="fogalmak-és-működés"><span
+class="header-section-number">12.3.1</span> Fogalmak és működés</h3>
+<p><strong>Definíció (store-and-forward).</strong> A store-and-forward
+olyan üzenetkezelési minta, amelyben a köztes csomópont (itt a gateway)
+az üzenetet először tartósan tárolja, majd a hálózati kapcsolat
+rendelkezésre állásakor továbbítja a cél felé. A tárolás akkor is
+megtörténik, ha a cél nem elérhető; így az adat nem vész el, legfeljebb
+késik.</p>
+<p><strong>Definíció (perzisztens puffer).</strong> A perzisztens puffer
+olyan, lemezen (vagy más nem felejtő közegen) tárolt várakozási sor,
+amely túléli a folyamat újraindulását is. A memóriapufferrel szemben nem
+törlődik áramszünet vagy processzkilépés esetén.</p>
+<p>A <code>ts-gw</code> C++ szolgáltatás már rendelkezik az alapvető
+protokollfordítással: a bejövő UDP/BLE üzeneteket MQTT publish-csomaggá
+alakítja, és elküldi a brokerre. A store-and-forward réteg beillesztése
+a következő logikával bővíti ezt:</p>
+<ol type="1">
+<li>A beérkező eszközüzenetből kinyerjük a <strong>deduplikációs
+kulcsot</strong>: az <code>node_id</code> és a monoton <code>seq</code>
+párost. Ez azonosítja az eszköz egy adott mérési csomagját.</li>
+<li>Az üzenetet beszúrjuk a perzisztens pufferbe,
+<code>UNIQUE(node_id, seq)</code> megkötéssel, hogy ugyanaz a csomag ne
+kerülhessen be kétszer.</li>
+<li>Egy külön <strong>publisher</strong> szál vagy ciklus folyamatosan
+figyeli az MQTT-kapcsolat állapotát. Ha van kapcsolat, a pufferben lévő
+rekordokat <code>id</code> szerinti sorrendben, egyesével
+továbbítja.</li>
+<li>Minden sikeres <code>PUBLISH</code> (QoS 1 esetén a
+<code>PUBACK</code> megérkezése) után a rekord törlődik a pufferből. Ha
+a publish kivételt dob, a rekord a pufferben marad, és a ciklus
+újrapróbálkozik.</li>
+</ol>
+<figure>
+<img src="assets/i037-diagram-1.png"
+alt="Store-and-forward offline és visszatöltés - A ts-gw az offline időszakban tárol, majd a kapcsolat visszaállása után sorrendben visszatölt. A PUBLISH akkor sikeres, ha a broker PUBACK-kel nyugtázza." />
+<figcaption aria-hidden="true">Store-and-forward offline és visszatöltés
+- A ts-gw az offline időszakban tárol, majd a kapcsolat visszaállása
+után sorrendben visszatölt. A PUBLISH akkor sikeres, ha a broker
+PUBACK-kel nyugtázza.</figcaption>
+</figure>
+<p>A puffer megvalósításához SQLite-ot használunk, <strong>WAL</strong>
+(Write-Ahead Logging) módban. A WAL lehetővé teszi, hogy az olvasó
+műveletek ne blokkolják az írót, és fordítva, ami akkor fontos, ha a
+publisher szál folyamatosan olvassa a sort, miközben az UDP-fogadó szál
+írja. A tranzakciók biztosítják, hogy a beszúrás vagy a törlés atomi
+legyen, és a folyamat váratlan leállása esetén sem sérüljön a tábla.</p>
+<p><strong>Tábla (spool séma).</strong></p>
+<table>
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 10%" />
+<col style="width: 30%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Oszlop</th>
+<th>Típus</th>
+<th>Megkötés</th>
+<th>Leírás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>id</code></td>
+<td>INTEGER</td>
+<td>PRIMARY KEY AUTOINCREMENT</td>
+<td>Visszatöltési sorrend</td>
+</tr>
+<tr class="even">
+<td><code>node_id</code></td>
+<td>TEXT</td>
+<td>NOT NULL</td>
+<td>Eszközazonosító (pl. <code>n001</code>)</td>
+</tr>
+<tr class="odd">
+<td><code>seq</code></td>
+<td>INTEGER</td>
+<td>NOT NULL</td>
+<td>Monoton sorszám (eszköz által generált)</td>
+</tr>
+<tr class="even">
+<td><code>ts</code></td>
+<td>INTEGER</td>
+<td>NOT NULL</td>
+<td>Eredeti eseményidő, epoch ms UTC</td>
+</tr>
+<tr class="odd">
+<td><code>topic</code></td>
+<td>TEXT</td>
+<td>NOT NULL</td>
+<td>Cél MQTT topic</td>
+</tr>
+<tr class="even">
+<td><code>payload</code></td>
+<td>TEXT</td>
+<td>NOT NULL</td>
+<td>Sorosított üzenet</td>
+</tr>
+<tr class="odd">
+<td></td>
+<td></td>
+<td>UNIQUE(<code>node_id</code>, <code>seq</code>)</td>
+<td>Deduplikáció</td>
+</tr>
+</tbody>
+</table>
+<p>A gateway a <code>payload</code> mezőt nem elemzi tovább, hanem az
+eredeti bájtokat vagy szöveget tárolja, így a visszatöltés bitazonos
+üzenetet küldhet. Ha az üzenet JSON, a <code>payload</code> a teljes
+JSON-szöveg; ha később CBOR-ra váltunk, a payload akár BLOB is
+lehet.</p>
+<h3 data-number="12.3.2" id="döntési-szempontok"><span
+class="header-section-number">12.3.2</span> Döntési szempontok</h3>
+<p><strong>Memóriapuffer vs. lemezes puffer.</strong> A memóriapuffer
+gyors, de nem vészeli át a folyamat újraindulását. Mivel a gateway
+kritikus adatútközvetítő, a lemezes puffer az alapértelmezés. A
+memóriapuffert legfeljebb a lemez előtti gyors átmeneti sorként érdemes
+használni.</p>
+<p><strong>SQLite vs. append-only fájl.</strong> Az append-only napló
+egyszerűbb, de a törlés utáni üresedés, a töredezettség és a konzisztens
+tranzakciók kezelése kézi munkát igényel. Az SQLite beépített
+tranzakciókat, lekérdezéseket és WAL-t ad, és C++-hoz is egyszerűen
+linkelhető.</p>
+<p><strong>Korlát és eldobási stratégia.</strong> A lemez véges. Meg
+kell határozni a puffer maximális méretét (például rekordszámban vagy
+bájtban). Ha a puffer megtelik, két gyakori stratégia van:</p>
+<ul>
+<li><strong>drop-oldest</strong>: a legrégebbi üzenet eldobása, az új
+megtartása, ami friss adatot biztosít, de lyukat hagy a múltban;</li>
+<li><strong>drop-newest</strong>: a beérkező üzenet eldobása, ami a
+múltat őrzi meg, de a legfrissebbet veszíti el.</li>
+</ul>
+<p>A TerraSense-ben a <strong>drop-oldest</strong> a választott
+stratégia, mert a riasztásoknak és a valós idejű megfigyelésnek jobban
+kedvez a friss adat, a történeti elemzés pedig ritkán igényel teljes
+offline időszakot másodperc pontossággal.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 27%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>SQLite WAL</th>
+<th>Append-only fájl</th>
+<th>Memóriapuffer</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Túlélés újrainduláskor</td>
+<td>igen</td>
+<td>igen</td>
+<td>nem</td>
+</tr>
+<tr class="even">
+<td>Tranzakciós biztonság</td>
+<td>igen</td>
+<td>kézzel</td>
+<td>nem értelmezett</td>
+</tr>
+<tr class="odd">
+<td>Olvasás írás közben</td>
+<td>jól támogatott</td>
+<td>nehézkes</td>
+<td>triviális</td>
+</tr>
+<tr class="even">
+<td>Lekérdezés és korlát</td>
+<td>SQL, könnyű</td>
+<td>saját kód</td>
+<td>saját kód</td>
+</tr>
+<tr class="odd">
+<td>Bonyolultság</td>
+<td>közepes</td>
+<td>kisebb kezdetben</td>
+<td>kicsi</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="12.3.3" id="kidolgozott-példa"><span
+class="header-section-number">12.3.3</span> Kidolgozott példa</h3>
+<p>Tegyük fel, hogy a broker 10:00:00-kor leáll. A <code>ts-node</code>
+továbbra is küldi a telemetriát 10 másodpercenként. A gateway a 10:00:10
+és 10:00:30 között érkező üzeneteket a pufferbe írja. 10:01:00-kor a
+broker újra elérhető, a publisher szál pedig megkezdi a
+visszatöltést.</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 48%" />
+<col style="width: 39%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Idő (UTC)</th>
+<th>Esemény</th>
+<th>Puffer tartalom (id, node_id, seq)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>10:00:00</td>
+<td>broker leáll</td>
+<td>üres</td>
+</tr>
+<tr class="even">
+<td>10:00:10</td>
+<td>UDP telemetria <code>n001</code> seq=41</td>
+<td>(1, n001, 41)</td>
+</tr>
+<tr class="odd">
+<td>10:00:20</td>
+<td>UDP telemetria <code>n001</code> seq=42</td>
+<td>(1, n001, 41), (2, n001, 42)</td>
+</tr>
+<tr class="even">
+<td>10:00:30</td>
+<td>UDP telemetria <code>n001</code> seq=43</td>
+<td>(1..3, n001, 41..43)</td>
+</tr>
+<tr class="odd">
+<td>10:01:00</td>
+<td>broker újra elindul</td>
+<td>(1..3, n001, 41..43)</td>
+</tr>
+<tr class="even">
+<td>10:01:00.2</td>
+<td>PUBLISH seq=41 sikeres, törlés</td>
+<td>(2, 42), (3, 43)</td>
+</tr>
+<tr class="odd">
+<td>10:01:00.4</td>
+<td>PUBLISH seq=42 sikeres, törlés</td>
+<td>(3, 43)</td>
+</tr>
+<tr class="even">
+<td>10:01:00.6</td>
+<td>PUBLISH seq=43 sikeres, törlés</td>
+<td>üres</td>
+</tr>
+</tbody>
+</table>
+<p>A visszatöltés sorrendjét az <code>id</code> oszlop garantálja, így a
+backend az eseményidőtől függetlenül a gateway általi fogadási
+sorrendben kapja az üzeneteket. Az <code>seq</code> mező a backend felé
+megőrzi az eszköz szerinti sorrendet, és az <code>ts</code> a mért
+időt.</p>
+<h3 data-number="12.3.4"
+id="labor-sqlite-alapú-store-and-forward-a-ts-gw-ben"><span
+class="header-section-number">12.3.4</span> Labor: SQLite-alapú
+store-and-forward a ts-gw-ben</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/iot-labor/i037</code><br />
+<strong>Előfeltétel:</strong> az <a href="i036.html">A ts-gw
+szolgáltatás C++-ban: protokollfordítás MQTT-re</a> alfejezetben
+elkészített <code>~/iot-labor/i036/ts-gw</code> projekt.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i037 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i037</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-r</span> ~/iot-labor/i036/ts-gw .</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ts-gw</span></code></pre></div>
+<p>Először adjuk hozzá a <code>store_forward.hpp</code> fejlécfájlt:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// store_forward.hpp</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> SpoolRecord <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> id<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string node_id<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int64_t</span> ts<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string topic<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string payload<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> StoreForwardDb <span class="op">{</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> StoreForwardDb<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> path<span class="op">);</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>StoreForwardDb<span class="op">();</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> initialize<span class="op">();</span>  <span class="co">// WAL mód, tábla létrehozása</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> enqueue<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> node_id<span class="op">,</span> <span class="dt">uint32_t</span> seq<span class="op">,</span> <span class="dt">int64_t</span> ts<span class="op">,</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>                 <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> topic<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> payload<span class="op">);</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>SpoolRecord<span class="op">&gt;</span> pending<span class="op">();</span>  <span class="co">// rendezve: id</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> remove<span class="op">(</span><span class="dt">int64_t</span> id<span class="op">);</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    sqlite3<span class="op">*</span> <span class="va">db_</span><span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Az <code>store_forward.cpp</code> az SQLite C API-t használja:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// store_forward.cpp</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;store_forward.hpp&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sqlite3.h&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>StoreForwardDb<span class="op">::</span>StoreForwardDb<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_open<span class="op">(</span>path<span class="op">.</span>c_str<span class="op">(),</span> <span class="op">&amp;</span><span class="va">db_</span><span class="op">)</span> <span class="op">!=</span> SQLITE_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;sqlite3_open failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>StoreForwardDb<span class="op">::~</span>StoreForwardDb<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">db_</span><span class="op">)</span> sqlite3_close<span class="op">(</span><span class="va">db_</span><span class="op">);</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> StoreForwardDb<span class="op">::</span>initialize<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> sql <span class="op">=</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;PRAGMA journal_mode=WAL;&quot;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;CREATE TABLE IF NOT EXISTS spool (&quot;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; id INTEGER PRIMARY KEY AUTOINCREMENT,&quot;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; node_id TEXT NOT NULL,&quot;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; seq INTEGER NOT NULL,&quot;</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; ts INTEGER NOT NULL,&quot;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; topic TEXT NOT NULL,&quot;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; payload TEXT NOT NULL,&quot;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot; UNIQUE(node_id, seq)&quot;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;);&quot;</span><span class="op">;</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span><span class="op">*</span> errmsg <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_exec<span class="op">(</span><span class="va">db_</span><span class="op">,</span> sql<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="op">&amp;</span>errmsg<span class="op">)</span> <span class="op">!=</span> SQLITE_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>string msg <span class="op">=</span> errmsg <span class="op">?</span> errmsg <span class="op">:</span> <span class="st">&quot;unknown&quot;</span><span class="op">;</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        sqlite3_free<span class="op">(</span>errmsg<span class="op">);</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;initialize failed: &quot;</span> <span class="op">+</span> msg<span class="op">);</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> StoreForwardDb<span class="op">::</span>enqueue<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> node_id<span class="op">,</span> <span class="dt">uint32_t</span> seq<span class="op">,</span> <span class="dt">int64_t</span> ts<span class="op">,</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>                             <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> topic<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> payload<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> sql <span class="op">=</span> <span class="st">&quot;INSERT INTO spool (node_id, seq, ts, topic, payload) &quot;</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>                      <span class="st">&quot;VALUES (?,?,?,?,?) ON CONFLICT(node_id, seq) DO NOTHING;&quot;</span><span class="op">;</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    sqlite3_stmt<span class="op">*</span> stmt <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_prepare_v2<span class="op">(</span><span class="va">db_</span><span class="op">,</span> sql<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>stmt<span class="op">,</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="op">!=</span> SQLITE_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;prepare failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> node_id<span class="op">.</span>c_str<span class="op">(),</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> SQLITE_TRANSIENT<span class="op">);</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">2</span><span class="op">,</span> seq<span class="op">);</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">3</span><span class="op">,</span> ts<span class="op">);</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">4</span><span class="op">,</span> topic<span class="op">.</span>c_str<span class="op">(),</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> SQLITE_TRANSIENT<span class="op">);</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">5</span><span class="op">,</span> payload<span class="op">.</span>c_str<span class="op">(),</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> SQLITE_TRANSIENT<span class="op">);</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_step<span class="op">(</span>stmt<span class="op">)</span> <span class="op">!=</span> SQLITE_DONE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        sqlite3_finalize<span class="op">(</span>stmt<span class="op">);</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;insert failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    sqlite3_finalize<span class="op">(</span>stmt<span class="op">);</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>vector<span class="op">&lt;</span>SpoolRecord<span class="op">&gt;</span> StoreForwardDb<span class="op">::</span>pending<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>SpoolRecord<span class="op">&gt;</span> result<span class="op">;</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> sql <span class="op">=</span> <span class="st">&quot;SELECT id, node_id, seq, ts, topic, payload &quot;</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>                      <span class="st">&quot;FROM spool ORDER BY id;&quot;</span><span class="op">;</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>    sqlite3_stmt<span class="op">*</span> stmt <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_prepare_v2<span class="op">(</span><span class="va">db_</span><span class="op">,</span> sql<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>stmt<span class="op">,</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="op">!=</span> SQLITE_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;prepare failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>sqlite3_step<span class="op">(</span>stmt<span class="op">)</span> <span class="op">==</span> SQLITE_ROW<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>        SpoolRecord rec<span class="op">;</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>id <span class="op">=</span> sqlite3_column_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>node_id <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(</span>sqlite3_column_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">1</span><span class="op">));</span></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>seq <span class="op">=</span> sqlite3_column_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>ts <span class="op">=</span> sqlite3_column_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">3</span><span class="op">);</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>topic <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(</span>sqlite3_column_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">4</span><span class="op">));</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>        rec<span class="op">.</span>payload <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> <span class="dt">char</span><span class="op">*&gt;(</span>sqlite3_column_text<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">5</span><span class="op">));</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>        result<span class="op">.</span>push_back<span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>rec<span class="op">));</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    sqlite3_finalize<span class="op">(</span>stmt<span class="op">);</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> StoreForwardDb<span class="op">::</span>remove<span class="op">(</span><span class="dt">int64_t</span> id<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> sql <span class="op">=</span> <span class="st">&quot;DELETE FROM spool WHERE id=?;&quot;</span><span class="op">;</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>    sqlite3_stmt<span class="op">*</span> stmt <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_prepare_v2<span class="op">(</span><span class="va">db_</span><span class="op">,</span> sql<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>stmt<span class="op">,</span> <span class="kw">nullptr</span><span class="op">)</span> <span class="op">!=</span> SQLITE_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;prepare failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>    sqlite3_bind_int64<span class="op">(</span>stmt<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> id<span class="op">);</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sqlite3_step<span class="op">(</span>stmt<span class="op">)</span> <span class="op">!=</span> SQLITE_DONE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>        sqlite3_finalize<span class="op">(</span>stmt<span class="op">);</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;delete failed&quot;</span><span class="op">);</span></span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>    sqlite3_finalize<span class="op">(</span>stmt<span class="op">);</span></span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>main.cpp</code>-ben a puffer használata a publish
+ciklusban:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// ts-gw/src/main.cpp (kivonat)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;store_forward.hpp&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mqtt/client.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    StoreForwardDb spool<span class="op">(</span><span class="st">&quot;/var/lib/ts-gw/spool.db&quot;</span><span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    spool<span class="op">.</span>initialize<span class="op">();</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    mqtt<span class="op">::</span>client mqtt<span class="op">(</span><span class="st">&quot;tcp://localhost:1883&quot;</span><span class="op">,</span> <span class="st">&quot;ts-gw&quot;</span><span class="op">);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> connected <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// csatlakozás, ha nem elérhető</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>connected<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>            <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>                mqtt<span class="op">.</span><span class="fu">connect</span><span class="op">();</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>                connected <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>exception<span class="op">&amp;</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;MQTT reconnect failed: &quot;</span> <span class="op">&lt;&lt;</span> e<span class="op">.</span>what<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">2</span><span class="op">));</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>        <span class="co">// visszatöltés sorrendben</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> records <span class="op">=</span> spool<span class="op">.</span>pending<span class="op">();</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="at">const</span> <span class="kw">auto</span><span class="op">&amp;</span> rec <span class="op">:</span> records<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>            <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>                mqtt<span class="op">.</span>publish<span class="op">(</span>rec<span class="op">.</span>topic<span class="op">,</span> rec<span class="op">.</span>payload<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="kw">false</span><span class="op">);</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>                spool<span class="op">.</span>remove<span class="op">(</span>rec<span class="op">.</span>id<span class="op">);</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>exception<span class="op">&amp;</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;publish failed, staying in spool: &quot;</span> <span class="op">&lt;&lt;</span> e<span class="op">.</span>what<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>                connected <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>mqtt::client::publish</code> QoS 1 használatakor a hívás
+blokkol, amíg a <code>PUBACK</code> meg nem érkezik, így a gateway
+tudja, hogy a broker elfogadta. Ha a kapcsolat közben megszakad,
+kivételt kapunk, a rekord a pufferben marad, és a ciklus később
+újrapróbálja.</p>
+<p>A CMakeLists.txt-hez adjuk hozzá az SQLite-ot és a
+<code>store_forward.cpp</code>-t:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># CMakeLists.txt (részlet)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">find_package</span>(<span class="im">PkgConfig</span> <span class="ot">REQUIRED</span>)</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">pkg_check_modules</span>(SQLITE3 <span class="ot">REQUIRED</span> sqlite3)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">add_executable</span>(<span class="bn">ts-gw</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    src/main.cpp</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    src/store_forward.cpp</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="co"># ... korábbi forrásfájlok</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">target_link_libraries</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    paho-mqttpp3</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="dv">${SQLITE3_LIBRARIES}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="kw">target_include_directories</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span> <span class="dv">${SQLITE3_INCLUDE_DIRS}</span>)</span></code></pre></div>
+<p>A build és futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i037/ts-gw</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> build <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> build</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> .. <span class="kw">&amp;&amp;</span> <span class="fu">make</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">./ts-gw</span></span></code></pre></div>
+<p>Indítsuk el a Mosquitto-t a közös stackből, majd teszteljük offline
+és online szakaszokkal:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># külön terminálban</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/stack</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose up <span class="at">-d</span> mosquitto</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="co"># node szimuláció UDP-vel (küldjön 5 mintát)</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> ../../i017/udp_sender.py <span class="at">--count</span> 5</span></code></pre></div>
+<p>Ellenőrizzük a puffer tartalmát, miután leállítottuk a brokert:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> stop mosquitto</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co"># küldjünk 3 újabb mintát</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> ../../i017/udp_sender.py <span class="at">--count</span> 3</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">sqlite3</span> /var/lib/ts-gw/spool.db <span class="st">&#39;SELECT id, node_id, seq, ts FROM spool;&#39;</span></span></code></pre></div>
+<p>Várt kimenet: a három új rekord megjelenik. Most indítsuk újra a
+brokert, és figyeljük a visszatöltést:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> start mosquitto</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># subscribe minden terrasense/# topicra</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_sub</span> <span class="at">-t</span> <span class="st">&#39;terrasense/#&#39;</span> <span class="at">-v</span></span></code></pre></div>
+<p>A publisher szál visszatölti a puffert; a kimenetben a három üzenet
+sorrendben jelenik meg, majd a puffer kiürül. Ismételt lekérdezéssel
+ellenőrizhetjük, hogy a <code>spool</code> tábla üres.</p>
+<h3 data-number="12.3.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">12.3.5</span> Ellenőrzés és
+hibakeresés</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 26%" />
+<col style="width: 40%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A puffer nem ürül, a broker elérhető</td>
+<td>A publish kivételt dob, de a hibaüzenet nem jelenik meg</td>
+<td>Növeld a naplózást, ellenőrizd a publish visszatérési értékét, és a
+<code>connected</code> flag kezelését</td>
+</tr>
+<tr class="even">
+<td>A visszatöltött üzenetek sorrendje nem megfelelő</td>
+<td>A <code>pending()</code> lekérdezés nem
+<code>ORDER BY id</code></td>
+<td>Javítsd a SQL-t <code>ORDER BY id</code>-re</td>
+</tr>
+<tr class="odd">
+<td>Duplikált sorok jelennek meg a pufferben</td>
+<td>Hiányzik az <code>UNIQUE(node_id, seq)</code> megkötés</td>
+<td>Add hozzá a sémához, és használj
+<code>ON CONFLICT DO NOTHING</code></td>
+</tr>
+<tr class="even">
+<td>A program induláskor „database is locked” hibát ad</td>
+<td>A WAL mód nincs bekapcsolva, vagy a fájl zárolva</td>
+<td>Ellenőrizd a <code>PRAGMA journal_mode=WAL</code> futtatását, és
+hogy nincs másik folyamat nyitott tranzakcióban</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="12.3.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">12.3.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><strong>A duplikáció kezelését a visszatöltés során
+elfelejtik.</strong> Ha a gateway az MQTT publish után, de a
+<code>remove()</code> hívása előtt leáll, a rekord megmarad, és
+újrainduláskor ismét elküldésre kerül. Ezt az
+<code>UNIQUE(node_id, seq)</code> not only a gateway szintjén, hanem a
+<strong>backendnek</strong> is kezelnie kell idempotensen (lásd <a
+href="i044.html">Ingest: MQTT-ből a backendbe, idempotensen</a>).</li>
+<li><strong>A korlátot elhanyagolják.</strong> A lemez végtelennek
+tűnik, de a puffer hosszú offline időszak alatt betelhet. Mindig
+definiálni kell a maximális méretet és az eldobási stratégiát.</li>
+<li><strong>A publish sikere utáni törlést kihagyják.</strong> A gateway
+a <code>publish</code> hívás után azonnal töröl, még a
+<code>PUBACK</code> előtt (ha QoS 1-et használ), ami adatvesztéshez
+vezethet a nyugta elvesztésekor. A szinkron
+<code>mqtt::client::publish</code> blokkol a <code>PUBACK</code>-ig, így
+a minta kódban ez nem fordul elő, de aszinkron kliens esetén
+kritikus.</li>
+<li><strong>A visszatöltés sebességét nem korlátozzák.</strong> Ha a
+puffer hosszú offline időszak alatt sok üzenetet halmozott fel, a
+kapcsolat visszaállásakor a teljes puffer egyszerre zúdul a brokerre. Ez
+túlterhelheti a hálózatot vagy a backendet. Be kell iktatni egy
+minimális késleltetést (például 100–200 ms) az egyes publish műveletek
+közé.</li>
+</ol>
+<h3 data-number="12.3.7" id="feladatok"><span
+class="header-section-number">12.3.7</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Döntési kérdés.</strong> Milyen esetben választanál
+memóriapuffert a lemezes puffert helyett a gateway-en? Indokold
+meg.</li>
+<li><strong>Számolási feladat.</strong> A <code>ts-node</code> 5 mintát
+küld 1 perc alatt (minden minta 120 B hasznos adat). A gateway offline
+24 órán át. Hány rekord keletkezik, és mekkora a minimális lemezterület,
+ha a rekordonkénti overhead 80 B? Add meg a választ KiB-ban (1 KiB =
+1024 B), és értékeld, hogy indokolt-e a lemez.</li>
+<li><strong>Implementáció.</strong> Bővítsd a
+<code>StoreForwardDb</code> osztályt egy <code>max_records</code>
+korláttal és <code>drop_oldest()</code> stratégiával: a
+<code>enqueue</code> hívás után ha a rekordszám nagyobb, mint a korlát,
+töröld a legkisebb <code>id</code>-jű rekordokat addig, amíg a határ alá
+nem kerülsz.</li>
+<li><strong>Hibakeresés.</strong> A tesztelés során azt tapasztalod,
+hogy a broker visszatérte után a puffer nem ürül, pedig a broker
+elérhető, és a <code>mosquitto_sub</code> látja a bejövő üzeneteket. A
+gateway naplója nem mutat publish hibát. Mi lehet a baj? Írd le a
+diagnosztikai lépéseket.</li>
+</ol>
+<h3 data-number="12.3.8" id="megoldások"><span
+class="header-section-number">12.3.8</span> Megoldások</h3>
+<ol type="1">
+<li>A memóriapuffer használata akkor indokolt, ha a gateway nem igényel
+tartós adatmegőrzést, például egy rövid ideig tartó hálózati kiesést
+simít ki, és az adatok újraküldése nem kritikus. De a TerraSense
+esetében a telemetria elvesztése nem elfogadható, ezért a lemezes puffer
+az alapértelmezett.</li>
+<li>Az üzenetek száma: 5/perc × 60 × 24 = 7200 üzenet. Rekordonkénti
+méret: 120 B payload + 80 B overhead = 200 B. Teljes méret: 7200 × 200 B
+= 1 440 000 B = 1 440 000 / 1024 = 1406,25 KiB ≈ 1,37 MiB. Ez
+kényelmesen elfér bármilyen modern gateway lemezen, tehát a lemezes
+puffer jól méretezhető.</li>
+<li>A <code>max_records</code> és <code>drop_oldest</code> hozzáadásához
+a <code>enqueue</code> végén ellenőrizni kell a rekordszámot, és ha túl
+nagy, törölni a legrégibbeket. Például a <code>initialize</code>-ben
+tárold el a korlátot, és a <code>enqueue</code> végén hívd meg a
+<code>delete_oldest_until_limit()</code> metódust:</li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> StoreForwardDb<span class="op">::</span>enforce_limit<span class="op">(</span><span class="dt">int64_t</span> max_records<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> sql <span class="op">=</span> <span class="st">&quot;DELETE FROM spool WHERE id IN &quot;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>                      <span class="st">&quot;(SELECT id FROM spool ORDER BY id LIMIT &quot;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>                      <span class="st">&quot;(SELECT MAX(0, COUNT(*) - ?) FROM spool));&quot;</span><span class="op">;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// paraméter kötés és futtatás</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="4" type="1">
+<li>Ha a puffer nem ürül, de a broker elérhető, és publish hibát nem
+látunk, valószínűleg a publisher ciklus nem fut le, mert a
+<code>connected</code> flag hamis maradt, vagy a ciklus
+<code>continue</code> miatt sose éri el a <code>pending()</code> hívást.
+Ellenőrizni kell: (a) a <code>mqtt.connect()</code> hívás valóban
+sikeres-e; (b) a <code>connected</code> flag értékét naplózd; (c) a
+<code>pending()</code> lekérdezés visszaadja-e a rekordokat. A minta
+kódban a <code>continue</code> akkor ugrik, ha a connect kivételt dob,
+de utána újra próbálkozik. Ha a <code>mqtt.connect()</code> elsőre
+sikertelen, a <code>sleep</code> 2 mp, majd ismét. Az a tünet, hogy a
+subscribe látja a bejövő üzeneteket, arra utalhat, hogy a gateway nem
+publish-öl, mert a publish ciklus sosem lép be a <code>for</code>
+ciklusba a hiba miatt. Érdemes a <code>pending()</code> visszatérését is
+naplózni.</li>
+</ol>
+<h3 data-number="12.3.9" id="rövid-összefoglaló"><span
+class="header-section-number">12.3.9</span> Rövid összefoglaló</h3>
+<p>Az alfejezet bemutatta a gateway store-and-forward rétegét SQLite
+WAL-módú perzisztens pufferrel. A <code>StoreForwardDb</code> osztály
+<code>enqueue()</code>, <code>pending()</code> és <code>remove()</code>
+metódusokkal kezeli a sort; a séma <code>UNIQUE(node_id, seq)</code>
+kulccsal biztosítja a deduplikációt. A publisher ciklus a brokerhez való
+sikeres QoS 1-es <code>PUBLISH</code> után törli a rekordot, offline
+állapotban pedig a pufferben tartja. A visszatöltés <code>id</code>
+szerinti sorrendben történik, szükség esetén késleltetéssel.
+<strong>Továbbvitt eredmény.</strong> A <code>node_id</code> +
+<code>seq</code> páros mint üzenetazonosító és a visszatöltési minta
+megegyezik azzal, amit az <a href="i044.html">Ingest: MQTT-ből a
+backendbe, idempotensen</a> a backend idempotens fogadása, valamint az
+<a href="i047.html">Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika</a> a Kafka-topicokra írás során használ. A labor kimenete a
+<code>~/iot-labor/i037/ts-gw</code> projekt, benne a
+<code>store_forward.hpp</code> / <code>.cpp</code> és a módosított
+<code>main.cpp</code>, valamint a <code>CMakeLists.txt</code>.</p>
+<h3 data-number="12.3.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">12.3.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><p>SQLite dokumentáció: WAL mód, <code>PRAGMA journal_mode</code>,
+<code>INSERT ... ON CONFLICT DO NOTHING</code>. URL:
+https://sqlite.org/docs.html (nem ellenőriztem közvetlenül).</p></li>
+<li><p>Eclipse Paho C++ client dokumentáció:
+<code>mqtt::client::publish</code> szinkron viselkedése QoS 1 esetén.
+URL: https://eclipse.dev/paho/ (nem ellenőriztem közvetlenül).</p></li>
+<li><p>Mosquitto dokumentáció: QoS 1 PUBACK viselkedés. URL:
+https://mosquitto.org/documentation/ (nem ellenőriztem
+közvetlenül).</p></li>
+<li><p><strong>Ellenőrizendő:</strong> a Paho <code>publish</code>
+szinkron hívás pontos blokkolási garanciája az aktuális
+könyvtárverzióban, valamint az SQLite C API <code>sqlite3_open_v2</code>
+szükségessége a paraméterezett tranzakciókhoz. A
+<code>sqlite3_bind_text</code> <code>SQLITE_TRANSIENT</code> makró
+használata a jelen kódban működik, de a pontos szemantika verziófüggő
+lehet. A <code>CMakeLists.txt</code>-ben a <code>paho-mqttpp3</code>
+target neve a telepített könyvtárnak megfelelően módosulhat.</p></li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i036.html">← 12.2 A ts-gw szolgáltatás C++-ban: protokollfordítás MQTT-re</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i038.html">12.4 A gateway üzemeltetése: systemd, konténerek, naplózás →</a></div>
+</nav>
+</body>
+</html>

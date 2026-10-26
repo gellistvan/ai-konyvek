@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.2 write, fsync, flush és crash consistency – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch10">10 Linux blokk-I/O, VFS és tartósság</a></p>
+<div class="links"><a class="prev" rel="prev" href="d046.html">← 10.1 Syscalltól az eszközig: I/O rétegek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d048.html">10.3 Buffered/direct/async I/O és diagnosztika →</a></div>
+</nav>
+<h2 data-number="10.2" id="d047"><span
+class="header-section-number">10.2</span> write, fsync, flush és crash
+consistency</h2>
+<h3 data-number="10.2.1" id="motiváció"><span
+class="header-section-number">10.2.1</span> Motiváció</h3>
+<p>Egy C++ szolgáltatás indításkor beolvassa a
+<code>/etc/myapp/config.json</code> fájlt. Amikor a vezérlő API frissíti
+a konfigurációt, a program <code>open(O_TRUNC)</code> +
+<code>write()</code> + <code>close()</code> sorozattal ír. Az alkalmazás
+fejlesztője úgy véli, a <code>write()</code> visszatérése után az adat a
+lemezen van. Ez a feltételezés hamis: a <code>write()</code> sikere csak
+annyit garantál, hogy az adat a kernel page cache-ébe került, azaz a
+processz oldaláról olvasható. Ha ebben a pillanatban a tápfeszültség
+megszakad, a dirty adat elveszhet, a fájl üres vagy félig írt maradhat.
+A d046 bemutatta az I/O rétegeket; jelen alfejezet a tartóssági
+szerződést határolja pontosan program, kernel, fájlrendszer és eszköz
+között.</p>
+<h3 data-number="10.2.2" id="definíció-és-működés"><span
+class="header-section-number">10.2.2</span> Definíció és működés</h3>
+<h4 data-number="10.2.2.1" id="buffered-write-és-dirty-page"><span
+class="header-section-number">10.2.2.1</span> Buffered write és dirty
+page</h4>
+<p>A Linux VFS rétegében a <code>write()</code> a processz userspace
+pufferéből a kernel page cache-be másol. A megváltozott lap dirty page.
+A <code>write()</code> normál esetben a másolás után visszatér, anélkül
+hogy a blokkréteghez nyúlna. A háttérben a kernel writeback mechanizmusa
+idővel kiírja a dirty page-eket. A dirty page-ek tehát a rendszer futó
+állapotában konzisztensek, de power-loss esetén nem tartósak.</p>
+<h4 data-number="10.2.2.2" id="fsync-és-fdatasync"><span
+class="header-section-number">10.2.2.2</span> fsync és fdatasync</h4>
+<p>A <code>fsync(int fd)</code> rendszerhívás két dolgot tesz: elindítja
+az adott fájlhoz tartozó dirty adat- és metaadatoldalak kiírását, majd
+megvárja, amíg a blokkréteg és az eszköz visszaigazolja, hogy azok
+tartósan a médiumra kerültek. Ez utóbbi gyakran egy device flush
+műveletet jelent. A <code>fdatasync(int fd)</code> szűkebb garancia:
+csak az adatok és a visszaolvasáshoz szükséges minimális metaadatok (pl.
+a fájlméret) kiírását kéri. Ha a fájlméret nem változott, a
+<code>fdatasync()</code> elkerülheti például az <code>mtime</code>
+frissítését. A <code>sync()</code> rendszerhívás az egész rendszer dirty
+oldalait indítja ki, de a visszatérése után nem feltétlenül várta meg az
+összes eszközt. (Ez a <code>sync()</code> szemantika függ a
+kernelverziótól; régebben a <code>sync</code> csak ütemezett, az
+<code>fsync</code> viszont várt. Modern Linuxban a <code>sync()</code>
+is vár, de az <code>fsync</code> az egyes fájlra vonatkozó
+garancia.)</p>
+<h4 data-number="10.2.2.3" id="device-flush"><span
+class="header-section-number">10.2.2.3</span> Device flush</h4>
+<p>A storage eszköz gyakran rendelkezik írási gyorsítótárral (write
+cache). Az eszköz a cache-be írt adatot már késznek jelezheti, miközben
+a médiumra még nem került. A <code>fsync</code> ezért a blokkrétegben
+flush/barrier kérést ad ki, amely a cache kiürítésére utasítja az
+eszközt. Ha az eszköz power-loss protected cache-el rendelkezik, a flush
+után az adat tartós; ha nem, a tartósság nem garantálható, még akkor
+sem, ha az eszköz nem jelez hibát.</p>
+<h4 data-number="10.2.2.4" id="atomic-rename-versus-durability"><span
+class="header-section-number">10.2.2.4</span> Atomic rename versus
+durability</h4>
+<p>A POSIX <code>rename()</code> ugyanazon fájlrendszeren belül
+atomikusan cseréli a névbejegyzéseket. Ez process szintű láthatósági
+garancia: egyetlen másik processz sem lát félig kész állapotot; a régi
+vagy az új fájl jelenik meg. Ez azonban nem durability garancia: a
+névbejegyzés változása a directory inode-jában dirty adat, amely
+power-loss esetén elveszhet. A tartós frissítéshez a directoryt is
+fsyncelni kell.</p>
+<h4 data-number="10.2.2.5" id="directory-fsync-és-névbejegyzés"><span
+class="header-section-number">10.2.2.5</span> Directory fsync és
+névbejegyzés</h4>
+<p>A directory maga is fájl, pontosabban inode, amelynek adata a nevek
+és az inode-számok párosai. Amikor a <code>rename()</code> lefut, a
+szülő directory tartalma módosul. Ha a <code>rename</code> után csak a
+file data-t fsynceljük, a directory bejegyzés nincs kiírva. Crash esetén
+a fájlrendszer-visszaállítás során a régi név vagy a hiányzó név
+jelenhet meg. A protokoll ezért megköveteli a directory fájldeszkriptor
+<code>fsync</code> hívását.</p>
+<h4 data-number="10.2.2.6" id="filesystem-journal-és-cow-előkép"><span
+class="header-section-number">10.2.2.6</span> Filesystem journal és CoW
+előkép</h4>
+<p>A journaled fájlrendszerek (ext4, XFS) a metaadat-változásokat előbb
+a journalba írják, majd commitolnak, végül a tényleges helyükre írnak. A
+journal commit is flush-t igényel. Ha a power-loss a commit előtt
+történik, a tranzakció visszajátszás nélkül elvész; ha a commit után, a
+visszajátszás helyreállítja a konzisztens állapotot. A copy-on-write
+(CoW) fájlrendszerek (Btrfs, ZFS) az új adatot új blokkba írják, majd
+egy atomi mutatófrissítéssel teszik láthatóvá. Itt a mutatófrissítés
+atomicitása és tartóssága a meghatározó, nem a felülírás.</p>
+<p>A következő táblázat összefoglalja a rétegek tartóssági
+vállalását:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Réteg</th>
+<th>Művelet</th>
+<th>Tartóssági vállalás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Program</td>
+<td><code>write()</code></td>
+<td>Adat a kernel page cache-ben; power-loss után nem garantált.</td>
+</tr>
+<tr class="even">
+<td>Kernel VFS</td>
+<td><code>fsync()</code>/<code>fdatasync()</code></td>
+<td>Dirty adat/metadata kiírása és várakozás a blokkréteg
+visszaigazolására.</td>
+</tr>
+<tr class="odd">
+<td>Blokkréteg</td>
+<td>flush/barrier</td>
+<td>Eszköz cache kiürítése a médiumra.</td>
+</tr>
+<tr class="even">
+<td>Fájlrendszer</td>
+<td><code>rename()</code></td>
+<td>Atomikus névcsere azonos filesystemen; durability nélkül.</td>
+</tr>
+<tr class="odd">
+<td>Eszköz</td>
+<td>cache flush</td>
+<td>Power-loss protected cache esetén tartós médium állapot.</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="10.2.2.7" id="power-loss-cache-és-szerverhiba"><span
+class="header-section-number">10.2.2.7</span> Power-loss cache és
+szerverhiba</h4>
+<p>A szerverhiba kétféle lehet: kernel crash vagy áramszünet. Kernel
+crash esetén a page cache tartalma elveszik, mert a memória nem íródik
+ki; az eszköz cache viszont megmaradhat, ha van tápellátása. Áramszünet
+esetén mind a page cache, mind a nem védett eszköz cache elveszik. A
+gyakorlatban a rendszertervezőnek fel kell tételeznie, hogy az fsync
+nélküli write-ok elveszhetnek, és a védelem nélküli eszköz cache is
+veszélyes. A tartós protokollnak mindig explicit fsync/flush hívással
+kell zárnia.</p>
+<h3 data-number="10.2.3" id="kidolgozott-példa"><span
+class="header-section-number">10.2.3</span> Kidolgozott példa</h3>
+<p>A következő C++ függvénypár egy JSON konfigurációs fájlt frissít. Az
+első a naiv, a második a crash-consistent protokollt valósítja meg.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cerrno&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> write_config_naive<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> path<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>path<span class="op">.</span>c_str<span class="op">(),</span> O_WRONLY <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>fd<span class="op">,</span> data<span class="op">.</span>data<span class="op">(),</span> data<span class="op">.</span>size<span class="op">())</span> <span class="op">!=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">ssize_t</span><span class="op">&gt;(</span>data<span class="op">.</span>size<span class="op">()))</span> <span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Nincs fsync: power-loss esetén a fájl lehet üres vagy félig írt.</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> write_config_durable<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> dir<span class="op">,</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>                          <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> name<span class="op">,</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>                          <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string tmp <span class="op">=</span> dir <span class="op">+</span> <span class="st">&quot;/&quot;</span> <span class="op">+</span> name <span class="op">+</span> <span class="st">&quot;.tmp&quot;</span><span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>tmp<span class="op">.</span>c_str<span class="op">(),</span> O_WRONLY <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC<span class="op">,</span> <span class="bn">0600</span><span class="op">);</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;open tmp&quot;</span><span class="op">);</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>fd<span class="op">,</span> data<span class="op">.</span>data<span class="op">(),</span> data<span class="op">.</span>size<span class="op">())</span> <span class="op">!=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">ssize_t</span><span class="op">&gt;(</span>data<span class="op">.</span>size<span class="op">()))</span> <span class="op">{</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;write tmp&quot;</span><span class="op">);</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>fd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;fsync tmp&quot;</span><span class="op">);</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>close<span class="op">(</span>fd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;close tmp&quot;</span><span class="op">);</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string final_path <span class="op">=</span> dir <span class="op">+</span> <span class="st">&quot;/&quot;</span> <span class="op">+</span> name<span class="op">;</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rename<span class="op">(</span>tmp<span class="op">.</span>c_str<span class="op">(),</span> final_path<span class="op">.</span>c_str<span class="op">())</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;rename&quot;</span><span class="op">);</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> dirfd <span class="op">=</span> open<span class="op">(</span>dir<span class="op">.</span>c_str<span class="op">(),</span> O_RDONLY <span class="op">|</span> O_DIRECTORY<span class="op">);</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>dirfd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;open dir&quot;</span><span class="op">);</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fsync<span class="op">(</span>dirfd<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">(</span><span class="st">&quot;fsync dir&quot;</span><span class="op">);</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>dirfd<span class="op">);</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Feltételek:</p>
+<ul>
+<li>A <code>dir</code> és a <code>name</code> ugyanazon a fájlrendszeren
+van, így a <code>rename</code> atomikus.</li>
+<li>A <code>fsync</code> a fájl adatát és metaadatait kiírja; a
+<code>fdatasync</code> is használható, mert a fájlméret változása miatt
+a size metadata is kiíródik. Az <code>fsync</code> a biztonság kedvéért
+a teljes metaadatot kéri.</li>
+<li>A <code>close()</code> nem garantál tartósságot; ezért hívjuk meg az
+<code>fsync</code>-et a <code>close</code> előtt.</li>
+<li>A rendszernek a storage eszközön a write cache-re vonatkozó
+garanciáit a kernel nem tudja ellenőrizni; ezt az üzemeltetési
+szerződésben külön kell rögzíteni.</li>
+</ul>
+<p>Várható kimenet:</p>
+<p>A naiv verzió után a fájl azonnal olvasható, de egy
+<code>kill -9</code> utáni újrainduláskor a tartalom lehet üres. A
+tartós verzió a <code>rename</code> után a fájl a régi vagy az új
+tartalommal jelenik meg; nem lehet félig írt állapot. A <code>tmp</code>
+fájl nem marad.</p>
+<p>Ellenőrzés <code>strace</code>-szal:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">strace</span> <span class="at">-e</span> trace=write,fsync,rename,close ./config_writer_durable /etc/myapp config.json <span class="st">&#39;{&quot;port&quot;:8080}&#39;</span></span></code></pre></div>
+<p>A várt kimenetben szerepel:</p>
+<pre><code>write(3, &quot;{\&quot;port\&quot;:8080}&quot;, 12) = 12
+fsync(3) = 0
+close(3) = 0
+rename(&quot;/etc/myapp/config.json.tmp&quot;, &quot;/etc/myapp/config.json&quot;) = 0
+openat(AT_FDCWD, &quot;/etc/myapp&quot;, O_RDONLY|O_DIRECTORY) = 4
+fsync(4) = 0
+close(4) = 0</code></pre>
+<p>Ez igazolja, hogy a protokoll minden tartóssági lépést
+végrehajtott.</p>
+<h3 data-number="10.2.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">10.2.4</span> Hibák és ellenpróbák</h3>
+<p><strong>1. <code>close()</code> után azt hinni, hogy az adat
+tartós.</strong><br />
+Tünet: a config elveszik power-loss után. Hipotézis: a
+<code>close</code> nem végez fsyncet. Adatgyűjtés: <code>strace</code>
+hiányzó fsync hívása. Egy változtatás: <code>fsync(fd)</code> hozzáadása
+a <code>close</code> előtt. Verifikáció: crash szimuláció után a fájl
+tartalma helyes.</p>
+<p><strong>2. <code>rename</code> után nincs directory
+fsync.</strong><br />
+Tünet: a fájl tartalma megvan, de a neve nem létezik a crash után.
+Hipotézis: a directory bejegyzés dirty maradt. Adatgyűjtés: a journalban
+a rename commit hiánya. Egy változtatás: <code>fsync(dirfd)</code>.
+Verifikáció: a crash után a névbejegyzés a várt állapotban van.</p>
+<p><strong>3. Temp fájl más fájlrendszeren.</strong><br />
+Tünet: <code>rename</code> <code>EXDEV</code> hibával tér vissza.
+Hipotézis: a temp fájl nincs a célfájllal azonos mounton. Adatgyűjtés:
+<code>df</code> vagy <code>stat</code> a két útvonalra. Egy változtatás:
+a temp fájlt a célfájl könyvtárába írni. Verifikáció: a
+<code>rename</code> sikeres.</p>
+<p><strong>4. Az eszköz cache nem power-loss protected.</strong><br />
+Tünet: minden fsync ellenére power-loss után sérült adat. Hipotézis: az
+eszköz write cache bekapcsolva, de nincs védelem. Adatgyűjtés: a tároló
+specifikációja, <code>hdparm -W</code> vagy <code>smartctl</code> write
+cache állapot. Egy változtatás: az eszköz cache letiltása vagy
+power-loss protected eszköz használata. Verifikáció: áramtalanítási
+teszt.</p>
+<h3 data-number="10.2.5" id="feladatok"><span
+class="header-section-number">10.2.5</span> Feladatok</h3>
+<p><strong>1. Magyarázó feladat.</strong> Magyarázd el, miért lehet egy
+<code>write()</code> visszatérése után az adat elvesztése power-loss
+esetén, és mi a különbség a <code>fsync</code> és <code>fdatasync</code>
+között. Milyen esetekben elegendő a <code>fdatasync</code>?</p>
+<p><strong>2. Adminisztrációs/konfigurációs feladat.</strong> Írj egy
+C++ vagy shell programot, amely egy megadott fájlt tartósan frissít
+atomi rename-nel. A program a <code>lab-write-atomic</code> nevet
+használja. Készíts <code>strace</code> kimenetet, amely bizonyítja a
+protokoll lépéseit, és teszteld a <code>rename</code> atomi láthatóságát
+két párhuzamos olvasóval.</p>
+<p><strong>3. Diagnosztikai/failure/recovery feladat.</strong> Egy
+szolgáltatás a konfigurációs fájlt <code>open(O_TRUNC)</code> +
+<code>write</code> + <code>close</code> sorozattal ír. Egy áramszünet
+után a fájl 0 bájt hosszú. Állapítsd meg a kiváltó okot, javítsd a
+frissítési protokollt, és írj egy ellenőrző eljárást, amely a
+<code>rename</code> előtti és utáni állapotot is ellenőrzi.</p>
+<h3 data-number="10.2.6" id="megoldások"><span
+class="header-section-number">10.2.6</span> Megoldások</h3>
+<p><strong>1. Megoldás.</strong> A <code>write()</code> a userspace és a
+kernel page cache közötti másolást végzi; a dirty page-ek a memóriában
+vannak, és a kernel ütemezi a kiírást. Power-loss esetén a memória
+tartalma elveszik. A <code>fsync</code> a fájl adat- és metaadatdirty
+oldalait kiírja, és megvárja az eszköz flush-t. A <code>fdatasync</code>
+csak az adatokat és a minimálisan szükséges metaadatokat írja ki. Ha a
+fájlméret nem változik, a <code>fdatasync</code> elkerülheti az
+<code>mtime</code> frissítést, így gyorsabb lehet. A
+<code>fdatasync</code> akkor elegendő, ha a tartóssághoz nincs szükség a
+teljes metadata frissítésére; például egy meglévő, változatlan méretű
+adatfájl módosításakor.</p>
+<p><strong>2. Megoldás.</strong> A fenti
+<code>write_config_durable</code> megvalósítja a protokollt. A
+<code>strace</code> kimenetben a <code>write</code>, <code>fsync</code>,
+<code>rename</code>, <code>fsync(dirfd)</code> sorrendnek kell
+szerepelnie. A párhuzamos olvasó teszt: indítsunk egy olvasót, amely
+folyamatosan olvassa a fájlt, miközben a frissítő cseréli. Azt
+tapasztaljuk, hogy az olvasó mindig a régi vagy az új teljes tartalmat
+látja, soha nem félig írtat. Postcondition: a fájl tartalma az új, a
+temp fájl nem létezik, és a directory bejegyzés tartós.</p>
+<p><strong>3. Megoldás.</strong> A kiváltó ok: a <code>write</code>
+utáni tartóssági szinkronizáció hiánya. Az <code>open(O_TRUNC)</code>
+törli a fájlt, a <code>write</code> a dirty page-be ír, a
+<code>close</code> nem flush-el. A javítás: a fájlt temp néven
+létrehozni, <code>fsync</code> a temp fájlon, <code>rename</code> a
+célra, majd <code>fsync</code> a directoryn. Az ellenőrzés: szimuláljuk
+a power-losst a program <code>kill -9</code> és a gép újraindításával. A
+fájl a crash után a régi vagy az új tartalommal létezik, nem üres.</p>
+<h3 data-number="10.2.7" id="rövid-összefoglaló"><span
+class="header-section-number">10.2.7</span> Rövid összefoglaló</h3>
+<p>A <code>write()</code> csak a page cache-be ír; a dirty page-ek
+power-loss esetén elveszhetnek. A
+<code>fsync</code>/<code>fdatasync</code> explicit tartóssági határt ad:
+kiírja a dirty adatokat és metaadatokat, majd megvárja az eszköz
+flush-t. Az atomi <code>rename</code> process szintű láthatóságot ad, de
+a névbejegyzés tartósságához a szülő directory <code>fsync</code> is
+szükséges. A crash-consistent protokoll ezért temp fájl írása,
+<code>fsync</code>, <code>rename</code>, directory <code>fsync</code>. A
+storage write cache power-loss védelmét külön kell ellenőrizni.</p>
+<p><strong>Továbbhasznált definíciók</strong>:</p>
+<ul>
+<li><strong>Dirty page</strong>: a page cache-ben módosított, de a
+blokkrétegbe még ki nem írt lap; power-loss esetén nem tartós.</li>
+<li><strong>fsync</strong>: rendszerhívás, amely a fájl dirty adat- és
+metadataoldalait kiírja, és megvárja az eszköz cache flush
+befejezését.</li>
+<li><strong>Atomic rename + directory fsync</strong>: ugyanazon
+fájlrendszeren atomi névcsere, amely process szinten félig kész állapot
+nélkül látszik, és a directory fsync a névbejegyzést tartóssá
+teszi.</li>
+</ul>
+<h3 data-number="10.2.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.2.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>A fejezethez megadott kiindulópontok:</p>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel
+documentation</a></li>
+<li><a href="https://man7.org/linux/man-pages/">man7.org Linux man
+pages</a></li>
+<li><a href="https://nvmexpress.org/specifications/">NVM Express
+specifications</a></li>
+</ul>
+<p>Ezeket a forrásokat a generálás során nem tekintem olvasottnak vagy
+ellenőrzöttnek; a fenti állítások a stabil POSIX/Linux fogalmi alapokon
+nyugszanak. A gyakorlati felhasználás előtt ellenőrizni kell a cél
+kernel és fájlrendszer verziójának pontos
+<code>fsync</code>/<code>fdatasync</code> szemantikáját, a
+<code>sync()</code> viselkedését, a storage eszköz write cache
+power-loss védelmét, valamint a fájlrendszer journal/CoW commit
+garanciáit a hivatalos dokumentációban.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d046.html">← 10.1 Syscalltól az eszközig: I/O rétegek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d048.html">10.3 Buffered/direct/async I/O és diagnosztika →</a></div>
+</nav>
+</body>
+</html>

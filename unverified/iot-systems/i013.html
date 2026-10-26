@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.1 Szenzorolvasás a Zephyr sensor API-val – IoT-rendszerek és
+szoftverkomponensek – az eszköztől a felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Az eszköz: mikrovezérlő, RTOS, szenzorok, energia</a> › <a href="index.html#ich05">6 Szenzorok és aktuátorok</a></p>
+<div class="links"><a class="prev" rel="prev" href="i012.html">← 5.4 Devicetree és Kconfig: a hardver és a konfiguráció leírása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i014.html">6.2 Mintavétel, kalibráció és szűrés →</a></div>
+</nav>
+<h2 data-number="6.1" id="i013"><span
+class="header-section-number">6.1</span> Szenzorolvasás a Zephyr sensor
+API-val</h2>
+<h3 data-number="6.1.1" id="motiváció"><span
+class="header-section-number">6.1.1</span> Motiváció</h3>
+<p>A TerraSense üvegház-monitorozó csomópontjának első és legfontosabb
+feladata, hogy a környezeti adatokat megbízhatóan, a fizikai valóságnak
+megfelelően kiolvassa. A hőmérséklet és a relatív páratartalom olyan
+analóg jelek, amelyeket a mikrovezérlő digitális világába át kell
+ültetni. A Zephyr RTOS ezt a feladatot a <strong>sensor API</strong>
+mögé szervezi: nem kell ismernünk az adott szenzor I2C- vagy
+SPI-regisztereit, a driverréteg már elvégzi a nyers bájtok és a fizikai
+mennyiségek közötti átalakítást. Ebben az alfejezetben bekötjük a
+<code>ts-node</code> emulált hőmérséklet- és páratartalom-szenzorát, és
+egy újrahasznosítható mérési függvényt készítünk, amelyet a későbbi
+szűrés, architektúra- és hálózati rétegek is használnak.</p>
+<p>Az előző alfejezetben (<a href="i011.html">Szinkronizáció és
+üzenetátadás</a>) definiáltuk a <code>ts_sample</code> rekordot és az
+<code>sample_msgq</code> üzenetsort. Most ezt a struktúrát töltjük meg
+éles, szenzorból származó adatokkal. A cél, hogy a mérőszál ne
+keveredjen a kommunikációval: a mérési logika egyetlen függvényben
+legyen, amely bármelyik későbbi rétegből hívható.</p>
+<h3 data-number="6.1.2" id="fogalmak-és-működés"><span
+class="header-section-number">6.1.2</span> Fogalmak és működés</h3>
+<p>A Zephyr szenzormodell két műveletet választ szét: az
+<strong>adatgyűjtést</strong> és az <strong>adatlekérdezést</strong>. Ez
+azért fontos, mert sok szenzor nem folyamatosan mér, hanem csak egy
+trigger hatására indít mintavételt (például egy I2C-parancs után néhány
+milliszekundumig tart az analóg-digitális átalakítás).</p>
+<p><strong>Definíció (sensor API fetch/get).</strong><br />
+A <code>sensor_sample_fetch()</code> hívás utasítja a driver-t, hogy
+indítson el egy mérési ciklust, és várja meg, amíg az adat rendelkezésre
+áll. A <code>sensor_channel_get()</code> ezt követően kérdezi le a
+kiválasztott csatorna (például hőmérséklet, páratartalom) értékét. A
+<code>fetch</code> tehát az adatgyűjtés, a <code>get</code> a már
+begyűjtött adat kiolvasása.</p>
+<p>A csatornák az <code>enum sensor_channel</code> értékeivel
+azonosíthatók: <code>SENSOR_CHAN_AMBIENT_TEMP</code> a környezeti
+hőmérséklet, <code>SENSOR_CHAN_HUMIDITY</code> a relatív páratartalom,
+<code>SENSOR_CHAN_PRESS</code> a légnyomás, és így tovább.</p>
+<p>A mért értéket a driver a <code>sensor_value</code> struktúrában adja
+vissza:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> sensor_value <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int32_t</span> val1<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int32_t</span> val2<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>val1</code> az egész rész, a <code>val2</code> a
+mikro-egységben kifejezett törtrész (általában 10⁻⁶, de a driver ettől
+eltérő felbontást is használhat). A javasolt átváltás a
+<code>sensor_value_to_double()</code> függvénnyel történik.</p>
+<figure>
+<img src="assets/i013-diagram-1.png"
+alt="Zephyr sensor API hívási sorrend - A mérőszál fetch-csel indítja a mérést, majd csatornánként get-tel kéri ki az értékeket." />
+<figcaption aria-hidden="true">Zephyr sensor API hívási sorrend - A
+mérőszál fetch-csel indítja a mérést, majd csatornánként get-tel kéri ki
+az értékeket.</figcaption>
+</figure>
+<p>A Zephyr eszközmodellben a szenzor is egy <code>device</code>
+objektum. A devicetree-ben definiált csomópontból a
+<code>DEVICE_DT_GET_ANY()</code> makróval vagy egy node label-lel
+kérhető le a mutató:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev <span class="op">=</span> DEVICE_DT_GET_ANY<span class="op">(</span>zephyr_sensor_sim<span class="op">);</span></span></code></pre></div>
+<p>Ezután a <code>device_is_ready(dev)</code> ellenőrzi, hogy a driver
+inicializálódott-e, és a hardver elérhető-e. Ha a mutató
+<code>NULL</code> vagy a <code>device_is_ready()</code> hamis, akkor nem
+szabad hívni a sensor API-t.</p>
+<p>A hiba- és állapotkezelés a Zephyr negatív errno-konvencióját követi:
+a függvények 0-t adnak vissza siker esetén, hiba esetén pedig
+<code>-ENODEV</code>, <code>-EBUSY</code>, <code>-EIO</code> és hasonló
+értékeket. A mérési ciklusban ezekre külön reagálhatunk: az
+<code>-EBUSY</code> és <code>-EAGAIN</code> átmeneti hibák, amelyek után
+érdemes rövid késleltetéssel újra próbálkozni.</p>
+<h3 data-number="6.1.3" id="döntési-szempontok"><span
+class="header-section-number">6.1.3</span> Döntési szempontok</h3>
+<p>A szenzor API-n belül több tervezési döntés is felmerül:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kérdés</th>
+<th>Opciók</th>
+<th>Mire érdemes figyelni</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Fetch és get szétválasztása</td>
+<td>a) <code>sensor_sample_fetch()</code> + több
+<code>sensor_channel_get()</code> b)
+<code>sensor_sample_fetch_chan(dev, chan)</code> csatornánként</td>
+<td>a) hatékonyabb, ha egyszerre több csatornát olvasunk; b) egyszerűbb,
+de többszöri mérést indíthat</td>
+</tr>
+<tr class="even">
+<td>Érték kinyerése</td>
+<td><code>val1</code>/<code>val2</code> közvetlen feldolgozása vagy
+<code>sensor_value_to_double()</code></td>
+<td>Lebegőpontos lebegés pontossága elegendő; ha bitpontos átvitel kell,
+őrizzük meg a nyers <code>sensor_value</code> párt</td>
+</tr>
+<tr class="odd">
+<td>Hiba újrapróbálkozás</td>
+<td>azonnali visszatérés, fix késleltetés, exponenciális
+visszavonulás</td>
+<td>Átmeneti <code>-EBUSY</code> esetén rövid késleltetés; tartós hiba
+esetén jelezzük a felügyeleti rétegnek</td>
+</tr>
+<tr class="even">
+<td>Szenzor kiválasztása</td>
+<td>gyártó-specifikus driver vs. emulált <code>sensor_sim</code></td>
+<td><code>native_sim</code>-en a <code>zephyr,sensor-sim</code>
+használható; éles hardverre a devicetree overlay cseréje szükséges</td>
+</tr>
+</tbody>
+</table>
+<p>A TerraSense esetében a fetch/get szétválasztást választjuk, mert
+egyetlen fetch-csel mindkét csatornát (hőmérséklet, páratartalom) be
+tudjuk tölteni. A talajnedvesség mérése későbbi laborban kerül
+hozzá.</p>
+<h3 data-number="6.1.4"
+id="kidolgozott-példa-sensor_value-átváltás-és-minta-kitöltése"><span
+class="header-section-number">6.1.4</span> Kidolgozott példa:
+<code>sensor_value</code> átváltás és minta kitöltése</h3>
+<p>Tegyük fel, hogy a hőmérséklet-szenzor a <code>sensor_value</code>
+struktúrában a következőt adja vissza:</p>
+<ul>
+<li>hőmérséklet: <code>val1 = 23</code>, <code>val2 = 450000</code> →
+23,45 °C</li>
+<li>páratartalom: <code>val1 = 45</code>, <code>val2 = 200000</code> →
+45,20 %RH</li>
+</ul>
+<p>A <code>sensor_value_to_double()</code> ezt a két mezőt
+<code>val1 + val2 * 1e-6</code> módon összegzi. A mérési függvényünk
+ezeket az értékeket a <code>ts_sample</code> struktúrába írja:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>sample<span class="op">-&gt;</span>temp_c <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>sample<span class="op">-&gt;</span>humidity_rh <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>sample<span class="op">-&gt;</span>soil_moisture_pct <span class="op">=</span> <span class="dv">0</span><span class="er">.0</span><span class="op">;</span>   <span class="co">/* most nem mért csatorna */</span></span></code></pre></div>
+<p>A <code>ts_sample</code> <code>seq</code> (sorszám) és
+<code>ts_ms</code> (időbélyeg) mezőit a mérőszál tölti ki, mert azok nem
+a szenzor driver hatáskörébe tartoznak. A <code>seq</code> egy monoton
+növekvő egyedi azonosító, a <code>ts_ms</code> jelen laborban a
+<code>k_uptime_get()</code> értéke (a rendszer indulása óta eltelt
+ezredmásodperc), ami a szimulációban elegendő. Valós rendszerben ezt a
+gateway vagy az RTC-alapú időszinkron váltja fel, ahogy azt az <a
+href="i034.html">Idő az IoT-ban</a> alfejezet tárgyalja.</p>
+<h3 data-number="6.1.5" id="labor-ts-node-emulált-szenzorral"><span
+class="header-section-number">6.1.5</span> Labor: <code>ts-node</code>
+emulált szenzorral</h3>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i013 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i013</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> src boards</span></code></pre></div>
+<p><strong>Előfeltétel:</strong> a <a href="i011.html">Szinkronizáció és
+üzenetátadás: mutex, szemafor, üzenetsor, work queue</a> laborban
+létrehozott <code>ts_sample</code> struktúra és <code>sample_msgq</code>
+mintáját itt újrahasznosítjuk. A teljes fájlt a <a
+href="i013.html">Szenzorolvasás a Zephyr sensor API-val</a> alfejezetben
+készítjük el, de a korábbi labor logikáját megtartjuk.</p>
+<p><strong>Fájlok:</strong></p>
+<ol type="1">
+<li><code>CMakeLists.txt</code>:</li>
+</ol>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">cmake_minimum_required</span>(<span class="ot">VERSION</span> <span class="dt">3.20.0</span>)</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">find_package</span>(Zephyr <span class="ot">REQUIRED</span> <span class="ot">HINTS</span> <span class="fl">$ENV{ZEPHYR_BASE}</span>)</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">project</span>(ts-node-sensor)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">target_sources</span>(<span class="bn">app</span> <span class="ot">PRIVATE</span> src/main.c)</span></code></pre></div>
+<ol start="2" type="1">
+<li><code>prj.conf</code>:</li>
+</ol>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">CONFIG_LOG</span><span class="ot">=</span><span class="st">y</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="dt">CONFIG_SENSOR</span><span class="ot">=</span><span class="st">y</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="dt">CONFIG_SENSOR_SIM</span><span class="ot">=</span><span class="st">y</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="dt">CONFIG_SENSOR_LOG_LEVEL_DBG</span><span class="ot">=</span><span class="st">y</span></span></code></pre></div>
+<ol start="3" type="1">
+<li><code>boards/native_sim.overlay</code>:</li>
+</ol>
+<pre class="dts"><code>/ {
+    sensim: sensim {
+        compatible = &quot;zephyr,sensor-sim&quot;;
+    };
+};</code></pre>
+<ol start="4" type="1">
+<li><code>src/main.c</code>:</li>
+</ol>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/kernel.h&gt;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/device.h&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/drivers/sensor.h&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/logging/log.h&gt;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>LOG_MODULE_REGISTER<span class="op">(</span>sensor_app<span class="op">,</span> LOG_LEVEL_INF<span class="op">);</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ts_sample <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq<span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> ts_ms<span class="op">;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> temp_c<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> humidity_rh<span class="op">;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> soil_moisture_pct<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>K_MSGQ_DEFINE<span class="op">(</span>sample_msgq<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="kw">struct</span> ts_sample<span class="op">),</span> <span class="dv">8</span><span class="op">,</span> <span class="dv">4</span><span class="op">);</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> sensor_read_sample<span class="op">(</span><span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> ts_sample <span class="op">*</span>sample<span class="op">)</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> sensor_value temp_val<span class="op">,</span> hum_val<span class="op">;</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret<span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>dev<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_sample_fetch<span class="op">(</span>dev<span class="op">);</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;fetch failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_AMBIENT_TEMP<span class="op">,</span> <span class="op">&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;temp get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_HUMIDITY<span class="op">,</span> <span class="op">&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;humidity get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>temp_c <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>humidity_rh <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>soil_moisture_pct <span class="op">=</span> <span class="dv">0</span><span class="er">.0</span><span class="op">;</span> <span class="co">/* nem mért ebben a laborban */</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> sensor_thread<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>arg1<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>arg2<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>arg3<span class="op">)</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev <span class="op">=</span> <span class="op">(</span><span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*)</span>arg1<span class="op">;</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> seq <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> ts_sample sample<span class="op">;</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> ret <span class="op">=</span> sensor_read_sample<span class="op">(</span>dev<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">);</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ret <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>            sample<span class="op">.</span>seq <span class="op">=</span> <span class="op">++</span>seq<span class="op">;</span></span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>            sample<span class="op">.</span>ts_ms <span class="op">=</span> k_uptime_get<span class="op">();</span></span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>k_msgq_put<span class="op">(&amp;</span>sample_msgq<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">,</span> K_NO_WAIT<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>                LOG_WRN<span class="op">(</span><span class="st">&quot;sample queue full, dropping&quot;</span><span class="op">);</span></span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>                LOG_INF<span class="op">(</span><span class="st">&quot;sample seq=</span><span class="sc">%u</span><span class="st"> temp=</span><span class="sc">%.2f</span><span class="st"> hum=</span><span class="sc">%.2f</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a>                        sample<span class="op">.</span>seq<span class="op">,</span> sample<span class="op">.</span>temp_c<span class="op">,</span> sample<span class="op">.</span>humidity_rh<span class="op">);</span></span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>ret <span class="op">==</span> <span class="op">-</span>EBUSY <span class="op">||</span> ret <span class="op">==</span> <span class="op">-</span>EAGAIN<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a>            LOG_WRN<span class="op">(</span><span class="st">&quot;sensor busy, retrying&quot;</span><span class="op">);</span></span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a>            k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span><span class="dv">50</span><span class="op">));</span></span>
+<span id="cb8-73"><a href="#cb8-73" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb8-74"><a href="#cb8-74" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a>            LOG_ERR<span class="op">(</span><span class="st">&quot;sensor read failed: </span><span class="sc">%d</span><span class="st">, skipping cycle&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a>        k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span><span class="dv">1000</span><span class="op">));</span></span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-80"><a href="#cb8-80" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-81"><a href="#cb8-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-82"><a href="#cb8-82" aria-hidden="true" tabindex="-1"></a>K_THREAD_DEFINE<span class="op">(</span>sensor_tid<span class="op">,</span> <span class="dv">2048</span><span class="op">,</span> sensor_thread<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span> NULL<span class="op">,</span></span>
+<span id="cb8-83"><a href="#cb8-83" aria-hidden="true" tabindex="-1"></a>                K_PRIO_PREEMPT<span class="op">(</span><span class="dv">8</span><span class="op">),</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb8-84"><a href="#cb8-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-85"><a href="#cb8-85" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb8-86"><a href="#cb8-86" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-87"><a href="#cb8-87" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev <span class="op">=</span> DEVICE_DT_GET_ANY<span class="op">(</span>zephyr_sensor_sim<span class="op">);</span></span>
+<span id="cb8-88"><a href="#cb8-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-89"><a href="#cb8-89" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>device_is_ready<span class="op">(</span>dev<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb8-90"><a href="#cb8-90" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;sensor device not ready&quot;</span><span class="op">);</span></span>
+<span id="cb8-91"><a href="#cb8-91" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb8-92"><a href="#cb8-92" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-93"><a href="#cb8-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-94"><a href="#cb8-94" aria-hidden="true" tabindex="-1"></a>    LOG_INF<span class="op">(</span><span class="st">&quot;TerraSense sensor thread started&quot;</span><span class="op">);</span></span>
+<span id="cb8-95"><a href="#cb8-95" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Build és futtatás:</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i013</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">west</span> build <span class="at">-b</span> native_sim</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/zephyr/zephyr.exe</span></span></code></pre></div>
+<p><strong>Várt kimenet (részlet):</strong></p>
+<pre class="text"><code>[00:00:00.000,000] &lt;inf&gt; sensor_app: TerraSense sensor thread started
+[00:00:01.000,000] &lt;inf&gt; sensor_app: sample seq=1 temp=25.01 hum=48.72
+[00:00:02.000,000] &lt;inf&gt; sensor_app: sample seq=2 temp=25.04 hum=48.60
+...</code></pre>
+<p>A <code>sensor_sim</code> driver szinuszosan változtatja az
+értékeket, ezért a hőmérséklet és páratartalom kis mértékben ingadozik.
+A pontos értékek a szimulátor konfigurációjától függenek.</p>
+<p><strong>Takarítás:</strong><br />
+A labor saját könyvtárának tartalmát törölhetjük, de a továbbvitt
+eredmény miatt célszerű megőrizni a <code>src/main.c</code>, a
+<code>boards/native_sim.overlay</code> és a <code>prj.conf</code>
+fájlokat. A build mappa és az ideiglenes állományok
+<code>rm -rf build</code> paranccsal távolíthatók el.</p>
+<h3 data-number="6.1.6" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">6.1.6</span> Ellenőrzés és
+hibakeresés</h3>
+<p>Az alábbi táblázat a labor során gyakran előforduló hibákat és azok
+javítását foglalja össze.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>device_is_ready</code> hamis,
+<code>sensor device not ready</code> log</td>
+<td>A devicetree overlay nem töltődött be, vagy a driver Kconfig nem
+engedélyezett</td>
+<td>Ellenőrizzük a <code>boards/native_sim.overlay</code> fájlt és a
+<code>CONFIG_SENSOR_SIM=y</code> bejegyzést; töröljük a
+<code>build</code> mappát, és futtassunk újra
+<code>west build</code>-et</td>
+</tr>
+<tr class="even">
+<td><code>fetch failed: -22</code> (<code>-EINVAL</code>)</td>
+<td>A devicetree-ből kapott device pointer érvénytelen, vagy a csatorna
+nem támogatott</td>
+<td>Használjuk a <code>DEVICE_DT_GET_ANY(zephyr_sensor_sim)</code>
+makrót, és ellenőrizzük a devicetree node compatible értékét</td>
+</tr>
+<tr class="odd">
+<td><code>temp get failed: -95</code> (<code>-ENOTSUP</code>)</td>
+<td>A szenzor driver nem támogatja a kért csatornát</td>
+<td>Ellenőrizzük a <code>SENSOR_CHAN_AMBIENT_TEMP</code> és
+<code>SENSOR_CHAN_HUMIDITY</code> támogatását a driver
+dokumentációjában; más csatornát kérünk le</td>
+</tr>
+<tr class="even">
+<td><code>sample queue full, dropping</code></td>
+<td>A fogyasztó szál nem fut, vagy túl lassú</td>
+<td>Növeljük a <code>sample_msgq</code> méretét, vagy csökkentsük a
+mintavételi gyakoriságot</td>
+</tr>
+<tr class="odd">
+<td>A logban csak 0,00 értékek jelennek meg</td>
+<td>A <code>sensor_value_to_double</code> nem a várt típust kapja, vagy
+a driver nem állítja be az értékeket</td>
+<td>Ellenőrizzük a <code>sensor_value</code> struktúra
+<code>val1</code>/<code>val2</code> tartalmát debug loggal</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="6.1.7" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">6.1.7</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>A <code>fetch</code> és a <code>get</code>
+összekeverése.</strong><br />
+Gyakori hiba, hogy a fejlesztő minden <code>sensor_channel_get()</code>
+előtt új <code>fetch</code>-et hív, vagy éppen fordítva, elfelejti a
+<code>fetch</code>-et. Az első esetben a mérés feleslegesen lassul és nő
+az energiafogyasztás, a másodikban viszont ugyanazt az adatot olvassuk
+ki többször, vagy elavult értéket kapunk. A szabály: egy
+<code>fetch</code> után több <code>get</code> jön, amíg új mérésre nincs
+szükség.</p></li>
+<li><p><strong>Lebegőpontos pontosság túlértékelése.</strong><br />
+A <code>sensor_value_to_double()</code> kényelmes, de lebegőpontos
+reprezentációja nem alkalmas minden esetben. Ha például a hőmérsékletet
+tized fok pontossággal akarjuk elküldeni, a <code>double</code> értékből
+kerekítés után pontatlanság keletkezhet. Ilyenkor jobb a nyers
+<code>sensor_value</code> párt megőrizni, és csak a megjelenítésnél
+konvertálni.</p></li>
+<li><p><strong>Hibakezelés hiánya az átmeneti hibáknál.</strong><br />
+A <code>sensor_sample_fetch()</code> <code>-EBUSY</code> hibával is
+visszatérhet, ha a driver éppen egy másik mérést végez. Ha ezt a hibát
+tartós hibaként kezeljük és leállítjuk a mérést, a szenzor kiesik a
+rendszerből. A helyes megoldás a rövid késleltetés utáni
+újrapróbálkozás, ahogy a labor kódja teszi.</p></li>
+</ol>
+<h3 data-number="6.1.8" id="feladatok"><span
+class="header-section-number">6.1.8</span> Feladatok</h3>
+<p><strong>(a) Fogalmi kérdés</strong><br />
+Mi a különbség a <code>sensor_sample_fetch()</code> és a
+<code>sensor_channel_get()</code> között? Miért választja szét a Zephyr
+ezt a két műveletet?</p>
+<p><strong>(b) Számolási/tervezési feladat</strong><br />
+Egy szenzor a hőmérsékletet <code>sensor_value</code> formában adja
+vissza: <code>val1 = -5</code>, <code>val2 = 250000</code>. Hány °C az
+érték? Ha a relatív páratartalom <code>val1 = 99</code>,
+<code>val2 = 900000</code>, akkor hány százalék? Írd le az átváltás
+képletét.</p>
+<p><strong>(c) Implementációs feladat</strong><br />
+Egészítsd ki a labor <code>sensor_read_sample()</code> függvényét úgy,
+hogy a hívás legfeljebb háromszor próbálkozzon meg a
+<code>sensor_sample_fetch()</code> hívással, ha az <code>-EBUSY</code>
+vagy <code>-EAGAIN</code> hibát ad. Minden próbálkozás között 50 ms-ot
+várjon. Ha a harmadik próbálkozás is sikertelen, a függvény adja vissza
+az utolsó hibakódot.</p>
+<p><strong>(d) Kiterjesztési feladat</strong><br />
+A TerraSense rendszerben talajnedvesség-mérésre is szükség van. Tegyük
+fel, hogy a fejlesztőkártyán egy külön szenzor van, amely a
+<code>SENSOR_CHAN_DIE_TEMP</code> csatornát használja a
+talajhőmérséklethez. Egészítsd ki a <code>sensor_read_sample()</code>
+függvényt, hogy ha a devicetree-ben létezik egy második szenzor
+(<code>DEVICE_DT_GET_ANY(zephyr_soil_sim)</code>), olvassa le annak a
+hőmérsékletét is, és töltse be a
+<code>ts_sample.soil_moisture_pct</code> helyett egy új mezőbe (például
+<code>soil_temp_c</code>). A feladat célja a több szenzor kezelésének
+gyakorlása; a devicetree módosítása is szükséges.</p>
+<h3 data-number="6.1.9" id="megoldások"><span
+class="header-section-number">6.1.9</span> Megoldások</h3>
+<p><strong>(a)</strong><br />
+A <code>sensor_sample_fetch()</code> utasítja a szenzort a mérés
+elvégzésére, és megvárja, amíg az adat rendelkezésre áll. A
+<code>sensor_channel_get()</code> a már begyűjtött adatot olvassa ki a
+kiválasztott csatornából. A szétválasztás lehetővé teszi, hogy egyetlen
+fetch-csel több csatornát is lekérjünk, és a driver egyszerre töltse fel
+a belső pufferét.</p>
+<p><strong>(b)</strong><br />
+A <code>sensor_value</code> értéke =
+<code>val1 + val2 * 1e-6</code>.<br />
+Hőmérséklet:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mn>5</mn><mo>+</mo><mn>250000</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><mo>=</mo><mo>−</mo><mn>4</mn><mo>,</mo><mn>75</mn></mrow><annotation encoding="application/x-tex">-5 + 250000 \times 10^{-6} = -4{,}75</annotation></semantics></math>
+°C.<br />
+Páratartalom:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>99</mn><mo>+</mo><mn>900000</mn><mo>×</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><mo>=</mo><mn>99</mn><mo>,</mo><mn>90</mn></mrow><annotation encoding="application/x-tex">99 + 900000 \times 10^{-6} = 99{,}90</annotation></semantics></math>
+%RH.</p>
+<p><strong>(c)</strong></p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> sensor_read_sample<span class="op">(</span><span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> ts_sample <span class="op">*</span>sample<span class="op">)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> sensor_value temp_val<span class="op">,</span> hum_val<span class="op">;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret<span class="op">;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> attempts<span class="op">;</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>dev<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>attempts <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> attempts <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> attempts<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>        ret <span class="op">=</span> sensor_sample_fetch<span class="op">(</span>dev<span class="op">);</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ret <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>ret <span class="op">==</span> <span class="op">-</span>EBUSY <span class="op">||</span> ret <span class="op">==</span> <span class="op">-</span>EAGAIN<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>            LOG_WRN<span class="op">(</span><span class="st">&quot;fetch busy, attempt </span><span class="sc">%d</span><span class="st">/3&quot;</span><span class="op">,</span> attempts <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>            k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span><span class="dv">50</span><span class="op">));</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;fetch failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;fetch failed after retries&quot;</span><span class="op">);</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_AMBIENT_TEMP<span class="op">,</span> <span class="op">&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;temp get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_HUMIDITY<span class="op">,</span> <span class="op">&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;humidity get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>temp_c <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>humidity_rh <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>soil_moisture_pct <span class="op">=</span> <span class="dv">0</span><span class="er">.0</span><span class="op">;</span></span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>(d)</strong><br />
+A devicetree overlay bővítése:</p>
+<pre class="dts"><code>/ {
+    sensim: sensim {
+        compatible = &quot;zephyr,sensor-sim&quot;;
+    };
+
+    soil_sensim: soil_sensim {
+        compatible = &quot;zephyr,soil-sim&quot;;
+    };
+};</code></pre>
+<p>A C kódban:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> sensor_read_sample<span class="op">(</span><span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>dev<span class="op">,</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">const</span> <span class="kw">struct</span> device <span class="op">*</span>soil_dev<span class="op">,</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>                              <span class="kw">struct</span> ts_sample <span class="op">*</span>sample<span class="op">)</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> sensor_value temp_val<span class="op">,</span> hum_val<span class="op">,</span> soil_temp_val<span class="op">;</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ret<span class="op">;</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>dev <span class="op">||</span> <span class="op">!</span>soil_dev<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_sample_fetch<span class="op">(</span>dev<span class="op">);</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;fetch failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_AMBIENT_TEMP<span class="op">,</span> <span class="op">&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;temp get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>dev<span class="op">,</span> SENSOR_CHAN_HUMIDITY<span class="op">,</span> <span class="op">&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;humidity get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_sample_fetch<span class="op">(</span>soil_dev<span class="op">);</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;soil fetch failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>    ret <span class="op">=</span> sensor_channel_get<span class="op">(</span>soil_dev<span class="op">,</span> SENSOR_CHAN_DIE_TEMP<span class="op">,</span> <span class="op">&amp;</span>soil_temp_val<span class="op">);</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>        LOG_ERR<span class="op">(</span><span class="st">&quot;soil temp get failed: </span><span class="sc">%d</span><span class="st">&quot;</span><span class="op">,</span> ret<span class="op">);</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>temp_c <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>temp_val<span class="op">);</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>humidity_rh <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>hum_val<span class="op">);</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>soil_moisture_pct <span class="op">=</span> <span class="dv">0</span><span class="er">.0</span><span class="op">;</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>    sample<span class="op">-&gt;</span>soil_temp_c <span class="op">=</span> sensor_value_to_double<span class="op">(&amp;</span>soil_temp_val<span class="op">);</span></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Megjegyzés: a <code>compatible = "zephyr,soil-sim"</code> kitalált,
+valós driver helyett a <code>zephyr,sensor-sim</code> egy másik
+példányát is használhatjuk, és a csatornát a devicetree-ben kell
+beállítani. A feladat célja a több szenzorpéldány kezelésének
+gyakorlása.</p>
+<h3 data-number="6.1.10" id="rövid-összefoglaló"><span
+class="header-section-number">6.1.10</span> Rövid összefoglaló</h3>
+<p>A Zephyr sensor API a mérést két fázisra bontja:
+<code>sensor_sample_fetch()</code> indítja az adatgyűjtést,
+<code>sensor_channel_get()</code> pedig kiolvassa a kiválasztott
+csatorna értékét. A mért érték <code>sensor_value</code> struktúrában
+érkezik, amelyet <code>sensor_value_to_double()</code> segítségével
+fizikai mennyiséggé alakítunk. A laborban bekötöttük az emulált
+hőmérséklet- és páratartalom-szenzort, és létrehoztuk a
+<code>sensor_read_sample()</code> függvényt, amely a
+<code>ts_sample</code> struktúrát tölti meg. A mérőszál ezt a mintát az
+<code>sample_msgq</code> üzenetsoron továbbítja, <code>seq</code>
+sorszámmal és <code>ts_ms</code> uptime időbélyeggel. <strong>Továbbvitt
+eredmény:</strong> a <code>sensor_read_sample()</code> függvény, a
+<code>ts_sample</code> struktúra, a <code>sample_msgq</code> és a
+devicetree node <code>sensim</code>; ezt használja az <a
+href="i014.html">Mintavétel, kalibráció és szűrés</a> alfejezet a
+szűrőlogika beépítéséhez, az <a
+href="i018.html">Eszközszoftver-architektúra: rétegek és
+állapotgépek</a> alfejezet a rétegek kialakításához, és az <a
+href="i025.html">IP az eszközön: IPv6, 6LoWPAN, Thread és a Zephyr
+hálózati stack</a> alfejezet a hálózati küldéshez. A laborfájlok:
+<code>~/iot-labor/i013/CMakeLists.txt</code>,
+<code>~/iot-labor/i013/prj.conf</code>,
+<code>~/iot-labor/i013/boards/native_sim.overlay</code>,
+<code>~/iot-labor/i013/src/main.c</code>.</p>
+<h3 data-number="6.1.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">6.1.11</span> Források és ellenőrzési
+hiányok</h3>
+<p>A Zephyr sensor API (<code>sensor_sample_fetch</code>,
+<code>sensor_channel_get</code>, <code>sensor_value</code>) nevei és a
+<code>native_sim</code> build menete a Zephyr hivatalos
+dokumentációjából származnak. A <code>zephyr,sensor-sim</code>
+compatible string és a <code>CONFIG_SENSOR_SIM</code> Kconfig név a
+telepített Zephyr-verzióban ellenőrizendő; a fenti példa a leggyakrabban
+használt változatot mutatja, de a build rendszer pontos neve verziófüggő
+lehet. A <code>DEVICE_DT_GET_ANY()</code> makró használata szintén a
+Zephyr aktuális API-ját feltételezi; ha a fejlesztői környezet régebbi
+verziót használ, a <code>DT_DRV_COMPAT</code> definíciót kell
+megvizsgálni. A <code>sensor_sim</code> driver által generált értékek
+pontossága és időbeli viselkedése illusztratív, nem valós szenzor mérési
+eredménye.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i012.html">← 5.4 Devicetree és Kconfig: a hardver és a konfiguráció leírása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i014.html">6.2 Mintavétel, kalibráció és szűrés →</a></div>
+</nav>
+</body>
+</html>

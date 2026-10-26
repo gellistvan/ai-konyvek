@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>23.1 no_std, embedded-hal és Embassy: Rust mikrovezérlőn – Rust
+programozás C++-fejlesztőknek – a nulláról a mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – Haladó Rust: unsafe, FFI, makrók, típusrendszer, teljesítmény</a> › <a href="index.html#rch22">23 Beágyazott Rust kitekintés</a></p>
+<div class="links"><a class="prev" rel="prev" href="r049.html">← 22.1 Teljesítmény: mérés, profilozás, allokáció, release-beállítások</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r051.html">24.1 Záróprojekt: az rkv teljes rendszerként →</a></div>
+</nav>
+<h2 data-number="23.1" id="r050"><span
+class="header-section-number">23.1</span> no_std, embedded-hal és
+Embassy: Rust mikrovezérlőn</h2>
+<h3 data-number="23.1.1" id="motiváció"><span
+class="header-section-number">23.1.1</span> Motiváció</h3>
+<p>Egy tapasztalt C++ beágyazott fejlesztő pontosan tudja, milyen érzés,
+amikor a hibakeresés nem a logikáról, hanem arról szól, hogy valamelyik
+megszakításkezelő túlírta a másik regiszterét. A C++11–C++20 hiába ad
+RAII-t, okosmutatókat és erős típusokat, a tipikus beágyazott C/C++ kód
+mégis gyakran makrókba, <code>volatile</code> pointerekbe, kézi
+regisztercímekbe és globális perifériaobjektumokba fut. A
+<code>GPIOB-&gt;ODR |= (1 &lt;&lt; 5)</code> stílusú sorok nem
+típusbiztosak, semmi nem akadályozza meg, hogy egy bemenetre konfigurált
+lábon feszültséget írjunk, és az ownership hiánya mindenféle rejtett
+aliasolási hibát enged.</p>
+<p>A Rust válasza erre nem csupán „más szintaxis”, hanem a típusrendszer
+és az ownership bevonása a hardver erőforrásainak modellezésébe. Ugyanaz
+a Rust, amit a host-oldali rkv szerverben megismertünk, <code>std</code>
+nélkül is működik mikrovezérlőn. Amit a <a href="r038.html">Pin, Unpin,
+async trait-ek és Send-határok</a> és a <a href="r047.html">Newtype,
+PhantomData, typestate és const generikusok</a> alfejezetekben
+tanultunk, most a fizikai hardveren kap szerepet.</p>
+<h3 data-number="23.1.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">23.1.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <code>no_std</code> környezet olyan
+Rust-környezet, amelyben a <code>std</code> könyvtár nem érhető el. A
+<code>std</code> a <code>core</code> és az <code>alloc</code> fölé épül,
+és olyan szolgáltatásokat ad, mint a thread, a fájlrendszer, a dinamikus
+időzítés vagy a standard I/O. A <code>no_std</code> tehát nem azt
+jelenti, hogy semmilyen könyvtár nincs.</p>
+<p><strong>Szabály.</strong> <code>#![no_std]</code> crateszintű
+attribútummal a crate lemond a <code>std</code>-ről. Ekkor a
+<code>core</code> könyvtár automatikusan elérhető: ez tartalmazza a
+legalapvetőbb elemeket, például az <code>Option</code>,
+<code>Result</code>, <code>Iterator</code>, <code>Clone</code>,
+<code>Copy</code>, <code>Send</code>, <code>Sync</code>,
+<code>Sized</code>, a <code>slice</code> és a <code>str</code>
+típusokat, valamint a <code>core::ptr</code>, <code>core::mem</code>,
+<code>core::ops</code>, <code>core::fmt</code> modulokat. Az
+<code>alloc</code> könyvtár a <code>Vec</code>, <code>String</code>,
+<code>Box</code>, <code>Arc</code> és hasonló, kupacot igénylő típusokat
+biztosítja, de csak akkor, ha a program rendelkezik globális
+allokátorral.</p>
+<p><strong>Szabály.</strong> A <code>std</code>-től megfosztott bináris
+programban nincs normál <code>main</code>; helyette
+<code>#![no_main]</code> attribútumot használunk, és a belépési pontot
+magunk definiáljuk <code>#[no_mangle] pub extern "C" fn _start</code>
+függvénnyel, vagy a platform-specifikus HAL adja.
+<code>#![no_std]</code> binárisban kötelező egy
+<code>#[panic_handler]</code> függvény, amely
+<code>fn(&amp;PanicInfo) -&gt; !</code> szignatúrájú, és soha nem tér
+vissza.</p>
+<p><strong>Definíció.</strong> A beágyazott Rust-ökoszisztéma szokásos
+rétegződése: <strong>PAC</strong> (<em>Peripheral Access Crate</em>),
+<strong>HAL</strong> (<em>Hardware Abstraction Layer</em>),
+<strong>embedded-hal traitek</strong>, majd <strong>driverek</strong> és
+alkalmazás. A PAC a gyártó által definiált regiszterek szintjét adja, a
+HAL típusbiztos, kényelmes periféria-API-t, az embedded-hal traitek
+pedig gyártófüggetlen interfészeket.</p>
+<p><strong>Szabály.</strong> A perifériák szingletonok: minden fizikai
+periféria — például egy GPIO-blokk vagy egy UART-vezérlő — egyetlen
+Rust-értékként jelenik meg. A <code>take()</code> metódus
+<code>Option</code>-t ad vissza, és a tulajdon elvétele után a típus nem
+klónozható, nem <code>Copy</code>. Ezáltal a fordító garantálja, hogy
+két kódrészlet nem vezérelheti ugyanazt a hardvert.</p>
+<p><strong>Definíció.</strong> A <strong>typestate</strong> minta a
+periféria üzemmódját típusparaméterként ábrázolja: például
+<code>Pin&lt;P, Input&lt;Floating&gt;&gt;</code> és
+<code>Pin&lt;P, Output&gt;</code> különböző típusok. A konfiguráció
+tehát fordítási időben rögzül, és a
+<code>Pin&lt;P, Input&lt;Floating&gt;&gt;</code> típuson egyszerűen
+nincs <code>set_high</code> metódus.</p>
+<h3 data-number="23.1.3" id="c-rust-összevetés"><span
+class="header-section-number">23.1.3</span> C++ ↔︎ Rust összevetés</h3>
+<p>A tipikus C++ beágyazott GPIO-kezelő osztály így nézhet ki:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// cpp</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> GpioPin <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="kw">public</span><span class="op">:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">enum</span> <span class="kw">class</span> Mode <span class="op">{</span> Input<span class="op">,</span> Output<span class="op">,</span> InputPullUp <span class="op">};</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> configure<span class="op">(</span>Mode mode<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>      <span class="va">mode_</span> <span class="op">=</span> mode<span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>      <span class="co">// ... registers ...</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> set_high<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>      <span class="co">// Feltételezi, hogy a láb Output módban van!</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>      <span class="co">// ... registers ...</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>  <span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    Mode <span class="va">mode_</span><span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A C++ megoldásban az üzemmód futási idejű adattag, a
+<code>set_high()</code> hívás helyessége a fejlesztő fegyelmén múlik.
+Rossz üzemmód esetén a hiba legfeljebb futás közben derül ki, vagy
+egyáltalán nem.</p>
+<p>Rustban a typestate ezt a hibát fordítási időben zárja ki:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust (vázlat, konkrét PAC/HAL API nem szükséges hozzá)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">core::marker::</span>PhantomData<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Pin<span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">,</span> MODE<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    _mode<span class="op">:</span> PhantomData<span class="op">&lt;</span>MODE<span class="op">&gt;,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Input<span class="op">&lt;</span>MODE<span class="op">&gt;</span>(PhantomData<span class="op">&lt;</span>MODE<span class="op">&gt;</span>)<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Floating<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> PullUp<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Output<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> PushPull<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span><span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Input<span class="op">&lt;</span>Floating<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> into_pull_up_input(<span class="kw">self</span>) <span class="op">-&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Input<span class="op">&lt;</span>PullUp<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a gyártói referencia szerint a P láb konfigurálható</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>        <span class="co">// bemeneti felhúzó üzemmódba, és az adott hardver csak a mi</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// tulajdonunkban van, mert a take() korábban lefutott.</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> configure_input_pull_up_register(P) <span class="op">};</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>        Pin <span class="op">{</span> _mode<span class="op">:</span> PhantomData <span class="op">}</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> into_push_pull_output(<span class="kw">self</span>) <span class="op">-&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Output<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a konfiguráció után a láb kimenetként fog viselkedni;</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        <span class="co">// a regiszterhez tartozó invariánsok teljesülnek.</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> configure_push_pull_output_register(P) <span class="op">};</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        Pin <span class="op">{</span> _mode<span class="op">:</span> PhantomData <span class="op">}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span><span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Output<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set_high(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: az Output mód már garantálja, hogy a kimeneti regiszter</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>        <span class="co">// írható; a `&amp;mut self` kizárja az aliasolást.</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> write_output_high(P) <span class="op">};</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set_low(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> write_output_low(P) <span class="op">};</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>Pin&lt;P, Input&lt;Floating&gt;&gt;</code> értéken nincs
+<code>set_high</code>: a metódus csak a
+<code>Pin&lt;P, Output&gt;</code> típuson létezik. Az <code>into_</code>
+konverziók felemésztik a régi értéket, és az új üzemmódnak megfelelő
+típust adják vissza. Ez a destruktív mozgatás pontosan azt az
+ownership-gondolkodást használja, amit az <a href="r012.html">Ownership:
+minden értéknek egy tulajdonosa van</a> alapozott meg.</p>
+<h3 data-number="23.1.4" id="a-no_std-könyvtárak-rétegződése"><span
+class="header-section-number">23.1.4</span> A no_std könyvtárak
+rétegződése</h3>
+<p>Az alábbi ábra a beágyazott Rust tipikus rétegződését mutatja:</p>
+<figure>
+<img src="assets/r050-diagram-1.png"
+alt="Beágyazott Rust rétegábra - A no_std ökoszisztéma tipikus rétegei. Az embedded-hal traitek biztosítják a hordozható driver-réteget." />
+<figcaption aria-hidden="true">Beágyazott Rust rétegábra - A no_std
+ökoszisztéma tipikus rétegei. Az embedded-hal traitek biztosítják a
+hordozható driver-réteget.</figcaption>
+</figure>
+<p>A rétegek felülről lefelé haladva: az alkalmazás csak a driverek és a
+HAL típusait látja. A PAC a gyártói regiszterek elrendezését írja le,
+gyakran <code>unsafe</code> hozzáféréssel. A HAL ebből a nyers rétegből
+biztonságos absztrakciót épít, és az <a href="r042.html">Unsafe Rust:
+szuperképességek és felelősség</a> alfejezetben tanult elv érvényesül:
+az <code>unsafe</code> blokkok a legbelső rétegbe kerülnek, a kívülről
+látható API <code>safe</code>. Az embedded-hal traitek e fölé a
+gyártóspecifikus HAL fölé helyeznek egy közös interfész-réteget. Egy
+I2C-szenzor driver például nem az STM32 vagy RP2040 konkrét típusát,
+hanem az <code>embedded_hal::i2c::I2c</code> trait implementációját
+fogadja el, így a driver újrahasznosítható bármely támogatott MCU-n.</p>
+<h3 data-number="23.1.5"
+id="embassy-async-taskok-a-megszakítások-helyett"><span
+class="header-section-number">23.1.5</span> Embassy: async taskok a
+megszakítások helyett</h3>
+<p>A hagyományos beágyazott C++ kódban a nem blokkoló várakozást gyakran
+megszakításokkal, callbackekkel vagy eseményzászlókkal oldjuk meg.
+Például egy LED villogtatása rendszerint egy timer-interrupt és egy
+globális számláló köré épül. A Rust async ehelyett lehetővé teszi, hogy
+a várakozási logikát lineáris kódban írjuk le, miközben az executor a
+várakozás idején más taskokat futtat.</p>
+<p>Az Embassy ezt a modellt viszi beágyazott környezetbe. A
+<code>Future</code> pollozását a <a href="r037.html">Future-ök és
+async/await</a> alfejezetben megismertük; Embassyben a pollozás nem egy
+host OS szálon, hanem a mikrokontroller megszakításaihoz kötve történik.
+Amikor a <code>Timer::after(...).await</code> fut, a future az
+executorra bízza a task felfüggesztését, a hardver timer pedig
+megszakítással ébreszti fel újra.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust (vázlat; a konkrét periféria-típus targetfüggő, ellenőrizendő,</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// és az Embassy API pontos neveit a docs.rs-en ellenőrizni kell)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">#![</span>no_std<span class="at">]</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">#![</span>no_main<span class="at">]</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">embassy_executor::</span>Spawner<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">embassy_time::</span><span class="op">{</span>Duration<span class="op">,</span> Timer<span class="op">};</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co">// A `Toggleable` itt a HAL-rétegben definiált, Output módú lábat</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">// absztraháló trait; a konkrét példány a targettől függ.</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="kw">trait</span> Toggleable <span class="op">{</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> toggle(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">embassy_executor::</span>main<span class="at">]</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main(_spawner<span class="op">:</span> Spawner) <span class="op">-&gt;</span> <span class="op">!</span> <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">// `led` létrehozása a HAL/PAC réteg segítségével történik.</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A konkrét típus például `stm32::gpio::Output` vagy</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// `rp_pico::gpio::Pin&lt;Output&gt;` lehet.</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> led <span class="op">=</span> create_led_output()<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        led<span class="op">.</span>toggle()<span class="op">;</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Timer::</span>after(<span class="pp">Duration::</span>from_millis(<span class="dv">500</span>))<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kódban a <code>led.toggle()</code> szinkron művelet, a
+várakozás viszont async. A <code>Timer::after</code> által visszaadott
+future a hardver idősítőjére épül, és az <code>embassy-time</code>
+könyvtár gondoskodik a megszakításvezérelt ébresztésről. A
+<code>no_std</code> és <code>no_main</code> itt is jelen van, de a
+<code>main</code> makró generálja a belépési pontot és a
+panic-kezelést.</p>
+<p><strong>Szabály.</strong> Embassy async taskok futtatásához szükséges
+egy executor. A <code>#[embassy_executor::main]</code> makró egy
+beépített main-executort konfigurál, de a taskokat általában a
+<code>Spawner</code> segítségével indítjuk, és a felhasznált
+Embassy-runtime-hoz a targetnek megfelelő feature-öket kell bekapcsolni
+a <code>Cargo.toml</code>-ban. A pontos API és a feature-ök
+verziófüggők.</p>
+<h3 data-number="23.1.6" id="labor-no_std-kísérlet"><span
+class="header-section-number">23.1.6</span> Labor: no_std kísérlet</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/r050/</code></p>
+<p>A labor célja, hogy a <code>no_std</code> korlátait kis léptékben
+megtapasztaljuk, mielőtt valódi mikrokontrolleres targetre váltanánk.
+Készíts egy <code>no_std</code> könyvtárcrate-et, amely csak a
+<code>core</code>-t használja:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/rust-labor/r050</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/r050</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> new <span class="at">--lib</span> nostd-core <span class="at">--vcs</span> none</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> nostd-core</span></code></pre></div>
+<p>A <code>src/lib.rs</code> tartalma:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">#![</span>no_std<span class="at">]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> clamp(value<span class="op">:</span> <span class="dt">i32</span><span class="op">,</span> min<span class="op">:</span> <span class="dt">i32</span><span class="op">,</span> max<span class="op">:</span> <span class="dt">i32</span>) <span class="op">-&gt;</span> <span class="dt">i32</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> value <span class="op">&lt;</span> min <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        min</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> value <span class="op">&gt;</span> max <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        max</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        value</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span>cfg<span class="at">(</span>test<span class="at">)]</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">mod</span> tests <span class="op">{</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">use</span> <span class="kw">super</span><span class="pp">::</span><span class="op">*;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">#[</span>test<span class="at">]</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> clamp_bounds() <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(clamp(<span class="dv">5</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">10</span>)<span class="op">,</span> <span class="dv">5</span>)<span class="op">;</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(clamp(<span class="op">-</span><span class="dv">3</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">10</span>)<span class="op">,</span> <span class="dv">0</span>)<span class="op">;</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        <span class="pp">assert_eq!</span>(clamp(<span class="dv">11</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">10</span>)<span class="op">,</span> <span class="dv">10</span>)<span class="op">;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítsd le és futtasd a teszteket:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test</span></code></pre></div>
+<p>A könyvtárcrate <code>no_std</code> módban is gond nélkül fordul a
+host gépen, mert nem használ <code>std</code>-t. Próbáld ki, mi
+történik, ha <code>String</code>-et vagy <code>Vec</code>-et akarsz
+létrehozni a <code>clamp</code> függvényben: a fordító hibát ad, mert az
+<code>alloc</code> nincs engedélyezve. Ez a kísérlet előkészíti, hogy
+miért fontos a <code>no_std</code> réteg tudatos használata.</p>
+<p><strong>Opcionális labor.</strong> A valós beágyazott futtatás
+QEMU-ban vagy fizikai kártyán ennek a fejezetnek a keretein túlmutat, de
+a teljesség kedvéért érdemes megemlíteni. Egy ARM Cortex-M target esetén
+például a <code>thumbv7em-none-eabihf</code> target telepítése után egy
+hasonló vázlat fordítható:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">rustup</span> target add thumbv7em-none-eabihf</span></code></pre></div>
+<p>A teljes bináris futtatáshoz azonban linker-szkript, boot-kód és a
+célhardverhez illeszkedő <code>memory.x</code> fálj is szükséges; ezek
+pontos tartalma függ a választott MCU-tól, és a QEMU-val való emuláció
+beállításait ellenőrizni kell a <code>cortex-m</code> és
+<code>cortex-m-rt</code> crate-ek aktuális dokumentációjában.</p>
+<h3 data-number="23.1.7" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">23.1.7</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><p><strong><code>Vec</code> és <code>String</code> használata
+<code>no_std</code> kódban automatikusan.</strong> A
+<code>std</code>-hez kötött típusok nem érhetők el, hacsak nem
+engedélyezzük az <code>alloc</code>-ot és nem biztosítunk globális
+allokátort egy beágyazott targeten. A <a href="r019.html">Box, Rc, Arc
+és Weak</a> alfejezetben tanult <code>Box</code> is csak akkor elérhető,
+ha az <code>alloc</code> jelen van és allokátor van
+konfigurálva.</p></li>
+<li><p><strong>A <code>panic_handler</code> hiánya.</strong> A
+<code>no_std</code> binárisban a <code>panic!</code> makró futási idejű
+hibát jelez, de ennek kezelése nincs beépítve. Fordítói/linkelési hiba
+keletkezik, ha a program nem definiál <code>#[panic_handler]</code>-t. A
+host-oldali <code>std</code> automatikusan ad panichandler-t, a
+beágyazott világban ezt kézzel kell megadni.</p></li>
+<li><p><strong>A periféria-singleton klónozása.</strong> A
+<code>take()</code> által visszaadott periféria nem <code>Clone</code>
+és nem <code>Copy</code>. A gyakori vágy, hogy két helyen is
+hozzáférjünk ugyanahhoz a perifériához, arra csábít, hogy
+<code>unsafe</code> pointereket vagy <code>RefCell</code>-t használjunk.
+A helyes Rust-idióma az, hogy a perifériát csatornán vagy
+<code>Arc&lt;Mutex&lt;...&gt;&gt;</code> mögé tesszük, ahogyan a <a
+href="r034.html">Mutex, RwLock, csatornák és a megosztott rkv</a> tette
+a host-oldali <code>Store</code>-ral.</p></li>
+<li><p><strong>A typestate kikerülése.</strong> Az
+<code>into_push_pull_output</code> utáni
+<code>Pin&lt;P, Output&gt;</code> típus nem engedi a bemeneti
+konfigurációs metódust, de ha a fejlesztő a hardverregisztert
+<code>unsafe</code> közvetlenül írja, akkor a typestate által adott
+garancia elveszik. A szabály itt is: az <code>unsafe</code> csak a
+legalsó rétegben, világos <code>// SAFETY:</code> indoklással.</p></li>
+</ol>
+<h3 data-number="23.1.8" id="feladatok"><span
+class="header-section-number">23.1.8</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Fogalmi kérdés.</strong> Mondd meg, melyik típus érhető
+el <code>#![no_std]</code> környezetben <code>alloc</code> nélkül:
+<code>Option</code>, <code>String</code>, <code>Vec</code>,
+<code>Result</code>, <code>Arc</code>, <code>core::iter::Map</code>.
+Indokold.</p></li>
+<li><p><strong>C++-kód átírása idiomatikus Rustra.</strong> Adott egy
+C++ generátorfüggvény, amely egy <code>std::vector&lt;int&gt;</code>-et
+ad vissza, és egy beágyazott hőmérséklet-szenzor kalibrációs értékeit
+olvassa. Írd át a logikát <code>no_std</code>-kompatibilis Rustra, amely
+statikusan lefoglalt puffert vagy a <code>heapless::Vec</code> típust
+használ. (A <code>heapless</code> útvonalat ellenőrizni kell a
+docs.rs-en.)</p></li>
+<li><p><strong>Typestate GPIO implementáció az rkv-mintában.</strong>
+Hozz létre az <code>rkv</code> workspace-től függetlenül egy
+<code>rkv-embedded</code> nevű gyakorló crate-et a
+<code>~/rust-labor/r050/rkv-embedded/</code> könyvtárban. Valósíts meg
+egy <code>Pin&lt;const P: u8, MODE&gt;</code> vázlatot
+<code>Input&lt;Floating&gt;</code>, <code>Input&lt;PullUp&gt;</code> és
+<code>Output</code> típusokkal, valamint
+<code>into_pull_up_input</code>, <code>into_push_pull_output</code>,
+<code>set_high</code>, <code>set_low</code> metódusokkal. A
+regiszter-hozzáférést egy üres <code>unsafe fn</code> hívással
+szimuláld. Fordíttasd le a crate-et.</p></li>
+<li><p><strong>Refaktorálási döntés.</strong> Az Embassy async
+LED-villogtatóban szeretnénk a LED-et egy másik taskból is vezérelni.
+Milyen típusú megosztást választanál, és miért? Írd le a kódvázat a
+<code>Spawner</code> és az <code>embassy_sync::Mutex</code>
+felhasználásával. (A pontos API-t ellenőrizni kell.)</p></li>
+</ol>
+<h3 data-number="23.1.9" id="megoldások"><span
+class="header-section-number">23.1.9</span> Megoldások</h3>
+<ol type="1">
+<li><p>Az <code>Option</code>, <code>Result</code> és a
+<code>core::iter::Map</code> elérhetők, mert a <code>core</code>-ban
+vannak. A <code>String</code>, <code>Vec</code> és <code>Arc</code> nem
+elérhetők <code>alloc</code> nélkül, mert kupacfoglalást igényelnek. Az
+<code>alloc</code> csak akkor adja ezeket, ha a crate bekapcsolja az
+<code>extern crate alloc;</code> sort és van globális
+allokátor.</p></li>
+<li><p>A C++ <code>std::vector&lt;int&gt;</code> helyett statikus puffer
+vagy <code>heapless::Vec</code> használható. Egy lehetséges
+Rust-változat:</p></li>
+</ol>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="at">#![</span>no_std<span class="at">]</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co">// A heapless::Vec használatakor a crate a Cargo.toml-ban:</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co">// heapless = &quot;0.8&quot; (ellenőrizendő a főverzió)</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">heapless::</span><span class="dt">Vec</span><span class="op">;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">fn</span> read_calibration_values<span class="op">&lt;</span><span class="kw">const</span> N<span class="op">:</span> <span class="dt">usize</span><span class="op">&gt;</span>(sensor<span class="op">:</span> <span class="op">&amp;</span><span class="kw">dyn</span> Sensor)</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">-&gt;</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">i32</span><span class="op">,</span> N<span class="op">&gt;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> values <span class="op">=</span> <span class="dt">Vec</span><span class="pp">::</span>new()<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span>N <span class="op">{</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Some</span>(v) <span class="op">=</span> sensor<span class="op">.</span>read_calibration(i) <span class="op">{</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>            <span class="co">// A push itt is hibát ad, ha a puffer tele van.</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> _ <span class="op">=</span> values<span class="op">.</span>push(v)<span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    values</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> Sensor <span class="op">{</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> read_calibration(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> index<span class="op">:</span> <span class="dt">usize</span>) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">i32</span><span class="op">&gt;;</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>Vec&lt;i32, N&gt;</code> a <code>heapless</code> crate
+típusa, amely statikus kapacitással rendelkezik. A <code>no_std</code>
+ezt tökéletesen támogatja, mert nincs dinamikus allokáció.</p>
+<ol start="3" type="1">
+<li>A <code>rkv-embedded</code> crate <code>src/lib.rs</code>
+tartalma:</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="at">#![</span>no_std<span class="at">]</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">core::marker::</span>PhantomData<span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Pin<span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">,</span> MODE<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    _mode<span class="op">:</span> PhantomData<span class="op">&lt;</span>MODE<span class="op">&gt;,</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Input<span class="op">&lt;</span>MODE<span class="op">&gt;</span>(PhantomData<span class="op">&lt;</span>MODE<span class="op">&gt;</span>)<span class="op">;</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Floating<span class="op">;</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> PullUp<span class="op">;</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> Output<span class="op">;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span><span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Input<span class="op">&lt;</span>Floating<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> into_pull_up_input(<span class="kw">self</span>) <span class="op">-&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Input<span class="op">&lt;</span>PullUp<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: szimulált konfiguráció; a valódi regiszter-hozzáférés</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>        <span class="co">// invariánsait a PAC dokumentációja adja.</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> configure_input_pull_up(P) <span class="op">};</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>        Pin <span class="op">{</span> _mode<span class="op">:</span> PhantomData <span class="op">}</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> into_push_pull_output(<span class="kw">self</span>) <span class="op">-&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Output<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: szimulált konfiguráció.</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> configure_push_pull_output(P) <span class="op">};</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>        Pin <span class="op">{</span> _mode<span class="op">:</span> PhantomData <span class="op">}</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span><span class="op">&lt;</span><span class="kw">const</span> P<span class="op">:</span> <span class="dt">u8</span><span class="op">&gt;</span> Pin<span class="op">&lt;</span>P<span class="op">,</span> Output<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set_high(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: az Output mód birtoklása kizárja, hogy bemeneti regisztert</span></span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>        <span class="co">// írnánk; a &amp;mut self biztosítja a kizárólagos hozzáférést.</span></span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> write_output_high(P) <span class="op">};</span></span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">pub</span> <span class="kw">fn</span> set_low(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">{</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> write_output_low(P) <span class="op">};</span></span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> configure_input_pull_up(_pin<span class="op">:</span> <span class="dt">u8</span>) <span class="op">{}</span></span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> configure_push_pull_output(_pin<span class="op">:</span> <span class="dt">u8</span>) <span class="op">{}</span></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> write_output_high(_pin<span class="op">:</span> <span class="dt">u8</span>) <span class="op">{}</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> write_output_low(_pin<span class="op">:</span> <span class="dt">u8</span>) <span class="op">{}</span></span></code></pre></div>
+<p>A <code>cargo build</code> parancs a <code>rkv-embedded</code>
+könyvtárban a <code>no_std</code> könyvtárcrate-et sikeresen
+lefordítja.</p>
+<ol start="4" type="1">
+<li>A LED megosztásához két task között
+<code>embassy_sync::Mutex&lt;...&gt;</code> típust érdemes használni,
+mert az Embassy runtime-hoz illeszkedő, async-barát mutex, amely nem
+blokkolja a taskokat. A kódváz:</li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rust (vázlat)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">embassy_sync::</span>Mutex<span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">embassy_sync::blocking_mutex::raw::</span>CriticalSectionRawMutex<span class="op">;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> SharedLed <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    led<span class="op">:</span> Mutex<span class="op">&lt;</span>CriticalSectionRawMutex<span class="op">,</span> <span class="dt">Option</span><span class="op">&lt;</span>Led<span class="op">&gt;&gt;,</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">embassy_executor::</span>task<span class="at">]</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> blink(shared<span class="op">:</span> <span class="op">&amp;</span><span class="ot">&#39;static</span> SharedLed) <span class="op">{</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> shared<span class="op">.</span>led<span class="op">.</span>lock()<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Some</span>(led) <span class="op">=</span> guard<span class="op">.</span>as_mut() <span class="op">{</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        led<span class="op">.</span>toggle()<span class="op">;</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>static</code> élettartam itt a beágyazott világban gyakori,
+mert a periféria-singletonok általában a program teljes életére szólnak.
+A pontos Embassy-szinkronizációs típus neve és a
+<code>CriticalSectionRawMutex</code> elérhetősége verziófüggő; a fenti
+vázlat ellenőrzést igényel.</p>
+<h3 data-number="23.1.10" id="rövid-összefoglaló"><span
+class="header-section-number">23.1.10</span> Rövid összefoglaló</h3>
+<p>A <code>no_std</code> környezet a <code>std</code> könyvtár
+elhagyását jelenti, de a <code>core</code> mindig elérhető, az
+<code>alloc</code> opcionális. A beágyazott Rust-ökoszisztéma rétegei:
+PAC → HAL → embedded-hal traitek → driverek. A perifériák szingletonok,
+a <code>take()</code> egyszeri ownershipet ad. A typestate minta a
+GPIO-láb üzemmódját típusparaméterként kezeli, így a
+<code>Pin&lt;P, Output&gt;</code> típus rendelkezik
+<code>set_high</code> metódussal, a
+<code>Pin&lt;P, Input&lt;Floating&gt;&gt;</code> nem. Az Embassy a Rust
+async modellt viszi beágyazott környezetbe: a
+<code>Timer::after(...).await</code> megszakításvezérelt ébresztéssel
+várakozik, miközben más taskok futhatnak. A <code>#![no_std]</code>
+binárisban <code>#![no_main]</code> és <code>#[panic_handler]</code>
+szükséges. <strong>Továbbvitt eredmény.</strong> A <a
+href="r052.html">Összefoglalás: C++→Rust fordítási kézikönyv és
+továbbtanulás</a> ezt a rétegződést és a no_std-elméletet használja
+tovább: a beágyazott és host-oldali Rust ugyanazokra a típusrendszeri
+alapokra épül, és a C++-ból hozott minták itt is az ownership, a
+generikusok és a trait-ek nyelvére fordíthatók.</p>
+<h3 data-number="23.1.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">23.1.11</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>A Rust Reference <code>#![no_std]</code>, <code>#![no_main]</code>
+és <code>panic_handler</code> leírása a
+<code>doc.rust-lang.org</code>-on elérhető, de a konkrét szakaszok
+verziófüggők.</li>
+<li>Az <code>embedded-hal</code> trait-dokumentációja a docs.rs-en
+ellenőrzendő; az 1.x-es <code>OutputPin::set_high/set_low</code>
+szignatúrája a felhasznált főverzió szerint változhat.</li>
+<li>Az Embassy <code>embassy-executor</code>, <code>embassy-time</code>
+és <code>embassy-sync</code> API-ja gyorsan fejlődik; a kódvázlatokban
+jelzett típusokat és makrókat a jelenlegi stable toolchainre a
+docs.rs-en ellenőrizni kell.</li>
+<li>A QEMU-val történő emuláció pontos beállításait és a
+<code>cortex-m-rt</code> linker-szkriptjének aktuális leírását a
+kapcsolódó dokumentációval kell ellenőrizni.</li>
+<li>A <code>heapless::Vec</code> főverziója és
+<code>no_std</code>-kompatibilitása a crate aktuális dokumentációjában
+ellenőrizendő.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r049.html">← 22.1 Teljesítmény: mérés, profilozás, allokáció, release-beállítások</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r051.html">24.1 Záróprojekt: az rkv teljes rendszerként →</a></div>
+</nav>
+</body>
+</html>

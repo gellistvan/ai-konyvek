@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.5 Log- és állapotdiagnosztikai labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch17">17 Linux naplók, audit és állapotmegfigyelés</a></p>
+<div class="links"><a class="prev" rel="prev" href="d084.html">← 17.4 Core dump, kernel crash és diagnosztikai artifact</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d086.html">18.1 Device naming, GPT és partitionkezelés →</a></div>
+</nav>
+<h2 data-number="17.5" id="d085"><span
+class="header-section-number">17.5</span> Log- és állapotdiagnosztikai
+labor</h2>
+<h3 data-number="17.5.1" id="motiváció-és-laborcél"><span
+class="header-section-number">17.5.1</span> Motiváció és laborcél</h3>
+<p>Egy éles rendszerben a szolgáltatás kiesésekor a fejlesztői ösztön
+először a kódot vagy a buildet vizsgálja. A sysadmin szempontból viszont
+a kiesés körülményeit előbb a rendszer állapota és naplói mutatják meg.
+Ebben a laborban egy <code>labhost1</code> Ubuntu Server 24.04 LTS VM-en
+futó <code>labservice</code> eseményeiből készítünk bizonyítékalapú
+reportot, miközben több logforrást – journald, syslog, auditd –
+egyeztetünk. A cél nem a szolgáltatás azonnali újraindítása, hanem egy
+olyan, titkokat nem tartalmazó rekonstrukció, amely a jövőben is
+reprodukálható, és a monitoring/alerting felé továbbkapcsolható.</p>
+<h3 data-number="17.5.2" id="definíciók-és-diagnosztikai-keret"><span
+class="header-section-number">17.5.2</span> Definíciók és diagnosztikai
+keret</h3>
+<p><strong>Logforrás</strong> alatt olyan strukturált vagy félig
+strukturált eseményfolyamot értünk, amely időbélyeggel, kibocsátó
+identitással és üzenettel rendelkezik. A Linux hoston a három
+legfontosabb forrás: a <code>systemd-journald</code> által gyűjtött
+napló (unit, boot és time scoped lekérdezéssel), a syslog (hagyományos
+facility/severity besorolással), valamint az auditd kernel- és
+felhasználói térben keletkező biztonsági eseményei. A
+<strong>retention</strong> a napló megőrzési idejét és méretkorlátját
+jelenti; ha egy esemény kiesik a retention ablakaiból, akkor a hiányt
+nem szabad hibás alkalmazásként értelmezni. A <strong>bizonyítékalapú
+report</strong> olyan, aláírt vagy legalább hash-elt kimenetű
+dokumentum, amely a forrásokat, az időablakot és a levont
+következtetéseket egyértelműen összeköti, titkos adatokat (jelszó,
+kulcs, token) pedig nem tartalmaz.</p>
+<p>A diagnosztikai ciklus a d004 alfejezetben tanult hipotézisvezérelt
+megközelítést követi: rendelkezésre álló adat → hipotézis → célzott
+adatgyűjtés → egy változtatás → verifikáció. Itt az adatgyűjtés a
+naplókon és az állapotjelzőkön alapul.</p>
+<h3 data-number="17.5.3"
+id="kidolgozott-példa-restart-ciklus-és-logrotate-open-fd"><span
+class="header-section-number">17.5.3</span> Kidolgozott példa: restart
+ciklus és logrotate open FD</h3>
+<p>A labor a következő kiindulási állapotból indul:</p>
+<ul>
+<li><strong>host:</strong> <code>labhost1</code> (labVM, Ubuntu 24.04
+LTS)</li>
+<li><strong>felhasználó:</strong> <code>labadmin</code> (UID 1000), sudo
+jogosultság a diagnosztikai parancsokra</li>
+<li><strong>szolgáltatás:</strong> <code>labservice</code> systemd unit,
+egy egyszerű C++ HTTP service a 8080-as porton; user context
+<code>labservice</code> (UID 2001)</li>
+<li><strong>log könyvtár:</strong> <code>/var/log/labservice</code></li>
+<li><strong>cél:</strong> a 02:00–03:00 közötti kiesés okának
+felderítése és egy rövid, reprodukciós report elkészítése</li>
+</ul>
+<p>A szolgáltatás a következő hibát mutatja: a rendszer 02:13-tól
+ismétlődően restartolja a <code>labservice</code>-t, de az soha nem
+marad futva. A diagnosztikai lépéseket futtatjuk.</p>
+<p>Első lépésként a unit-scoped journal exportot készítünk:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin, UID: 1000, előfeltétel: journald fut</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-u</span> labservice <span class="at">--since</span> <span class="st">&quot;2025-01-15 02:00:00&quot;</span> <span class="at">--until</span> <span class="st">&quot;2025-01-15 03:00:00&quot;</span> <span class="at">--output</span><span class="op">=</span>short-precise</span></code></pre></div>
+<p>Várható, illusztratív kimenet (a tényleges futtatás nélkül):</p>
+<pre><code>Jan 15 02:13:11.482213 labhost1 systemd[1]: Started labservice web endpoint.
+Jan 15 02:13:11.501129 labhost1 labservice[18211]: error: cannot open /var/log/labservice/access.log: Permission denied
+Jan 15 02:13:11.502034 labhost1 systemd[1]: labservice.service: Main process exited, code=exited, status=1/FAILURE
+Jan 15 02:13:12.507118 labhost1 systemd[1]: labservice.service: Scheduled restart job, restart counter is at 1.
+...</code></pre>
+<p>A journald bejegyzés egyértelműen mutatja a permission hibát. Most
+megvizsgáljuk a fájlok tulajdonosát:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /var/log/labservice/</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">getfacl</span> /var/log/labservice/access.log <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="bu">echo</span> <span class="st">&quot;getfacl not installed or not applicable&quot;</span></span></code></pre></div>
+<p>Feltételezett kimenet:</p>
+<pre><code>-rw-r----- 1 root root 0 Jan 15 02:12 access.log</code></pre>
+<p>A hiba oka: a logfájlt a root hozta létre a logrotate tesztfutása
+során, de a <code>labservice</code> user nem tud írni bele. A systemd a
+szolgáltatást <code>Restart=always</code> beállítással futtatja, ezért a
+sérült állapot rövid időn belül restart ciklust okoz.</p>
+<p>Ellenőrizzük a logrotate konfigurációt, és azt, hogy a szolgáltatás
+nyitva tartja-e a file descriptor-t:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> grep <span class="at">-R</span> <span class="st">&quot;labservice&quot;</span> /etc/logrotate.d/ /etc/logrotate.conf</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lsof <span class="at">-p</span> <span class="va">$(</span><span class="ex">pgrep</span> <span class="at">-f</span> labservice<span class="va">)</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&quot;access.log|deleted&quot;</span></span></code></pre></div>
+<p>Ha a szolgáltatás futna, a <code>lsof</code> esetleg mutatná, hogy
+egy régi inode-ra hivatkozik (deleted jelölés mellett). Most a
+szolgáltatás nem fut, ezért a <code>lsof</code> nem ad találatot. A
+logrotate hibája: a <code>postrotate</code> szekció nem küld
+<code>HUP</code> jelzést a folyamatnak, vagy a szolgáltatás nem kezeli
+azt; így a rotáció után a nyitott FD a régi fájlra mutat. Ezt a
+jelenséget <strong>open FD fixture</strong>-nek nevezzük, mert
+reprodukálható módon befagyasztja a naplóírást.</p>
+<p>Az audit logban megkeressük a változtatási markert:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ausearch <span class="at">-f</span> /var/log/labservice/access.log <span class="at">--format</span> text</span></code></pre></div>
+<p>Várható kimenetrészlet:</p>
+<pre><code>time-&gt;Tue Jan 15 02:12:45 2025
+type=PATH msg=audit(1705286565.412:119): item=0 name=&quot;/var/log/labservice/access.log&quot; ...
+type=SYSCALL msg=audit(1705286565.412:119): arch=x86_64 syscall=257 success=no exit=-13 errno=EACCES ...</code></pre>
+<p>Ez a marker igazolja, hogy a létrehozás vagy módosítás 02:12:45-kor
+történt, és a <code>labservice</code> user írása <code>EACCES</code>
+hibával járt. A syslogban ugyanez az esemény a <code>systemd</code> unit
+naplójából is kinyerhető.</p>
+<p>A javítás egyetlen változtatás: a logfájl tulajdonosának módosítása,
+majd a <code>logrotate</code> konfigurációban a <code>su</code>
+direktíva és a <code>postrotate</code> jelzés beállítása. A módosítás
+előtt az audit log rögzíti a változtatást:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin; módosító parancs, rollback: sudo chown root:root /var/log/labservice/access.log</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown labservice:labservice /var/log/labservice/access.log</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart labservice</span></code></pre></div>
+<p>Ellenőrzés:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> <span class="at">-l</span> /var/log/labservice/access.log</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl is-active labservice</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-u</span> labservice <span class="at">--since</span> <span class="st">&quot;2025-01-15 03:05:00&quot;</span> <span class="at">--output</span><span class="op">=</span>short-precise <span class="kw">|</span> <span class="fu">tail</span> <span class="at">-n</span> 5</span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre><code>-rw-r----- 1 labservice labservice 1230 Jan 15 03:07 access.log
+active
+Jan 15 03:07:02.115321 labhost1 systemd[1]: Started labservice web endpoint.</code></pre>
+<p>A javítás után a szolgáltatás fut, és a naplóba ír.</p>
+<p>A report elkészítéséhez a parancsok kimeneteit hash-elve rögzítjük,
+és a riportból kihagyjuk a környezet érzékeny adatait (például IP címek,
+felhasználói nevek, ha azok nem szükségesek). A report szekciói: cél,
+források, időablak, eseménysor, root cause, javítás, ellenőrzés,
+monitoring következtetés. A riport tartalmazzon a
+<code>journalctl</code> exportból származó kulcssorokat, de teljes
+dumpot nem.</p>
+<h3 data-number="17.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">17.5.4</span> Hibák és ellenpróbák</h3>
+<ol type="1">
+<li><p><strong>Több logforrás egyidejű elmulasztása.</strong> Ha csak a
+syslogot nézzük, a journald-ben rejtett systemd indítási okok elvesznek.
+Hipotézis: “a service nem indult el”; valójában a journald megmutatja,
+hogy a folyamat elindult, majd a permission hiba miatt kilépett.
+Adatgyűjtés: <code>journalctl -u</code> és
+<code>ausearch</code>.</p></li>
+<li><p><strong>A logrotate open FD figyelmen kívül hagyása.</strong> A
+rotáció sikeresnek tűnik, de a szolgáltatás továbbra is a régi inode-ra
+ír. Ellenpróba: <code>lsof | grep deleted</code> mutatja a nyitott, de
+törölt fájlt. A javítás a <code>postrotate</code> jelzés, nem a logfájl
+törlése.</p></li>
+<li><p><strong>A permission hiba összekeverése a disk full-lal.</strong>
+Mindkét esetben a szolgáltatás nem tud írni, de a hibaüzenet különbözik:
+permission esetén <code>EACCES</code>, disk full esetén
+<code>ENOSPC</code>. Az <code>echofree</code> és <code>df -i</code>
+futtatása megkülönbözteti. Hipotézis: “nincs elég hely”; ellenőrzés:
+<code>df -h /var/log/labservice</code> és <code>df -i</code>. Ha a disk
+full, a <code>fallocate</code> nem sikerül; ha permission, a
+<code>df</code> nem jelez.</p></li>
+<li><p><strong>A retention hiba téves diagnózisa.</strong> A régi napló
+hiányát nem feltétlenül törlés okozza, hanem a
+<code>SystemMaxUse=</code> vagy a <code>logrotate rotate N</code>
+beállítás. A <code>journalctl --disk-usage</code> és a logrotate
+konfiguráció ellenőrzése szükséges. A hiányzó adatot nem lehet
+visszahozni, de a konfigurációt lehet javítani.</p></li>
+</ol>
+<h3 data-number="17.5.5" id="feladatok"><span
+class="header-section-number">17.5.5</span> Feladatok</h3>
+<h4 data-number="17.5.5.1"
+id="feladat-magyarázó-eseménysor-rekonstrukciója"><span
+class="header-section-number">17.5.5.1</span> 1. Feladat (magyarázó):
+Eseménysor rekonstrukciója</h4>
+<p>Adott a <code>labhost1</code> VM és a <code>labservice</code> unit. A
+labor adminisztrátora elindítja a szolgáltatást 02:10-kor, majd
+02:13-kor a szolgáltatás meghal. A journald-ben, a syslogban és az
+auditd-ben a következő (rövidített, időben nem rendezett) bejegyzések
+láthatók:</p>
+<ul>
+<li>journald:
+<code>Jan 15 02:13:11 labservice[18211]: cannot open /var/log/labservice/access.log: Permission denied</code></li>
+<li>syslog:
+<code>Jan 15 02:13:11 systemd[1]: labservice.service: Failed with result 'exit-code'.</code></li>
+<li>audit:
+<code>Jan 15 02:12:45 syscall=257 success=no exit=-13</code></li>
+</ul>
+<p>Rekonstruáld az eseménysort, és állapítsd meg a kiesés legvalószínűbb
+okát. Írd le, melyik forrás melyik részt bizonyítja.</p>
+<h4 data-number="17.5.5.2"
+id="feladat-adminisztrációskonfigurációs-logrotate-javítása-open-fd-ellen"><span
+class="header-section-number">17.5.5.2</span> 2. Feladat
+(adminisztrációs/konfigurációs): Logrotate javítása open FD ellen</h4>
+<p>A <code>labservice</code> használja a
+<code>/var/log/labservice/access.log</code> fájlt, és nem kezeli a
+<code>HUP</code> jelzést. Készíts egy <code>logrotate</code>
+konfigurációt a <code>/etc/logrotate.d/labservice</code> fájlban, amely:
+- napi rotációt végez, 7 nap retention, -
+<code>su labservice labservice</code> direktívát használ, - rotáció után
+<code>systemctl reload labservice</code> parancsot futtat (ha a unit nem
+támogatja a reloadot, használj <code>copytruncate</code>-et, de
+indokold), - <code>missingok</code> és <code>notifempty</code>
+beállításokat alkalmaz.</p>
+<p>Ellenőrizd a konfigurációt <code>logrotate -d</code> segítségével,
+majd futtasd egyszer <code>logrotate -f</code>-fel. Igazold, hogy a
+szolgáltatás továbbra is a helyes fájlba ír.</p>
+<h4 data-number="17.5.5.3"
+id="feladat-diagnosztikaifailurerecovery-disk-full-szimuláció"><span
+class="header-section-number">17.5.5.3</span> 3. Feladat
+(diagnosztikai/failure/recovery): Disk full szimuláció</h4>
+<p>A laborban szimuláld a disk full állapotot úgy, hogy a
+<code>/var/log/labservice</code> könyvtárat egy kis méretű, loopback
+mountolt fájlrendszerre költözteted (például
+<code>truncate -s 10M /tmp/lablog.img</code>, <code>mkfs.ext4</code>,
+<code>mount -o loop</code>). Indítsd el a <code>labservice</code>
+szolgáltatást, és várd meg, amíg a log betölti a rendelkezésre álló
+helyet. Diagnosztizáld a hibát a naplókból, bizonyítsd a <code>df</code>
+kimenettel, majd állítsd helyre az eredeti könyvtárat, és indítsd újra a
+szolgáltatást. A feladat során ne használj a termelési adatokat, és a
+rollbacket előre dokumentáld.</p>
+<h3 data-number="17.5.6" id="megoldások"><span
+class="header-section-number">17.5.6</span> Megoldások</h3>
+<h4 data-number="17.5.6.1" id="megoldás"><span
+class="header-section-number">17.5.6.1</span> 1. Megoldás</h4>
+<p>Az eseménysor: 1. 02:12:45 – valaki (valószínűleg root) létrehozza a
+<code>/var/log/labservice/access.log</code> fájlt; az audit
+<code>exit=-13 (EACCES)</code> rögzíti, hogy a <code>labservice</code>
+user írása nem sikerült. 2. 02:13:11 – a <code>labservice</code>
+elindul, de nem tudja megnyitni a logfájlt; a journald rögzíti az
+alkalmazás hibaüzenetét. 3. 02:13:11 – a systemd érzékeli a nem nulla
+kilépési kódot, és <code>Failed with result 'exit-code'</code>
+bejegyzést ír; a syslogban is megjelenik. 4. A
+<code>Restart=always</code> miatt a ciklus folytatódik.</p>
+<p>A legvalószínűbb ok: permission hiba a logfájlon. A journald
+bizonyítja az alkalmazás nézőpontját, a syslog a systemd állapotát, az
+audit a változtatás időpontját és a kernelben eldöntött hozzáférést.</p>
+<h4 data-number="17.5.6.2" id="megoldás-1"><span
+class="header-section-number">17.5.6.2</span> 2. Megoldás</h4>
+<p>A konfiguráció:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin, előfeltétel: logrotate telepítve</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tee /etc/logrotate.d/labservice <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="st">/var/log/labservice/access.log {</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="st">    daily</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="st">    rotate 7</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="st">    missingok</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="st">    notifempty</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="st">    su labservice labservice</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="st">    postrotate</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="st">        systemctl reload labservice &gt;/dev/null 2&gt;&amp;1 || true</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="st">    endscript</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span></code></pre></div>
+<p>Ellenőrzés <code>sudo logrotate -d /etc/logrotate.d/labservice</code>
+parancs, majd
+<code>sudo logrotate -f /etc/logrotate.d/labservice</code>. Ha a
+<code>reload</code> nem támogatott, a <code>copytruncate</code>
+alternativa, mert nem igényli a szolgáltatás jelzéskezelését. A
+<code>su</code> direktíva biztosítja, hogy a rotáció a megfelelő userrel
+történjen. A <code>postcondition</code>: a szolgáltatás továbbra is a
+helyes, frissített inode-ra ír, azaz <code>lsof</code> nem mutat
+<code>deleted</code> jelölést.</p>
+<h4 data-number="17.5.6.3" id="megoldás-2"><span
+class="header-section-number">17.5.6.3</span> 3. Megoldás</h4>
+<p>A loopback fájlrendszer létrehozása és mountolása:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin; módosító parancsok, rollback: cd / &amp;&amp; sudo umount /var/log/labservice &amp;&amp; sudo rmdir /var/log/labservice &amp;&amp; sudo mv /root/labservice.bak /var/log/labservice</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mv /var/log/labservice /root/labservice.bak</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir /var/log/labservice</span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> truncate <span class="at">-s</span> 10M /tmp/lablog.img</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 /tmp/lablog.img</span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount <span class="at">-o</span> loop /tmp/lablog.img /var/log/labservice</span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown labservice:labservice /var/log/labservice</span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart labservice</span></code></pre></div>
+<p>A szolgáltatás naplózni kezd, és hamarosan betölti a 10 MiB-ot. A
+hibaüzenet a journald-ben:
+<code>cannot write to /var/log/labservice/access.log: No space left on device</code>.
+A <code>df -h /var/log/labservice</code> mutatja a 100%-os
+kihasználtságot. A helyreállítás:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: labhost1, user: labadmin</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop labservice</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> umount /var/log/labservice</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rmdir /var/log/labservice</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mv /root/labservice.bak /var/log/labservice</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start labservice</span></code></pre></div>
+<p>A rollback előre dokumentált; a postcondition: a szolgáltatás fut, és
+a logfájl írható. A disk full szimuláció nem érinti a host tényleges
+adatait, mert csak a labor könyvtárat használja.</p>
+<h3 data-number="17.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">17.5.7</span> Rövid összefoglaló</h3>
+<p>A d085 labor célja, hogy a logforrásokat ne elszigetelten, hanem
+konzisztens történetként kezeljük. A journald, syslog és auditd
+együttesen adják meg a kiesések okát, a változtatások időpontját és a
+rendszer állapotát. A diagnosztika során a permission hiba, disk full,
+logrotate open FD és retention hiány mind elkülöníthető, ha a megfelelő
+parancsokat (journalctl, ausearch, lsof, df) használjuk. A végső report
+titkok nélkül, hash-elt kimenettel reprodukálható, és a monitoring
+rendszer felé továbbkapcsolható. A jövőbeli incidentekhez az alerting a
+journald <code>ENOSPC</code> vagy <code>EACCES</code> mintáit
+figyeli.</p>
+<p><strong>Továbbhasznált definíciók:</strong> -
+<strong>Logforrás:</strong> strukturált eseményfolyam, időbélyeggel,
+kibocsátóval és üzenettel (journald, syslog, auditd). - <strong>Open FD
+fixture:</strong> rotáció után a szolgáltatás továbbra is a régi
+inode-ra ír, mert nem kap jelzést a fájl bezárására. - <strong>Retention
+hiba:</strong> a napló hiánya a megőrzési korlát vagy méretgazdálkodás
+miatt, nem alkalmazáshiba.</p>
+<h3 data-number="17.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">17.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>A fejezet forráskiindulópontjai: - <a
+href="https://systemd.io/">systemd.io</a> - <a
+href="https://man7.org/linux/man-pages/">man7.org Linux man pages</a> -
+<a href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a></p>
+<p>Ezeket az alap kérésben nem olvastam, ezért nem állítom, hogy
+ellenőrzött bizonyítékként használtam őket. A parancsok és viselkedések
+stabil fogalmi alapokon nyugszanak, de a pontos systemd/journald/auditd
+verziófüggő kimeneteket a laborban ellenőrizni kell az adott Ubuntu
+24.04 LTS kiadáson. A logrotate <code>su</code> direktíva és a
+<code>copytruncate</code> alternatíva a man oldalakon megerősítendő; a
+laborban a várt kimenetek illusztratívak, nem tényleges futtatásból
+származnak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d084.html">← 17.4 Core dump, kernel crash és diagnosztikai artifact</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d086.html">18.1 Device naming, GPT és partitionkezelés →</a></div>
+</nav>
+</body>
+</html>

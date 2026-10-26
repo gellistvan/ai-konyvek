@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.1 Parancsok és konfiguráció lefelé: kézbesítés, nyugtázás,
+időkorlát – IoT-rendszerek és szoftverkomponensek – az eszköztől a
+felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Backend és enterprise integráció</a> › <a href="index.html#ich16">17 Parancsok, digitális iker és megjelenítés</a></p>
+<div class="links"><a class="prev" rel="prev" href="i048.html">← 16.2 Enterprise integrációs minták IoT-ban</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i050.html">17.2 Eszközárnyék és digitális iker: kívánt és jelentett állapot →</a></div>
+</nav>
+<h2 data-number="17.1" id="i049"><span
+class="header-section-number">17.1</span> Parancsok és konfiguráció
+lefelé: kézbesítés, nyugtázás, időkorlát</h2>
+<h3 data-number="17.1.1" id="motiváció"><span
+class="header-section-number">17.1.1</span> Motiváció</h3>
+<p>A TerraSense üvegházban a <code>ts-node</code> szenzorcsomópont
+nemcsak mér, hanem beavatkozik is: az öntözőszelepet nyitja és zárja. A
+felhasználó a felhőből szeretne például egy 10 perces öntözést
+elindítani. Ez egy <strong>lefelé irányuló parancs</strong>: a backend
+felől az eszköz felé halad. Az MQTT publish/subscribe modellje
+alapvetően az eszköztől a felhő felé tartó telemetriára kényelmes;
+lefelé a kézbesítés, a nyugtázás és az időkorlát kezelése külön
+tervezést igényel. Ha a parancs elveszik, a felhasználó azt hiheti, hogy
+öntözött; ha kétszer hajtódik végre, túlöntözés lehet a vége. Az alvó
+eszköz pedig éppen nem figyel a hálózatra, ezért a parancsot késleltetve
+kell kézbesíteni.</p>
+<p>Ebben az alfejezetben megtervezzük a <code>ts-backend</code> és
+<code>ts-node</code> közötti parancsutat: szabványos parancsüzenetet,
+nyugtázási és eredményjelentési protokollt, backend oldali állapotgépet,
+és az alvó eszközök kezelését.</p>
+<h3 data-number="17.1.2" id="parancsmodell-és-üzenetformátum"><span
+class="header-section-number">17.1.2</span> Parancsmodell és
+üzenetformátum</h3>
+<p><strong>Definíció.</strong> A <strong>parancs</strong> (command) a
+backend által kibocsátott, egy adott eszköznek címzett üzenet, amely egy
+művelet végrehajtását kéri. A TerraSense parancsüzenete legalább az
+alábbi mezőket tartalmazza:</p>
+<ul>
+<li><code>id</code>: a parancs egyedi azonosítója, amelyet a backend
+generál (UUID vagy monoton növekvő szám). Ezzel hivatkozunk a nyugtára
+és az eredményre, és ezzel biztosítjuk az idempotenciát.</li>
+<li><code>type</code>: a művelet neve, például <code>valve.open</code>
+vagy <code>valve.close</code>.</li>
+<li><code>params</code>: típusfüggő paraméterobjektum, például
+<code>{"duration_ms": 600000}</code>.</li>
+<li><code>expiry</code>: a parancs lejárati ideje, UTC epoch ms. Ha az
+eszköz eddig nem tudta elfogadni vagy végrehajtani a parancsot, hagyja
+figyelmen kívül.</li>
+<li><code>timestamp</code> (opcionális): a kibocsátás ideje,
+hibakereséshez.</li>
+</ul>
+<p>A topic-konvenció az <a href="i027.html">MQTT QoS, munkamenetek,
+retain, Last Will és MQTT 5</a> alfejezetben rögzített: a parancs az</p>
+<pre><code>terrasense/gh1/n001/cmd</code></pre>
+<p>topicra kerül, az eredmény pedig a</p>
+<pre><code>terrasense/gh1/n001/cmd/result</code></pre>
+<p>topicra. Mindkét topic QoS 1, <code>retain=false</code>.</p>
+<p>Példa parancs JSON-üzenetre:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;c7d2f9a0-3b21-4f15-9e2f-6f9d2a3c1e4b&quot;</span><span class="fu">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;valve.open&quot;</span><span class="fu">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;params&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;duration_ms&quot;</span><span class="fu">:</span> <span class="dv">600000</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;expiry&quot;</span><span class="fu">:</span> <span class="dv">1735689600000</span><span class="fu">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;timestamp&quot;</span><span class="fu">:</span> <span class="dv">1735689000000</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>A parancsazonosító akkor is egyedi marad, ha a backend újraindul;
+UUID használata esetén nincs szükség központi számlálóra. Ha egy
+parancsot újra kell küldeni (például a backend újraindul, vagy az eszköz
+nem nyugtázta), ugyanazt az <code>id</code>-t kell megtartani.</p>
+<h3 data-number="17.1.3"
+id="nyugtázás-és-eredmény-backend-állapotgép"><span
+class="header-section-number">17.1.3</span> Nyugtázás és eredmény:
+backend állapotgép</h3>
+<p>A parancs életciklusa a backendben egy állapotgéppel írható le. A
+<strong>nyugta</strong> (acknowledgement, ACK) azt jelenti, hogy az
+eszköz megkapta és értelmezni tudta a parancsot; az
+<strong>eredmény</strong> (result) pedig a végrehajtás utáni állapotot
+jelenti. A kettő szétválasztása azért fontos, mert a végrehajtás hosszú
+lehet (például a szelep 10 percig nyitva marad), és a felhasználó előbb
+szeretné tudni, hogy a parancs eljutott-e.</p>
+<p>A <code>ts-backend</code> a következő állapotokat tartja nyilván
+minden parancsra:</p>
+<ul>
+<li><code>PENDING</code>: a parancsot a REST API fogadta, de még nem
+publikáltuk MQTT-n, vagy publikáltuk, de nem érkezett nyugta.</li>
+<li><code>ACCEPTED</code>: az eszköz nyugtázta a parancsot; a
+végrehajtás folyamatban van.</li>
+<li><code>SUCCESS</code>: az eszköz eredményt küldött, a végrehajtás
+sikeres volt.</li>
+<li><code>FAILED</code>: az eszköz eredményt küldött, de a végrehajtás
+hibára futott.</li>
+<li><code>TIMEOUT</code>: a parancs az <code>expiry</code> időpontig nem
+kapott nyugtát vagy eredményt.</li>
+<li><code>EXPIRED</code>: az eszköz jelezte, hogy a parancs lejárt,
+mielőtt végrehajthatta volna (például alvásból ébredve látta, hogy az
+<code>expiry</code> már elmúlt).</li>
+</ul>
+<p>Az átmeneteket az alábbi <code>flow</code> ábra mutatja.</p>
+<figure>
+<img src="assets/i049-diagram-1.png"
+alt="Parancs állapotgépe a ts-backendben - A nyugta és az eredmény MQTT üzenetek formájában érkezik." />
+<figcaption aria-hidden="true">Parancs állapotgépe a ts-backendben - A
+nyugta és az eredmény MQTT üzenetek formájában érkezik.</figcaption>
+</figure>
+<p>Átmenettáblázattal:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Jelenlegi állapot</th>
+<th>Esemény</th>
+<th>Következő állapot</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>PENDING</code></td>
+<td>ACK érkezik az eszköztől</td>
+<td><code>ACCEPTED</code></td>
+</tr>
+<tr class="even">
+<td><code>PENDING</code></td>
+<td>eredmény érkezik ACK nélkül (rövid parancs)</td>
+<td><code>SUCCESS</code> vagy <code>FAILED</code></td>
+</tr>
+<tr class="odd">
+<td><code>PENDING</code></td>
+<td><code>expiry</code> lejár</td>
+<td><code>TIMEOUT</code></td>
+</tr>
+<tr class="even">
+<td><code>ACCEPTED</code></td>
+<td>eredmény érkezik</td>
+<td><code>SUCCESS</code> vagy <code>FAILED</code></td>
+</tr>
+<tr class="odd">
+<td><code>ACCEPTED</code></td>
+<td><code>expiry</code> lejár</td>
+<td><code>TIMEOUT</code></td>
+</tr>
+<tr class="even">
+<td><code>PENDING</code> vagy <code>ACCEPTED</code></td>
+<td>az eszköz <code>EXPIRED</code>-et küld</td>
+<td><code>EXPIRED</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <code>ts-backend</code> a parancsokat memóriában tárolja
+(<code>ConcurrentHashMap</code>), és ütemezetten ellenőrzi a lejáratot.
+A nyugta és az eredmény ugyanazon a <code>cmd/result</code> topicon
+érkezik, és a parancsazonosító alapján azonosítja a backend, melyik
+parancshoz tartozik. A nyugta és az eredmény szétválasztható a
+<code>status</code> mezővel:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;c7d2f9a0-3b21-4f15-9e2f-6f9d2a3c1e4b&quot;</span><span class="fu">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;ACCEPTED&quot;</span><span class="fu">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;timestamp&quot;</span><span class="fu">:</span> <span class="dv">1735689001000</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Egy későbbi eredményüzenet:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;c7d2f9a0-3b21-4f15-9e2f-6f9d2a3c1e4b&quot;</span><span class="fu">,</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;SUCCESS&quot;</span><span class="fu">,</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;result&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;valve_opened_ms&quot;</span><span class="fu">:</span> <span class="dv">600000</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;timestamp&quot;</span><span class="fu">:</span> <span class="dv">1735689605000</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p><strong>Definíció.</strong> Az <strong>idempotens
+parancsvégrehajtás</strong> azt jelenti, hogy ugyanaz a parancsazonosító
+többszöri kézbesítés esetén is legfeljebb egyszer vált ki hatást. Az
+eszköz oldalán ezt a parancsazonosító megjegyzésével és a már
+feldolgozott azonosítók halmazával érjük el (a
+<code>valve_set_target</code> már idempotens a <a
+href="i015.html">Aktuátorok: biztonságos vezérlés és visszajelzés</a>
+alfejezetből). Ha az eszköz egy <code>SUCCESS</code> eredményt adott, és
+ugyanaz a parancs ismét megérkezik (például MQTT QoS 1 miatt), az eszköz
+nem hajtja végre újra, csak újraküldi az eredményt.</p>
+<h3 data-number="17.1.4"
+id="mqtt-5-requestresponse-vs.-topic-alapú-konvenció"><span
+class="header-section-number">17.1.4</span> MQTT 5 request–response
+vs. topic-alapú konvenció</h3>
+<p>Az MQTT 5 szabvány bevezet egy explicit request–response mintát: a
+<code>Response Topic</code> és a <code>Correlation Data</code> user
+property-k segítségével a kliens megadhatja, hova várja a választ, és
+hogyan korrelálja a kéréssel. Ez különösen akkor hasznos, ha sok parancs
+fut párhuzamosan, és nincs természetes topic-szétválasztás.</p>
+<p>A TerraSense-ben azonban az eszközönkénti topic-struktúra
+(<code>cmd</code> és <code>cmd/result</code>) eleve biztosítja a
+korrelációt, és a parancsüzenetben szereplő <code>id</code> mező erre
+elég. Az MQTT 5 feature-öket akkor érdemes bevetni, ha:</p>
+<ul>
+<li>többféle parancstípusra eltérő választ várunk,</li>
+<li>a válasz nem egy fix topicra jön, hanem például a backend egy
+kérésazonosítóra szűrt,</li>
+<li>a rendszer sok eszközt és sok párhuzamos parancsot kezel, és a
+topic-struktúra bonyolulttá válna.</li>
+</ul>
+<p>A döntést a következő táblázat foglalja össze:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>Topic-alapú <code>cmd</code>/<code>cmd/result</code></th>
+<th>MQTT 5 response topic</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Egyszerűség</td>
+<td>egyszerű, konvencióval rögzíthető</td>
+<td>több metaadatot igényel</td>
+</tr>
+<tr class="even">
+<td>Skálázhatóság</td>
+<td>eszközönként jó, központi válaszgyűjtőnél szűrés kell</td>
+<td>korrelációs adat megkönnyíti a szűrést</td>
+</tr>
+<tr class="odd">
+<td>MQTT verzió</td>
+<td>3.1.1 is támogatja</td>
+<td>csak MQTT 5 kliens és broker</td>
+</tr>
+<tr class="even">
+<td>Fejlesztési hiba lehetősége</td>
+<td>elgépelt topic, hiányzó feliratkozás</td>
+<td>helytelen correlation data</td>
+</tr>
+<tr class="odd">
+<td>TerraSense-ben</td>
+<td>választott megoldás</td>
+<td>nem használjuk a TerraSense-ben</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="17.1.5" id="alvó-eszközök-és-parancskézbesítés"><span
+class="header-section-number">17.1.5</span> Alvó eszközök és
+parancskézbesítés</h3>
+<p>Az energiatakarékos <code>ts-node</code> az idő nagy részében alvó
+állapotban van, és csak mintavételre vagy ébredési időzítőre kapcsolja
+be a rádiót. Ilyenkor egy azonnali parancs nem ér el hozzá. Két alapvető
+stratégia létezik:</p>
+<ol type="1">
+<li><p><strong>Retained parancs a <code>cmd</code> topicra.</strong> Az
+MQTT retained üzenet az utolsó értéket tárolja a broker, és minden új
+feliratkozó megkapja. Ha a parancs retained, az alvó eszköz ébredéskor
+feliratkozik, és azonnal megkapja. Hátránya: csak egyetlen parancs
+tárolható, és ha új parancs érkezik, felülírja a régit. Ráadásul a
+lejárt parancs retained maradhat, és az eszköz feleslegesen kap egy
+elavult parancsot. Az <code>expiry</code> mezőt ilyenkor muszáj
+ellenőrizni.</p></li>
+<li><p><strong>Backend oldali parancssor.</strong> A backend eltárolja a
+függő parancsokat, és amikor az eszköz felébred (például MQTT
+<code>status</code> üzenettel jelzi), a backend leküldi a következő
+érvényes parancsot. Ez rugalmasabb, több parancsot is tárolhat, és
+lejárat szerint rendezhet. Hátránya: a backendnek tudnia kell az eszköz
+ébredéséről, és a kézbesítés késleltetése a backend–eszköz ciklusból
+adódik.</p></li>
+</ol>
+<p>A TerraSense-ben a <strong>retained parancsot</strong> használjuk a
+következő ébredéskor végrehajtandó parancsra, de a <code>cmd</code>
+topic <code>retain=false</code> alapbeállítását <strong>nem</strong>
+módosítjuk; ehelyett a backend figyeli az eszköz <code>status</code>
+jelenlétét, és akkor publikálja a függő parancsot. Ezzel elkerüljük az
+elavult retained parancsokat, és megtartjuk a parancsok sorrendjét. A
+laborban ezt a backend oldali <code>CommandScheduler</code> valósítja
+meg: amikor az eszköz <code>status</code> üzenete megérkezik, a backend
+lekéri az adott eszközre váró, nem lejárt parancsokat, és sorban
+publikálja őket.</p>
+<p><strong>Továbbvitt eredmény.</strong> A parancs- és eredménytopicok,
+valamint a parancsazonosítóval történő korreláció később az <a
+href="i050.html">Eszközárnyék és digitális iker: kívánt és jelentett
+állapot</a> alfejezetben a kívánt állapot (<code>desired</code>)
+kézbesítésére, a <a href="i066.html">Záróprojekt: a teljes TerraSense
+rendszer összeállítása és átvétele</a> alfejezetben pedig a teljes
+parancsút integrációjára épül.</p>
+<h3 data-number="17.1.6"
+id="labor-szelepnyitás-parancs-a-ts-backendtől-a-ts-node-ig"><span
+class="header-section-number">17.1.6</span> Labor: szelepnyitás parancs
+a ts-backendtől a ts-node-ig</h3>
+<p>Ebben a laborban a <code>ts-backend</code> REST API-ján keresztül
+küldünk egy <code>valve.open</code> parancsot. A backend MQTT-n
+publikálja a <code>terrasense/gh1/n001/cmd</code> topicra. A
+<code>ts-node</code>-t egy egyszerű Python MQTT-kliens szimulálja, mert
+a Zephyr <code>native_sim</code> MQTT-stack integrációját az <a
+href="i028.html">MQTT a gyakorlatban: Zephyr-kliens és Mosquitto</a>
+alfejezetben már elvégeztük; a labort a backendre és a protokollra
+fókuszáljuk. A szimulátor feliratkozik a <code>cmd</code> topicra,
+végrehajtja a szelepnyitást (szimulált GPIO), nyugtát küld, majd a
+végrehajtás után eredményt a <code>cmd/result</code> topicra.</p>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i049 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i049</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-r</span> ../i043 ts-backend</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ts-backend/src/main/java/com/terrasense/backend/<span class="dt">{command</span><span class="op">,</span><span class="dt">mqtt}</span></span></code></pre></div>
+<p>A <code>ts-backend</code> a <a href="i043.html">A ts-backend váza:
+REST API és egészségellenőrzés</a> alfejezetben elkészített Spring Boot
+váza. A Maven <code>pom.xml</code>-hez adjuk hozzá az Eclipse Paho Java
+kliens függőséget:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode xml"><code class="sourceCode xml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">dependency</span>&gt;</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">groupId</span>&gt;org.eclipse.paho&lt;/<span class="kw">groupId</span>&gt;</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">artifactId</span>&gt;org.eclipse.paho.client.mqttv3&lt;/<span class="kw">artifactId</span>&gt;</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">version</span>&gt;1.2.5&lt;/<span class="kw">version</span>&gt;</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">dependency</span>&gt;</span></code></pre></div>
+<blockquote>
+<p>Ellenőrzési igény: a Paho Java kliens pontos verziója a telepített
+Maven repository-tól függ.</p>
+</blockquote>
+<p>A parancsmodell és az állapotgép osztálya:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/main/java/com/terrasense/backend/command/CommandState.java</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">command</span><span class="op">;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">enum</span> CommandState <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    PENDING<span class="op">,</span> ACCEPTED<span class="op">,</span> SUCCESS<span class="op">,</span> FAILED<span class="op">,</span> <span class="bu">TIMEOUT</span><span class="op">,</span> EXPIRED</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/main/java/com/terrasense/backend/command/DeviceCommand.java</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">command</span><span class="op">;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">java</span><span class="op">.</span><span class="im">util</span><span class="op">.</span><span class="im">Map</span><span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">java</span><span class="op">.</span><span class="im">util</span><span class="op">.</span><span class="im">UUID</span><span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">record</span> <span class="fu">DeviceCommand</span><span class="op">(</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> id<span class="op">,</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> nodeId<span class="op">,</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> type<span class="op">,</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;</span> params<span class="op">,</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> expiry<span class="op">,</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    CommandState state</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">static</span> DeviceCommand <span class="fu">create</span><span class="op">(</span><span class="bu">String</span> nodeId<span class="op">,</span> <span class="bu">String</span> type<span class="op">,</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>                                       <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;</span> params<span class="op">,</span> <span class="dt">long</span> ttlMs<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        <span class="dt">long</span> now <span class="op">=</span> <span class="bu">System</span><span class="op">.</span><span class="fu">currentTimeMillis</span><span class="op">();</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">new</span> <span class="fu">DeviceCommand</span><span class="op">(</span><span class="bu">UUID</span><span class="op">.</span><span class="fu">randomUUID</span><span class="op">().</span><span class="fu">toString</span><span class="op">(),</span> nodeId<span class="op">,</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>                type<span class="op">,</span> params<span class="op">,</span> now <span class="op">+</span> ttlMs<span class="op">,</span> CommandState<span class="op">.</span><span class="fu">PENDING</span><span class="op">);</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>CommandService</code> felel a parancs tárolásáért,
+MQTT-publikálásért és az eredmény fogadásáért. Az MQTT kapcsolatot egy
+<code>MqttCommandGateway</code> osztály kezeli. A laborban a teljes
+MQTT-kliens kódot mutatjuk be röviden:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/main/java/com/terrasense/backend/mqtt/MqttCommandGateway.java</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">mqtt</span><span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">eclipse</span><span class="op">.</span><span class="im">paho</span><span class="op">.</span><span class="im">client</span><span class="op">.</span><span class="im">mqttv3</span><span class="op">.*;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">eclipse</span><span class="op">.</span><span class="im">paho</span><span class="op">.</span><span class="im">client</span><span class="op">.</span><span class="im">mqttv3</span><span class="op">.</span><span class="im">persist</span><span class="op">.</span><span class="im">MemoryPersistence</span><span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">command</span><span class="op">.*;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">java</span><span class="op">.</span><span class="im">util</span><span class="op">.</span><span class="im">Map</span><span class="op">;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">java</span><span class="op">.</span><span class="im">util</span><span class="op">.</span><span class="im">concurrent</span><span class="op">.</span><span class="im">ConcurrentHashMap</span><span class="op">;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> MqttCommandGateway <span class="kw">implements</span> MqttCallback <span class="op">{</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> MqttClient client<span class="op">;</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> DeviceCommand<span class="op">&gt;</span> pending <span class="op">=</span> <span class="kw">new</span> <span class="bu">ConcurrentHashMap</span><span class="op">&lt;&gt;();</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">MqttCommandGateway</span><span class="op">(</span><span class="bu">String</span> brokerUrl<span class="op">,</span> <span class="bu">String</span> clientId<span class="op">)</span> <span class="kw">throws</span> <span class="bu">Exception</span> <span class="op">{</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>        client <span class="op">=</span> <span class="kw">new</span> <span class="fu">MqttClient</span><span class="op">(</span>brokerUrl<span class="op">,</span> clientId<span class="op">,</span> <span class="kw">new</span> <span class="fu">MemoryPersistence</span><span class="op">());</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">connect</span><span class="op">();</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">setCallback</span><span class="op">(</span><span class="kw">this</span><span class="op">);</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Feliratkozás az összes node cmd/result topicjára</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">subscribe</span><span class="op">(</span><span class="st">&quot;terrasense/+/+/cmd/result&quot;</span><span class="op">,</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">publishCommand</span><span class="op">(</span>DeviceCommand cmd<span class="op">)</span> <span class="kw">throws</span> <span class="bu">Exception</span> <span class="op">{</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>        pending<span class="op">.</span><span class="fu">put</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">);</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> topic <span class="op">=</span> <span class="st">&quot;terrasense/gh1/&quot;</span> <span class="op">+</span> cmd<span class="op">.</span><span class="fu">nodeId</span><span class="op">()</span> <span class="op">+</span> <span class="st">&quot;/cmd&quot;</span><span class="op">;</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> payload <span class="op">=</span> <span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="st">                {&quot;id&quot;:&quot;%s&quot;,&quot;type&quot;:&quot;%s&quot;,&quot;params&quot;:%s,&quot;expiry&quot;:%d}</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="st">                &quot;&quot;&quot;</span><span class="op">.</span><span class="fu">formatted</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">type</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">params</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">expiry</span><span class="op">());</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>        MqttMessage msg <span class="op">=</span> <span class="kw">new</span> <span class="fu">MqttMessage</span><span class="op">(</span>payload<span class="op">.</span><span class="fu">getBytes</span><span class="op">());</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>        msg<span class="op">.</span><span class="fu">setQos</span><span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">publish</span><span class="op">(</span>topic<span class="op">,</span> msg<span class="op">);</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">@Override</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">messageArrived</span><span class="op">(</span><span class="bu">String</span> topic<span class="op">,</span> MqttMessage message<span class="op">)</span> <span class="kw">throws</span> <span class="bu">Exception</span> <span class="op">{</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>        <span class="co">// cmd/result feldolgozása: nyugta vagy eredmény</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> json <span class="op">=</span> <span class="kw">new</span> <span class="bu">String</span><span class="op">(</span>message<span class="op">.</span><span class="fu">getPayload</span><span class="op">());</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Egyszerű feldolgozás Jacksonnal (a ts-backend vázban elérhető)</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Frissíti a pending map állapotát a status mező alapján.</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>    <span class="at">@Override</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">connectionLost</span><span class="op">(</span><span class="bu">Throwable</span> cause<span class="op">)</span> <span class="op">{</span> <span class="co">/* újracsatlakozás */</span> <span class="op">}</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    <span class="at">@Override</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">deliveryComplete</span><span class="op">(</span>IMqttDeliveryToken token<span class="op">)</span> <span class="op">{</span> <span class="co">/* QoS 1 nyugta */</span> <span class="op">}</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A REST vezérlő:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/main/java/com/terrasense/backend/controller/CommandController.java</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">controller</span><span class="op">;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">.</span><span class="im">command</span><span class="op">.*;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">springframework</span><span class="op">.</span><span class="im">web</span><span class="op">.</span><span class="im">bind</span><span class="op">.</span><span class="im">annotation</span><span class="op">.*;</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="at">@RestController</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="at">@RequestMapping</span><span class="op">(</span><span class="st">&quot;/api/devices/{nodeId}/commands&quot;</span><span class="op">)</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> CommandController <span class="op">{</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> CommandService commandService<span class="op">;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">CommandController</span><span class="op">(</span>CommandService commandService<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">this</span><span class="op">.</span><span class="fu">commandService</span> <span class="op">=</span> commandService<span class="op">;</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">@PostMapping</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> DeviceCommand <span class="fu">createCommand</span><span class="op">(</span><span class="at">@PathVariable</span> <span class="bu">String</span> nodeId<span class="op">,</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>                                       <span class="at">@RequestBody</span> <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;</span> body<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> type <span class="op">=</span> <span class="op">(</span><span class="bu">String</span><span class="op">)</span> body<span class="op">.</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;type&quot;</span><span class="op">);</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>        <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;</span> params <span class="op">=</span> <span class="op">(</span><span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;)</span> body<span class="op">.</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;params&quot;</span><span class="op">);</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>        <span class="dt">long</span> ttlMs <span class="op">=</span> body<span class="op">.</span><span class="fu">containsKey</span><span class="op">(</span><span class="st">&quot;ttl_ms&quot;</span><span class="op">)</span> <span class="op">?</span> <span class="op">((</span><span class="bu">Number</span><span class="op">)</span> body<span class="op">.</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;ttl_ms&quot;</span><span class="op">)).</span><span class="fu">longValue</span><span class="op">()</span> <span class="op">:</span> <span class="dv">30000</span><span class="op">;</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> commandService<span class="op">.</span><span class="fu">createAndPublish</span><span class="op">(</span>nodeId<span class="op">,</span> type<span class="op">,</span> params<span class="op">,</span> ttlMs<span class="op">);</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A szimulált ts-node Pythonban, a <code>ts-node-sim.py</code>
+fájlban:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env python3</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json, time, uuid, paho.mqtt.client <span class="im">as</span> mqtt</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>BROKER <span class="op">=</span> <span class="st">&quot;localhost&quot;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>CMD_TOPIC <span class="op">=</span> <span class="st">&quot;terrasense/gh1/n001/cmd&quot;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>RESULT_TOPIC <span class="op">=</span> <span class="st">&quot;terrasense/gh1/n001/cmd/result&quot;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> on_connect(client, userdata, flags, rc):</span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>    client.subscribe(CMD_TOPIC, qos<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> on_message(client, userdata, msg):</span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>    cmd <span class="op">=</span> json.loads(msg.payload)</span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="st">&quot;Parancs érkezett:&quot;</span>, cmd)</span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Nyugta</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>    ack <span class="op">=</span> {<span class="st">&quot;id&quot;</span>: cmd[<span class="st">&quot;id&quot;</span>], <span class="st">&quot;status&quot;</span>: <span class="st">&quot;ACCEPTED&quot;</span>, <span class="st">&quot;node_id&quot;</span>: <span class="st">&quot;n001&quot;</span>,</span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>           <span class="st">&quot;timestamp&quot;</span>: <span class="bu">int</span>(time.time()<span class="op">*</span><span class="dv">1000</span>)}</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>    client.publish(RESULT_TOPIC, json.dumps(ack), qos<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Szelepnyitás szimulálása</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    duration <span class="op">=</span> cmd.get(<span class="st">&quot;params&quot;</span>, {}).get(<span class="st">&quot;duration_ms&quot;</span>, <span class="dv">0</span>)</span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>    time.sleep(duration <span class="op">/</span> <span class="fl">1000.0</span>)</span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> {<span class="st">&quot;id&quot;</span>: cmd[<span class="st">&quot;id&quot;</span>], <span class="st">&quot;status&quot;</span>: <span class="st">&quot;SUCCESS&quot;</span>,</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;result&quot;</span>: {<span class="st">&quot;valve_opened_ms&quot;</span>: duration},</span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>              <span class="st">&quot;node_id&quot;</span>: <span class="st">&quot;n001&quot;</span>, <span class="st">&quot;timestamp&quot;</span>: <span class="bu">int</span>(time.time()<span class="op">*</span><span class="dv">1000</span>)}</span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>    client.publish(RESULT_TOPIC, json.dumps(result), qos<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>client <span class="op">=</span> mqtt.Client(<span class="st">&quot;ts-node-sim&quot;</span>)</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>client.on_connect <span class="op">=</span> on_connect</span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>client.on_message <span class="op">=</span> on_message</span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>client.<span class="ex">connect</span>(BROKER, <span class="dv">1883</span>, <span class="dv">60</span>)</span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>client.loop_forever()</span></code></pre></div>
+<p>A futtatáshoz indítsuk el a Mosquitto brokert a közös stackből, majd
+a backendet és a szimulátort.</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Mosquitto indítása a ~/iot-labor/stack segítségével</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml up <span class="at">-d</span> mosquitto</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Backend build és futtatás</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i049/ts-backend <span class="kw">&amp;&amp;</span> <span class="ex">mvn</span> spring-boot:run</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Szimulátor egy másik terminálban</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i049 <span class="kw">&amp;&amp;</span> <span class="ex">python3</span> ts-node-sim.py</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Parancs küldése</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST http://localhost:8080/api/devices/n001/commands <span class="dt">\</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&quot;Content-Type: application/json&quot;</span> <span class="dt">\</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;type&quot;:&quot;valve.open&quot;,&quot;params&quot;:{&quot;duration_ms&quot;:10000},&quot;ttl_ms&quot;:30000}&#39;</span></span></code></pre></div>
+<p>Várt kimenet a backend logjában: a parancs <code>PENDING</code>, majd
+<code>ACCEPTED</code>, végül <code>SUCCESS</code> állapotba kerül. A
+szimulátor termináljában megjelenik a parancs és a nyugta. A
+szelepnyitás után az eredmény a <code>cmd/result</code> topicra
+kerül.</p>
+<p>Takarítás:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml down</span></code></pre></div>
+<p>A labor során létrehozott fájlok:
+<code>ts-backend/src/main/java/com/terrasense/backend/command/CommandState.java</code>,
+<code>DeviceCommand.java</code>, <code>CommandService.java</code>,
+<code>MqttCommandGateway.java</code>,
+<code>CommandController.java</code>, valamint a
+<code>ts-node-sim.py</code>. A <code>~/iot-labor/i049</code> könyvtár
+marad.</p>
+<h3 data-number="17.1.7" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">17.1.7</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A parancsút működését a backend naplójában a parancsazonosítóval és
+az állapotváltásokkal ellenőrizhetjük. A Mosquitto log
+(<code>docker logs mosquitto</code>) mutatja a publikált üzenetek
+topicjait és QoS-ét. A szimulátor <code>print</code> kimenete igazolja,
+hogy a nyugta és az eredmény megérkezett.</p>
+<p>Tipikus hibatünetek:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hibatünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A parancs <code>PENDING</code> marad</td>
+<td>Az eszköz nincs feliratkozva a <code>cmd</code> topicra, vagy a
+topic elgépelt</td>
+<td>Ellenőrizze a szimulátor feliratkozását és a topic prefixet</td>
+</tr>
+<tr class="even">
+<td>A nyugta megérkezik, de nincs eredmény</td>
+<td>A szimulátor kivételt dob a <code>sleep</code> közben, vagy a
+backend nem figyeli a <code>cmd/result</code> topicot</td>
+<td>Vizsgálja a szimulátor stderr-jét, ellenőrizze a wildcard
+feliratkozást</td>
+</tr>
+<tr class="odd">
+<td>Duplikált parancs végrehajtás</td>
+<td>Az eszköz nem jegyzi meg a feldolgozott azonosítókat</td>
+<td>Vezessen be <code>processed_ids</code> halmazt az eszköz
+oldalán</td>
+</tr>
+<tr class="even">
+<td>Az <code>expiry</code> lejár, de a parancs nem
+<code>TIMEOUT</code></td>
+<td>Nincs ütemezett lejárat-ellenőrzés a backendben</td>
+<td>Implementáljon <code>@Scheduled</code> taskot az elavult parancsok
+lezárására</td>
+</tr>
+<tr class="odd">
+<td>Az alvó eszköz nem kap parancsot</td>
+<td>A backend nem várja meg az eszköz ébredését, vagy retained nélkül
+publikál</td>
+<td>Használja a backend oldali parancssort, és publikáljon a
+<code>status</code> üzenet hatására</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="17.1.8" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">17.1.8</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>A nyugta és az eredmény összemosása.</strong> Ha csak egy
+üzenetet várunk a végrehajtás végén, a felhasználó hosszú ideig nem
+tudja, hogy a parancs eljutott-e. A szelepnyitásnál ez különösen zavaró:
+a <code>ACCEPTED</code> nyugta nélkül a backend nem tudja
+megkülönböztetni a hálózati hibát a lassú végrehajtástól.</p></li>
+<li><p><strong>Az idempotencia elhanyagolása.</strong> Az MQTT QoS 1
+legalább egyszer kézbesít, tehát duplikátumok előfordulhatnak. Ha az
+eszköz minden <code>valve.open</code> parancsra újra kinyitja a
+szelepet, a duplikátum túlöntözést okoz. A parancsazonosító alapú
+deduplikáció kötelező.</p></li>
+<li><p><strong>Elavult retained parancs.</strong> Ha valaki mégis
+retained <code>cmd</code> üzenetet használ, és az eszköz ébredéskor
+feltétel nélkül végrehajtja, egy régi, lejárt parancs váratlan hatást
+válthat ki. Az <code>expiry</code> mezőt mindig ellenőrizni
+kell.</p></li>
+<li><p><strong>A lejárati idő helytelen megválasztása.</strong> Ha az
+<code>expiry</code> túl rövid, az alvó eszköz ébredése előtt lejár; ha
+túl hosszú, a felhasználó sokáig bizonytalanságban marad. A lejárati
+időt az eszköz alvási periódusához és a hálózati késleltetéshez kell
+igazítani.</p></li>
+</ol>
+<h3 data-number="17.1.9" id="feladatok"><span
+class="header-section-number">17.1.9</span> Feladatok</h3>
+<h4 data-number="17.1.9.1" id="fogalmi-kérdés"><span
+class="header-section-number">17.1.9.1</span> 1. Fogalmi kérdés</h4>
+<p>Miért nem elegendő a parancs <code>cmd</code> topicra történő QoS 1
+publikálása a megbízható parancskézbesítéshez? Milyen további
+mechanizmusokra van szükség a végrehajtás igazolásához és a duplikátumok
+kezeléséhez?</p>
+<h4 data-number="17.1.9.2" id="tervezési-feladat"><span
+class="header-section-number">17.1.9.2</span> 2. Tervezési feladat</h4>
+<p>Egy <code>ts-node</code> percenként egyszer ébred fel, és 5
+másodpercig hallgatja a rádiót. A backend egy <code>valve.open</code>
+parancsot akar kézbesíteni. Az átlagos hálózati késleltetés MQTT-ben 200
+ms, a maximális késleltetés 2 s. Mekkora legyen a parancs
+<code>expiry</code> értéke, ha a parancsot a lehető leghamarabb végre
+akarjuk hajtani, de nem akarunk feleslegesen hosszú várakozást?
+Indokoljon.</p>
+<h4 data-number="17.1.9.3" id="implementációs-feladat"><span
+class="header-section-number">17.1.9.3</span> 3. Implementációs
+feladat</h4>
+<p>Egészítse ki a <code>ts-backend</code> <code>CommandService</code>
+osztályát úgy, hogy a <code>cmd/result</code> topicról érkező
+<code>EXPIRED</code> állapotú eredmény esetén naplózza az eseményt, és a
+parancsot <code>EXPIRED</code> állapotba állítsa. Készítsen
+egységtesztet a <code>CommandService</code> állapotátmenetére.</p>
+<h4 data-number="17.1.9.4" id="hibakeresési-feladat"><span
+class="header-section-number">17.1.9.4</span> 4. Hibakeresési
+feladat</h4>
+<p>A labor során a parancs <code>ACCEPTED</code> állapotban marad, de
+<code>SUCCESS</code> soha nem érkezik. A szimulátor naplója szerint a
+nyugta elküldésre került. Hol keresse a hibát? Soroljon fel legalább
+három lehetséges okot, és mindegyikhez adjon ellenőrzési lépést.</p>
+<h3 data-number="17.1.10" id="megoldások"><span
+class="header-section-number">17.1.10</span> Megoldások</h3>
+<h4 data-number="17.1.10.1" id="fogalmi-kérdés-1"><span
+class="header-section-number">17.1.10.1</span> 1. Fogalmi kérdés</h4>
+<p>A QoS 1 csak a brokerbe történő kézbesítést garantálja, de nem
+garantálja, hogy az eszköz megkapta, és azt sem, hogy végrehajtotta. A
+nyugta (ACK) igazolja a kézbesítést az eszközig, az eredményüzenet pedig
+a végrehajtás sikerességét. A duplikátumok ellen a parancsazonosító
+alapú deduplikáció véd. Az időkorlát (expiry) pedig jelzi, ha a parancs
+nem hajtható végre értelmes időn belül.</p>
+<h4 data-number="17.1.10.2" id="tervezési-feladat-1"><span
+class="header-section-number">17.1.10.2</span> 2. Tervezési feladat</h4>
+<p>Az eszköz legfeljebb 60 s + 5 s = 65 s alatt ébred fel és hallgatja a
+rádiót. A hálózati késleltetés maximuma 2 s, tehát a legrosszabb esetben
+a parancs 65 s + 2 s = 67 s múlva juthat el az eszközhöz. A végrehajtás
+(például a szelepnyitás) további időt vehet igénybe, ami a feladat
+szerint rövid, de vegyünk hozzá 1 s tartalékot. Így az
+<code>expiry</code>-t legalább 68 s-ra kell állítani. Ugyanakkor ha a
+parancs ennél hosszabb ideig nem jut el, a felhasználót értesíteni kell.
+Érdemes az <code>expiry</code>-t 70 s környékére választani, hogy a
+lejárat ne következzen be a normál kézbesítés során, de ne is hagyja a
+felhasználót túl sokáig bizonytalanságban.</p>
+<h4 data-number="17.1.10.3" id="implementációs-feladat-1"><span
+class="header-section-number">17.1.10.3</span> 3. Implementációs
+feladat</h4>
+<p>A <code>CommandService</code> bővítése az <code>EXPIRED</code>
+esemény kezelésére:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="dt">void</span> <span class="fu">handleResult</span><span class="op">(</span><span class="bu">String</span> json<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// JSON feldolgozás Jacksonnal (itt leegyszerűsítve)</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Object</span><span class="op">&gt;</span> result <span class="op">=</span> <span class="fu">jsonToMap</span><span class="op">(</span>json<span class="op">);</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> id <span class="op">=</span> <span class="op">(</span><span class="bu">String</span><span class="op">)</span> result<span class="op">.</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;id&quot;</span><span class="op">);</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> status <span class="op">=</span> <span class="op">(</span><span class="bu">String</span><span class="op">)</span> result<span class="op">.</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;status&quot;</span><span class="op">);</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    DeviceCommand cmd <span class="op">=</span> pending<span class="op">.</span><span class="fu">get</span><span class="op">(</span>id<span class="op">);</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>cmd <span class="op">==</span> <span class="kw">null</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="st">&quot;ACCEPTED&quot;</span><span class="op">.</span><span class="fu">equals</span><span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>        cmd <span class="op">=</span> <span class="kw">new</span> <span class="fu">DeviceCommand</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">nodeId</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">type</span><span class="op">(),</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>                cmd<span class="op">.</span><span class="fu">params</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">expiry</span><span class="op">(),</span> CommandState<span class="op">.</span><span class="fu">ACCEPTED</span><span class="op">);</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span><span class="st">&quot;SUCCESS&quot;</span><span class="op">.</span><span class="fu">equals</span><span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>        cmd <span class="op">=</span> <span class="kw">new</span> <span class="fu">DeviceCommand</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">nodeId</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">type</span><span class="op">(),</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>                cmd<span class="op">.</span><span class="fu">params</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">expiry</span><span class="op">(),</span> CommandState<span class="op">.</span><span class="fu">SUCCESS</span><span class="op">);</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span><span class="st">&quot;FAILED&quot;</span><span class="op">.</span><span class="fu">equals</span><span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>        cmd <span class="op">=</span> <span class="kw">new</span> <span class="fu">DeviceCommand</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">nodeId</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">type</span><span class="op">(),</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>                cmd<span class="op">.</span><span class="fu">params</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">expiry</span><span class="op">(),</span> CommandState<span class="op">.</span><span class="fu">FAILED</span><span class="op">);</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span><span class="st">&quot;EXPIRED&quot;</span><span class="op">.</span><span class="fu">equals</span><span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>        log<span class="op">.</span><span class="fu">warn</span><span class="op">(</span><span class="st">&quot;Parancs lejárt: {}&quot;</span><span class="op">,</span> id<span class="op">);</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>        cmd <span class="op">=</span> <span class="kw">new</span> <span class="fu">DeviceCommand</span><span class="op">(</span>cmd<span class="op">.</span><span class="fu">id</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">nodeId</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">type</span><span class="op">(),</span></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>                cmd<span class="op">.</span><span class="fu">params</span><span class="op">(),</span> cmd<span class="op">.</span><span class="fu">expiry</span><span class="op">(),</span> CommandState<span class="op">.</span><span class="fu">EXPIRED</span><span class="op">);</span></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>    pending<span class="op">.</span><span class="fu">put</span><span class="op">(</span>id<span class="op">,</span> cmd<span class="op">);</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az egységteszt Mockito-val vagy a <code>CommandService</code>
+tesztpéldányával ellenőrzi, hogy egy <code>EXPIRED</code> eredmény
+hatására a parancs állapota <code>EXPIRED</code>-re változik, és a
+logban megjelenik a figyelmeztetés.</p>
+<h4 data-number="17.1.10.4" id="hibakeresési-feladat-1"><span
+class="header-section-number">17.1.10.4</span> 4. Hibakeresési
+feladat</h4>
+<p>Lehetséges okok és ellenőrzésük:</p>
+<ul>
+<li><strong>A backend nincs feliratkozva a <code>cmd/result</code>
+topicra.</strong> Ellenőrizze a <code>MqttCommandGateway</code>
+konstruktorában a <code>subscribe</code> hívást; a wildcard
+<code>terrasense/+/+/cmd/result</code> lefedi-e a
+<code>terrasense/gh1/n001/cmd/result</code> topicot.</li>
+<li><strong>A szimulátor más <code>id</code>-t küld a nyugtában, mint az
+eredményben.</strong> Hasonlítsa össze a nyugta és az eredmény
+<code>id</code> mezőjét; ha nem egyezik, a backend nem tudja a
+parancshoz kötni.</li>
+<li><strong>A szimulátor kivételt dob a <code>time.sleep</code> alatt,
+és nem jut el az eredményküldésig.</strong> Nézze meg a szimulátor
+stderr-jét; kezelje a kivételeket, és mindig küldjön <code>FAILED</code>
+eredményt hiba esetén.</li>
+<li><strong>A parancs <code>expiry</code> lejárt, mielőtt az eredmény
+megérkezett volna, és a backend nem frissítette
+<code>TIMEOUT</code>-ra.</strong> Ellenőrizze az ütemezett
+lejáratkezelést, és hogy az eredmény később érkezik-e a lejáratnál.</li>
+</ul>
+<h3 data-number="17.1.11" id="rövid-összefoglaló"><span
+class="header-section-number">17.1.11</span> Rövid összefoglaló</h3>
+<p>A <code>ts-backend</code> parancsútja a
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/cmd</code> topicra publikál,
+az eszköz pedig a <code>cmd/result</code> topicra küld nyugtát és
+eredményt. A parancsüzenet az <code>id</code>, <code>type</code>,
+<code>params</code>, <code>expiry</code> mezőket tartalmazza. A backend
+állapotgépe <code>PENDING</code>, <code>ACCEPTED</code>,
+<code>SUCCESS</code>, <code>FAILED</code>, <code>TIMEOUT</code>,
+<code>EXPIRED</code> állapotokat kezel, és ütemezetten ellenőrzi a
+lejáratot. Az alvó eszközök parancsait a backend a <code>status</code>
+üzenet észlelésekor, sorban publikálja. A laborban a
+<code>ts-backend</code> REST API-val fogad parancsot, MQTT-n publikál,
+és egy Python szimulátor hajtja végre a szelepnyitást. A kulcsfájlok:
+<code>CommandState.java</code>, <code>DeviceCommand.java</code>,
+<code>CommandService.java</code>, <code>MqttCommandGateway.java</code>,
+<code>CommandController.java</code>, <code>ts-node-sim.py</code>.
+<strong>Továbbvitt eredmény.</strong> A parancsazonosítóval történő
+korreláció, a <code>cmd</code> és <code>cmd/result</code> topicok,
+valamint az állapotgép az <a href="i050.html">Eszközárnyék és digitális
+iker: kívánt és jelentett állapot</a> alfejezetben a kívánt állapot
+kézbesítésére, a <a href="i066.html">Záróprojekt: a teljes TerraSense
+rendszer összeállítása és átvétele</a> alfejezetben a teljes parancsút
+integrációjára épül.</p>
+<h3 data-number="17.1.12" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">17.1.12</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az MQTT publish/subscribe és QoS 1 definíciói az MQTT 3.1.1 és MQTT
+5.0 szabványokon alapulnak. A Paho Java kliens, a Python
+<code>paho-mqtt</code> és a Spring Boot verziók gyorsan változnak;
+használat előtt ellenőrizze a pontos verziókat és kompatibilitást. Az
+MQTT 5 request–response minta a szabvány <code>Response Topic</code> és
+<code>Correlation Data</code> user property-ire épül, de a
+TerraSense-ben a saját topic-konvenciót használjuk. A laborban szimulált
+eszköz nem helyettesíti a valós Zephyr <code>native_sim</code> eszközt;
+a teljes eszközszoftvert az <a href="i028.html">MQTT a gyakorlatban:
+Zephyr-kliens és Mosquitto</a> alfejezet szerint kell integrálni.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i048.html">← 16.2 Enterprise integrációs minták IoT-ban</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i050.html">17.2 Eszközárnyék és digitális iker: kívánt és jelentett állapot →</a></div>
+</nav>
+</body>
+</html>

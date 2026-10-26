@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>37.3 Registry auth, push/pull és retention – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch37">37 Konténerimage, build, registry és artifact</a></p>
+<div class="links"><a class="prev" rel="prev" href="d182.html">← 37.2 OCI image, digest, tag és multiarch</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d184.html">37.4 SBOM, scanning, aláírás és build titkok →</a></div>
+</nav>
+<h2 data-number="37.3" id="d183"><span
+class="header-section-number">37.3</span> Registry auth, push/pull és
+retention</h2>
+<h3 data-number="37.3.1" id="motiváció-és-definíció"><span
+class="header-section-number">37.3.1</span> Motiváció és definíció</h3>
+<p>A build pipeline eredménye akkor válik futó szolgáltatássá, ha a
+Kubernetes node vagy a céleszköz le tudja húzni a tárolt image-et. A
+registry ezért nem egyszerű HTTP fájlszerver, hanem elérhetőséggel,
+hitelesítéssel, integritással és retention élettartammal rendelkező
+szolgáltatás. Ha a DNS-feloldás, a TLS-lánc, a token-scope vagy a
+manifest bármely rétege hibás, a pull nem jön létre, és a hiba a
+fejlesztő buildjétől függetlenül áll elő.</p>
+<p>Az előzményekből <a href="d182.html">d182</a> az OCI image, digest és
+tag modellt, <a href="d142.html">d142</a> a TLS- és tanúsítványláncot,
+<a href="d111.html">d111</a> az inventory, desired state és drift
+fogalmát adja. Itt ezeket a registry mint artifact distribution
+szolgáltatás üzemeltetési nézetébe kapcsoljuk.</p>
+<p><strong>Registry endpoint:</strong> az a hálózati erőforrás, amely az
+OCI Distribution API-t kiszolgálja; a repository nevekkel és
+reference-ekkel együtt értelmezett, ezért nem csak IP-cím vagy port.
+Például <code>https://registry.lab.example:5000</code> az endpoint,
+amelyen belül a <code>lab-team/cpp-service</code> repository érhető
+el.</p>
+<p><strong>OCI Distribution API:</strong> szabványos HTTP API image
+manifestek és blobok feltöltésére, lekérdezésére és törlésére; a
+specifikáció biztosítja, hogy a Docker, Podman, containerd, skopeo és
+más OCI-kliens közös protokollt beszéljen. A scope itt a
+regisztrációkliens és registry közötti hitelesített, tartalomcímzett
+műveletekre terjed ki, nem a node-ra való kép pull scheduler
+működésére.</p>
+<p>A munkafolyamatot így modellezzük:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mrow><mi>p</mi><mi>u</mi><mi>l</mi><mi>l</mi></mrow></msub><mo>=</mo><mtext mathvariant="normal">DNS</mtext><mo>→</mo><mtext mathvariant="normal">TCP/TLS</mtext><mo>→</mo><mtext mathvariant="normal">Auth</mtext><mo>→</mo><mtext mathvariant="normal">Manifest</mtext><mo>→</mo><mtext mathvariant="normal">Blobs</mtext></mrow><annotation encoding="application/x-tex"> P_{pull} = \text{DNS} \rightarrow \text{TCP/TLS} \rightarrow \text{Auth} \rightarrow \text{Manifest} \rightarrow \text{Blobs} </annotation></semantics></math></p>
+<p>ahol minden lépés előfeltétele a következőnek; a digest-verifikáció a
+manifest és blob réteg integritását együtt zárja.</p>
+<h3 data-number="37.3.2"
+id="registry-endpoint-és-oci-distribution-api"><span
+class="header-section-number">37.3.2</span> Registry endpoint és OCI
+Distribution API</h3>
+<p>A registry elérhetőség értékelése mindig a fenti lánc mentén halad. A
+DNS-feloldás a service name, port és feloldott címek közötti kapcsolatot
+ellenőrzi; a TLS a hitelesítést; a HTTP az API elérhetőségét. Az
+endpoint állapota tehát nem bináris: a
+<code>curl https://registry...</code> sikeréhez mindhárom rétegnek
+működnie kell.</p>
+<p>A leggyakoribb OCI Distribution API műveletek:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Művelet</th>
+<th>Metódus</th>
+<th>Példa útvonal</th>
+<th>Cél</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>API discovery</td>
+<td>GET</td>
+<td><code>/v2/</code></td>
+<td>végpont verzió és support ellenőrzése</td>
+</tr>
+<tr class="even">
+<td>Tag lista</td>
+<td>GET</td>
+<td><code>/v2/&lt;name&gt;/tags/list</code></td>
+<td>referencia felsorolás</td>
+</tr>
+<tr class="odd">
+<td>Manifest</td>
+<td>HEAD/GET/PUT/DELETE</td>
+<td><code>/v2/&lt;name&gt;/manifests/&lt;reference&gt;</code></td>
+<td>manifest és digest műveletek</td>
+</tr>
+<tr class="even">
+<td>Blob létezés</td>
+<td>HEAD</td>
+<td><code>/v2/&lt;name&gt;/blobs/&lt;digest&gt;</code></td>
+<td>tartalomcímzett blob ellenőrzés</td>
+</tr>
+<tr class="odd">
+<td>Blob upload</td>
+<td>POST/PUT</td>
+<td><code>/v2/&lt;name&gt;/blobs/uploads/</code></td>
+<td>rétegfeltöltés</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>reference</code> lehet tag (<code>1.0.0</code>) vagy digest
+(<code>sha256:...</code>). A tag mutálható, a digest immutable. Emiatt a
+laborban mindig digestet kérünk, amikor a tényleges artifactot
+azonosítjuk, a tag csak kényelmi index.</p>
+<p>A registry endpoint láthatósága a build agent, a Kubernetes node és a
+fejlesztői gép felől azonos vizsgálattal történik:
+<code>getent hosts</code>, <code>openssl s_client</code>,
+<code>curl -I /v2/</code>. A <code>/v2/</code> API-válasz rate-limit és
+auth szempontból is diagnosztikus; a 401 válasz a hitelesítés
+szükségességéről árulkodik, a 200-as válasz az API elérhetőségét
+jelenti.</p>
+<h3 data-number="37.3.3" id="auth-tokenscope-és-credential-helper"><span
+class="header-section-number">37.3.3</span> Auth token/scope és
+credential helper</h3>
+<p>A hitelesítés modellje a Bearer token. A kliens először a registrytől
+<code>401 Unauthorized</code> választ kap, amely
+<code>WWW-Authenticate</code> headerben hirdeti a token-szerver
+realmjét, service nevét és scope-ját. A kliens ezután a felhasználó
+hitelesítőadataival tokent kér a realmből, majd azt
+<code>Authorization: Bearer &lt;token&gt;</code> headerben csatolja a
+registry API-műveletekhez.</p>
+<p>A token scope a jogosultság határát jelöli, nem csupán a user
+létezését. Például:</p>
+<pre class="text"><code>repository:lab-team/cpp-service:pull
+repository:lab-team/cpp-service:pull,push</code></pre>
+<p>Az első csak pullra használható, a második pushra is. A credential
+helper ezt a hitelesítési folyamatot automatizálja: a
+<code>docker login</code> / <code>podman login</code> parancs lekéri a
+tokent, és a CLI konfigurációjában tárolja. A tárolás helye
+<code>~/.docker/config.json</code>, illetve
+<code>~/.config/containers/auth.json</code>. A helper maga gyakran külső
+bináris, például egy vállalati Vault-tal integrált credential helper;
+ezt a konfigurációban <code>credHelpers</code> kulccsal jelöljük.</p>
+<p>A labregistryben a htpasswd-hitelesítés beépített realm használatával
+demonstrálható:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># registry lab config.yml kivonat</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">version</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.1</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">auth</span><span class="kw">:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">htpasswd</span><span class="kw">:</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">realm</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;registry.lab.example:5000/auth&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">path</span><span class="kw">:</span><span class="at"> /auth/htpasswd</span></span></code></pre></div>
+<p>A user hozzáadása a htpasswd fájlhoz a registry üzemeltető művelete;
+a kliens oldalán a <code>podman login</code> kezeli a tokencserét. A
+login után érdemes ellenőrizni, hogy a mentett credential tényleg a
+kívánt endpointra vonatkozik: a config fájlban a key a teljes endpoint,
+nem csak a registry hostname.</p>
+<h3 data-number="37.3.4" id="pushpulldigest-verify"><span
+class="header-section-number">37.3.4</span> Push/pull/digest verify</h3>
+<p>A push nem egyszerű fájl feltöltés, hanem OCI Distribution API
+szekvencia. A kliens először a blobokat tölti fel, majd manifestet ír. A
+manifest PUT után a registry visszaadja az artifact manifest digestjét;
+ez az érték az immutable referencia.</p>
+<p>A pull során a kliens a manifestet kéri le, megkapja a blob digest
+listát, letölti a blobokat, és minden réteg tartalmát ellenőrzi a
+manifestben hivatkozott digest ellen. Ez a digest verify: nem elég a tag
+azonosítása, a tartalmat a manifestben rögzített <code>sha256</code>
+értékekhez kell kötni.</p>
+<p>Fontos különbség: a <code>podman push</code> utáni
+<code>Digest: sha256:...</code> a manifest digest; a blob réteg
+digest-ek pedig a manifest <code>layers[].digest</code> mezői. A
+referenciaintegritás akkor teljes, ha a manifest digestet és a blob
+digesteket együtt tudjuk reprodukálni. A laborban ezt a
+<code>skopeo inspect</code> vagy a <code>crane digest</code> parancs
+mutatja meg.</p>
+<p>A deployment protokollban a manifest digestet kell pin-elni, nem a
+taget. A Kubernetes pod spec-ben ez közvetlenül nem mindig lehetséges,
+mert a konténer spec <code>image</code> mezője taget vár; ilyenkor a
+digestet <code>imagePullPolicy</code> és a registryben rögzített
+tag-replace workflow kezeli. A legtisztább megoldás a digest-prefixelt
+image név a pod specben.</p>
+<h3 data-number="37.3.5" id="proxy-mirrorcache-és-air-gap"><span
+class="header-section-number">37.3.5</span> Proxy mirror/cache és air
+gap</h3>
+<p>A proxy registry (registry mirror) egy köztes HTTP gyorsítótár. A
+kliens a mirrorhoz fordul; ha a kért manifest nincs cache-ben, a mirror
+lekéri az upstream registryből, tárolja, majd továbbítja. A mirror célja
+a network egress csökkentése és a pull latency javítása, de nem
+helyettesíti az upstream auth policy-t, mert a mirror csak az
+artifact-ot cache-ezi.</p>
+<p>A Podman és Docker konfigurációjában a mirror deklarative megadható.
+Például a labban a host <code>/etc/containers/registries.conf</code>
+fájlja:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/containers/registries.conf lab kivonat</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">unqualified-search-registries = [&quot;registry.lab.example:5000&quot;]</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">[[</span><span class="at">registry</span><span class="kw">]]</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">prefix = &quot;docker.io&quot;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">location = &quot;mirror.lab.example:5000&quot;</span></span></code></pre></div>
+<p>Az <strong>air gap</strong> környezetben nincs egress; a mirror nem
+tud upstreamhez fordulni. Ilyenkor az image-et szállítható köztes
+formátumba kell írni, majd a céloldali registrybe importálni. A
+<code>skopeo copy</code> megőrzi a digestet:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1, lab-user UID 1000; egress nélkül a közvetlen copy nem futhat</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">skopeo</span> copy docker://registry.lab.example:5000/lab-team/cpp-service:1.0.0 dir:./lab-airgap</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co"># céloldali, egress nélküli registrybe</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">skopeo</span> copy dir:./lab-airgap docker://registry.airgap.lab:5000/lab-team/cpp-service:1.0.0</span></code></pre></div>
+<p>A <code>dir:</code> köztes formátum manifest és blob mellett hordozza
+az integritási adatokat, ezért a digest-verify a céloldalon újra
+futtatható.</p>
+<h3 data-number="37.3.6"
+id="retentiongarbage-collectionreferenced-blob"><span
+class="header-section-number">37.3.6</span> Retention/garbage
+collection/referenced blob</h3>
+<p>A registry tárolója content-addressable: a blobokat digestjük
+azonosítja, a manifestek hivatkoznak rájuk. A tag törlése önmagában nem
+törli a blobokat, mert más tag vagy manifest tovább hivatkozhat rájuk. A
+<strong>garbage collection (GC)</strong> az a folyamat, amely a
+hivatkozás nélküli blobokat ténylegesen felszabadítja.</p>
+<p>A retention policy azt adja meg, hogy mely tag-ek vagy manifestek
+őrződnek meg, és melyek törölhetők. A megadás mindig a registry product
+specifikus API-ján vagy konfigurációján keresztül történik; a
+labregistry Docker Distribution image-ben nincs beépített retention,
+ezért ott a törlés API-műveletekkel, a GC pedig a registry image
+parancsával demonstrálható. A retention policy-t tehát ne a kliens
+<code>docker rmi</code> parancsával keverjük: az a helyi cache-ből
+töröl, nem a registryből.</p>
+<p>A <strong>referenced blob</strong> fogalma: a blob akkor
+törölhetetlen, ha legalább egy manifest <code>schemaVersion</code>
+szerinti hivatkozásában szerepel. Amíg a hivatkozó manifest nem
+törlődött, a GC-nek meg kell tartania a blobot. Ez a hivatkozási gráf a
+retention célja: mindig a manifest-törlés az előfeltétel, a blob törlés
+csak utána következhet.</p>
+<p>A labban a retention policy karbantartása így válik ellenőrizhetővé:
+a tag lista, a manifest digest lekérés, a DELETE művelet és a GC utáni
+<code>du</code> méretváltozás külön lépésekben jelentkezik.</p>
+<h3 data-number="37.3.7" id="rate-limitegress-és-availability"><span
+class="header-section-number">37.3.7</span> Rate limit/egress és
+availability</h3>
+<p>A registry mint szolgáltatás rate limit alá eshet. Ha a kliens túl
+sok requests-et ad, a registry <code>429 Too Many Requests</code> HTTP
+választ adhat, gyakran <code>Retry-After</code> headerrel. Az anonim
+pull korlátozott, a bejelentkezett user többet kaphat; a policy a
+provider által meghatározott.</p>
+<p>A registry availability nem azonos a registry endpoint
+elérhetőségével. A node-on már letöltött image cache, a Kubernetes
+<code>imagePullPolicy</code> és a replicaset process mind külön réteg. A
+pod csak akkor lép kép pullra, ha a node nem rendelkezik az image-t,
+vagy a pull policy ezt előírja. A read-only file system és a registry
+SLO szempontjából a lekért artifact digest rögzítése csökkenti a
+mutálódó tagre mutató dependencyt.</p>
+<p>A rate limit és egress hibát a registry oldali log, a
+<code>curl -I</code> válasz és a kliens HTTP-napló együttesen jelzi. A
+metric a pull kérés száma, a manifest és blob letöltési ideje; a nagy
+blob pull a throughput méréshez tartozik. Az availability service level
+indicator (SLI) a sikeres pull időbeli aránya; a rate limit által
+visszautasított kéréseket a policy explicit módon kizárhatja vagy
+belevonhatja.</p>
+<h3 data-number="37.3.8"
+id="kidolgozott-példa-labregistry-push-és-digest-verify"><span
+class="header-section-number">37.3.8</span> Kidolgozott példa:
+labregistry push és digest verify</h3>
+<p>A példa a <code>labhost1</code> Ubuntu 24.04 VM-en fut,
+<code>lab-user</code> UID 1000, a <code>lab-user</code> a Podman group
+tagja. A registry a lab hálózatban fut, dokumentációs címpéldában
+<code>192.0.2.10</code> IP-vel, service név
+<code>registry.lab.example:5000</code>. A lab DNS
+<code>/etc/hosts</code> bejegyzésre épül, a TLS tanúsítvány subject CN
+<code>registry.lab.example</code>.</p>
+<p><strong>1. DNS és TLS ellenőrzés:</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1, lab-user UID 1000</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">getent</span> hosts registry.lab.example</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> s_client <span class="at">-connect</span> registry.lab.example:5000 <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-servername</span> registry.lab.example <span class="op">&lt;</span>/dev/null <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="ex">openssl</span> x509 <span class="at">-noout</span> <span class="at">-subject</span> <span class="at">-dates</span></span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>192.0.2.10  registry.lab.example
+subject=CN = registry.lab.example
+notBefore=...   notAfter=...</code></pre>
+<p><strong>2. Login és push:</strong></p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1, lab-user UID 1000; REGISTRY_USER/PASSWORD a lab inventory dummy változóból</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> login registry.lab.example:5000 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--username</span> <span class="st">&quot;</span><span class="va">$LAB_REGISTRY_USER</span><span class="st">&quot;</span> <span class="at">--password-stdin</span> <span class="op">&lt;&lt;&lt;</span><span class="st">&quot;</span><span class="va">$LAB_REGISTRY_PASSWORD</span><span class="st">&quot;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> tag localhost/lab-cpp-service:latest <span class="dt">\</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  registry.lab.example:5000/lab-team/cpp-service:1.0.0</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> push registry.lab.example:5000/lab-team/cpp-service:1.0.0</span></code></pre></div>
+<p>Várható záró sor:</p>
+<pre class="text"><code>Digest: sha256:ab12... (a tényleges manifest digest)</code></pre>
+<p><strong>3. Pull és digest verify:</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># digest pinning a tag helyett</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="va">REG_DIGEST</span><span class="op">=</span><span class="va">$(</span><span class="ex">skopeo</span> inspect <span class="dt">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  docker://registry.lab.example:5000/lab-team/cpp-service:1.0.0 <span class="kw">|</span> <span class="dt">\</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span class="ex">jq</span> <span class="at">-r</span> .Digest<span class="va">)</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$REG_DIGEST</span><span class="st">&quot;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: sha256:ab12... (megegyezik a push visszaadott digesttel)</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> pull <span class="st">&quot;registry.lab.example:5000/lab-team/cpp-service@</span><span class="va">${REG_DIGEST}</span><span class="st">&quot;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: a letöltött image digest azonos</span></span></code></pre></div>
+<p>Ellenőrzési feltétel: a <code>podman images --digests</code>
+kimenetben a megfelelő image digest megegyezik <code>$REG_DIGEST</code>
+értékével.</p>
+<p><strong>4. Retention demonstráció:</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Tag lista lekérés</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="va">TOKEN</span><span class="op">=</span><span class="va">$(</span><span class="ex">curl</span> <span class="at">-fsS</span> <span class="at">-u</span> <span class="st">&quot;</span><span class="va">$LAB_REGISTRY_USER</span><span class="st">:</span><span class="va">$LAB_REGISTRY_PASSWORD</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;https://registry.lab.example:5000/auth?scope=repository:lab-team/cpp-service:pull,push&amp;service=registry.lab.example:5000&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">jq</span> <span class="at">-r</span> .token<span class="va">)</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-fsS</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;https://registry.lab.example:5000/v2/lab-team/cpp-service/tags/list&quot;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: {&quot;name&quot;:&quot;lab-team/cpp-service&quot;,&quot;tags&quot;:[&quot;1.0.0&quot;]}</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="co"># A manifest digest lekérése a DELETE-hez</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-I</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;https://registry.lab.example:5000/v2/lab-team/cpp-service/manifests/1.0.0&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> docker-content-digest</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="co"># DELETE reference</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> DELETE <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>  <span class="st">&quot;https://registry.lab.example:5000/v2/lab-team/cpp-service/manifests/sha256:...&quot;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="co"># GC a registry konténerben (a registry image verziójától függ)</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> exec registry-lab bin/registry garbage-collect <span class="dt">\</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>  /etc/docker/registry/config.yml</span></code></pre></div>
+<p>A GC utáni blob felszabadulást a registry storage kötet
+méretváltozása mutatja. A retention policy itt implicit; production
+registry product esetén a policy megadás vagy a webes API, vagy
+konfigurációs YAML.</p>
+<h3 data-number="37.3.9" id="hibák-és-ellenpróbák"><span
+class="header-section-number">37.3.9</span> Hibák és ellenpróbák</h3>
+<p><strong>Hiba:</strong>
+<code>dial tcp: lookup registry.lab.example: no such host</code>.<br />
+<strong>Hipotézis:</strong> a DNS-feloldás nem éri el a lab domain
+nevet.<br />
+<strong>Adatgyűjtés:</strong>
+<code>getent hosts registry.lab.example</code>,
+<code>dig +short registry.lab.example</code>.<br />
+<strong>Egy változtatás:</strong> a lab host <code>/etc/hosts</code>
+bejegyzését hozzáadni, vagy a lab DNS A rekordját javítani.<br />
+<strong>Verifikáció:</strong> <code>getent hosts</code> ismételt
+futtatása a várt IP-t adja.</p>
+<p><strong>Hiba:</strong>
+<code>certificate signed by unknown authority</code>.<br />
+<strong>Hipotézis:</strong> a kliens nem bízik meg a lab registry
+CA-ban.<br />
+<strong>Adatgyűjtés:</strong> <code>openssl s_client -showcerts</code> a
+lánc megtekintéséhez.<br />
+<strong>Egy változtatás:</strong> a lab CA certet a Podman/Docker trust
+store-ba másolni
+(<code>/etc/docker/certs.d/registry.lab.example:5000/ca.crt</code> vagy
+Podman esetén a trust store konfigurálása).<br />
+<strong>Verifikáció:</strong> <code>podman pull</code> újraindítása, a
+TLS kapcsolat sikeres.</p>
+<p><strong>Hiba:</strong>
+<code>unauthorized: authentication required</code>, bár a login korábban
+sikeres volt.<br />
+<strong>Hipotézis:</strong> a credential helper nem a megfelelő
+endpointra ad token; vagy a token scope hiányos.<br />
+<strong>Adatgyűjtés:</strong>
+<code>podman login --get-login registry.lab.example:5000</code>,
+<code>podman push --log-level=debug</code> a token kérés
+megtekintéséhez.<br />
+<strong>Egy változtatás:</strong> a credential config endpoint key
+törlése a <code>~/.config/containers/auth.json</code> fájlból, majd új
+<code>podman login</code>.<br />
+<strong>Verifikáció:</strong> a push sikeres, a debug logban a
+<code>Authorization: Bearer</code> header jelen van.</p>
+<p><strong>Hiba:</strong> push után a
+<code>podman images --digests</code> más digestet mutat, mint a manifest
+inspect.<br />
+<strong>Hipotézis:</strong> a helyi image réteg digest eltér a registry
+manifestben rögzítettől; vagy a tag mutálódott.<br />
+<strong>Adatgyűjtés:</strong> <code>skopeo inspect</code> a registry
+manifest digestre, és a helyi <code>podman image inspect</code>
+<code>RepoDigests</code> mezőjére.<br />
+<strong>Egy változtatás:</strong> a deploy reference-et digestre
+cserélni, ahogy a példában.<br />
+<strong>Verifikáció:</strong> a <code>podman pull @digest</code>
+sikeres, a <code>podman rmi</code> a taget törli, de a digest image
+megmarad.</p>
+<h3 data-number="37.3.10" id="feladatok"><span
+class="header-section-number">37.3.10</span> Feladatok</h3>
+<p><strong>1. Magyarázó feladat</strong></p>
+<p>Írd le, miért nem elegendő a <code>podman push</code> visszatérési
+értéke a registry artifact integritás bizonyításához, és miért kell a
+manifest digest mellé a blob digesteket is ellenőrizni. Sorold fel az
+OCI Distribution API három olyan műveletét, amely a digest-verify
+szempontjából releváns.</p>
+<p><strong>2. Adminisztrációs/konfigurációs feladat</strong></p>
+<p>A labregistryben hozz létre egy <code>lab-team</code> repository-t,
+végpontot, login konfigurációt, és tölts fel egy image-t. Ezután
+rögzítsd a manifest digestet fájlba, és bizonyítsd a pull utáni
+azonosságot. A feladat célja a credential helper és digest-pinning
+használata; a push és pull parancsok mellett a
+<code>skopeo inspect</code> kimenet is szerepeljen.</p>
+<p><strong>3. Diagnosztikai/failure feladat</strong></p>
+<p>A build agent nem tud pullolni a registryből, a hiba
+<code>toomanyrequests</code>. A kezdeti hipotézis az, hogy a registry
+túlterhelt vagy rate limit lépett életbe. Nyújts diagnosztikai eljárást:
+milyen HTTP kódot vársz, hogyan olvasod le a <code>Retry-After</code>
+headert, és milyen registry logot vizsgálnál. Adj meg egy változtatást,
+amely a pull rate limitet csökkenti anélkül, hogy az auth policy-t
+megsértené.</p>
+<h3 data-number="37.3.11" id="megoldások"><span
+class="header-section-number">37.3.11</span> Megoldások</h3>
+<p><strong>1. megoldás</strong></p>
+<p>A <code>podman push</code> visszatérési kódja csak a művelet
+sikerességét jelzi, nem a tartalom integritását. A manifest digest a
+manifest tartalmát hash-eli; a blob rétegek digestjei a manifestben
+hivatkoznak. Ha egy blob sértül, a manifest digest változatlan marad,
+ezért a réteghash ismerete nélkül a sérülést nem észleljük. A három
+releváns OCI Distribution API művelet:
+<code>HEAD /v2/&lt;name&gt;/manifests/&lt;reference&gt;</code> a digest
+lekéréshez, <code>GET /v2/&lt;name&gt;/blobs/&lt;digest&gt;</code> a
+rétegek letöltéséhez,
+<code>HEAD /v2/&lt;name&gt;/blobs/&lt;digest&gt;</code> a blob
+létezésének ellenőrzéséhez. A helyes <code>podman pull @digest</code>
+mindhárom műveletet elvégzi a kliensben. <em>Postcondition:</em> a pull
+után a kliens képes a manifest és blob digesteket együttesen
+ellenőrizni.</p>
+<p><strong>2. megoldás</strong></p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># labhost1, lab-user UID 1000; login, push, digest pinning</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> login registry.lab.example:5000 <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--username</span> <span class="st">&quot;</span><span class="va">$LAB_REGISTRY_USER</span><span class="st">&quot;</span> <span class="at">--password-stdin</span> <span class="op">&lt;&lt;&lt;</span><span class="st">&quot;</span><span class="va">$LAB_REGISTRY_PASSWORD</span><span class="st">&quot;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> tag localhost/lab-cpp-service:latest <span class="dt">\</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>  registry.lab.example:5000/lab-team/cpp-service:1.0.0</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> push registry.lab.example:5000/lab-team/cpp-service:1.0.0</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">skopeo</span> inspect docker://registry.lab.example:5000/lab-team/cpp-service:1.0.0 <span class="dt">\</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">|</span> <span class="ex">jq</span> <span class="at">-r</span> .Digest <span class="op">&gt;</span> /tmp/lab-cpp-service.digest</span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /tmp/lab-cpp-service.digest</span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: sha256:... (a manifest digest)</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> pull <span class="st">&quot;registry.lab.example:5000/lab-team/cpp-service@</span><span class="va">$(</span><span class="fu">cat</span> /tmp/lab-cpp-service.digest<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="ex">podman</span> images <span class="at">--digests</span> registry.lab.example:5000/lab-team/cpp-service</span></code></pre></div>
+<p><em>Indoklás:</em> a <code>skopeo inspect</code> a registryben tárolt
+artifact-ot kérdezi le, függetlenül a lokális cache-től. A
+<code>podman pull @digest</code> a manifest digestet pin-eli; a
+<code>podman images --digests</code> kimenetben az azonosítónak egyeznie
+kell. <em>Postcondition:</em> a lokális image digest megegyezik a
+<code>/tmp/lab-cpp-service.digest</code> fájl tartalmával.</p>
+<p><strong>3. megoldás</strong></p>
+<p>A <code>toomanyrequests</code> hibát a
+<code>429 Too Many Requests</code> HTTP válasz jelzi. A
+<code>Retry-After</code> header a várakozási időt adja meg. A
+diagnosztikai eljárás:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co"># curl a registry /v2/ API-ra, auth nélkül is lehet 401, de a 429 a rate limit</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-I</span> <span class="st">&quot;https://registry.lab.example:5000/v2/&quot;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Várható: HTTP/1.1 429 Too Many Requests, Retry-After: 3600</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-I</span> <span class="st">&quot;https://registry.lab.example:5000/v2/&quot;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> retry-after</span></code></pre></div>
+<p>A registry oldali logban a rate limiter eseményeket a
+<code>registry</code> konténer stdoutja vagy a journal mutatja; a
+<code>podman logs registry-lab</code> a bejövő kérések számát és a rate
+limit döntést rögzíti. Az egy változtatás: használjon a build agent egy
+pull-through mirror cache-t (a konfigurációt a host
+<code>/etc/containers/registries.conf</code> fájl tartalmazza), így az
+ismételt kérések a mirrorból indulnak, nem az upstream registryből. A
+hitelesítés változatlan marad, mert a mirror az upstream autentikációt
+továbbítja. <em>Postcondition:</em> a build agent image pull kérés nem
+lép túl az upstream provider rate limitjén, a mirrorból a
+<code>podman pull</code> sikeres.</p>
+<h3 data-number="37.3.12" id="rövid-összefoglaló"><span
+class="header-section-number">37.3.12</span> Rövid összefoglaló</h3>
+<p>A registry endpoint elérhetősége és hitelesítése a DNS, TLS, Auth és
+Manifest rétegek együttes működésétől függ. A push/pull mindig
+digest-verify mellett történik: a tag mutálható, a manifest digest
+immutable referencia. A credential helper a token-scope-ot kezeli; a
+scope meghatározza a pull/push jogot. A mirror cache csökkenti az egress
+terhelést, de az air gap eszköz nélkül nem érhető el; ilyenkor
+<code>skopeo copy</code> köztes <code>dir:</code> formátummal szállít. A
+retention policy a tag/manifest törlés és a hivatkozatlan blob GC
+sorrendjét rögzíti. A rate limit és availability külön service
+réteg.</p>
+<ul>
+<li><strong>Digest:</strong> az artifact tartalomra számított immutable
+hash, hivatkozási azonosító.</li>
+<li><strong>Credential helper:</strong> a registry
+hitelesítőadat-tárolást és token-cserét végző klienskomponens.</li>
+<li><strong>Referenced blob:</strong> olyan blob, amelyet legalább egy
+manifest hivatkozik, ezért a GC nem törölheti.</li>
+</ul>
+<h3 data-number="37.3.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">37.3.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a fejezet seed-forrásai, <strong>nem ebben a
+munkamenetben olvasott források</strong>:</p>
+<ul>
+<li><a href="https://docs.docker.com/">Docker dokumentáció</a></li>
+<li><a href="https://opencontainers.org/">Open Container
+Initiative</a></li>
+<li><a href="https://docs.podman.io/">Podman dokumentáció</a></li>
+<li><a href="https://slsa.dev/spec/">SLSA Specification</a></li>
+</ul>
+<p><strong>Ellenőrzési hiányok:</strong> a labregistryben használt
+Docker Registry image pontos verziója és GC parancs útvonala, a Podman
+credential helper konkrét konfigurációs fájlformátuma, a Docker Hub és
+más provider rate limit aktuális értékei, valamint a lab Docker Registry
+beépített htpasswd auth realm pontos flow-ja a telepített verzió szerint
+ellenőrizendő. A self-hosted registry retention és GC API képességei a
+product verziójától függenek.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d182.html">← 37.2 OCI image, digest, tag és multiarch</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d184.html">37.4 SBOM, scanning, aláírás és build titkok →</a></div>
+</nav>
+</body>
+</html>

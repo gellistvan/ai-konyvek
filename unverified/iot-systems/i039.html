@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>13.1 Helyi feldolgozás: szűrés, aggregálás, eseménydetektálás –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Edge és gateway</a> › <a href="index.html#ich12">13 Edge-feldolgozás</a></p>
+<div class="links"><a class="prev" rel="prev" href="i038.html">← 12.4 A gateway üzemeltetése: systemd, konténerek, naplózás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i040.html">13.2 Gépi tanulás az eszközön és az edge-en: TinyML áttekintés →</a></div>
+</nav>
+<h2 data-number="13.1" id="i039"><span
+class="header-section-number">13.1</span> Helyi feldolgozás: szűrés,
+aggregálás, eseménydetektálás</h2>
+<h3 data-number="13.1.1" id="motiváció"><span
+class="header-section-number">13.1.1</span> Motiváció</h3>
+<p>A TerraSense üvegházban a <code>ts-node</code> másodpercenként vagy
+akár gyakrabban küld mérési adatot a <code>ts-gw</code> gateway-nek. A
+gateway feladata nem csak a protokollfordítás: ha minden nyers mintát
+azonnal továbbítana MQTT-n a felhőbe, az uplink folyamatosan terhelt
+lenne, a mobil adatkeret hamar elfogyna, és a backend is nagyobb
+számítási kapacitást igényelne. Ugyanakkor a felhasználót nem
+feltétlenül érdekli, hogy a hőmérséklet 22,1 °C-ról 22,2 °C-ra
+változott; elég, ha a jelentős változásról azonnal értesül, a lassú
+trendről pedig percenkénti összegzést kap. A gateway ezért ideális hely
+a helyi feldolgozásra: közel van az eszközökhöz, rendelkezik számítási
+kapacitással, és csökkentheti a felhőbe küldött adatmennyiséget,
+miközben a kritikus riasztások késleltetését alacsonyan tartja.</p>
+<h3 data-number="13.1.2" id="fogalmak-és-működés"><span
+class="header-section-number">13.1.2</span> Fogalmak és működés</h3>
+<h4 data-number="13.1.2.1" id="deadband-és-hiszterézis"><span
+class="header-section-number">13.1.2.1</span> Deadband és
+hiszterézis</h4>
+<p><strong>Definíció.</strong> A deadband (holtsáv) olyan szűrési
+szabály, amely szerint egy új mérési értéket csak akkor továbbítunk, ha
+az utolsó továbbított értéktől legalább egy előre megadott abszolút
+küszöbértékkel eltér. Ha az eltérés kisebb, az értéket eldobjuk vagy egy
+későbbi aggregálásba gyűjtjük.</p>
+<p>Példa: ha a hőmérséklet-deadband 0,5 °C, akkor a 22,0 °C után csak
+akkor küldünk új értéket, ha a hőmérséklet 21,5 °C alá csökken vagy 22,5
+°C fölé emelkedik. Ez a mechanizmus C++-ban egyszerűen egy előző-érték
+tárolással valósítható meg.</p>
+<p>A hiszterézis (hysteresis) ennek általánosítása: a be- és
+kikapcsolási küszöb nem ugyanaz. Például egy fűtési riasztásnál a magas
+hőmérséklet riasztást 30,0 °C felett vált ki, de a riasztás csak 28,0 °C
+alatt szűnik meg. Ezzel elkerüljük, hogy az érték a küszöb körül lebegve
+másodpercenként kapcsolgassa a riasztást, ami zajos telemetriát és
+felesleges értesítéseket okozna.</p>
+<h4 data-number="13.1.2.2" id="ablakos-aggregálás"><span
+class="header-section-number">13.1.2.2</span> Ablakos aggregálás</h4>
+<p><strong>Definíció.</strong> Az ablakos aggregálás során a beérkező
+mintákat időablakokba csoportosítjuk, és minden ablak végén egyetlen
+összegző üzenetet küldünk, amely statisztikai jellemzőket tartalmaz:
+minimum, maximum, átlag, esetleg szórás vagy minta darabszám.</p>
+<p>Két fő ablaktípust különböztetünk meg:</p>
+<ul>
+<li><strong>Tumbling (ugró) ablak:</strong> az ablakok nem fedik
+egymást. Például minden egész perckor kezdődő 60 másodperces ablak; az
+ablak végén kiértékeljük, majd az aggregátumot publikáljuk, és új
+ablakot kezdünk. A tumbling ablak egyszerű, de a határokon késleltetés
+léphet fel.</li>
+<li><strong>Sliding (csúszó) ablak:</strong> az ablak hossza rögzített,
+de az indítás gyakori, például 60 másodperces ablakot 10 másodpercenként
+indítunk. Ez nagyobb számítási és adatforgalmi költséget jelent, de
+frissebb eredményt ad.</li>
+</ul>
+<p>A TerraSense gateway-ben az első változatban tumbling ablakot
+használunk: 60 másodperces ablakban számolunk minimumot, maximumot és
+átlagot.</p>
+<h4 data-number="13.1.2.3" id="helyi-riasztás"><span
+class="header-section-number">13.1.2.3</span> Helyi riasztás</h4>
+<p><strong>Definíció.</strong> A helyi riasztás olyan, a gateway-en futó
+szabály, amely a bejövő mérési értékekből azonnal, felhő-kapcsolat
+nélkül is képes döntést hozni, és állapotváltozást jelezni. A riasztás
+lehet:</p>
+<ul>
+<li><strong>Küszöbalapú:</strong> az érték átlép egy felső vagy alsó
+határt.</li>
+<li><strong>Időtartam-alapú:</strong> a küszöbátlépésnek egy minimális
+ideig fenn kell állnia, hogy elkerüljük a kiugró értékekből adódó téves
+riasztást.</li>
+<li><strong>Trendalapú:</strong> az érték rövid idő alatt gyorsan
+változik (például 2 °C emelkedés 10 perc alatt), ami közelgő problémára
+utalhat.</li>
+</ul>
+<p>Ezek a riasztások a TerraSense-ben a
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/state</code> retained topicra
+kerülnek, hogy a backend és a felhasználói felület is lássa a jelenlegi
+állapotot.</p>
+<h3 data-number="13.1.3" id="döntési-szempontok"><span
+class="header-section-number">13.1.3</span> Döntési szempontok</h3>
+<p>Az alábbi táblázat azt foglalja össze, mikor érdemes a feldolgozást a
+gateway-en végezni a nyers felhőbe küldés helyett.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>Nyers adat felhőbe</th>
+<th>Deadband</th>
+<th>Ablakos aggregálás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Sávszélesség-igény</td>
+<td>Magas</td>
+<td>Közepes</td>
+<td>Alacsony</td>
+</tr>
+<tr class="even">
+<td>Információvesztés</td>
+<td>Nincs</td>
+<td>Kicsi (küszöb alatti változás)</td>
+<td>Nagyobb (részletek elvesznek)</td>
+</tr>
+<tr class="odd">
+<td>Riasztási késleltetés</td>
+<td>Alacsony</td>
+<td>Alacsony</td>
+<td>Akár az ablak hossza</td>
+</tr>
+<tr class="even">
+<td>Tárolási költség</td>
+<td>Magas</td>
+<td>Közepes</td>
+<td>Alacsony</td>
+</tr>
+<tr class="odd">
+<td>Gateway CPU-terhelés</td>
+<td>Alacsony</td>
+<td>Alacsony</td>
+<td>Közepes</td>
+</tr>
+<tr class="even">
+<td>Tipikus felhasználás</td>
+<td>Hibakeresés, kalibráció</td>
+<td>Hirtelen változások</td>
+<td>Trend, élettartam, költség</td>
+</tr>
+</tbody>
+</table>
+<p>A TerraSense-ben a telemetria-topicra a deadband-szűrt azonnali
+értékek és a percenkénti aggregátumok is felkerülnek, de eltérő
+séma-mezőkkel; a részleteket az <a href="i032.html">Adatformátumok:
+JSON, CBOR, Protocol Buffers, SenML</a> alfejezet rögzíti.</p>
+<h3 data-number="13.1.4"
+id="kidolgozott-példa-megtakarítás-számítás"><span
+class="header-section-number">13.1.4</span> Kidolgozott példa:
+megtakarítás-számítás</h3>
+<p>Tegyük fel, hogy a <code>ts-node</code> 10 másodpercenként küld egy
+nyers telemetria-üzenetet, amelynek mérete JSON-ban 86 B. A gateway
+deadband-szűrést és 60 másodperces tumbling ablakot alkalmaz. Az
+aggregált üzenet – amely tartalmazza a minimumot, maximumot és átlagot –
+mérete 96 B, mert több mező van benne, de csak percenként egy ilyen
+üzenet keletkezik.</p>
+<p>Jelölje:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>m</mi></msub><mo>=</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">T_m = 10</annotation></semantics></math>
+s a mérési periódus,</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mtext mathvariant="normal">nyers</mtext></msub><mo>=</mo><mn>86</mn></mrow><annotation encoding="application/x-tex">S_\text{nyers} = 86</annotation></semantics></math>
+B a nyers üzenet mérete,</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>w</mi></msub><mo>=</mo><mn>60</mn></mrow><annotation encoding="application/x-tex">T_w = 60</annotation></semantics></math>
+s az ablak hossza,</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>S</mi><mtext mathvariant="normal">agg</mtext></msub><mo>=</mo><mn>96</mn></mrow><annotation encoding="application/x-tex">S_\text{agg} = 96</annotation></semantics></math>
+B az aggregált üzenet mérete.</li>
+</ul>
+<p>A naponta küldött üzenetek száma nyers esetben:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mtext mathvariant="normal">nyers</mtext></msub><mo>=</mo><mfrac><mrow><mn>86</mn><mspace width="0.167em"></mspace><mn>400</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> s</mtext></mrow></mrow><mrow><mn>10</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> s</mtext></mrow></mrow></mfrac><mo>=</mo><mn>8</mn><mspace width="0.167em"></mspace><mn>640</mn></mrow><annotation encoding="application/x-tex">N_\text{nyers} = \frac{86\,400 \text{ s}}{10 \text{ s}} = 8\,640</annotation></semantics></math></p>
+<p>A napi nyers adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>D</mi><mtext mathvariant="normal">nyers</mtext></msub><mo>=</mo><msub><mi>N</mi><mtext mathvariant="normal">nyers</mtext></msub><mo>⋅</mo><msub><mi>S</mi><mtext mathvariant="normal">nyers</mtext></msub><mo>=</mo><mn>8</mn><mspace width="0.167em"></mspace><mn>640</mn><mo>×</mo><mn>86</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>=</mo><mn>743</mn><mspace width="0.167em"></mspace><mn>040</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>≈</mo><mn>743</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> kB</mtext></mrow></mrow><annotation encoding="application/x-tex">D_\text{nyers} = N_\text{nyers} \cdot S_\text{nyers} = 8\,640 \times 86 \text{ B} = 743\,040 \text{ B} \approx 743 \text{ kB}</annotation></semantics></math></p>
+<p>Az aggregálással percenként egy üzenet keletkezik, tehát naponta:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mtext mathvariant="normal">agg</mtext></msub><mo>=</mo><mfrac><mrow><mn>86</mn><mspace width="0.167em"></mspace><mn>400</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> s</mtext></mrow></mrow><mrow><mn>60</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> s</mtext></mrow></mrow></mfrac><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn></mrow><annotation encoding="application/x-tex">N_\text{agg} = \frac{86\,400 \text{ s}}{60 \text{ s}} = 1\,440</annotation></semantics></math></p>
+<p>A napi aggregált adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>D</mi><mtext mathvariant="normal">agg</mtext></msub><mo>=</mo><msub><mi>N</mi><mtext mathvariant="normal">agg</mtext></msub><mo>⋅</mo><msub><mi>S</mi><mtext mathvariant="normal">agg</mtext></msub><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>440</mn><mo>×</mo><mn>96</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>=</mo><mn>138</mn><mspace width="0.167em"></mspace><mn>240</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>≈</mo><mn>138</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> kB</mtext></mrow></mrow><annotation encoding="application/x-tex">D_\text{agg} = N_\text{agg} \cdot S_\text{agg} = 1\,440 \times 96 \text{ B} = 138\,240 \text{ B} \approx 138 \text{ kB}</annotation></semantics></math></p>
+<p>A megtakarítás:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Δ</mi><mo>=</mo><mn>1</mn><mo>−</mo><mfrac><msub><mi>D</mi><mtext mathvariant="normal">agg</mtext></msub><msub><mi>D</mi><mtext mathvariant="normal">nyers</mtext></msub></mfrac><mo>=</mo><mn>1</mn><mo>−</mo><mfrac><mrow><mn>138</mn><mspace width="0.167em"></mspace><mn>240</mn></mrow><mrow><mn>743</mn><mspace width="0.167em"></mspace><mn>040</mn></mrow></mfrac><mo>≈</mo><mn>0</mn><mo>,</mo><mn>814</mn></mrow><annotation encoding="application/x-tex">\Delta = 1 - \frac{D_\text{agg}}{D_\text{nyers}} = 1 - \frac{138\,240}{743\,040} \approx 0{,}814</annotation></semantics></math></p>
+<p>Tehát a gateway-en végzett ablakos aggregálás körülbelül
+<strong>81,4%</strong> sávszélesség-megtakarítást eredményez.
+Természetesen az információ egy része elvész: a percen belüli
+ingadozások csak a minimum- és maximumértékben jelennek meg, az átlag
+ezeket elrejti. Ezért az aggregátumboz mindig érdemes csatolni a
+<code>min</code> és <code>max</code> mezőket is.</p>
+<p>Az alábbi ábra illusztrálja a nyers és az aggregált adat
+megjelenését.</p>
+<figure>
+<img src="assets/i039-plot-1.png"
+alt="Nyers és aggregált hőmérséklet a gateway-en - Illusztratív, számított mintaadatok; az aggregált pont az első 60 s átlagát mutatja." />
+<figcaption aria-hidden="true">Nyers és aggregált hőmérséklet a
+gateway-en - Illusztratív, számított mintaadatok; az aggregált pont az
+első 60 s átlagát mutatja.</figcaption>
+</figure>
+<h3 data-number="13.1.5" id="labor-aggregáló-modul-a-ts-gw-ben"><span
+class="header-section-number">13.1.5</span> Labor: aggregáló modul a
+<code>ts-gw</code>-ben</h3>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i039 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i039</span></code></pre></div>
+<p>Ebben a laborban egy C++ modult készítünk, amelyet a
+<code>ts-gw</code> szolgáltatás későbbi változata fog használni. A modul
+három fő osztályt tartalmaz: <code>DeadbandFilter</code>,
+<code>TumblingWindowAggregator</code> és <code>ThresholdAlert</code>. A
+példában a mintákat egy egyszerű <code>Sample</code> struktúra
+reprezentálja.</p>
+<p><strong>Fájl: <code>edge_aggregator.h</code></strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Sample <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> temperature<span class="op">;</span>     <span class="co">// °C</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> humidity<span class="op">;</span>        <span class="co">// %RH</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> soil_moisture<span class="op">;</span>   <span class="co">// %</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> ts<span class="op">;</span>            <span class="co">// epoch ms, UTC</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> AggregatedSample <span class="op">{</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> window_start<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> temp_min<span class="op">,</span> temp_max<span class="op">,</span> temp_avg<span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> hum_min<span class="op">,</span> hum_max<span class="op">,</span> hum_avg<span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> soil_min<span class="op">,</span> soil_max<span class="op">,</span> soil_avg<span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> count<span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> DeadbandFilter <span class="op">{</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> DeadbandFilter<span class="op">(</span><span class="dt">double</span> threshold<span class="op">);</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> should_forward<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">);</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> <span class="va">threshold_</span><span class="op">;</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">has_last_</span><span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    Sample <span class="va">last_</span><span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> TumblingWindowAggregator <span class="op">{</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> TumblingWindowAggregator<span class="op">(</span><span class="dt">uint64_t</span> window_ms<span class="op">);</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> add<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">);</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ready<span class="op">(</span><span class="dt">uint64_t</span> now<span class="op">)</span> <span class="at">const</span><span class="op">;</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    AggregatedSample aggregate<span class="op">();</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> <span class="va">window_ms_</span><span class="op">;</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">has_start_</span><span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> <span class="va">window_start_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>Sample<span class="op">&gt;</span> <span class="va">buffer_</span><span class="op">;</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ThresholdAlert <span class="op">{</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    ThresholdAlert<span class="op">(</span><span class="dt">double</span> high_threshold<span class="op">,</span> <span class="dt">double</span> low_threshold<span class="op">,</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>                   <span class="dt">uint64_t</span> min_duration_ms<span class="op">);</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> update<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">);</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> is_active<span class="op">()</span> <span class="at">const</span><span class="op">;</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> <span class="va">high_</span><span class="op">;</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> <span class="va">low_</span><span class="op">;</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> <span class="va">min_duration_ms_</span><span class="op">;</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">active_</span><span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> <span class="va">since_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p><strong>Fájl: <code>edge_aggregator.cpp</code></strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;edge_aggregator.h&quot;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>DeadbandFilter<span class="op">::</span>DeadbandFilter<span class="op">(</span><span class="dt">double</span> threshold<span class="op">)</span> <span class="op">:</span> <span class="va">threshold_</span><span class="op">(</span>threshold<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> DeadbandFilter<span class="op">::</span>should_forward<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span><span class="va">has_last_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="va">last_</span> <span class="op">=</span> s<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="va">has_last_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> diff <span class="op">=</span> s<span class="op">.</span>temperature <span class="op">-</span> <span class="va">last_</span><span class="op">.</span>temperature<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>diff <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> diff <span class="op">=</span> <span class="op">-</span>diff<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>diff <span class="op">&gt;=</span> <span class="va">threshold_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        <span class="va">last_</span> <span class="op">=</span> s<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>TumblingWindowAggregator<span class="op">::</span>TumblingWindowAggregator<span class="op">(</span><span class="dt">uint64_t</span> window_ms<span class="op">)</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">:</span> <span class="va">window_ms_</span><span class="op">(</span>window_ms<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> TumblingWindowAggregator<span class="op">::</span>add<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span><span class="va">has_start_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="va">window_start_</span> <span class="op">=</span> s<span class="op">.</span>ts<span class="op">;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="va">has_start_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="va">buffer_</span><span class="op">.</span>push_back<span class="op">(</span>s<span class="op">);</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> TumblingWindowAggregator<span class="op">::</span>ready<span class="op">(</span><span class="dt">uint64_t</span> now<span class="op">)</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="va">has_start_</span> <span class="op">&amp;&amp;</span> <span class="op">(</span>now <span class="op">-</span> <span class="va">window_start_</span><span class="op">)</span> <span class="op">&gt;=</span> <span class="va">window_ms_</span><span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>AggregatedSample TumblingWindowAggregator<span class="op">::</span>aggregate<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    AggregatedSample out<span class="op">{};</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    out<span class="op">.</span>window_start <span class="op">=</span> <span class="va">window_start_</span><span class="op">;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    out<span class="op">.</span>count <span class="op">=</span> <span class="va">buffer_</span><span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="at">const</span> <span class="kw">auto</span><span class="op">&amp;</span> s <span class="op">:</span> <span class="va">buffer_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>out<span class="op">.</span>count <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>s<span class="op">.</span>temperature <span class="op">&lt;</span> out<span class="op">.</span>temp_min <span class="op">||</span> out<span class="op">.</span>count <span class="op">==</span> <span class="dv">1</span><span class="op">)</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>            out<span class="op">.</span>temp_min <span class="op">=</span> s<span class="op">.</span>temperature<span class="op">;</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>s<span class="op">.</span>temperature <span class="op">&gt;</span> out<span class="op">.</span>temp_max <span class="op">||</span> out<span class="op">.</span>count <span class="op">==</span> <span class="dv">1</span><span class="op">)</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>            out<span class="op">.</span>temp_max <span class="op">=</span> s<span class="op">.</span>temperature<span class="op">;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>temp_avg <span class="op">+=</span> s<span class="op">.</span>temperature<span class="op">;</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>        <span class="co">// hasonlóan a humidity és soil mezőkhöz</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>hum_min <span class="op">=</span> out<span class="op">.</span>hum_min <span class="op">&lt;</span> s<span class="op">.</span>humidity <span class="op">?</span> out<span class="op">.</span>hum_min <span class="op">:</span> s<span class="op">.</span>humidity<span class="op">;</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>hum_max <span class="op">=</span> out<span class="op">.</span>hum_max <span class="op">&gt;</span> s<span class="op">.</span>humidity <span class="op">?</span> out<span class="op">.</span>hum_max <span class="op">:</span> s<span class="op">.</span>humidity<span class="op">;</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>hum_avg <span class="op">+=</span> s<span class="op">.</span>humidity<span class="op">;</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>soil_min <span class="op">=</span> out<span class="op">.</span>soil_min <span class="op">&lt;</span> s<span class="op">.</span>soil_moisture <span class="op">?</span> out<span class="op">.</span>soil_min <span class="op">:</span> s<span class="op">.</span>soil_moisture<span class="op">;</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>soil_max <span class="op">=</span> out<span class="op">.</span>soil_max <span class="op">&gt;</span> s<span class="op">.</span>soil_moisture <span class="op">?</span> out<span class="op">.</span>soil_max <span class="op">:</span> s<span class="op">.</span>soil_moisture<span class="op">;</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>soil_avg <span class="op">+=</span> s<span class="op">.</span>soil_moisture<span class="op">;</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>out<span class="op">.</span>count <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>temp_avg <span class="op">/=</span> out<span class="op">.</span>count<span class="op">;</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>hum_avg <span class="op">/=</span> out<span class="op">.</span>count<span class="op">;</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>soil_avg <span class="op">/=</span> out<span class="op">.</span>count<span class="op">;</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    <span class="va">buffer_</span><span class="op">.</span>clear<span class="op">();</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>    <span class="va">has_start_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out<span class="op">;</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>ThresholdAlert<span class="op">::</span>ThresholdAlert<span class="op">(</span><span class="dt">double</span> high_threshold<span class="op">,</span> <span class="dt">double</span> low_threshold<span class="op">,</span></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">uint64_t</span> min_duration_ms<span class="op">)</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>    <span class="op">:</span> <span class="va">high_</span><span class="op">(</span>high_threshold<span class="op">),</span> <span class="va">low_</span><span class="op">(</span>low_threshold<span class="op">),</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>      <span class="va">min_duration_ms_</span><span class="op">(</span>min_duration_ms<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ThresholdAlert<span class="op">::</span>update<span class="op">(</span><span class="at">const</span> Sample<span class="op">&amp;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span><span class="va">active_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>s<span class="op">.</span>temperature <span class="op">&gt;</span> <span class="va">high_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>            <span class="va">since_</span> <span class="op">=</span> s<span class="op">.</span>ts<span class="op">;</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>            <span class="va">active_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>s<span class="op">.</span>temperature <span class="op">&lt;</span> <span class="va">low_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>s<span class="op">.</span>ts <span class="op">-</span> <span class="va">since_</span> <span class="op">&gt;=</span> <span class="va">min_duration_ms_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>                <span class="va">active_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a><span class="dt">bool</span> ThresholdAlert<span class="op">::</span>is_active<span class="op">()</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="va">active_</span><span class="op">;</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Fájl: <code>main.cpp</code></strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;edge_aggregator.h&quot;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iomanip&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">uint64_t</span> start <span class="op">=</span> <span class="dv">1&#39;700&#39;000&#39;000&#39;000</span><span class="bu">ULL</span><span class="op">;</span> <span class="co">// példa epoch ms</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    DeadbandFilter deadband<span class="op">(</span><span class="fl">0.5</span><span class="op">);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    TumblingWindowAggregator agg<span class="op">(</span><span class="dv">60&#39;000</span><span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    ThresholdAlert alert<span class="op">(</span><span class="fl">30.0</span><span class="op">,</span> <span class="fl">28.0</span><span class="op">,</span> <span class="dv">5</span> <span class="op">*</span> <span class="dv">60&#39;000</span><span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="bu">std::</span>fixed <span class="op">&lt;&lt;</span> <span class="bu">std::</span>setprecision<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">12</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint64_t</span> now <span class="op">=</span> start <span class="op">+</span> i <span class="op">*</span> <span class="dv">10&#39;000</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="dt">double</span> temp <span class="op">=</span> <span class="fl">22.0</span> <span class="op">+</span> <span class="op">(</span>i <span class="op">%</span> <span class="dv">5</span><span class="op">)</span> <span class="op">*</span> <span class="fl">0.1</span><span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>i <span class="op">==</span> <span class="dv">8</span><span class="op">)</span> temp <span class="op">=</span> <span class="fl">23.0</span><span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        Sample s<span class="op">{</span>temp<span class="op">,</span> <span class="fl">55.0</span><span class="op">,</span> <span class="fl">40.0</span><span class="op">,</span> now<span class="op">};</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>deadband<span class="op">.</span>should_forward<span class="op">(</span>s<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Deadband forward: &quot;</span> <span class="op">&lt;&lt;</span> temp <span class="op">&lt;&lt;</span> <span class="st">&quot; °C</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>        agg<span class="op">.</span>add<span class="op">(</span>s<span class="op">);</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>agg<span class="op">.</span>ready<span class="op">(</span>now<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>            <span class="kw">auto</span> a <span class="op">=</span> agg<span class="op">.</span>aggregate<span class="op">();</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Aggregated window &quot;</span> <span class="op">&lt;&lt;</span> a<span class="op">.</span>window_start</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>                      <span class="op">&lt;&lt;</span> <span class="st">&quot;: avg=&quot;</span> <span class="op">&lt;&lt;</span> a<span class="op">.</span>temp_avg <span class="op">&lt;&lt;</span> <span class="st">&quot;, min=&quot;</span> <span class="op">&lt;&lt;</span> a<span class="op">.</span>temp_min</span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>                      <span class="op">&lt;&lt;</span> <span class="st">&quot;, max=&quot;</span> <span class="op">&lt;&lt;</span> a<span class="op">.</span>temp_max <span class="op">&lt;&lt;</span> <span class="st">&quot;, count=&quot;</span> <span class="op">&lt;&lt;</span> a<span class="op">.</span>count <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>        alert<span class="op">.</span>update<span class="op">(</span>s<span class="op">);</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>alert<span class="op">.</span>is_active<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Alert active at &quot;</span> <span class="op">&lt;&lt;</span> temp <span class="op">&lt;&lt;</span> <span class="st">&quot; °C</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Build és futtatás:</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">g++</span> <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-Wall</span> <span class="at">-Wextra</span> <span class="at">-o</span> edge_agg_test main.cpp edge_aggregator.cpp</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./edge_agg_test</span></span></code></pre></div>
+<p><strong>Várt kimenet:</strong></p>
+<pre class="text"><code>Deadband forward: 22.0 °C
+Deadband forward: 23.0 °C
+Aggregated window 1700000000000: avg=22.3, min=22.0, max=23.0, count=6</code></pre>
+<p>Az első ablak 6 mintát tartalmaz, mert a 60 másodperces ablak 6 darab
+10 másodperces mintát fed le. A deadband-szűrő az első mintát mindig
+továbbítja, majd csak a 0,5 °C-ot meghaladó változást, ami itt a 8.
+mintánál következik be.</p>
+<h3 data-number="13.1.6" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">13.1.6</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A modul működését unit tesztekkel ellenőrizhetjük, például a Google
+Test keretrendszerrel, de a fenti egyszerű <code>main</code> is alkalmas
+a kézi validálásra.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A deadband nem továbbít, pedig nagy a változás</td>
+<td>A küszöbérték túl nagy, vagy a <code>last_</code> nem frissül</td>
+<td>Csökkentsd a küszöböt, ellenőrizd a <code>should_forward</code>
+logikát</td>
+</tr>
+<tr class="even">
+<td>Az aggregátor nem ad ki eredményt</td>
+<td>A <code>ready</code> visszatérési feltétele hibás, vagy az ablak
+hossza rossz</td>
+<td>Ellenőrizd, hogy a <code>now</code> epoch ms, és az ablak
+<code>window_ms_</code> ugyanabban az egységben van</td>
+</tr>
+<tr class="odd">
+<td>A riasztás nem szűnik meg</td>
+<td>A hiszterézis alsó küszöbe magasabb, mint a jelenlegi hőmérséklet,
+vagy a minimális időtartam nem telt le</td>
+<td>Ellenőrizd a <code>low_</code> és <code>min_duration_ms_</code>
+értékeit</td>
+</tr>
+<tr class="even">
+<td>Az átlag irreálisan magas</td>
+<td>A <code>buffer_</code> nem ürül az aggregálás után, vagy az
+<code>avg</code> számításnál nem osztasz a darabszámmal</td>
+<td>Ellenőrizd az <code>aggregate</code> metódust</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="13.1.7" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">13.1.7</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><strong>Túl nagy deadband:</strong> ha a küszöböt 5 °C-ra állítjuk,
+egy lassú, de fontos 4 °C-os emelkedés soha nem kerül továbbításra, amíg
+a küszöböt át nem lépi. A deadband értékét a fizikai folyamat
+időállandójához kell igazítani.</li>
+<li><strong>Hiszterézis nélküli riasztás:</strong> ha a riasztás be- és
+kikapcsolási küszöbe azonos, a hőmérséklet a küszöb körül ingadozva
+másodpercenként kapcsolgatja a riasztást, ami riasztási fáradtsághoz
+vezet. Mindig használjunk legalább 1–2 °C széles hiszterézis-sávot.</li>
+<li><strong>Helyi idő UTC helyett:</strong> ha a gateway a helyi
+időzónát használja az ablakokhoz, a nyári időszámítás váltásakor az
+ablakok eltolódnak. Mindig UTC epoch ms-t használjunk.</li>
+<li><strong>Az aggregált átlag elrejti a kiugró értéket:</strong> ha
+csak átlagot küldünk, egy rövid ideig tartó 40 °C-os kiugrás az átlagban
+alig látszik. Mindig küldjünk min/max értéket is.</li>
+</ol>
+<h3 data-number="13.1.8" id="feladatok"><span
+class="header-section-number">13.1.8</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Fogalmi kérdés:</strong> Miért előnyös a deadband-szűrést a
+gateway-en végezni, ha a szenzor már küld nyers adatot?</li>
+<li><strong>Számolási feladat:</strong> Egy eszköz 5 másodpercenként
+küld 100 B méretű nyers üzenetet. A gateway 120 másodperces tumbling
+ablakkal aggregál, az aggregált üzenet mérete 150 B. Számítsd ki a napi
+adatforgalmat nyers és aggregált esetben, valamint a megtakarítás
+százalékát!</li>
+<li><strong>Implementációs feladat:</strong> Módosítsd a
+<code>TumblingWindowAggregator</code> osztályt úgy, hogy 60 másodperces
+sliding ablakot valósítson meg 10 másodperces csúszással! A laborban
+készített modulban add hozzá a <code>SlidingWindowAggregator</code>
+osztályt, és teszteld le a <code>main.cpp</code>-ben.</li>
+<li><strong>Hibakeresési feladat:</strong> A riasztás nem lép ki, pedig
+a hőmérséklet 25 °C-ra csökkent. Mit néznél meg először a kódban és a
+konfigurációban?</li>
+</ol>
+<h3 data-number="13.1.9" id="megoldások"><span
+class="header-section-number">13.1.9</span> Megoldások</h3>
+<ol type="1">
+<li>A deadband-szűrés a gateway-en azért előnyös, mert a szenzor és a
+gateway közötti kis hatótávú, alacsony költségű kapcsolaton (például BLE
+vagy UDP) olcsó a nyers adat továbbítása, de a gateway és a felhő
+közötti mobil vagy nagy távolságú kapcsolat drága és korlátozott. A
+gateway a nyers adatból csak a jelentős változást engedi tovább, ezzel
+csökkenti a felhőbe küldött forgalmat anélkül, hogy a szenzor energiáját
+vagy a mérési gyakoriságot csökkentené.</li>
+<li>Nyers esetben a minták száma naponta:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>86</mn><mspace width="0.167em"></mspace><mn>400</mn><mi>/</mi><mn>5</mn><mo>=</mo><mn>17</mn><mspace width="0.167em"></mspace><mn>280</mn></mrow><annotation encoding="application/x-tex">86\,400 / 5 = 17\,280</annotation></semantics></math>.
+A nyers adatforgalom:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>17</mn><mspace width="0.167em"></mspace><mn>280</mn><mo>×</mo><mn>100</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>728</mn><mspace width="0.167em"></mspace><mn>000</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>≈</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>728</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> kB</mtext></mrow></mrow><annotation encoding="application/x-tex">17\,280 \times 100 \text{ B} = 1\,728\,000 \text{ B} \approx 1\,728 \text{ kB}</annotation></semantics></math>.
+Aggregált esetben az ablak hossza 120 s, tehát naponta
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>86</mn><mspace width="0.167em"></mspace><mn>400</mn><mi>/</mi><mn>120</mn><mo>=</mo><mn>720</mn></mrow><annotation encoding="application/x-tex">86\,400 / 120 = 720</annotation></semantics></math>
+ablak. Az aggregált adatforgalom:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>720</mn><mo>×</mo><mn>150</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>=</mo><mn>108</mn><mspace width="0.167em"></mspace><mn>000</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> B</mtext></mrow><mo>=</mo><mn>108</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> kB</mtext></mrow></mrow><annotation encoding="application/x-tex">720 \times 150 \text{ B} = 108\,000 \text{ B} = 108 \text{ kB}</annotation></semantics></math>.
+A megtakarítás:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mn>108</mn><mi>/</mi><mn>1728</mn><mo>≈</mo><mn>93</mn><mo>,</mo><mn>75</mn><mi>%</mi></mrow><annotation encoding="application/x-tex">1 - 108 / 1728 \approx 93{,}75\%</annotation></semantics></math>.</li>
+<li>A sliding ablak megvalósításához olyan puffert kell fenntartani,
+amely a mintákat időrendben tárolja, és minden 10. másodpercben
+eltávolítja a 60 másodpercnél régebbi elemeket, majd kiszámítja az
+aktuális ablak statisztikáit. Egy lehetséges megoldás: a
+<code>SlidingWindowAggregator</code> rendelkezik egy
+<code>std::deque&lt;Sample&gt;</code> pufferrel, és minden
+<code>slide</code> hívásnál a <code>now - window_ms_</code>-nél régebbi
+elemeket eldobja, majd a maradékból aggregál.</li>
+<li>Először ellenőrizném a <code>ThresholdAlert::update</code>
+metódusban, hogy az <code>active_</code> állapotból való kilépés
+feltétele helyes-e: a hőmérsékletnek a <code>low_</code> küszöb alá kell
+esnie, és a <code>since_</code> óta el kell telnie a
+<code>min_duration_ms_</code> időtartamnak. Ha a hőmérséklet 25 °C, az
+valószínűleg a <code>low_</code> (például 28 °C) alatt van, de lehet,
+hogy a <code>min_duration_ms_</code> még nem telt le, vagy a
+<code>since_</code> nem frissül, mert az <code>update</code> metódus nem
+hívódik meg rendszeresen.</li>
+</ol>
+<h3 data-number="13.1.10" id="rövid-összefoglaló"><span
+class="header-section-number">13.1.10</span> Rövid összefoglaló</h3>
+<p>A gateway-en végzett helyi feldolgozás csökkenti a felhőbe irányuló
+adatforgalmat és költséget, miközben a kritikus riasztások késleltetése
+alacsony marad. A deadband-szűrés csak a jelentős változásokat
+továbbítja, a hiszterézis pedig megakadályozza a riasztási lebegést. A
+tumbling ablakos aggregálás percenként egy min/max/átlag üzenetet állít
+elő, ami az adott példában körülbelül 81%-os megtakarítást eredményez. A
+laborban elkészült az <code>edge_aggregator.h/cpp</code> modul, amely a
+<code>DeadbandFilter</code>, <code>TumblingWindowAggregator</code> és
+<code>ThresholdAlert</code> osztályokat tartalmazza. <strong>Továbbvitt
+eredmény.</strong> Az aggregált telemetria továbbra is a
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/telemetry</code> topicra
+kerül, de az üzenet tartalmaz egy <code>agg</code> objektumot
+<code>window_start</code>, <code>min</code>, <code>max</code>,
+<code>avg</code> és <code>count</code> mezőkkel; ezt a konvenciót
+használja az <a href="i045.html">Idősoros adatbázisok és
+adatmodellezés</a> és az <a href="i047.html">Eseményvezérelt
+feldolgozás: Kafka</a>. A helyi riasztás állapota a
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/state</code> retained topicra
+kerül <code>local_alert</code> mezővel, amelyet az <a
+href="i052.html">Riasztás: szabályok, értesítés, riasztási fáradtság</a>
+alfejezet használ fel.</p>
+<h3 data-number="13.1.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">13.1.11</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>A C++20 szabvány <code>std::deque</code>, <code>std::vector</code>
+és az időkezelő függvények viselkedése ismert; azonban a
+<code>main.cpp</code>-ben használt epoch ms értékek illusztratívak,
+valós rendszerben a <code>std::chrono</code> és a rendszeridő UTC-ből
+való leképzését ellenőrizni kell.</li>
+<li>A gateway és a felhő közötti MQTT-topicok és a <code>agg</code> séma
+a jelen alfejezetben rögzített konvenció, amelyet az <a
+href="i032.html">Adatformátumok: JSON, CBOR, Protocol Buffers, SenML</a>
+alfejezetnek kell véglegesítenie.</li>
+<li>A sávszélesség-megtakarítási példa számított, illusztratív érték;
+valós rendszerben a tényleges méretek a séma, a kódolás és a tömörítés
+függvényében változhatnak.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i038.html">← 12.4 A gateway üzemeltetése: systemd, konténerek, naplózás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i040.html">13.2 Gépi tanulás az eszközön és az edge-en: TinyML áttekintés →</a></div>
+</nav>
+</body>
+</html>

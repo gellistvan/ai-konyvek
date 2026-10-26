@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.4 Az rkv hálózati szerver: TCP, protokoll, kecses leállás –
+Rust programozás C++-fejlesztőknek – a nulláról a mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Párhuzamosság és aszinkronitás</a> › <a href="index.html#rch16">17 Aszinkron Rust</a></p>
+<div class="links"><a class="prev" rel="prev" href="r039.html">← 17.3 Tokio: taskok, I/O, csatornák, select és megszakítás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r041.html">17.5 Naplózás és megfigyelhetőség: tracing →</a></div>
+</nav>
+<h2 data-number="17.4" id="r040"><span
+class="header-section-number">17.4</span> Az rkv hálózati szerver: TCP,
+protokoll, kecses leállás</h2>
+<h3 data-number="17.4.1" id="motiváció"><span
+class="header-section-number">17.4.1</span> Motiváció</h3>
+<p>Egy C++-ban írt TCP-szerver tipikusan a következő mintát követi: egy
+<code>accept</code> ciklus, minden kapcsolatnak egy
+<code>std::thread</code>, és egy osztott, mutexszel védett állapot. A
+kecses leállás (graceful shutdown) azonban gyakran utólag kerül be, és
+ilyenkor jönnek a jellegzetes hibák: a szálak nem tudnak egy atomi
+<code>bool</code> leállítási flagre időben reagálni, a <code>join</code>
+a blokkoló <code>recv</code> miatt lefagy, a nyitott kapcsolatokra nem
+lehet hatni. A Rust async modellben a leállítás is elsőrendű
+állampolgár: a futó feladatok (taskok) megszakíthatók, ahelyett hogy egy
+blokkoló hívásban ragadnának. Ebben az alfejezetben az rkv-hoz építünk
+egy tokio-alapú TCP-szervert, amely soronkénti szöveges protokollt
+beszél, és <strong>graceful shutdownnal</strong> áll le: új
+kapcsolatokat nem fogad, a folyamatban lévő parancsokat befejezi, és a
+klienseket hagyja kilépni.</p>
+<h3 data-number="17.4.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">17.4.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <em>keretezés</em> (framing) az a
+szabály, amely meghatározza, hol kezdődik és végződik egy üzenet egy
+bájtfolyamban. A mi szerverünknél a keretezés egy sor vége
+(<code>\n</code>): minden parancs egyetlen sorból áll, a válasz is
+soronkénti (a <code>LIST</code> kivételével, ahol több
+<code>VALUE</code> sor és egy záró <code>OK</code> sor érkezik).</p>
+<p><strong>Definíció.</strong> A <em>kecses leállás</em> (graceful
+shutdown) olyan leállítási folyamat, amely során a szerver nem szakítja
+meg azonnal az aktív kapcsolatokat, hanem: (1) leállítja az új
+kapcsolatok fogadását, (2) jelzi a klienseknek, hogy a folyamatban lévő
+művelet befejezése után lépjenek ki, és (3) megvárja a futó taskok
+befejeződését.</p>
+<p><strong>Szabály.</strong> Ha egy <code>MutexGuard</code>-ot
+<code>.await</code> ponton át tartunk, a kritikus szakasz akár
+tetszőlegesen hosszú ideig zárva maradhat, ami csökkenti az
+áteresztőképességet, és <code>Mutex</code>-függő holtversenyt okozhat.
+Async kódban a zárat csak rövid, nem <code>.await</code>-elő szakaszra
+szerezhetjük meg, és a <code>.await</code> előtt el kell engednünk.</p>
+<p>A tokio két választ ad a megosztott állapotra: a
+<code>std::sync::Mutex</code> (vagy <code>RwLock</code>) és a
+<code>tokio::sync::Mutex</code>. A hálózati szerverben a tárolóművelet
+nem blokkol (memóriában vagy gyors fájlművelet), ezért a
+<code>std</code>-változat elegendő; a <code>tokio::sync::Mutex</code>
+akkor jön jól, ha a védett szakasz maga is <code>.await</code>-el.</p>
+<p><strong>Definíció.</strong> A
+<code>tokio_util::sync::CancellationToken</code> egy olyan jelzés,
+amelyet <code>cancel()</code> hívással lehet bekapcsolni, és a váró
+taskok <code>.cancelled()</code>-re ébrednek. Jól használható a
+leállítási jel terjesztésére: minden task kap egy klónt, és
+<code>select!</code>-ben versenyezteti a normál eseménnyel.</p>
+<h3 data-number="17.4.3" id="c-rust-összevetés"><span
+class="header-section-number">17.4.3</span> C++ ↔︎ Rust összevetés</h3>
+<p>Egy C++ szerver vázlata szálakkal és leállítási flaggel:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/socket.h&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;netinet/in.h&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> stop<span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> handle_client<span class="op">(</span><span class="dt">int</span> fd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">1024</span><span class="op">];</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>stop<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="dt">ssize_t</span> n <span class="op">=</span> recv<span class="op">(</span>fd<span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">),</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">// feldolgozás...</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> listener <span class="op">=</span> socket<span class="op">(</span>AF_INET<span class="op">,</span> SOCK_STREAM<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// bind, listen...</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>thread<span class="op">&gt;</span> threads<span class="op">;</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>stop<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> fd <span class="op">=</span> accept<span class="op">(</span>listener<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">);</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        threads<span class="op">.</span>emplace_back<span class="op">(</span>handle_client<span class="op">,</span> fd<span class="op">);</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="co">// leállítás: stop = true; majd join...</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A probléma: ha a kliens nem küld adatot, a <code>recv</code> blokkol,
+és a <code>stop</code> flaget soha nem veszi észre; a <code>join</code>
+a blokkoló szálon függ. Ezt jellemzően <code>poll</code>-lal,
+<code>shutdown</code> hívással vagy timeouttal kell megkerülni. A
+Rust/tokio szerver ehelyett <code>select!</code>-ben figyeli a
+megszakítást, és a task kilép a futó <code>.await</code>-ből akkor is,
+ha épp sorra várt.</p>
+<p>A Rust szerver fő hurka:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::net::</span>TcpListener<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio_util::sync::</span>CancellationToken<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>Storage<span class="op">,</span> MemStore<span class="op">};</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> run_server(listener<span class="op">:</span> TcpListener<span class="op">,</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;,</span> token<span class="op">:</span> CancellationToken) <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> listener<span class="op">.</span>accept() <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> (socket<span class="op">,</span> addr) <span class="op">=</span> <span class="cf">match</span> res <span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Ok</span>(v) <span class="op">=&gt;</span> v<span class="op">,</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="op">{</span> <span class="pp">eprintln!</span>(<span class="st">&quot;accept error: {e}&quot;</span>)<span class="op">;</span> <span class="cf">continue</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>                <span class="op">};</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> store <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>store)<span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> token <span class="op">=</span> token<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>                <span class="pp">tokio::</span>spawn(<span class="kw">async</span> <span class="kw">move</span> <span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> handle_client(socket<span class="op">,</span> store<span class="op">,</span> token)<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>                        <span class="pp">eprintln!</span>(<span class="st">&quot;client {addr}: {e}&quot;</span>)<span class="op">;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>                    <span class="op">}</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A különbség: a <code>select!</code> a listner <code>accept</code> és
+a leállítási token között választ; ha a token megszakad, a ciklus kilép
+anélkül, hogy új kapcsolatot fogadna. A futó klienstaskokat nem öljük
+meg, hanem ők is figyelik a saját tokenjüket, ahogy az alábbi laborban
+látni fogjuk.</p>
+<h3 data-number="17.4.4" id="a-protokoll-és-a-válaszformátum"><span
+class="header-section-number">17.4.4</span> A protokoll és a
+válaszformátum</h3>
+<p>Az rkv-szerver protokollja soralapú. A kliens egyetlen sora egy
+parancsot tartalmaz:</p>
+<pre class="text"><code>GET &lt;kulcs&gt;
+SET &lt;kulcs&gt; &lt;érték&gt;
+DEL &lt;kulcs&gt;
+LIST [&lt;prefix&gt;]</code></pre>
+<p>A szerver válaszai:</p>
+<pre class="text"><code>OK                  – SET és DEL sikeres; LIST lezáró sora
+VALUE &lt;kulcs&gt; &lt;érték&gt;  – GET találat vagy LIST elem
+NOTFOUND            – GET/DEL nem létező kulcs esetén
+ERR &lt;üzenet&gt;        – hibás parancs vagy belső hiba</code></pre>
+<p>A <code>LIST</code> válasza: minden egyező kulcshoz egy-egy
+<code>VALUE</code> sor, majd egy <code>OK</code> sor. Egy munkamenet
+<code>nc</code>-vel:</p>
+<pre class="text"><code>$ nc localhost 8080
+SET hello world
+OK
+GET hello
+VALUE hello world
+LIST he
+VALUE hello world
+OK
+DEL hello
+OK
+GET hello
+NOTFOUND</code></pre>
+<p>A sorokban a kulcs és az érték nem tartalmazhat szóközt, mert a
+protokollt szóközökkel tagoljuk; a parsert az rkv-core
+<code>Tokenizer</code> típusa valósítja meg, és a
+<code>Command::parse</code> visszaadja a <code>Command</code>
+enumot.</p>
+<h3 data-number="17.4.5" id="keretezés-bufreaderlines"><span
+class="header-section-number">17.4.5</span> Keretezés:
+BufReader::lines</h3>
+<p>A bejövő adatfolyam bájtok sorozata. A
+<code>tokio::io::BufReader</code> belső puffert tart, és a
+<code>.lines()</code> metódus egy <code>AsyncBufReadExt</code>-traiten
+keresztül egyszerre egy sort ad vissza. A <code>next_line()</code> egy
+<code>Future</code>, amely a <code>\n</code> karakterig tartó szakaszt
+várja; így a TCP-ből folyamatosan olvashatunk, nem kell magunk
+pufferezni.</p>
+<p>A klienst kezelő függvény eleje:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::net::</span>TcpStream<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::io::</span><span class="op">{</span>BufReader<span class="op">,</span> AsyncBufReadExt<span class="op">,</span> AsyncWriteExt<span class="op">,</span> BufWriter<span class="op">};</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> handle_client(socket<span class="op">:</span> TcpStream<span class="op">,</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;,</span> token<span class="op">:</span> CancellationToken)</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">-&gt;</span> <span class="pp">anyhow::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (read_half<span class="op">,</span> write_half) <span class="op">=</span> socket<span class="op">.</span>into_split()<span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> lines <span class="op">=</span> <span class="pp">BufReader::</span>new(read_half)<span class="op">.</span>lines()<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> writer <span class="op">=</span> <span class="pp">BufWriter::</span>new(write_half)<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> line <span class="op">=</span> <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> lines<span class="op">.</span>next_line() <span class="op">=&gt;</span> <span class="cf">match</span> res<span class="op">?</span> <span class="op">{</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>                <span class="cn">Some</span>(l) <span class="op">=&gt;</span> l<span class="op">,</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>                <span class="cn">None</span> <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span> <span class="co">// kliens bontotta a kapcsolatot</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> response <span class="op">=</span> process_line(<span class="op">&amp;</span>line<span class="op">,</span> <span class="op">&amp;</span>store)<span class="op">;</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>        <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> writer<span class="op">.</span>write_all(response<span class="op">.</span>as_bytes()) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>                res<span class="op">?;</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>                writer<span class="op">.</span>write_all(<span class="st">b&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>socket.into_split()</code> az olvasó- és íróoldalt
+különválasztja. A <code>BufReader</code> a <code>read_half</code>-ból
+olvas, a <code>BufWriter</code> a <code>write_half</code>-ra pufferel. A
+<code>select!</code> azt jelenti: ha a leállítási token megszakad, a
+<code>next_line()</code>-re váró task is azonnal kilép, mert a
+<code>select!</code> csak a befejeződő jövővel foglalkozik. Ugyanez igaz
+a válasz írására is.</p>
+<p>A <code>tokio_util::codec</code> modul kifinomultabb keretezést ad:
+például hosszprefixes vagy szigorúbb szöveges protokollt
+(<code>any_delimiter</code>, <code>LinesCodec</code>), és a
+<code>Framed</code> típus <code>Stream</code>-ként kezeli a bejövő
+kereteket. A mi protokollunknál a <code>BufReader::lines</code>
+elegendő; a codecalapú megoldást a <a href="r040.html">Kecses
+leállás</a> nem igényli, de nagyobb rendszereknél érdemes
+megfontolni.</p>
+<h3 data-number="17.4.6"
+id="megosztott-állapot-arcmutexdyn-storage-kal"><span
+class="header-section-number">17.4.6</span> Megosztott állapot
+Arc&lt;Mutex&lt;dyn Storage&gt;&gt;-kal</h3>
+<p>A szerver több klienssel dolgozik, ezért a tárolót minden tasknak el
+kell érnie. A típus <code>Arc&lt;Mutex&lt;dyn Storage&gt;&gt;</code>: az
+<code>Arc</code> biztosítja a közös tulajdonjogot a taskok között, a
+<code>Mutex</code> a kizárólagos hozzáférést a tárolóhoz. A
+<code>dyn Storage</code> trait-objektum azt jelenti, hogy a szerver nem
+tudja, hogy <code>MemStore</code> vagy <code>FileStore</code> van
+mögötte, csak a <code>Storage</code> trait metódusait hívja – ugyanúgy,
+ahogy egy C++ interfész mögé rejtett
+<code>MemStore</code>/<code>FileStore</code> implementációt
+használnánk.</p>
+<p>A kritikus rész a parancs feldolgozása:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> process_line(line<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> store<span class="op">:</span> <span class="op">&amp;</span>Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span>) <span class="op">-&gt;</span> <span class="dt">String</span> <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> command <span class="op">=</span> <span class="cf">match</span> <span class="pp">Command::</span>parse(line) <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(cmd) <span class="op">=&gt;</span> cmd<span class="op">,</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="cf">return</span> <span class="pp">format!</span>(<span class="st">&quot;ERR {e}&quot;</span>)<span class="op">,</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> store<span class="op">.</span>lock()<span class="op">.</span>expect(<span class="st">&quot;storage lock poisoned&quot;</span>)<span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> execute(<span class="op">&amp;</span><span class="kw">mut</span> <span class="op">*</span>guard<span class="op">,</span> command) <span class="op">{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(response) <span class="op">=&gt;</span> response<span class="op">,</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">format!</span>(<span class="st">&quot;ERR {e}&quot;</span>)<span class="op">,</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>MutexGuard</code> hatóköre a belső blokkra korlátozódik:
+a <code>guard</code> létrejön, a tárolóművelet lefut, majd a blokk vége
+elengedi a zárat. A <code>process_line</code> nem
+<code>.await</code>-el, tehát nincs esély arra, hogy a zárat egy
+<code>Future</code> belsejében tartsuk. A válasz stringje ezután kerül a
+<code>writer.write_all(...).await</code>-hez, már zár nélkül.</p>
+<p>Ha a zárat az <code>.await</code>-ig kiterjesztenénk, például
+így:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Ez a változat szándékosan rossz tervezési mintát mutat:</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> handle_client_bad(socket<span class="op">:</span> TcpStream<span class="op">,</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span>) <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> lines <span class="op">=</span> <span class="pp">BufReader::</span>new(socket)<span class="op">.</span>lines()<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="kw">let</span> <span class="cn">Ok</span>(<span class="cn">Some</span>(line)) <span class="op">=</span> lines<span class="op">.</span>next_line()<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> store<span class="op">.</span>lock()<span class="op">.</span>unwrap()<span class="op">;</span>  <span class="co">// std Mutex zára itt elengedhető lenne,</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">// de ha tokio::sync::Mutex-et használunk, a guard .await-en át tartása</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// holtversenyt okozhat.</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> response <span class="op">=</span> execute(<span class="op">&amp;</span><span class="kw">mut</span> <span class="op">*</span>guard<span class="op">,</span> <span class="pp">Command::</span>parse(<span class="op">&amp;</span>line)<span class="op">.</span>unwrap())<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... itt .await a válaszírásnál; a guard még élne</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        drop(guard)<span class="op">;</span> <span class="co">// ez csak a példában jelzi a helyes elengedést</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A tokio <code>Mutex</code> guardja nem <code>Send</code>, és a
+<code>.await</code> alatt tartva más taskok kizárásra kerülnek; a
+<code>std::sync::Mutex</code> esetén is fennáll, hogy hosszú hálózati
+írás alatt a zár blokkolja a többi klienst. Ezért a fenti
+<code>process_line</code> mintája a helyes.</p>
+<h3 data-number="17.4.7" id="kecses-leállás-cancellationtoken-nel"><span
+class="header-section-number">17.4.7</span> Kecses leállás
+CancellationToken-nel</h3>
+<p>A leállítás folyamata a következő: 1. A <code>main</code> függvény
+létrehoz egy <code>CancellationToken</code> példányt. 2. Egy külön task
+figyeli a <code>Ctrl-C</code> jelet
+<code>tokio::signal::ctrl_c().await</code> segítségével, majd meghívja a
+<code>token.cancel()</code>-t. 3. A listener <code>select!</code>-ben
+figyeli a <code>token.cancelled()</code>-et, így az <code>accept</code>
+ciklus kilép, és nem fogad új kapcsolatot. 4. A klienstaskok a saját
+<code>select!</code>-jeikben észreveszik a megszakítást, befejezik az
+aktuális sort, és kilépnek. 5. A szerver <code>main</code> függvénye a
+<code>run_server</code> visszatérése után befejeződik.</p>
+<p>A teljes főprogram:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">-&gt;</span> <span class="pp">anyhow::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> addr <span class="op">=</span> <span class="pp">std::env::</span>args()<span class="op">.</span>nth(<span class="dv">1</span>)<span class="op">.</span>unwrap_or_else(<span class="op">||</span> <span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>to_string())<span class="op">;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> listener <span class="op">=</span> <span class="pp">TcpListener::</span>bind(<span class="op">&amp;</span>addr)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;rkv-server listening on {addr}&quot;</span>)<span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span> <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> token <span class="op">=</span> <span class="pp">CancellationToken::</span>new()<span class="op">;</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> shutdown_token <span class="op">=</span> token<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(<span class="kw">async</span> <span class="kw">move</span> <span class="op">{</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> <span class="pp">tokio::signal::</span>ctrl_c()<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>            <span class="pp">eprintln!</span>(<span class="st">&quot;ctrl_c failed: {e}&quot;</span>)<span class="op">;</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;shutdown signal received&quot;</span>)<span class="op">;</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        shutdown_token<span class="op">.</span>cancel()<span class="op">;</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    run_server(listener<span class="op">,</span> store<span class="op">,</span> token)<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;shutdown complete&quot;</span>)<span class="op">;</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tokio::signal::ctrl_c()</code> a Unix <code>SIGINT</code>
+jelet aszinkron módon várja. A haladóbb alkalmazások
+<code>tracing</code>-gel naplózhatják az eseményeket; ezt a <a
+href="r041.html">Naplózás és megfigyelhetőség</a> alfejezetben tesszük
+hozzá.</p>
+<p>A leállítás és a klienskezelés kapcsolatát foglalja össze az alábbi
+ábra:</p>
+<figure>
+<img src="assets/r040-diagram-1.png"
+alt="Kecses leállás üzenetfolyama - A Ctrl-C hatására a token megszakad, a listener leáll, a kliens befejezi az aktuális parancsot." />
+<figcaption aria-hidden="true">Kecses leállás üzenetfolyama - A Ctrl-C
+hatására a token megszakad, a listener leáll, a kliens befejezi az
+aktuális parancsot.</figcaption>
+</figure>
+<p>Az ábrán látható, hogy a <code>SET</code> parancs feldolgozása közben
+érkező <code>SIGINT</code> nem szakítja félbe a tároló műveletet; a
+token megszakad, de a kliens csak a válasz elküldése után lép ki. Ez a
+kecses leállás lényege.</p>
+<h3 data-number="17.4.8" id="labor-az-rkv-server-crate"><span
+class="header-section-number">17.4.8</span> Labor: az rkv-server
+crate</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/rkv/</code></p>
+<p>A labor célja az <code>rkv-server</code> bináris létrehozása, amely
+az rkv-core <code>Storage</code> traitjét és a <code>Tokenizer</code>
+alapú <code>Command::parse</code>-t használja.</p>
+<h4 data-number="17.4.8.1"
+id="lépés-a-crate-létrehozása-és-a-workspace-be-illesztése"><span
+class="header-section-number">17.4.8.1</span> 1. lépés: a crate
+létrehozása és a workspace-be illesztése</h4>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> new <span class="at">--bin</span> rkv-server</span></code></pre></div>
+<p>A gyökér <code>Cargo.toml</code>-ben adjuk hozzá a workspace-tagok
+közé:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[workspace]</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">members</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;rkv-core&quot;</span><span class="op">,</span> <span class="st">&quot;rkv-cli&quot;</span><span class="op">,</span> <span class="st">&quot;rkv-server&quot;</span><span class="op">]</span></span></code></pre></div>
+<p>Az <code>rkv-server/Cargo.toml</code> tartalma:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[package]</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="dt">name</span> <span class="op">=</span> <span class="st">&quot;rkv-server&quot;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="dt">version</span> <span class="op">=</span> <span class="st">&quot;0.1.0&quot;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="dt">edition</span> <span class="op">=</span> <span class="st">&quot;2024&quot;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="kw">[dependencies]</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="dt">rkv-core</span> <span class="op">=</span> <span class="op">{ </span><span class="dt">path</span><span class="op"> =</span> <span class="st">&quot;../rkv-core&quot;</span><span class="op"> }</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="dt">tokio</span> <span class="op">=</span> <span class="op">{ </span><span class="dt">version</span><span class="op"> =</span> <span class="st">&quot;1&quot;</span><span class="op">, </span><span class="dt">features</span><span class="op"> =</span> <span class="op">[</span><span class="st">&quot;full&quot;</span><span class="op">] }</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="dt">tokio-util</span> <span class="op">=</span> <span class="op">{ </span><span class="dt">version</span><span class="op"> =</span> <span class="st">&quot;0.7&quot;</span><span class="op">, </span><span class="dt">features</span><span class="op"> =</span> <span class="op">[</span><span class="st">&quot;rt&quot;</span><span class="op">] }</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="dt">anyhow</span> <span class="op">=</span> <span class="st">&quot;1&quot;</span></span></code></pre></div>
+<p>A <code>tokio-util</code> <code>rt</code> feature a
+<code>CancellationToken</code> használatához szükséges; a pontos
+feature-listát a <code>docs.rs/tokio-util</code>-on ellenőrizni
+kell.</p>
+<h4 data-number="17.4.8.2"
+id="lépés-az-rkv-serversrcmain.rs-megvalósítása"><span
+class="header-section-number">17.4.8.2</span> 2. lépés: az
+<code>rkv-server/src/main.rs</code> megvalósítása</h4>
+<p>A fenti <code>main.rs</code> kódot kiegészítjük a
+<code>process_line</code> és <code>execute</code> függvényekkel. A
+következő teljes fájl:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">anyhow::</span><span class="dt">Result</span><span class="op">;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>Command<span class="op">,</span> <span class="bu">Error</span><span class="op">,</span> MemStore<span class="op">,</span> Storage<span class="op">};</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::io::</span><span class="op">{</span>AsyncBufReadExt<span class="op">,</span> AsyncWriteExt<span class="op">,</span> BufReader<span class="op">,</span> BufWriter<span class="op">};</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::net::</span><span class="op">{</span>TcpListener<span class="op">,</span> TcpStream<span class="op">};</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio_util::sync::</span>CancellationToken<span class="op">;</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>main<span class="at">]</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> main() <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> addr <span class="op">=</span> <span class="pp">std::env::</span>args()<span class="op">.</span>nth(<span class="dv">1</span>)<span class="op">.</span>unwrap_or_else(<span class="op">||</span> <span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>to_string())<span class="op">;</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> listener <span class="op">=</span> <span class="pp">TcpListener::</span>bind(<span class="op">&amp;</span>addr)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;rkv-server listening on {addr}&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span> <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> token <span class="op">=</span> <span class="pp">CancellationToken::</span>new()<span class="op">;</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> shutdown_token <span class="op">=</span> token<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    <span class="pp">tokio::</span>spawn(<span class="kw">async</span> <span class="kw">move</span> <span class="op">{</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> <span class="pp">tokio::signal::</span>ctrl_c()<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>            <span class="pp">eprintln!</span>(<span class="st">&quot;ctrl_c failed: {e}&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>        <span class="pp">println!</span>(<span class="st">&quot;shutdown signal received&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>        shutdown_token<span class="op">.</span>cancel()<span class="op">;</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>    run_server(listener<span class="op">,</span> store<span class="op">,</span> token)<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;shutdown complete&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> run_server(listener<span class="op">:</span> TcpListener<span class="op">,</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;,</span> token<span class="op">:</span> CancellationToken) <span class="op">{</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a>        <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> listener<span class="op">.</span>accept() <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> (socket<span class="op">,</span> addr) <span class="op">=</span> <span class="cf">match</span> res <span class="op">{</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Ok</span>(v) <span class="op">=&gt;</span> v<span class="op">,</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="op">{</span> <span class="pp">eprintln!</span>(<span class="st">&quot;accept error: {e}&quot;</span>)<span class="op">;</span> <span class="cf">continue</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>                <span class="op">};</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> store <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>store)<span class="op">;</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> token <span class="op">=</span> token<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>                <span class="pp">tokio::</span>spawn(<span class="kw">async</span> <span class="kw">move</span> <span class="op">{</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> handle_client(socket<span class="op">,</span> store<span class="op">,</span> token)<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a>                        <span class="pp">eprintln!</span>(<span class="st">&quot;client {addr}: {e}&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a>                    <span class="op">}</span></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-52"><a href="#cb13-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> handle_client(</span>
+<span id="cb13-55"><a href="#cb13-55" aria-hidden="true" tabindex="-1"></a>    socket<span class="op">:</span> TcpStream<span class="op">,</span></span>
+<span id="cb13-56"><a href="#cb13-56" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;,</span></span>
+<span id="cb13-57"><a href="#cb13-57" aria-hidden="true" tabindex="-1"></a>    token<span class="op">:</span> CancellationToken<span class="op">,</span></span>
+<span id="cb13-58"><a href="#cb13-58" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb13-59"><a href="#cb13-59" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (read_half<span class="op">,</span> write_half) <span class="op">=</span> socket<span class="op">.</span>into_split()<span class="op">;</span></span>
+<span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> lines <span class="op">=</span> <span class="pp">BufReader::</span>new(read_half)<span class="op">.</span>lines()<span class="op">;</span></span>
+<span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> writer <span class="op">=</span> <span class="pp">BufWriter::</span>new(write_half)<span class="op">;</span></span>
+<span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> line <span class="op">=</span> <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb13-65"><a href="#cb13-65" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb13-66"><a href="#cb13-66" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> lines<span class="op">.</span>next_line() <span class="op">=&gt;</span> <span class="cf">match</span> res<span class="op">?</span> <span class="op">{</span></span>
+<span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a>                <span class="cn">Some</span>(l) <span class="op">=&gt;</span> l<span class="op">,</span></span>
+<span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a>                <span class="cn">None</span> <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb13-69"><a href="#cb13-69" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb13-70"><a href="#cb13-70" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb13-71"><a href="#cb13-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-72"><a href="#cb13-72" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> response <span class="op">=</span> process_line(<span class="op">&amp;</span>line<span class="op">,</span> <span class="op">&amp;</span>store)<span class="op">;</span></span>
+<span id="cb13-73"><a href="#cb13-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a>        <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb13-76"><a href="#cb13-76" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> writer<span class="op">.</span>write_all(response<span class="op">.</span>as_bytes()) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a>                res<span class="op">?;</span></span>
+<span id="cb13-78"><a href="#cb13-78" aria-hidden="true" tabindex="-1"></a>                writer<span class="op">.</span>write_all(<span class="st">b&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb13-79"><a href="#cb13-79" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-80"><a href="#cb13-80" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-81"><a href="#cb13-81" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-82"><a href="#cb13-82" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb13-83"><a href="#cb13-83" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-84"><a href="#cb13-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-85"><a href="#cb13-85" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> process_line(line<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> store<span class="op">:</span> <span class="op">&amp;</span>Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span>) <span class="op">-&gt;</span> <span class="dt">String</span> <span class="op">{</span></span>
+<span id="cb13-86"><a href="#cb13-86" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> command <span class="op">=</span> <span class="cf">match</span> <span class="pp">Command::</span>parse(line) <span class="op">{</span></span>
+<span id="cb13-87"><a href="#cb13-87" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(cmd) <span class="op">=&gt;</span> cmd<span class="op">,</span></span>
+<span id="cb13-88"><a href="#cb13-88" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="cf">return</span> <span class="pp">format!</span>(<span class="st">&quot;ERR {e}&quot;</span>)<span class="op">,</span></span>
+<span id="cb13-89"><a href="#cb13-89" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb13-90"><a href="#cb13-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-91"><a href="#cb13-91" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb13-92"><a href="#cb13-92" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> guard <span class="op">=</span> store<span class="op">.</span>lock()<span class="op">.</span>expect(<span class="st">&quot;storage lock poisoned&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-93"><a href="#cb13-93" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> execute(<span class="op">&amp;</span><span class="kw">mut</span> <span class="op">*</span>guard<span class="op">,</span> command) <span class="op">{</span></span>
+<span id="cb13-94"><a href="#cb13-94" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(response) <span class="op">=&gt;</span> response<span class="op">,</span></span>
+<span id="cb13-95"><a href="#cb13-95" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">format!</span>(<span class="st">&quot;ERR {e}&quot;</span>)<span class="op">,</span></span>
+<span id="cb13-96"><a href="#cb13-96" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-97"><a href="#cb13-97" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-98"><a href="#cb13-98" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-99"><a href="#cb13-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-100"><a href="#cb13-100" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> execute(store<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Storage<span class="op">,</span> command<span class="op">:</span> Command) <span class="op">-&gt;</span> <span class="pp">std::result::</span><span class="dt">Result</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> command <span class="op">{</span></span>
+<span id="cb13-102"><a href="#cb13-102" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Command::</span>Get(key) <span class="op">=&gt;</span> <span class="cf">match</span> store<span class="op">.</span>get(<span class="op">&amp;</span>key)<span class="op">?</span> <span class="op">{</span></span>
+<span id="cb13-103"><a href="#cb13-103" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Some</span>(value) <span class="op">=&gt;</span> <span class="cn">Ok</span>(<span class="pp">format!</span>(<span class="st">&quot;VALUE {key} {value}&quot;</span>))<span class="op">,</span></span>
+<span id="cb13-104"><a href="#cb13-104" aria-hidden="true" tabindex="-1"></a>            <span class="cn">None</span> <span class="op">=&gt;</span> <span class="cn">Ok</span>(<span class="st">&quot;NOTFOUND&quot;</span><span class="op">.</span>to_string())<span class="op">,</span></span>
+<span id="cb13-105"><a href="#cb13-105" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb13-106"><a href="#cb13-106" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Command::</span>Set(key<span class="op">,</span> value) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb13-107"><a href="#cb13-107" aria-hidden="true" tabindex="-1"></a>            store<span class="op">.</span>set(key<span class="op">,</span> value)<span class="op">?;</span></span>
+<span id="cb13-108"><a href="#cb13-108" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="st">&quot;OK&quot;</span><span class="op">.</span>to_string())</span>
+<span id="cb13-109"><a href="#cb13-109" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-110"><a href="#cb13-110" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Command::</span>Delete(key) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb13-111"><a href="#cb13-111" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> store<span class="op">.</span>delete(<span class="op">&amp;</span>key)<span class="op">?</span> <span class="op">{</span></span>
+<span id="cb13-112"><a href="#cb13-112" aria-hidden="true" tabindex="-1"></a>                <span class="cn">Ok</span>(<span class="st">&quot;OK&quot;</span><span class="op">.</span>to_string())</span>
+<span id="cb13-113"><a href="#cb13-113" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb13-114"><a href="#cb13-114" aria-hidden="true" tabindex="-1"></a>                <span class="cn">Ok</span>(<span class="st">&quot;NOTFOUND&quot;</span><span class="op">.</span>to_string())</span>
+<span id="cb13-115"><a href="#cb13-115" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-116"><a href="#cb13-116" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-117"><a href="#cb13-117" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Command::</span>List(prefix) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb13-118"><a href="#cb13-118" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> items <span class="op">=</span> store<span class="op">.</span>list(prefix<span class="op">.</span>as_deref())<span class="op">?;</span></span>
+<span id="cb13-119"><a href="#cb13-119" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> <span class="kw">mut</span> out <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>new()<span class="op">;</span></span>
+<span id="cb13-120"><a href="#cb13-120" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> (k<span class="op">,</span> v) <span class="kw">in</span> items <span class="op">{</span></span>
+<span id="cb13-121"><a href="#cb13-121" aria-hidden="true" tabindex="-1"></a>                out<span class="op">.</span>push_str(<span class="op">&amp;</span><span class="pp">format!</span>(<span class="st">&quot;VALUE {k} {v}</span><span class="sc">\n</span><span class="st">&quot;</span>))<span class="op">;</span></span>
+<span id="cb13-122"><a href="#cb13-122" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-123"><a href="#cb13-123" aria-hidden="true" tabindex="-1"></a>            out<span class="op">.</span>push_str(<span class="st">&quot;OK&quot;</span>)<span class="op">;</span></span>
+<span id="cb13-124"><a href="#cb13-124" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(out)</span>
+<span id="cb13-125"><a href="#cb13-125" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-126"><a href="#cb13-126" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-127"><a href="#cb13-127" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>process_line</code> visszaadhat többsoros választ a
+<code>LIST</code> esetén; a <code>handle_client</code> a végére mindig
+egy <code>\n</code>-t tesz, így a <code>LIST</code> záró <code>OK</code>
+sora is sortörést kap. A
+<code>write_all(response.as_bytes()).await</code> és a kiegészítő
+<code>\n</code> írása után a <code>BufWriter</code> puffereli az
+adatokat.</p>
+<h4 data-number="17.4.8.3" id="lépés-fordítás-és-kézi-teszt"><span
+class="header-section-number">17.4.8.3</span> 3. lépés: fordítás és kézi
+teszt</h4>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> rkv-server</span></code></pre></div>
+<p>Egy másik terminálon:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="at">-e</span> <span class="st">&quot;SET hello world\nGET hello\nLIST he\nDEL hello\n&quot;</span> <span class="kw">|</span> <span class="ex">nc</span> localhost 8080</span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code>OK
+VALUE hello world
+VALUE hello world
+OK
+OK</code></pre>
+<p>A <code>LIST he</code> esetén a <code>hello</code> kulcs megjelenik,
+mert a prefix <code>he</code>. A <code>DEL</code> után a
+<code>GET</code>-et már nem küldtük a példában; az <code>echo</code>
+sorban csak négy parancs van.</p>
+<h4 data-number="17.4.8.4" id="lépés-integrációs-teszt"><span
+class="header-section-number">17.4.8.4</span> 4. lépés: integrációs
+teszt</h4>
+<p>Hozzuk létre az <code>rkv-server/tests/server.rs</code> fájlt. A
+teszt a szervert egy tokio taskban indítja, és egy TCP-klienssel
+kommunikál:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span><span class="op">{</span>Arc<span class="op">,</span> Mutex<span class="op">};</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>MemStore<span class="op">,</span> Storage<span class="op">};</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_server::</span>run_server<span class="op">;</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::io::</span><span class="op">{</span>AsyncBufReadExt<span class="op">,</span> AsyncWriteExt<span class="op">,</span> BufReader<span class="op">,</span> BufWriter<span class="op">};</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio::net::</span>TcpListener<span class="op">;</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">tokio_util::sync::</span>CancellationToken<span class="op">;</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="pp">tokio::</span>test<span class="at">]</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> set_get_delete() <span class="op">{</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> listener <span class="op">=</span> <span class="pp">TcpListener::</span>bind(<span class="st">&quot;127.0.0.1:0&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> addr <span class="op">=</span> listener<span class="op">.</span>local_addr()<span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store<span class="op">:</span> Arc<span class="op">&lt;</span>Mutex<span class="op">&lt;</span><span class="kw">dyn</span> Storage<span class="op">&gt;&gt;</span> <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Mutex::</span>new(<span class="pp">MemStore::</span>new()))<span class="op">;</span></span>
+<span id="cb17-14"><a href="#cb17-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> token <span class="op">=</span> <span class="pp">CancellationToken::</span>new()<span class="op">;</span></span>
+<span id="cb17-15"><a href="#cb17-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> server <span class="op">=</span> <span class="pp">tokio::</span>spawn(run_server(listener<span class="op">,</span> store<span class="op">,</span> token<span class="op">.</span>clone()))<span class="op">;</span></span>
+<span id="cb17-16"><a href="#cb17-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-17"><a href="#cb17-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> stream <span class="op">=</span> <span class="pp">tokio::net::TcpStream::</span>connect(addr)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (read_half<span class="op">,</span> write_half) <span class="op">=</span> stream<span class="op">.</span>into_split()<span class="op">;</span></span>
+<span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> reader <span class="op">=</span> <span class="pp">BufReader::</span>new(read_half)<span class="op">.</span>lines()<span class="op">;</span></span>
+<span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> writer <span class="op">=</span> <span class="pp">BufWriter::</span>new(write_half)<span class="op">;</span></span>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>    writer<span class="op">.</span>write_all(<span class="st">b&quot;SET hello world</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>    writer<span class="op">.</span>write_all(<span class="st">b&quot;GET hello</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>    writer<span class="op">.</span>write_all(<span class="st">b&quot;DEL hello</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>    writer<span class="op">.</span>write_all(<span class="st">b&quot;GET hello</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>    writer<span class="op">.</span>flush()<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> lines<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;</span> <span class="op">=</span> [</span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>        reader<span class="op">.</span>next_line()<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">.</span>unwrap()<span class="op">,</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>        reader<span class="op">.</span>next_line()<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">.</span>unwrap()<span class="op">,</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>        reader<span class="op">.</span>next_line()<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">.</span>unwrap()<span class="op">,</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>        reader<span class="op">.</span>next_line()<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">.</span>unwrap()<span class="op">,</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>    ]</span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>to_vec()<span class="op">;</span></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>    <span class="pp">assert_eq!</span>(lines<span class="op">,</span> <span class="pp">vec!</span>[<span class="st">&quot;OK&quot;</span><span class="op">,</span> <span class="st">&quot;VALUE hello world&quot;</span><span class="op">,</span> <span class="st">&quot;OK&quot;</span><span class="op">,</span> <span class="st">&quot;NOTFOUND&quot;</span>])<span class="op">;</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>    token<span class="op">.</span>cancel()<span class="op">;</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>    server<span class="op">.</span><span class="kw">await</span><span class="op">.</span>unwrap()<span class="op">;</span></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>run_server</code> függvényt <code>pub</code>-ként kell
+elérhetővé tenni az <code>rkv-server</code> binárisban, például a
+<code>main.rs</code>-ben <code>pub async fn run_server(...)</code>-ként.
+A teszt <code>cargo test -p rkv-server</code> paranccsal futtatható.</p>
+<h4 data-number="17.4.8.5" id="lépés-leállítási-teszt"><span
+class="header-section-number">17.4.8.5</span> 5. lépés: leállítási
+teszt</h4>
+<p>Indítsuk el a szervert, majd küldjünk egy <code>Ctrl-C</code>-t. A
+terminálban a kimenet:</p>
+<pre class="text"><code>rkv-server listening on 127.0.0.1:8080
+^Cshutdown signal received
+shutdown complete</code></pre>
+<p>Ha egy kliens éppen kapcsolódva van, a leállítás után a kliens a
+következő parancs után <code>connection reset</code> értesülést kap, de
+a szerver előtte a token miatt már nem vár a következő sorra.</p>
+<h3 data-number="17.4.9" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">17.4.9</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><p><strong>Zár tartása <code>.await</code>-en át.</strong> A tokio
+<code>MutexGuard</code> nem <code>Send</code>, és nem szabad
+<code>.await</code>-en át tartani. Ha mégis megteszed, a task várakozás
+közben birtokolja a zárat, a többi task áll, és a tokio scheduler
+futásidejű <code>panic</code>-et is adhat. A megoldás a fenti
+<code>process_line</code>-minta: a zár hatóköre rövid, szinkron blokk,
+és a válaszírást zár nélkül végezzük.</p></li>
+<li><p><strong>A leállítási jel elfelejtése a kliensben.</strong> Ha a
+kliens task nem figyeli a <code>CancellationToken</code>-t, a szerver
+leállási kérése után a kliens a <code>next_line()</code>-ra vár, és a
+szerver futó taskjai sosem érnek véget. Minden <code>.await</code>-et –
+különösen a hosszú I/O-t – <code>select!</code>-ben kell a
+<code>token.cancelled()</code>-tel párhuzamosítani.</p></li>
+<li><p><strong><code>unwrap</code> mindenhol a záron.</strong> A
+<code>store.lock().expect(...)</code> a laborban indokolt, mert a
+mérgezés (poisoning) a tároló hibája utáni váratlan állapot. Éles kódban
+a könyvtári rétegben <code>Result</code>-et adj vissza, és a binárisban
+csak a legfelső szinten <code>expect</code>-elj. A fejezet példájában a
+<code>process_line</code> <code>String</code>-et ad, ezért a hiba
+szöveggé alakítása elfogadható.</p></li>
+<li><p><strong>A <code>LIST</code> válaszának rossz keretezése.</strong>
+Ha minden <code>VALUE</code> sor után a <code>handle_client</code> külön
+<code>\n</code>-t írna, a <code>LIST</code> belső sortörései és a
+hozzáfűzés dupla sortörést eredményezne. A <code>process_line</code>
+egyetlen stringet épít, benne a szükséges <code>\n</code>-ekkel, és a
+<code>handle_client</code> csak a válasz végére tesz egyet.</p></li>
+</ol>
+<h3 data-number="17.4.10" id="feladatok"><span
+class="header-section-number">17.4.10</span> Feladatok</h3>
+<h4 data-number="17.4.10.1" id="a-lefordul-e-és-miért"><span
+class="header-section-number">17.4.10.1</span> a) Lefordul-e és
+miért?</h4>
+<p>Az alábbi tokio kliens task <code>select!</code>-ben a
+<code>token.cancelled()</code>-et és a <code>lines.next_line()</code>-t
+versenyezteti:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> line <span class="op">=</span> <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>    _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>    res <span class="op">=</span> lines<span class="op">.</span>next_line() <span class="op">=&gt;</span> res<span class="op">?,</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Miért nem okoz ez lefordulási hibát? Mi történik, ha a token már a
+<code>select!</code> előtt meg volt szakítva?</p>
+<h4 data-number="17.4.10.2"
+id="b-c-kód-átírása-idiomatikus-rustra"><span
+class="header-section-number">17.4.10.2</span> b) C++ kód átírása
+idiomatikus Rustra</h4>
+<p>Adott egy egyszerű C++ echo-szerver, amely minden bejövő sort
+visszaküld. Írd át a kapcsolatkezelőt Rust/tokio
+<code>select!</code>-tel és <code>CancellationToken</code>-nel kecses
+leállással. A szerver globális leállási flag helyett tokent
+használjon.</p>
+<h4 data-number="17.4.10.3"
+id="c-implementálási-feladat-az-rkv-ban"><span
+class="header-section-number">17.4.10.3</span> c) Implementálási feladat
+az rkv-ban</h4>
+<p>Bővítsd az <code>rkv-server</code> <code>execute</code> függvényét
+úgy, hogy a <code>LIST</code> parancs a kulcsok szerint rendezve adja
+vissza az elemeket, és a <code>LIST</code> válasza mindig
+<code>OK</code> sort zárjon. Ellenőrizd a <code>MemStore</code>
+<code>list</code> metódusának visszatérési sorrendjét; ha nem rendezett,
+a szerverben rendezd.</p>
+<h4 data-number="17.4.10.4"
+id="d-refaktorálás-vagy-tervezési-döntés"><span
+class="header-section-number">17.4.10.4</span> d) Refaktorálás vagy
+tervezési döntés</h4>
+<p>A leállítás során a kliens, amelyik épp <code>next_line()</code>-re
+vár, csak a token megszakadásakor lép ki. Ha a kliens nem küld adatot, a
+leállás azonnal megtörténik, de mi van akkor, ha egy kliens folyamatosan
+küld parancsokat? Tervezz egy időkorlátot: a leállás után legfeljebb 5
+másodpercig engedjük a folyamatban lévő parancsok befejezését, utána
+kényszerítsük a kilépést. Milyen tokio eszközöket használnál?</p>
+<h3 data-number="17.4.11" id="megoldások"><span
+class="header-section-number">17.4.11</span> Megoldások</h3>
+<h4 data-number="17.4.11.1" id="a-megoldás"><span
+class="header-section-number">17.4.11.1</span> a) Megoldás</h4>
+<p>Nem fordulási hiba, mert a <code>select!</code> makró minden ág egy
+<code>Future</code>-t vár. A <code>token.cancelled()</code> egy azonnal
+elérhető jövőt ad, ha a token már megszakadt; ekkor a
+<code>select!</code> ezt az ágat választja, és a <code>break</code>
+kiugrik a ciklusból. Ha a token nincs megszakítva, a
+<code>next_line()</code> ág vár. A <code>res?</code> az ágban csak akkor
+fut, ha a sor olvasása befejeződött. A <code>break</code> értéke
+<code>()</code>, a <code>select!</code> kifejezés egyenértékű a hurok
+törzsével; a <code>let line = ...</code> nem hajtódik végre, mert a
+<code>break</code>-kel elhagyjuk a ciklust.</p>
+<h4 data-number="17.4.11.2" id="b-megoldás"><span
+class="header-section-number">17.4.11.2</span> b) Megoldás</h4>
+<p>A C++ echo-szerver kapcsolatkezelőjének Rust megfelelője:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="kw">async</span> <span class="kw">fn</span> echo_client(socket<span class="op">:</span> TcpStream<span class="op">,</span> token<span class="op">:</span> CancellationToken) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> (read_half<span class="op">,</span> write_half) <span class="op">=</span> socket<span class="op">.</span>into_split()<span class="op">;</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> lines <span class="op">=</span> <span class="pp">BufReader::</span>new(read_half)<span class="op">.</span>lines()<span class="op">;</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> writer <span class="op">=</span> <span class="pp">BufWriter::</span>new(write_half)<span class="op">;</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">loop</span> <span class="op">{</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> line <span class="op">=</span> <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> lines<span class="op">.</span>next_line() <span class="op">=&gt;</span> <span class="cf">match</span> res<span class="op">?</span> <span class="op">{</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>                <span class="cn">Some</span>(l) <span class="op">=&gt;</span> l<span class="op">,</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>                <span class="cn">None</span> <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a>            <span class="op">},</span></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>        <span class="pp">tokio::select!</span> <span class="op">{</span></span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a>            _ <span class="op">=</span> token<span class="op">.</span>cancelled() <span class="op">=&gt;</span> <span class="cf">break</span><span class="op">,</span></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a>            res <span class="op">=</span> writer<span class="op">.</span>write_all(line<span class="op">.</span>as_bytes()) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a>                res<span class="op">?;</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a>                writer<span class="op">.</span>write_all(<span class="st">b&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span><span class="kw">await</span><span class="op">?;</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="17.4.11.3" id="c-megoldás"><span
+class="header-section-number">17.4.11.3</span> c) Megoldás</h4>
+<p>Az <code>execute</code> <code>Command::List</code> ágában a
+<code>let mut items = store.list(prefix.as_deref())?;</code> után
+rendezzük:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="pp">Command::</span>List(prefix) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> items <span class="op">=</span> store<span class="op">.</span>list(prefix<span class="op">.</span>as_deref())<span class="op">?;</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>    items<span class="op">.</span>sort_by(<span class="op">|</span>a<span class="op">,</span> b<span class="op">|</span> a<span class="op">.</span><span class="dv">0</span><span class="op">.</span>cmp(<span class="op">&amp;</span>b<span class="op">.</span><span class="dv">0</span>))<span class="op">;</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> out <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>new()<span class="op">;</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (k<span class="op">,</span> v) <span class="kw">in</span> items <span class="op">{</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>        out<span class="op">.</span>push_str(<span class="op">&amp;</span><span class="pp">format!</span>(<span class="st">&quot;VALUE {k} {v}</span><span class="sc">\n</span><span class="st">&quot;</span>))<span class="op">;</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>    out<span class="op">.</span>push_str(<span class="st">&quot;OK&quot;</span>)<span class="op">;</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(out)</span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>list</code> metódus visszatérési típusa
+<code>Result&lt;Vec&lt;(String, String)&gt;, Error&gt;</code>; a
+rendezés a kulcsok szerint növekvő. A <code>String</code> kulcsok
+lexikografikus rendezése megfelel a protokollnak.</p>
+<h4 data-number="17.4.11.4" id="d-megoldás"><span
+class="header-section-number">17.4.11.4</span> d) Megoldás</h4>
+<p>A tervezési döntés: a tokio <code>timeout</code>-ja és a
+<code>CancellationToken</code> kombinálható. A leállítási szakaszban a
+fő task a token megszakítása után elindít egy
+<code>timeout(Duration::from_secs(5))</code>-t, és a kliens taskokat egy
+<code>JoinSet</code>-ben várja. A <code>JoinSet</code> minden taskot
+megvár, de a <code>timeout</code> segítségével 5 másodperc után kilép. A
+kliens taskok továbbra is a saját tokent figyelik, de a fő task a
+<code>JoinSet</code> bontásával eldobja őket. Egy másik lehetőség a
+<code>tokio::time::timeout</code> minden egyes sor olvasására a
+kliensben, hogy a leállás után ne várjunk új parancsra.</p>
+<p>Példa a leállítási szakaszra:</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> _ <span class="op">=</span> <span class="pp">tokio::time::</span>timeout(<span class="pp">Duration::</span>from_secs(<span class="dv">5</span>)<span class="op">,</span> <span class="kw">async</span> <span class="op">{</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="kw">let</span> <span class="cn">Some</span>(res) <span class="op">=</span> join_set<span class="op">.</span>join_next()<span class="op">.</span><span class="kw">await</span> <span class="op">{</span></span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="kw">let</span> <span class="cn">Err</span>(e) <span class="op">=</span> res <span class="op">{</span></span>
+<span id="cb22-4"><a href="#cb22-4" aria-hidden="true" tabindex="-1"></a>            <span class="pp">eprintln!</span>(<span class="st">&quot;task error: {e}&quot;</span>)<span class="op">;</span></span>
+<span id="cb22-5"><a href="#cb22-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb22-6"><a href="#cb22-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb22-7"><a href="#cb22-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">.</span><span class="kw">await</span><span class="op">;</span></span></code></pre></div>
+<h3 data-number="17.4.12" id="rövid-összefoglaló"><span
+class="header-section-number">17.4.12</span> Rövid összefoglaló</h3>
+<p>Ebben az alfejezetben megépítettük az <code>rkv-server</code>
+tokio-alapú TCP-szervert, amely soralapú szöveges protokollt beszél:
+<code>GET</code>, <code>SET</code>, <code>DEL</code>, <code>LIST</code>
+parancsokat fogad, és <code>OK</code>, <code>VALUE</code>,
+<code>NOTFOUND</code>, <code>ERR</code> válaszokat ad. A keretezéshez
+<code>BufReader::lines</code>-t használunk; a
+<code>tokio_util::codec</code>-et nagyobb, összetettebb protokollokhoz
+említettük. A megosztott állapot
+<code>Arc&lt;Mutex&lt;dyn Storage&gt;&gt;</code>, amelyben a
+<code>process_line</code> szinkron blokkjában rövid időre szerzünk
+zárat, és soha nem tartjuk <code>.await</code>-en át. A kecses leállást
+<code>tokio_util::sync::CancellationToken</code> valósítja meg: a
+<code>main</code> <code>tokio::signal::ctrl_c()</code>-re indít egy
+taskot, amely <code>cancel()</code>-t hív; a listener és a klienstaskok
+<code>select!</code>-ben figyelik a tokent, így az új kapcsolatok
+fogadása leáll, a folyamatban lévő parancsok befejeződnek. A laborban
+létrehoztuk az <code>rkv-server</code> crate-et, a
+<code>run_server</code> és <code>handle_client</code> függvényeket, és
+integrációs tesztet írtunk. <strong>Továbbvitt eredmény:</strong> az
+<code>rkv-server</code> bináris, a <code>run_server</code> és a
+<code>process_line</code> függvény a <a href="r041.html">Naplózás és
+megfigyelhetőség</a> és a <a href="r051.html">Záróprojekt</a>
+alapja.</p>
+<h3 data-number="17.4.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">17.4.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alfejezet a Rust és a tokio stabil, jól ismert részeire épül. A
+<code>tokio::net::TcpListener</code>,
+<code>tokio::io::BufReader::lines</code>,
+<code>tokio::signal::ctrl_c</code>, a <code>select!</code> makró és a
+<code>tokio_util::sync::CancellationToken</code> használata a hivatalos
+dokumentációban érhető el. A pontos API-k és feature-nevek (például a
+<code>tokio-util</code> <code>rt</code> feature-je) a
+<code>docs.rs/tokio</code> és <code>docs.rs/tokio-util</code> oldalakon
+ellenőrizendők; a fenti példák a <code>tokio</code> 1.x és
+<code>tokio-util</code> 0.7 főverziókon alapulnak. A hibaüzenetek pontos
+szövege verziófüggő. A <code>Command::parse</code> és a
+<code>Storage</code> trait metódusainak pontos szignatúrája az
+<code>rkv-core</code> aktuális forrásában ellenőrizendő, mivel azok a
+korábbi laborokban változhattak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r039.html">← 17.3 Tokio: taskok, I/O, csatornák, select és megszakítás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r041.html">17.5 Naplózás és megfigyelhetőség: tracing →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.4 A gateway üzemeltetése: systemd, konténerek, naplózás –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Edge és gateway</a> › <a href="index.html#ich11">12 A gateway</a></p>
+<div class="links"><a class="prev" rel="prev" href="i037.html">← 12.3 Store-and-forward: offline működés és visszatöltés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i039.html">13.1 Helyi feldolgozás: szűrés, aggregálás, eseménydetektálás →</a></div>
+</nav>
+<h2 data-number="12.4" id="i038"><span
+class="header-section-number">12.4</span> A gateway üzemeltetése:
+systemd, konténerek, naplózás</h2>
+<h3 data-number="12.4.1" id="motiváció"><span
+class="header-section-number">12.4.1</span> Motiváció</h3>
+<p>A <a href="i036.html">A ts-gw szolgáltatás C++-ban: protokollfordítás
+MQTT-re</a> alfejezetben elkészített <code>ts-gw</code> már lefordítható
+és kézzel elindítható, de éles környezetben ez kevés. Az üvegházban futó
+gatewaynek akkor is élnie kell, ha a folyamat összeomlik, a gép
+újraindul, vagy egy frissítés hibásnak bizonyul. Emellett a logokból
+gyorsan ki kell derülnie, hogy melyik csomópont üzenete veszett el, és a
+telepítésnek reprodukálhatónak kell lennie a fejlesztői géptől az edge
+hardverig.</p>
+<p>Ebben az alfejezetben a <code>ts-gw</code>-t Linux-szolgáltatásként
+és konténerben is üzemeltethetővé tesszük. A systemd biztosítja az
+automatikus újraindítást és a watchdog-felügyeletet, a strukturált
+JSON-naplózás a journald-ben kereshetővé teszi az eseményeket, a
+többlépcsős Docker-build pedig kicsi, jól korlátozott futásidejű
+image-et eredményez.</p>
+<h3 data-number="12.4.2" id="fogalmak-és-működés"><span
+class="header-section-number">12.4.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció.</strong> A <em>systemd unit</em> a systemd által
+kezelt erőforrás (szolgáltatás, socket, timer, mount stb.) deklaratív
+leírása. A szolgáltatások unitfájlja <code>.service</code>
+kiterjesztésű, és a <code>[Unit]</code>, <code>[Service]</code>,
+<code>[Install]</code> szekciókban adja meg, hogy mit, hogyan és mikor
+indítson a rendszer.</p>
+<p><strong>Definíció.</strong> A systemd <em>watchdog</em> egy
+szoftveres felügyelet: ha a szolgáltatás <code>WatchdogSec</code>
+értéken belül nem küld életjelet, a systemd megöli és az újraindítási
+politika szerint újraindítja a folyamatot. A folyamat a
+<code>WATCHDOG=1</code> üzenetet az <code>sd_notify</code> interfészen
+keresztül, a <code>$NOTIFY_SOCKET</code> Unix-socketre írva jelzi.</p>
+<p><strong>Definíció.</strong> A <em>Type=notify</em> indítási mód azt
+jelenti, hogy a szolgáltatás nem akkor tekinthető sikeresen elindultnak,
+amikor a fork visszatér, hanem amikor a folyamat <code>READY=1</code>
+üzenetet küld. Ugyanezen a csatornán megy a watchdog-életjel is.</p>
+<p><strong>Definíció.</strong> A <em>többlépcsős Docker-build</em> olyan
+image-építés, ahol a buildhez szükséges eszközöket (compiler, fejlesztői
+fejlécek) egy külön építő konténerbe tesszük, majd a kész binárist és a
+minimális futásidejű függőségeket egy második, jóval kisebb image-be
+másoljuk.</p>
+<p>Az alábbi sequence-diagram a systemd és a <code>ts-gw</code>
+együttműködését mutatja watchdog felügyelet mellett:</p>
+<figure>
+<img src="assets/i038-diagram-1.png"
+alt="systemd watchdog és újraindítás - A ts-gw Type=notify szolgáltatásként indul, WATCHDOG=1 üzenetekkel jelzi életképességét." />
+<figcaption aria-hidden="true">systemd watchdog és újraindítás - A ts-gw
+Type=notify szolgáltatásként indul, WATCHDOG=1 üzenetekkel jelzi
+életképességét.</figcaption>
+</figure>
+<p>A szolgáltatás tehát három dolgot ír: a szabványos kimenetre
+JSON-sorokat (napló), a <code>$NOTIFY_SOCKET</code>-re
+<code>READY=1</code>-et és periodikusan <code>WATCHDOG=1</code>-et
+(életjel). A journald ezeket együtt tárolja, és
+<code>journalctl -u ts-gw</code> paranccsal lekérdezhető.</p>
+<h3 data-number="12.4.3" id="döntési-szempontok"><span
+class="header-section-number">12.4.3</span> Döntési szempontok</h3>
+<p>A gateway üzemeltetési módjának kiválasztása több szemponttól
+függ:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>systemd szolgáltatás</th>
+<th>Docker-konténer</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Újraindítás, watchdog</td>
+<td>natív, jól integrált (<code>Restart</code>,
+<code>WatchdogSec</code>)</td>
+<td>a konténer újraindítása Docker/Compose szinten, watchdog a
+konténeren belül vagy healthcheckkel</td>
+</tr>
+<tr class="even">
+<td>Erőforrás-limit</td>
+<td><code>MemoryMax</code>, <code>CPUQuota</code>,
+<code>TasksMax</code></td>
+<td><code>mem_limit</code>, <code>cpus</code>,
+<code>pids_limit</code></td>
+</tr>
+<tr class="odd">
+<td>Függőségek kezelése</td>
+<td>OS-szintű csomagok, verzióütközések lehetnek</td>
+<td>az image-ben szigetelt, reprodukálható</td>
+</tr>
+<tr class="even">
+<td>Frissítés</td>
+<td>bináris csere + <code>systemctl restart</code></td>
+<td>image-tag csere + <code>docker compose up -d</code>, rollback
+egyszerű</td>
+</tr>
+<tr class="odd">
+<td>Naplózás</td>
+<td>közvetlenül journald-be</td>
+<td>konténerlogból gyűjtőbe, vagy journald-driverrel</td>
+</tr>
+</tbody>
+</table>
+<p>Egyetlen edge-gatewayn általában a systemd a természetes választás,
+mert nincs plusz réteg, és a watchdog közvetlenül a folyamatot figyeli.
+A konténer akkor előnyös, ha a teljes edge-szoftvercsomagot (gateway +
+MQTT-kliens + konfiguráció) egyetlen egységként akarjuk szállítani és
+több gépre telepíteni. A TerraSense laborban mindkettőt bemutatjuk: a
+systemd a hoston futó natív telepítés, a Docker a hordozható
+változat.</p>
+<h3 data-number="12.4.4" id="kidolgozott-példa-és-labor"><span
+class="header-section-number">12.4.4</span> Kidolgozott példa és
+labor</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/iot-labor/i038</code></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i038 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i038</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-r</span> ../i036/ts-gw .</span></code></pre></div>
+<p>A labor előfeltétele az <a href="i036.html">A ts-gw szolgáltatás
+C++-ban: protokollfordítás MQTT-re</a> alfejezetből származó
+<code>ts-gw</code> forráskód. Ebből indulunk ki, és bővítjük
+watchdog-támogatással és JSON-naplózással.</p>
+<h4 data-number="12.4.4.1" id="rendszerszintű-konfiguráció"><span
+class="header-section-number">12.4.4.1</span> Rendszerszintű
+konfiguráció</h4>
+<p>Először készítsük el a konfigurációs fájlt, amelyet a systemd-unit és
+a program is olvas. Tegyük fel, hogy a telepítési útvonal
+<code>/etc/ts-gw/config.toml</code>:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/ts-gw/config.toml</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[mqtt]</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">broker</span> <span class="op">=</span> <span class="st">&quot;localhost&quot;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">port</span> <span class="op">=</span> <span class="dv">1883</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">client_id</span> <span class="op">=</span> <span class="st">&quot;ts-gw&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">[udp]</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="dt">port</span> <span class="op">=</span> <span class="dv">41234</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">[logging]</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="dt">level</span> <span class="op">=</span> <span class="st">&quot;info&quot;</span></span></code></pre></div>
+<p>A program a konfigurációs fájlt olvassa, de a környezeti változók
+felülbírálhatják a legfontosabb értékeket. A <code>main.cpp</code>
+elején egy egyszerű konfigurációbetöltést alkalmazunk:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fstream&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Config <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string mqtt_broker <span class="op">=</span> <span class="st">&quot;localhost&quot;</span><span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> mqtt_port <span class="op">=</span> <span class="dv">1883</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string client_id <span class="op">=</span> <span class="st">&quot;ts-gw&quot;</span><span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> udp_port <span class="op">=</span> <span class="dv">41234</span><span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string log_level <span class="op">=</span> <span class="st">&quot;info&quot;</span><span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>Config load_config<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    Config cfg<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// valódi TOML-parszolás helyett itt csak a környezeti változókat kezeljük:</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> env <span class="op">=</span> <span class="bu">std::</span>getenv<span class="op">(</span><span class="st">&quot;TS_GW_MQTT_BROKER&quot;</span><span class="op">))</span> cfg<span class="op">.</span>mqtt_broker <span class="op">=</span> env<span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> env <span class="op">=</span> <span class="bu">std::</span>getenv<span class="op">(</span><span class="st">&quot;TS_GW_MQTT_PORT&quot;</span><span class="op">))</span> cfg<span class="op">.</span>mqtt_port <span class="op">=</span> <span class="bu">std::</span>stoi<span class="op">(</span>env<span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> env <span class="op">=</span> <span class="bu">std::</span>getenv<span class="op">(</span><span class="st">&quot;TS_GW_CLIENT_ID&quot;</span><span class="op">))</span> cfg<span class="op">.</span>client_id <span class="op">=</span> env<span class="op">;</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> env <span class="op">=</span> <span class="bu">std::</span>getenv<span class="op">(</span><span class="st">&quot;TS_GW_UDP_PORT&quot;</span><span class="op">))</span> cfg<span class="op">.</span>udp_port <span class="op">=</span> <span class="bu">std::</span>stoi<span class="op">(</span>env<span class="op">);</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> env <span class="op">=</span> <span class="bu">std::</span>getenv<span class="op">(</span><span class="st">&quot;TS_GW_LOG_LEVEL&quot;</span><span class="op">))</span> cfg<span class="op">.</span>log_level <span class="op">=</span> env<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> cfg<span class="op">;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Ellenőrzési igény.</strong> A fenti kódban a TOML-fájl
+tényleges feldolgozása nincs implementálva, csak a környezeti változókat
+kezeli. Éles kódban használjunk egy TOML-könyvtárat (például
+<code>toml++</code>), vagy egyszerűsítsünk INI formátumra.</p>
+<h4 data-number="12.4.4.2"
+id="watchdog-és-json-naplózás-a-ts-gw-ben"><span
+class="header-section-number">12.4.4.2</span> Watchdog és JSON-naplózás
+a ts-gw-ben</h4>
+<p>A systemd értesítéshez linkeljük a <code>libsystemd</code>-t. A
+<code>CMakeLists.txt</code>-ben:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">find_package</span>(<span class="im">PkgConfig</span> <span class="ot">REQUIRED</span>)</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">pkg_check_modules</span>(SYSTEMD <span class="ot">REQUIRED</span> libsystemd)</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">target_link_libraries</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span> <span class="dv">${SYSTEMD_LIBRARIES}</span>)</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">target_include_directories</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span> <span class="dv">${SYSTEMD_INCLUDE_DIRS}</span>)</span></code></pre></div>
+<p>A program elején a watchdog-életjelet egy külön szál küldi, a fő szál
+pedig a saját ciklusát futtatja. A lényeg, hogy a watchdog-intervallum
+fele alatt mindig küldjünk életjelet:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;systemd/sd-daemon.h&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> watchdog_loop<span class="op">(</span><span class="bu">std::</span>chrono::seconds interval<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        sd_notify<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="st">&quot;WATCHDOG=1&quot;</span><span class="op">);</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span>interval <span class="op">/</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    sd_notify<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="st">&quot;READY=1&quot;</span><span class="op">);</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread wd<span class="op">(</span>watchdog_loop<span class="op">,</span> <span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">30</span><span class="op">));</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    wd<span class="op">.</span>detach<span class="op">();</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// fő ciklus...</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A strukturált naplózáshoz egy segédfüggvényt adunk, amely JSON-sort
+ír a <code>stdout</code>-ra:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> log_json<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> level<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> msg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;{</span><span class="sc">\&quot;</span><span class="st">ts</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">\&quot;</span><span class="st">&quot;</span> <span class="op">&lt;&lt;</span> current_iso8601_utc<span class="op">()</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">,</span><span class="sc">\&quot;</span><span class="st">level</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">\&quot;</span><span class="st">&quot;</span> <span class="op">&lt;&lt;</span> level</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">,</span><span class="sc">\&quot;</span><span class="st">msg</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">\&quot;</span><span class="st">&quot;</span> <span class="op">&lt;&lt;</span> msg <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">}&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>current_iso8601_utc()</code> egy segédfüggvény, amely az
+aktuális időt ISO 8601 formátumban adja vissza. A systemd a szabványos
+kimenetet automatikusan a journald-be irányítja, így a JSON-sorok a
+journald-ben is megjelennek.</p>
+<h4 data-number="12.4.4.3" id="systemd-unit"><span
+class="header-section-number">12.4.4.3</span> systemd-unit</h4>
+<p>Hozzuk létre az <code>~/iot-labor/i038/ts-gw.service</code>
+fájlt:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[Unit]</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">Description</span><span class="ot">=</span><span class="st">TerraSense Gateway (ts-gw)</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="dt">After</span><span class="ot">=</span><span class="st">network-online.target</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">Wants</span><span class="ot">=</span><span class="st">network-online.target</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">[Service]</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="dt">Type</span><span class="ot">=</span><span class="st">notify</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="dt">ExecStart</span><span class="ot">=</span><span class="st">/usr/local/bin/ts-gw --config /etc/ts-gw/config.toml</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="dt">Restart</span><span class="ot">=</span><span class="st">on-failure</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="dt">RestartSec</span><span class="ot">=</span><span class="st">5s</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="dt">WatchdogSec</span><span class="ot">=</span><span class="st">30s</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="dt">EnvironmentFile</span><span class="ot">=</span><span class="st">-/etc/default/ts-gw</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="dt">User</span><span class="ot">=</span><span class="st">tsgw</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="dt">Group</span><span class="ot">=</span><span class="st">tsgw</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="dt">NoNewPrivileges</span><span class="ot">=</span><span class="kw">true</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="dt">ProtectSystem</span><span class="ot">=</span><span class="st">full</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="dt">ProtectHome</span><span class="ot">=</span><span class="kw">true</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="dt">MemoryMax</span><span class="ot">=</span><span class="st">256M</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="dt">CPUQuota</span><span class="ot">=</span><span class="st">50%</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="kw">[Install]</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="dt">WantedBy</span><span class="ot">=</span><span class="st">multi-user.target</span></span></code></pre></div>
+<p>Magyarázat: - <code>Type=notify</code> miatt a systemd várja a
+<code>READY=1</code> üzenetet. - <code>Restart=on-failure</code> és
+<code>RestartSec=5s</code> biztosítja az újraindítást hibás kilépés
+esetén. - <code>WatchdogSec=30s</code> azt jelenti, hogy a folyamatnak
+30 másodpercen belül legalább egyszer <code>WATCHDOG=1</code>-et kell
+küldenie. - <code>MemoryMax=256M</code> és <code>CPUQuota=50%</code>
+erőforrás-korlátot szab; a CPUQuota egy mag 50%-át jelenti. -
+<code>ProtectSystem=full</code> és <code>NoNewPrivileges=true</code>
+csökkenti a támadási felületet.</p>
+<p>A unitot a rendszerre telepítve:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp ts-gw.service /etc/systemd/system/</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl enable <span class="at">--now</span> ts-gw</span></code></pre></div>
+<p>Ha a program nincs még telepítve, a
+<code>systemd-analyze verify</code> csak szintaktikai ellenőrzést
+végez:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-analyze</span> verify ts-gw.service</span></code></pre></div>
+<h4 data-number="12.4.4.4" id="docker-image-többlépcsős-builddel"><span
+class="header-section-number">12.4.4.4</span> Docker-image többlépcsős
+builddel</h4>
+<p>Készítsünk <code>Dockerfile</code>-t:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode dockerfile"><code class="sourceCode dockerfile"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build stage</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> ubuntu:24.04 <span class="kw">AS</span> build</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> <span class="dt">\</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    g++ cmake pkg-config libpaho-mqtt-dev libsystemd-dev</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WORKDIR</span> /src</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> . .</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="fu">cmake</span> <span class="at">-B</span> build <span class="kw">&amp;&amp;</span> <span class="fu">cmake</span> <span class="at">--build</span> build <span class="at">-j</span><span class="va">$(</span><span class="fu">nproc</span><span class="va">)</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Runtime stage</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> ubuntu:24.04</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">apt-get</span> update <span class="kw">&amp;&amp;</span> <span class="ex">apt-get</span> install <span class="at">-y</span> <span class="at">--no-install-recommends</span> <span class="dt">\</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>    libpaho-mqtt1.0 libsystemd0 <span class="kw">&amp;&amp;</span> <span class="fu">rm</span> <span class="at">-rf</span> /var/lib/apt/lists/<span class="pp">*</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="kw">COPY</span> <span class="op">--from=build</span> /src/build/ts-gw /usr/local/bin/ts-gw</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="kw">RUN</span> <span class="ex">useradd</span> <span class="at">--system</span> <span class="at">--no-create-home</span> <span class="at">--shell</span> /usr/sbin/nologin tsgw</span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="kw">USER</span> tsgw</span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="kw">ENTRYPOINT</span> [<span class="st">&quot;/usr/local/bin/ts-gw&quot;</span>]</span></code></pre></div>
+<p><strong>Ellenőrzési igény.</strong> A Paho MQTT C++ csomag pontos
+neve (<code>libpaho-mqtt-dev</code>, <code>libpaho-mqtt1.0</code>)
+Ubuntu 24.04-en ellenőrizendő; a laborban a
+<code>apt-cache search paho</code> paranccsal győződjünk meg róla.</p>
+<p>A Compose-részlet a közös <code>~/iot-labor/stack/compose.yaml</code>
+fájlba illeszthető:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">services</span><span class="kw">:</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">ts-gw</span><span class="kw">:</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">build</span><span class="kw">:</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">context</span><span class="kw">:</span><span class="at"> ../i038/ts-gw</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">container_name</span><span class="kw">:</span><span class="at"> ts-gw</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">environment</span><span class="kw">:</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">TS_GW_MQTT_BROKER</span><span class="kw">:</span><span class="at"> mosquitto</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">TS_GW_MQTT_PORT</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;1883&quot;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">TS_GW_UDP_PORT</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;41234&quot;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;41234:41234/udp&quot;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">depends_on</span><span class="kw">:</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> mosquitto</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">restart</span><span class="kw">:</span><span class="at"> unless-stopped</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">mem_limit</span><span class="kw">:</span><span class="at"> 256m</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cpus</span><span class="kw">:</span><span class="at"> </span><span class="fl">0.5</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">pids_limit</span><span class="kw">:</span><span class="at"> </span><span class="dv">128</span></span></code></pre></div>
+<p>A <code>mosquitto</code> szolgáltatás már létezik a stackben. A
+<code>ts-gw</code> így a brokerhez a belső hálózaton csatlakozik, a
+<code>TS_GW_MQTT_BROKER</code> környezeti változóval felülírva az
+alapértelmezett <code>localhost</code>-ot.</p>
+<p>Build és futtatás:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/stack</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose up <span class="at">-d</span> <span class="at">--build</span> ts-gw</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose logs <span class="at">-f</span> ts-gw</span></code></pre></div>
+<h4 data-number="12.4.4.5" id="frissítés-és-visszaállítás"><span
+class="header-section-number">12.4.4.5</span> Frissítés és
+visszaállítás</h4>
+<p>Natív systemd-telepítésnél a binárist verziózott könyvtárakba
+telepítjük, és egy <code>current</code> szimbolikus link mutat az aktív
+verzióra. Az <code>ExecStart</code> a linkre hivatkozik. Frissítéskor az
+új binárist a <code>/opt/ts-gw/v1.3.0/</code> könyvtárba másoljuk, majd
+<code>ln -sfn /opt/ts-gw/v1.3.0 /opt/ts-gw/current</code> és
+<code>systemctl restart ts-gw</code>. Ha a folyamat nem indul el, a
+linket visszaállítjuk az előző verzióra. Ez az A/B vagy szimbolikus
+linkes rollback az <a href="i060.html">OTA-frissítés: A/B képek,
+rollback, delta, fokozatos kiadás</a> alfejezetben tér vissza
+részletesen.</p>
+<p>Konténeres telepítésnél a rollback egyszerűbb: a <code>ts-gw</code>
+szolgáltatást korábbi image-taggel indítjuk újra, például
+<code>image: ts-gw:1.2.0</code> helyett <code>ts-gw:1.1.0</code>, majd
+<code>docker compose up -d</code>.</p>
+<h3 data-number="12.4.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">12.4.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p><strong>Továbbvitt eredmény.</strong> A <code>ts-gw.service</code>
+unit és a <code>Dockerfile</code> a <a href="i062.html">Megfigyelhetőség
+végponttól végpontig: metrikák, naplók, nyomkövetés</a> alfejezetben a
+log- és metrika-gyűjtés alapjául szolgál; a frissítési stratégia az <a
+href="i060.html">OTA-frissítés: A/B képek, rollback, delta, fokozatos
+kiadás</a> alfejezetbe csatlakozik, a teljes stack pedig a <a
+href="i066.html">Záróprojekt: a teljes TerraSense rendszer összeállítása
+és átvétele</a> alfejezetben áll össze.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hibatünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A szolgáltatás nem indul el, <code>status=203/EXEC</code></td>
+<td>rossz bináris útvonal vagy hiányzó jogosultság</td>
+<td>ellenőrizzük az <code>ExecStart</code> útvonalat és a
+<code>User</code>-t; <code>journalctl -u ts-gw -b</code> részleteket
+ad</td>
+</tr>
+<tr class="even">
+<td>A watchdog újraindítja a folyamatot</td>
+<td>a <code>WATCHDOG=1</code> üzenet nem érkezik elég gyakran</td>
+<td>ellenőrizzük a watchdog-szálat, és hogy a <code>sd_notify</code> a
+<code>$NOTIFY_SOCKET</code>-re ír-e</td>
+</tr>
+<tr class="odd">
+<td>A JSON-naplósorok nem jelennek meg a journald-ben</td>
+<td>a program nem a <code>stdout</code>-ra ír, hanem fájlba</td>
+<td>irányítsuk a naplózást <code>std::cout</code>-ra, vagy használjunk
+<code>syslog</code>-ot</td>
+</tr>
+<tr class="even">
+<td>A Docker-konténer nem éri el a Mosquittót</td>
+<td>a <code>TS_GW_MQTT_BROKER</code> értéke <code>localhost</code>, nem
+a szolgáltatásnév</td>
+<td>Compose-ban a környezeti változót a belső szolgáltatásnévre állítsuk
+(<code>mosquitto</code>)</td>
+</tr>
+<tr class="odd">
+<td>A konténer memórialimitet lép át és meghal</td>
+<td>túl alacsony <code>mem_limit</code> vagy memóriaszivárgás</td>
+<td>növeljük a limitet, vagy profilozzuk a folyamatot</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="12.4.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">12.4.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>A <code>Type=notify</code> elhagyása watchdoggal
+együtt.</strong> Ha a unit <code>Type=simple</code>, a systemd nem
+figyeli a <code>READY=1</code> üzenetet, és a <code>WatchdogSec</code>
+csak akkor működik, ha a program mégis küld <code>WATCHDOG=1</code>-et –
+de az indítási állapot nem lesz megbízható. A <code>Type=notify</code>
+és a watchdog együtt értelmes.</p></li>
+<li><p><strong>JSON-naplózás rossz mezőnevekkel.</strong> Ha a mezőnevek
+nem konzisztensek (<code>timestamp</code>, <code>ts</code>,
+<code>time</code> keverednek), a későbbi naplóelemzés és a
+Grafana-dashboardok nem tudnak egységesen szűrni. A TerraSense-ben a
+<code>ts</code>, <code>level</code>, <code>msg</code> mezőket
+használjuk, és ezt a konvenciót a <a href="i062.html">Megfigyelhetőség
+végponttól végpontig</a> alfejezet is átveszi.</p></li>
+<li><p><strong>A rendszeróra és a naplóidő keverése.</strong> A gateway
+helyi ideje és a UTC közötti különbség gyakran okoz sorrendi hibákat.
+Minden naplóbejegyzés UTC ISO 8601 formátumú legyen, ahogy a telemetria
+is.</p></li>
+<li><p><strong>Erőforráskorlát nélküli konténer.</strong> A
+<code>mem_limit</code> és <code>cpus</code> elhagyása lehetővé teszi,
+hogy egy hibás gateway az egész edge-eszköz erőforrásait lefoglalja, ami
+a szenzorcsomópontokról érkező adatok elvesztéséhez vezethet.</p></li>
+</ol>
+<h3 data-number="12.4.7" id="feladatok"><span
+class="header-section-number">12.4.7</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Fogalmi kérdés.</strong> Miért előnyösebb a
+<code>Type=notify</code> a <code>Type=simple</code>-höz képest, ha
+watchdogot is használunk? Milyen hibát kerülünk el vele?</p></li>
+<li><p><strong>Tervezési feladat.</strong> Egy gateway szolgáltatás
+<code>WatchdogSec=30s</code>. Mekkora legyen a watchdog-üzenetek küldési
+periódusa, hogy a systemd ne indítsa újra a folyamatot, ha a rendszer
+egy rövid ideig (pl. 2 s) lassú? Válaszát indokolja.</p></li>
+<li><p><strong>Implementációs feladat.</strong> Egészítse ki a
+<code>ts-gw</code> programot úgy, hogy a watchdog-életjelet ne külön
+szál, hanem a fő ciklus minden iterációjában küldje, és a ciklus
+periódusát a <code>WatchdogSec</code> harmadára állítsa be. Módosítsa a
+<code>main</code> függvényt és a unitfájlt is.</p></li>
+<li><p><strong>Hibakeresési feladat.</strong> A Docker-konténer
+<code>ts-gw</code> nem csatlakozik a Mosquitto brokerhez. A logban a
+<code>connection refused</code> üzenet látható. Hogyan deríti ki, hogy a
+<code>TS_GW_MQTT_BROKER</code> környezeti változó helyes-e, és a
+<code>depends_on</code> miért nem elég a kapcsolat biztosításához?
+Javítsa a Compose-fájlt.</p></li>
+</ol>
+<h3 data-number="12.4.8" id="megoldások"><span
+class="header-section-number">12.4.8</span> Megoldások</h3>
+<ol type="1">
+<li><p>A <code>Type=notify</code> esetén a systemd csak akkor tekinti a
+szolgáltatást sikeresen elindultnak, ha a folyamat explicit
+<code>READY=1</code> üzenetet küld. Ha a program elindul, de valamiért
+nem éri el a működő állapotot (pl. nem tud csatlakozni a brokerhez), a
+<code>Type=simple</code> mellett a systemd már sikeresnek látná, és nem
+indítaná újra. A <code>Type=notify</code> ezt a hibát felfedi, és a
+<code>Restart=on-failure</code> beavatkozik.</p></li>
+<li><p>A watchdog-üzenetek periódusának kisebbnek kell lennie, mint a
+<code>WatchdogSec</code> fele, hogy egyetlen késés ne okozzon
+újraindítást. Jó választás például <code>WatchdogSec / 3 = 10 s</code>.
+Így két egymást követő késés (20 s) is még a 30 s alatt marad, és a
+rendszer rövid terhelése nem vált ki téves újraindítást.</p></li>
+<li><p>A fő ciklusban a watchdog-küldés:</p></li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;systemd/sd-daemon.h&gt;</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    sd_notify<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="st">&quot;READY=1&quot;</span><span class="op">);</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="kw">auto</span> period <span class="op">=</span> <span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">10</span><span class="op">);</span> <span class="co">// WatchdogSec=30, harmada</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>running<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>        sd_notify<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="st">&quot;WATCHDOG=1&quot;</span><span class="op">);</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... UDP fogadás, MQTT küldés ...</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span>period<span class="op">);</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A unitfájlban <code>WatchdogSec=30</code> marad. Így a ciklus
+periódusa 10 s, ami kisebb a watchdog-intervallum felénél (15 s).</p>
+<ol start="4" type="1">
+<li>Ellenőrizzük a konténer környezeti változóját:
+<code>docker compose exec ts-gw env | grep TS_GW</code>. Ha a
+<code>TS_GW_MQTT_BROKER</code> értéke <code>localhost</code>, az a
+konténer saját hálózatát jelenti, nem a stack belső szolgáltatását.
+Állítsuk <code>mosquitto</code>-ra. A <code>depends_on</code> csak az
+indítási sorrendet biztosítja, nem várja meg, amíg a broker ténylegesen
+fogadja a kapcsolatokat. Ezért a <code>ts-gw</code> indulhat a Mosquitto
+előtt, ami <code>connection refused</code> hibát okoz. Megoldás:
+<code>depends_on</code> mellett <code>condition: service_healthy</code>
+és a Mosquitto szolgáltatás healthcheckje, vagy a <code>ts-gw</code>-ben
+újrapróbálkozási logika.</li>
+</ol>
+<h3 data-number="12.4.9" id="rövid-összefoglaló"><span
+class="header-section-number">12.4.9</span> Rövid összefoglaló</h3>
+<p>A <code>ts-gw</code> üzemeltetéséhez systemd-unitot készítettünk
+<code>Type=notify</code>, <code>Restart=on-failure</code> és
+<code>WatchdogSec=30s</code> beállításokkal; a program
+<code>sd_notify</code>-on keresztül küld <code>READY=1</code> és
+<code>WATCHDOG=1</code> üzeneteket. A naplózást JSON-sorokként a
+stdoutra írjuk, amelyet a journald gyűjt. A Docker-többlépcsős build
+külön építő és futásidejű konténert használ; a Compose-ban
+<code>mem_limit</code>, <code>cpus</code> és <code>pids_limit</code>
+erőforráskorlátokat adtunk meg. A konfigurációt fájlból és környezeti
+változókból töltjük be; a frissítés és visszaállítás natív rendszeren
+szimbolikus linkkel, konténerben image-tag cserével történik.
+<strong>Továbbvitt eredmények:</strong> <code>ts-gw.service</code>,
+<code>Dockerfile</code>, a Compose-részlet és a JSON-naplózási konvenció
+az <a href="i062.html">Megfigyelhetőség</a>, az <a
+href="i060.html">OTA</a> és a <a href="i066.html">Záróprojekt</a>
+alfejezetekhez csatlakozik.</p>
+<h3 data-number="12.4.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">12.4.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>systemd dokumentáció: <code>man systemd.service</code>,
+<code>man systemd.exec</code>, <code>man sd_notify</code>. Az elérhető
+opciók (pl. <code>MemoryMax</code>, <code>CPUQuota</code>,
+<code>ProtectSystem</code>) pontos szintaxisa a rendszer verziójától
+függ; Ubuntu 24.04 systemd 255-ön ellenőrizendő.</li>
+<li>Docker Compose specifikáció: a <code>mem_limit</code>,
+<code>cpus</code>, <code>pids_limit</code> mezők verziófüggők; a Compose
+v2-ben a <code>deploy.resources.limits</code> ajánlott.</li>
+<li>Paho MQTT C++ csomag neve és elérhetősége Ubuntu 24.04-en
+(<code>libpaho-mqtt-dev</code>, <code>libpaho-mqtt-cpp-dev</code>)
+ellenőrizendő; a laborban <code>apt-cache search paho</code> parancsot
+használjunk.</li>
+<li>A <code>sd_notify</code> és a <code>$NOTIFY_SOCKET</code>
+viselkedését a <code>sd_notify(3)</code> man-oldal írja le.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i037.html">← 12.3 Store-and-forward: offline működés és visszatöltés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i039.html">13.1 Helyi feldolgozás: szűrés, aggregálás, eseménydetektálás →</a></div>
+</nav>
+</body>
+</html>

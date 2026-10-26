@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>15.1 Ingest: MQTT-ből a backendbe, idempotensen –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Backend és enterprise integráció</a> › <a href="index.html#ich14">15 Ingest és adattárolás</a></p>
+<div class="links"><a class="prev" rel="prev" href="i043.html">← 14.3 A ts-backend váza: REST API és egészségellenőrzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i045.html">15.2 Idősoros adatbázisok és adatmodellezés →</a></div>
+</nav>
+<h2 data-number="15.1" id="i044"><span
+class="header-section-number">15.1</span> Ingest: MQTT-ből a backendbe,
+idempotensen</h2>
+<h3 data-number="15.1.1" id="motiváció"><span
+class="header-section-number">15.1.1</span> Motiváció</h3>
+<p>A TerraSense rendszerben a telemetria a
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/telemetry</code> topicra
+érkezik, és a <a href="i027.html">MQTT QoS, munkamenetek, retain, Last
+Will és MQTT 5</a> alfejezetben meghatározott konvenció szerint QoS 1-es
+publikálással utazik. A QoS 1 garantálja, hogy az üzenet legalább
+egyszer megérkezik a brokerhez, de a hálózati hibák utáni újraküldés
+miatt ugyanazt az üzenetet többször is kézbesítheti. Ha a backend minden
+egyes érkezést új sorként ír az adatbázisba, a duplikátumok torzítják az
+átlagot, a riasztási szabályokat és a későbbi idősoros elemzést. Ebben
+az alfejezetben megépítjük a ts-backend MQTT-ingest komponensét, amely
+validálja a sémát, és az <code>(node_id, seq)</code> páros mint egyedi
+kulcs segítségével idempotensen dolgozza fel az üzeneteket.</p>
+<h3 data-number="15.1.2" id="fogalmak-és-működés"><span
+class="header-section-number">15.1.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció. (Idempotens feldolgozás)</strong> Egy feldolgozási
+lépés akkor idempotens, ha ugyanazt a bemeneti üzenetet többször
+végrehajtva ugyanazt a külső hatást érjük el, mint egyszeri
+végrehajtáskor. MQTT-ingest esetén ez azt jelenti, hogy a duplikált
+telemetriaüzenet nem hoz létre új adatsort, és nem vált ki többszörös
+riasztást vagy más mellékhatást.</p>
+<p><strong>Definíció. (Shared subscription)</strong> Az MQTT 5 shared
+subscription egy broker-szolgáltatás, amely lehetővé teszi, hogy egy
+topicüzenetet egy feliratkozási csoport több kliense közül csak egy
+kapjon meg. A szintaxis:
+<code>$share/&lt;csoportnév&gt;/&lt;topic&gt;</code>. Ha például két
+ts-backend példány fut, mindkettő a
+<code>$share/ingest/terrasense/+/+/telemetry</code> topicra iratkozik
+fel, és a Mosquitto egy-egy üzenetet csak az egyiküknek továbbít. Ezzel
+elkerülhető a párhuzamos példányok közötti duplikált feldolgozás
+anélkül, hogy közös állapotot kellene fenntartaniuk.</p>
+<p><strong>Definíció. (Dead letter)</strong> A dead letter olyan tároló
+(tipikusan topic vagy adatbázistábla), ahová azok az üzenetek kerülnek,
+amelyeket a rendszer nem tud értelmezni vagy feldolgozni. Az
+ingest-komponensben ez az érvénytelen JSON-üzenetek célhelye, hogy az
+üzemeltető később kivizsgálhassa őket anélkül, hogy a hibás üzenet
+blokkolná a teljes adatcsatornát.</p>
+<p>Az ingest adatútja a következő:</p>
+<figure>
+<img src="assets/i044-diagram-1.png"
+alt="Idempotens MQTT-ingest üzenetfolyam - A duplikált QoS 1 üzenetet a ts-backend az (node_id, seq) egyedi kulccsal fogadja; az UPSERT nem hoz létre új sort." />
+<figcaption aria-hidden="true">Idempotens MQTT-ingest üzenetfolyam - A
+duplikált QoS 1 üzenetet a ts-backend az (node_id, seq) egyedi kulccsal
+fogadja; az UPSERT nem hoz létre új sort.</figcaption>
+</figure>
+<p>A fenti diagramon a ts-node QoS 1-es üzenetet küld, amelyet a
+Mosquitto PUBACK-kel nyugtáz. Ha a PUBACK elveszik, a kliens újraküldi
+ugyanazt az üzenetet; a hálózati duplikátum ismét eljut a backendhez. A
+backend mindkét esetben ugyanazt az UPSERT utasítást futtatja, így az
+adatbázisban egyetlen sor marad.</p>
+<h3 data-number="15.1.3" id="döntési-szempontok"><span
+class="header-section-number">15.1.3</span> Döntési szempontok</h3>
+<p>Az MQTT-kliens kiválasztásakor a Spring világban két tipikus út van:
+az Eclipse Paho Java kliens közvetlen használata, vagy a Spring
+Integration MQTT-adaptere. A TerraSense oktatási céljaihoz a
+<strong>Paho Java kliens</strong> mellett döntünk, mert:</p>
+<ul>
+<li>a callback-alapú kód átláthatóan mutatja az MQTT 5 tulajdonságait
+(például a <code>messageArrived</code> metódusban elérhető
+<code>MqttMessage</code>-et);</li>
+<li>a C++-os Paho kliensből ismert fogalmak (publisher, connection
+options) közvetlenül megjelennek;</li>
+<li>a Spring Integration absztrakció kényelmes, de a jelen alfejezet
+tanulási célja nem a keretrendszer-konfiguráció, hanem az idempotens
+feldolgozás és a protokollszintű viselkedés megértése;</li>
+<li>a Paho 5-ös kliense shared subscriptiont is tud, ami a többpéldányos
+telepítés alapja.</li>
+</ul>
+<p>A választás kompromisszumait az alábbi táblázat foglalja össze.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>Paho Java kliens</th>
+<th>Spring Integration MQTT</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>MQTT 5 támogatás</td>
+<td>közvetlen, verziófüggő</td>
+<td>újabb verziókban, absztrakció mögött</td>
+</tr>
+<tr class="even">
+<td>Tanulási átláthatóság</td>
+<td>magas</td>
+<td>közepes</td>
+</tr>
+<tr class="odd">
+<td>Rugalmasság (callback, manuális ack)</td>
+<td>teljes</td>
+<td>korlátozott</td>
+</tr>
+<tr class="even">
+<td>Konfigurációs kód</td>
+<td>explicit</td>
+<td>deklaratív</td>
+</tr>
+<tr class="odd">
+<td>TerraSense-ben</td>
+<td><strong>választott</strong></td>
+<td>nem használt</td>
+</tr>
+</tbody>
+</table>
+<p>A shared subscription használatáról akkor érdemes dönteni, ha a
+ts-backend több példányban fut. Egy példány esetén a normál
+<code>terrasense/+/+/telemetry</code> feliratkozás elegendő, és a
+topic-wildcard biztosítja, hogy minden üzenet eljusson az ingesthez.
+Több példánynál a <code>$share/ingest/terrasense/+/+/telemetry</code>
+használata megakadályozza, hogy ugyanazt az üzenetet mindegyik példány
+feldolgozza – azonban az idempotens adatmodell így is védőhálót ad, mert
+ha valamelyik példány mégis kétszer kapná az üzenetet, az UPSERT akkor
+sem hoz létre duplikátumot.</p>
+<p>A validálás során a backend a <a href="i033.html">Sémák és verziózás:
+kompatibilis változtatások</a> alfejezetben rögzített elvet követi: a
+sémaverziót az üzenet hordozza (<code>schema_version</code> mező), és az
+ismeretlen mezőket nem dobja el, hanem naplózza. Az érvénytelen
+üzeneteket a <code>dead_letter</code> táblába írjuk, és a
+<code>terrasense/ingest/dead-letter</code> topicra is publikáljuk, hogy
+az üzemeltető külön fogyasztóval is figyelhesse őket.</p>
+<h3 data-number="15.1.4" id="kidolgozott-példa-vagy-labor"><span
+class="header-section-number">15.1.4</span> Kidolgozott példa vagy
+labor</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/iot-labor/i044</code></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i044 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i044</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-r</span> ~/iot-labor/i043/ts-backend ./ts-backend</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ts-backend</span></code></pre></div>
+<p><strong>Előfeltétel:</strong> a <a href="i043.html">A ts-backend
+váza: REST API és egészségellenőrzés</a> alfejezetben elkészített Spring
+Boot projekt. A labor során a közös
+<code>~/iot-labor/stack/compose.yaml</code>-ben futó Mosquitto és
+PostgreSQL szolgáltatásokat használjuk; a Postgres elindításához:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml up <span class="at">-d</span> postgres</span></code></pre></div>
+<p>A <code>compose.yaml</code> releváns részlete (ha még nincs a
+verzióban, a labor elején adjuk hozzá):</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">services</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">postgres</span><span class="kw">:</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> timescale/timescaledb:latest-pg16</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">environment</span><span class="kw">:</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_DB</span><span class="kw">:</span><span class="at"> terrasense</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_USER</span><span class="kw">:</span><span class="at"> ts</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_PASSWORD</span><span class="kw">:</span><span class="at"> ts_lab_only</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;5432:5432&quot;</span></span></code></pre></div>
+<p><strong>1. Maven függőség a Paho MQTT 5 klienshez.</strong> A
+<code>pom.xml</code> <code>dependencies</code> szakaszába kerül:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode xml"><code class="sourceCode xml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">dependency</span>&gt;</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">groupId</span>&gt;org.eclipse.paho&lt;/<span class="kw">groupId</span>&gt;</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">artifactId</span>&gt;org.eclipse.paho.mqttv5.client&lt;/<span class="kw">artifactId</span>&gt;</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">version</span>&gt;1.2.5&lt;/<span class="kw">version</span>&gt; <span class="co">&lt;!-- ellenőrizendő: a legfrissebb stabil Paho Java 5 kliens --&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">dependency</span>&gt;</span></code></pre></div>
+<p><strong>2. Telemetria DTO.</strong> A
+<code>src/main/java/com/terrasense/backend/TelemetryMessage.java</code>:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">com</span><span class="op">.</span><span class="im">fasterxml</span><span class="op">.</span><span class="im">jackson</span><span class="op">.</span><span class="im">annotation</span><span class="op">.</span><span class="im">JsonIgnoreProperties</span><span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">java</span><span class="op">.</span><span class="im">util</span><span class="op">.</span><span class="im">Map</span><span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">@JsonIgnoreProperties</span><span class="op">(</span>ignoreUnknown <span class="op">=</span> <span class="kw">true</span><span class="op">)</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">record</span> <span class="fu">TelemetryMessage</span><span class="op">(</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="bu">String</span> node_id<span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> seq<span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> ts<span class="op">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> schema_version<span class="op">,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">Map</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Double</span><span class="op">&gt;</span> sensor_data</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="op">)</span> <span class="op">{}</span></span></code></pre></div>
+<p>A <code>@JsonIgnoreProperties(ignoreUnknown = true)</code>
+biztosítja, hogy az ismeretlen mezők ne okozzanak deszerializációs
+hibát, csak naplózzuk őket – ezzel teljesítjük a sémaverziós alfejezet
+követelményét.</p>
+<p><strong>3. Ingest szolgáltatás.</strong> A
+<code>src/main/java/com/terrasense/backend/TelemetryIngestService.java</code>
+tartalmazza az MQTT-kapcsolatot és a feldolgozási logikát:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">jakarta</span><span class="op">.</span><span class="im">annotation</span><span class="op">.</span><span class="im">PostConstruct</span><span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">jakarta</span><span class="op">.</span><span class="im">annotation</span><span class="op">.</span><span class="im">PreDestroy</span><span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">lombok</span><span class="op">.</span><span class="im">extern</span><span class="op">.</span><span class="im">slf4j</span><span class="op">.</span><span class="im">Slf4j</span><span class="op">;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">eclipse</span><span class="op">.</span><span class="im">paho</span><span class="op">.</span><span class="im">mqttv5</span><span class="op">.</span><span class="im">client</span><span class="op">.*;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">eclipse</span><span class="op">.</span><span class="im">paho</span><span class="op">.</span><span class="im">mqttv5</span><span class="op">.</span><span class="im">common</span><span class="op">.</span><span class="im">MqttMessage</span><span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">springframework</span><span class="op">.</span><span class="im">stereotype</span><span class="op">.</span><span class="im">Service</span><span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">com</span><span class="op">.</span><span class="im">fasterxml</span><span class="op">.</span><span class="im">jackson</span><span class="op">.</span><span class="im">databind</span><span class="op">.</span><span class="im">ObjectMapper</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="at">@Slf4j</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="at">@Service</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> TelemetryIngestService <span class="op">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> TelemetryRepository repository<span class="op">;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> ObjectMapper objectMapper<span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> MqttClient client<span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">TelemetryIngestService</span><span class="op">(</span>TelemetryRepository repository<span class="op">,</span> ObjectMapper objectMapper<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="kw">this</span><span class="op">.</span><span class="fu">repository</span> <span class="op">=</span> repository<span class="op">;</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">this</span><span class="op">.</span><span class="fu">objectMapper</span> <span class="op">=</span> objectMapper<span class="op">;</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">@PostConstruct</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">start</span><span class="op">()</span> <span class="kw">throws</span> MqttException <span class="op">{</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> brokerUri <span class="op">=</span> <span class="st">&quot;tcp://localhost:1883&quot;</span><span class="op">;</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> clientId <span class="op">=</span> <span class="st">&quot;ts-backend-ingest&quot;</span><span class="op">;</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>        client <span class="op">=</span> <span class="kw">new</span> <span class="fu">MqttClient</span><span class="op">(</span>brokerUri<span class="op">,</span> clientId<span class="op">);</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>        MqttConnectionOptions options <span class="op">=</span> <span class="kw">new</span> <span class="fu">MqttConnectionOptions</span><span class="op">();</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>        options<span class="op">.</span><span class="fu">setAutomaticReconnect</span><span class="op">(</span><span class="kw">true</span><span class="op">);</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>        options<span class="op">.</span><span class="fu">setCleanStart</span><span class="op">(</span><span class="kw">true</span><span class="op">);</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">connect</span><span class="op">(</span>options<span class="op">);</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> topic <span class="op">=</span> <span class="st">&quot;terrasense/+/+/telemetry&quot;</span><span class="op">;</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>        client<span class="op">.</span><span class="fu">subscribe</span><span class="op">(</span>topic<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="kw">this</span><span class="op">::</span>handleMessage<span class="op">);</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>        log<span class="op">.</span><span class="fu">info</span><span class="op">(</span><span class="st">&quot;Feliratkozva: {}&quot;</span><span class="op">,</span> topic<span class="op">);</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">void</span> <span class="fu">handleMessage</span><span class="op">(</span><span class="bu">String</span> topic<span class="op">,</span> MqttMessage message<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>            <span class="bu">String</span> payload <span class="op">=</span> <span class="kw">new</span> <span class="bu">String</span><span class="op">(</span>message<span class="op">.</span><span class="fu">getPayload</span><span class="op">(),</span> java<span class="op">.</span><span class="fu">nio</span><span class="op">.</span><span class="fu">charset</span><span class="op">.</span><span class="fu">StandardCharsets</span><span class="op">.</span><span class="fu">UTF_8</span><span class="op">);</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>            TelemetryMessage telemetry <span class="op">=</span> objectMapper<span class="op">.</span><span class="fu">readValue</span><span class="op">(</span>payload<span class="op">,</span> TelemetryMessage<span class="op">.</span><span class="fu">class</span><span class="op">);</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span><span class="fu">validate</span><span class="op">(</span>telemetry<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>                repository<span class="op">.</span><span class="fu">insertDeadLetter</span><span class="op">(</span>topic<span class="op">,</span> payload<span class="op">,</span> <span class="st">&quot;séma hiba&quot;</span><span class="op">);</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>                log<span class="op">.</span><span class="fu">warn</span><span class="op">(</span><span class="st">&quot;Érvénytelen telemetria: {}&quot;</span><span class="op">,</span> payload<span class="op">);</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>            repository<span class="op">.</span><span class="fu">upsert</span><span class="op">(</span>telemetry<span class="op">);</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>            log<span class="op">.</span><span class="fu">info</span><span class="op">(</span><span class="st">&quot;Ingest OK: node={}, seq={}&quot;</span><span class="op">,</span> telemetry<span class="op">.</span><span class="fu">node_id</span><span class="op">(),</span> telemetry<span class="op">.</span><span class="fu">seq</span><span class="op">());</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="bu">Exception</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>            repository<span class="op">.</span><span class="fu">insertDeadLetter</span><span class="op">(</span>topic<span class="op">,</span> <span class="kw">new</span> <span class="bu">String</span><span class="op">(</span>message<span class="op">.</span><span class="fu">getPayload</span><span class="op">()),</span> e<span class="op">.</span><span class="fu">getClass</span><span class="op">().</span><span class="fu">getSimpleName</span><span class="op">());</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>            log<span class="op">.</span><span class="fu">error</span><span class="op">(</span><span class="st">&quot;Feldolgozási hiba&quot;</span><span class="op">,</span> e<span class="op">);</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">boolean</span> <span class="fu">validate</span><span class="op">(</span>TelemetryMessage m<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">node_id</span><span class="op">()</span> <span class="op">==</span> <span class="kw">null</span> <span class="op">||</span> m<span class="op">.</span><span class="fu">node_id</span><span class="op">().</span><span class="fu">isBlank</span><span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">seq</span><span class="op">()</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">ts</span><span class="op">()</span> <span class="op">&lt;</span> <span class="dv">1_600_000_000_000L</span> <span class="op">||</span> m<span class="op">.</span><span class="fu">ts</span><span class="op">()</span> <span class="op">&gt;</span> <span class="dv">4_000_000_000_000L</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">()</span> <span class="op">!=</span> <span class="kw">null</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">().</span><span class="fu">isEmpty</span><span class="op">();</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>    <span class="at">@PreDestroy</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">stop</span><span class="op">()</span> <span class="kw">throws</span> MqttException <span class="op">{</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>client <span class="op">!=</span> <span class="kw">null</span> <span class="op">&amp;&amp;</span> client<span class="op">.</span><span class="fu">isConnected</span><span class="op">())</span> <span class="op">{</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>            client<span class="op">.</span><span class="fu">disconnect</span><span class="op">();</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>            client<span class="op">.</span><span class="fu">close</span><span class="op">();</span></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A callback-ben csak gyors, nem blokkoló műveleteket végzünk; az
+adatbázisírás a repository rétegen keresztül szinkron, de a laborban a
+forgalom alacsony. Nagy terhelés esetén érdemes az ingestet work
+queue-ba vagy reaktív pipeline-ba helyezni, ezt a <a
+href="i047.html">Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika</a> tárgyalja.</p>
+<p><strong>4. Repository az idempotens UPSERT-tel.</strong>
+<code>src/main/java/com/terrasense/backend/TelemetryRepository.java</code>:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span><span class="im"> com</span><span class="op">.</span><span class="im">terrasense</span><span class="op">.</span><span class="im">backend</span><span class="op">;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">springframework</span><span class="op">.</span><span class="im">jdbc</span><span class="op">.</span><span class="im">core</span><span class="op">.</span><span class="im">JdbcTemplate</span><span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="im">org</span><span class="op">.</span><span class="im">springframework</span><span class="op">.</span><span class="im">stereotype</span><span class="op">.</span><span class="im">Repository</span><span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="at">@Repository</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> TelemetryRepository <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> JdbcTemplate jdbc<span class="op">;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">TelemetryRepository</span><span class="op">(</span>JdbcTemplate jdbc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">this</span><span class="op">.</span><span class="fu">jdbc</span> <span class="op">=</span> jdbc<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">upsert</span><span class="op">(</span>TelemetryMessage m<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> sql <span class="op">=</span> <span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="st">            INSERT INTO telemetry (node_id, seq, received_at, ts, schema_version, payload)</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="st">            VALUES (?, ?, NOW(), ?, ?, ?::jsonb)</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="st">            ON CONFLICT (node_id, seq)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="st">            DO UPDATE SET</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="st">                received_at = NOW(),</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="st">                ts = EXCLUDED.ts,</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="st">                payload = EXCLUDED.payload</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="st">            &quot;&quot;&quot;</span><span class="op">;</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>        jdbc<span class="op">.</span><span class="fu">update</span><span class="op">(</span>sql<span class="op">,</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>            m<span class="op">.</span><span class="fu">node_id</span><span class="op">(),</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>            m<span class="op">.</span><span class="fu">seq</span><span class="op">(),</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>            m<span class="op">.</span><span class="fu">ts</span><span class="op">(),</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>            m<span class="op">.</span><span class="fu">schema_version</span><span class="op">(),</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>            <span class="fu">objectToJson</span><span class="op">(</span>m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">()));</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">insertDeadLetter</span><span class="op">(</span><span class="bu">String</span> topic<span class="op">,</span> <span class="bu">String</span> payload<span class="op">,</span> <span class="bu">String</span> reason<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> sql <span class="op">=</span> <span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="st">            INSERT INTO dead_letter (topic, payload, reason, received_at)</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="st">            VALUES (?, ?, ?, NOW())</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a><span class="st">            &quot;&quot;&quot;</span><span class="op">;</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>        jdbc<span class="op">.</span><span class="fu">update</span><span class="op">(</span>sql<span class="op">,</span> topic<span class="op">,</span> payload<span class="op">,</span> reason<span class="op">);</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="bu">String</span> <span class="fu">objectToJson</span><span class="op">(</span><span class="bu">Object</span> o<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="kw">new</span> com<span class="op">.</span><span class="fu">fasterxml</span><span class="op">.</span><span class="fu">jackson</span><span class="op">.</span><span class="fu">databind</span><span class="op">.</span><span class="fu">ObjectMapper</span><span class="op">().</span><span class="fu">writeValueAsString</span><span class="op">(</span>o<span class="op">);</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="bu">Exception</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>            <span class="cf">throw</span> <span class="kw">new</span> <span class="bu">RuntimeException</span><span class="op">(</span>e<span class="op">);</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>schema.sql</code> a <code>src/main/resources/</code> alatt
+hozza létre a táblákat:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="cf">IF</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> telemetry (</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    node_id        TEXT        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    seq            BIGINT      <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    received_at    TIMESTAMPTZ <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    ts             BIGINT      <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    schema_version <span class="dt">INT</span>         <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    payload        JSONB       <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (node_id, seq)</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> <span class="cf">IF</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> dead_letter (</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">id</span>          BIGSERIAL   <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    topic       TEXT        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    payload     TEXT        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    reason      TEXT,</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    received_at TIMESTAMPTZ <span class="kw">NOT</span> <span class="kw">NULL</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div>
+<p>Az <code>application.yaml</code> beállítja az adatbázis-kapcsolatot
+és az SQL inicializálást:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">spring</span><span class="kw">:</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">datasource</span><span class="kw">:</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">url</span><span class="kw">:</span><span class="at"> jdbc:postgresql://localhost:5432/terrasense</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">username</span><span class="kw">:</span><span class="at"> ts</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">password</span><span class="kw">:</span><span class="at"> ts_lab_only</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">sql</span><span class="kw">:</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">init</span><span class="kw">:</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mode</span><span class="kw">:</span><span class="at"> always</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">schema-locations</span><span class="kw">:</span><span class="at"> classpath:schema.sql</span></span></code></pre></div>
+<p>A <code>telemetry</code> tábla mostantól az idempotens ingest
+központi eleme; a hypertable-létrehozást és az idősoros optimalizálást a
+<a href="i045.html">Idősoros adatbázisok és adatmodellezés</a>
+alfejezetben végezzük el.</p>
+<p><strong>5. Build és futtatás.</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i044/ts-backend</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mvn</span> clean package</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mvn</span> spring-boot:run</span></code></pre></div>
+<p>Egy másik terminálban tesztüzenet küldése QoS 1-gyel:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_pub</span> <span class="at">-h</span> localhost <span class="at">-t</span> terrasense/gh1/n001/telemetry <span class="at">-q</span> 1 <span class="at">-m</span> <span class="st">&#39;{&quot;node_id&quot;:&quot;n001&quot;,&quot;seq&quot;:42,&quot;ts&quot;:1710000000000,&quot;schema_version&quot;:1,&quot;sensor_data&quot;:{&quot;temperature&quot;:23.5,&quot;humidity&quot;:55.0,&quot;soil_moisture&quot;:30.0}}&#39;</span></span></code></pre></div>
+<p>Várt kimenet a backend logjában:</p>
+<pre class="text"><code>Feliratkozva: terrasense/+/+/telemetry
+Ingest OK: node=n001, seq=42</code></pre>
+<p><strong>Duplikáció-teszt.</strong> Küldjük el ugyanezt a parancsot
+még egyszer (a <code>seq</code> ugyanaz). A táblában továbbra is egy sor
+van:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml exec postgres <span class="dt">\</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>  psql <span class="at">-U</span> ts <span class="at">-d</span> terrasense <span class="at">-c</span> <span class="st">&quot;SELECT count(*) FROM telemetry WHERE node_id=&#39;n001&#39; AND seq=42;&quot;</span></span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code> count
+-------
+     1</code></pre>
+<p>Érvénytelen üzenet tesztje (hiányzó <code>node_id</code>):</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_pub</span> <span class="at">-h</span> localhost <span class="at">-t</span> terrasense/gh1/n002/telemetry <span class="at">-q</span> 1 <span class="at">-m</span> <span class="st">&#39;{&quot;seq&quot;:43}&#39;</span></span></code></pre></div>
+<p>A backend logban <code>Érvénytelen telemetria</code>, és a
+<code>dead_letter</code> táblában egy sor jelenik meg.</p>
+<h3 data-number="15.1.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">15.1.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A labor működését a fenti duplikáció- és érvénytelenüzenet-teszttel
+ellenőrizzük. Gyakori hibák:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A backend nem csatlakozik a brokerhez</td>
+<td>A Mosquitto nem fut a stackben</td>
+<td><code>docker compose -f ~/iot-labor/stack/compose.yaml up -d mosquitto</code></td>
+</tr>
+<tr class="even">
+<td>A <code>terrasense/+/+/telemetry</code> topicra nem érkezik
+üzenet</td>
+<td>A publisher más topicra küld, vagy a backend topic-mintája
+hibás</td>
+<td>Ellenőrizd a topic pontos nevét; a wildcard <code>+</code> pontosan
+egy szintet helyettesít</td>
+</tr>
+<tr class="odd">
+<td>A duplikátumok mégis bekerülnek a <code>telemetry</code>
+táblába</td>
+<td>A <code>PRIMARY KEY (node_id, seq)</code> hiányzik, vagy a
+<code>schema.sql</code> nem fut le</td>
+<td>Ellenőrizd a tábla definícióját: <code>\d telemetry</code></td>
+</tr>
+<tr class="even">
+<td>A <code>dead_letter</code> tábla üres érvénytelen üzenet után
+is</td>
+<td>Az alkalmazás nem hívja az <code>insertDeadLetter</code>-t, vagy a
+tranzakció hibát dob</td>
+<td>Nézd a backend logját; a <code>validate</code> metódus
+<code>false</code> értéket adott-e</td>
+</tr>
+<tr class="odd">
+<td>A Paho kliens <code>NoClassDefFoundError</code></td>
+<td>A Maven függőség hiányzik vagy rossz verzió</td>
+<td>Ellenőrizd a <code>pom.xml</code>-t és a
+<code>mvn clean package</code> kimenetét</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="15.1.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">15.1.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><strong>QoS 1 idempotencia nélkül.</strong> Sokan azt hiszik, hogy a
+QoS 1 „legalább egyszer” kézbesítése csak elméleti duplikációval jár. A
+PUBACK elvesztése valós hálózati hiba, ezért a backendnek mindenképp
+idempotensnek kell lennie; az egyedi kulcs nélküli <code>INSERT</code>
+felesleges sorokat szül.</li>
+<li><strong>Helyi idő UTC helyett.</strong> A
+<code>received_at</code>-et az adatbázis <code>NOW()</code>-val állítja,
+ami a szerver időzónájától függhet. A TerraSense konvenció szerint
+mindig UTC-t használunk; a <code>TIMESTAMPTZ</code> típus és a Postgres
+UTC-re normalizálása ezt biztosítja, de az alkalmazásszintű
+időbélyegzőknél ügyelni kell az <code>Instant</code> használatára.</li>
+<li><strong>ISR-hez hasonló blokkoló hívás a callbackben.</strong> Az
+MQTT callback nem megszakítás, de ha hosszú adatbázis- vagy hálózati
+műveletet végzünk benne, a broker felé késleltetjük a nyugtázást, és nő
+a memóriaigény. Nagy terhelésnél a callback csak a gyors validálást és
+queue-ba helyezést végezze.</li>
+<li><strong>Shared subscription hiánya több példány esetén.</strong>
+MQTT 3.1.1-ben nincs shared subscription, így két backend példány
+ugyanazt az üzenetet mindketten megkapja. Az idempotens adatmodell véd a
+duplikált soroktól, de a külső mellékhatások (például értesítések) akkor
+is kétszer futhatnak le, hacsak nem használunk egyedi feldolgozási
+azonosítót.</li>
+</ol>
+<h3 data-number="15.1.7" id="feladatok"><span
+class="header-section-number">15.1.7</span> Feladatok</h3>
+<ol type="1">
+<li>(Fogalmi) Miért nem elegendő a QoS 2 használata az idempotens
+feldolgozás kiváltására a teljes rendszerben?</li>
+<li>(Tervezési) Tegyük fel, hogy a hálózaton 0,5% annak a valószínűsége,
+hogy egy PUBACK elveszik, és az eszköz 10 000 üzenetet küld naponta.
+Mennyi a várható duplikált üzenetek száma naponta, ha az eszköz minden
+elveszett PUBACK esetén pontosan egyszer újraküldi az üzenetet?</li>
+<li>(Implementációs) Egészítsd ki a <code>TelemetryIngestService</code>
+<code>validate</code> metódusát úgy, hogy a <code>sensor_data</code>-ban
+csak számértékeket fogadjon el, és a <code>temperature</code> értéke −40
+és 80 °C közé essen.</li>
+<li>(Hibakeresési) A <code>telemetry</code> táblában ugyanarra az
+<code>(node_id, seq)</code> párra két sor van, de a
+<code>PRIMARY KEY</code> definíció helyes. Hol lehet a hiba a
+feldolgozási láncban?</li>
+</ol>
+<h3 data-number="15.1.8" id="megoldások"><span
+class="header-section-number">15.1.8</span> Megoldások</h3>
+<ol type="1">
+<li>A QoS 2 a broker és a kliens közötti hálózati duplikációt szünteti
+meg, de nem véd a feldolgozói szintű ismétléstől (például ha a backend
+egy tranzakciót visszagörget, majd újra futtatja), és nem oldja meg a
+különböző kiadók által küldött ugyanolyan adatokat sem. Az idempotencia
+a feldolgozó oldal saját felelőssége.</li>
+<li>naponta 10 000 üzenet, 0,005 veszteség → várhatóan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mspace width="0.167em"></mspace><mn>000</mn><mo>×</mo><mn>0</mn><mo>,</mo><mn>005</mn><mo>=</mo><mn>50</mn></mrow><annotation encoding="application/x-tex">10\,000 \times 0{,}005 = 50</annotation></semantics></math>
+PUBACK-vész, tehát várhatóan 50 duplikált üzenet. Az idempotens ingest
+ezeket mind egyetlen sorba írja.</li>
+<li>Példakód:</li>
+</ol>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span> <span class="dt">boolean</span> <span class="fu">validate</span><span class="op">(</span>TelemetryMessage m<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">node_id</span><span class="op">()</span> <span class="op">==</span> <span class="kw">null</span> <span class="op">||</span> m<span class="op">.</span><span class="fu">node_id</span><span class="op">().</span><span class="fu">isBlank</span><span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">seq</span><span class="op">()</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">ts</span><span class="op">()</span> <span class="op">&lt;</span> <span class="dv">1_600_000_000_000L</span> <span class="op">||</span> m<span class="op">.</span><span class="fu">ts</span><span class="op">()</span> <span class="op">&gt;</span> <span class="dv">4_000_000_000_000L</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">()</span> <span class="op">==</span> <span class="kw">null</span> <span class="op">||</span> m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">().</span><span class="fu">isEmpty</span><span class="op">())</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="bu">Map</span><span class="op">.</span><span class="fu">Entry</span><span class="op">&lt;</span><span class="bu">String</span><span class="op">,</span> <span class="bu">Double</span><span class="op">&gt;</span> e <span class="op">:</span> m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">().</span><span class="fu">entrySet</span><span class="op">())</span> <span class="op">{</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>e<span class="op">.</span><span class="fu">getValue</span><span class="op">()</span> <span class="op">==</span> <span class="kw">null</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">().</span><span class="fu">containsKey</span><span class="op">(</span><span class="st">&quot;temperature&quot;</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">double</span> t <span class="op">=</span> m<span class="op">.</span><span class="fu">sensor_data</span><span class="op">().</span><span class="fu">get</span><span class="op">(</span><span class="st">&quot;temperature&quot;</span><span class="op">);</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>t <span class="op">&lt;</span> <span class="op">-</span><span class="fl">40.0</span> <span class="op">||</span> t <span class="op">&gt;</span> <span class="fl">80.0</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="4" type="1">
+<li>A hiba valószínűleg a <code>sensor_data</code>
+JSON-szerializálásában van: ha a <code>payload</code> oszlop értéke
+eltér a két bejegyzésben, akkor az UPSERT <code>DO UPDATE</code> ága nem
+fut le? Nem, az egyedi kulcs akkor is megakadályozná a második sort. Ha
+mégis két sor van, akkor a <code>seq</code> értéke eltér (például
+<code>long</code> helyett <code>String</code> vagy a JSON-ből
+<code>seq</code> karakterláncként jön), vagy a <code>node_id</code>
+tartalmaz rejtett szóközt. Ellenőrizd a tényleges értékeket:
+<code>SELECT node_id, seq, count(*) FROM telemetry GROUP BY 1,2 HAVING count(*) &gt; 1;</code>
+és a JSON-ben a <code>seq</code> típusát.</li>
+</ol>
+<h3 data-number="15.1.9" id="rövid-összefoglaló"><span
+class="header-section-number">15.1.9</span> Rövid összefoglaló</h3>
+<p>A laborban elkészült a ts-backend MQTT-ingest komponense, amely Paho
+MQTT 5 Java klienssel feliratkozik a
+<code>terrasense/+/+/telemetry</code> topicra, validálja a JSON-sémát,
+és az <code>(node_id, seq)</code> páros mint elsődleges kulcs
+segítségével UPSERT művelettel idempotensen dolgozza fel az üzeneteket.
+Az érvénytelen üzenetek a <code>dead_letter</code> táblába kerülnek.
+<strong>Továbbvitt eredmény.</strong> A
+<code>TelemetryRepository.upsert</code> metódus és a
+<code>telemetry</code> tábla sémája az <a href="i045.html">Idősoros
+adatbázisok és adatmodellezés</a> alfejezetben hypertable-lé alakítva, a
+<a href="i047.html">Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika</a> alfejezetben a Kafka-producer tranzakciókban, a <a
+href="i066.html">Záróprojekt: a teljes TerraSense rendszer összeállítása
+és átvétele</a> alfejezetben pedig a végpontok közötti átvételi
+tesztekben használt idempotens ingest alapjaként szolgál. A labor
+kimenete a <code>~/iot-labor/i044/ts-backend</code> projekt, benne a
+<code>TelemetryIngestService.java</code>,
+<code>TelemetryMessage.java</code>,
+<code>TelemetryRepository.java</code>, <code>schema.sql</code> és a
+módosított <code>application.yaml</code>.</p>
+<h3 data-number="15.1.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">15.1.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>MQTT 5 shared subscription szintaxis és szemantika: OASIS MQTT 5.0
+szabvány, 4.8. fejezet. Ellenőrzendő a pontos fejezetszám.</li>
+<li>Eclipse Paho MQTT 5 Java kliens használata:
+https://eclipse.dev/paho/ (nem ellenőriztem közvetlenül a működést a
+laborban; az <code>org.eclipse.paho.mqttv5.client</code> artifact pontos
+verzióját ellenőrizni kell).</li>
+<li>Spring Boot <code>spring.sql.init</code> és
+<code>JdbcTemplate</code> használata:
+https://docs.spring.io/spring-boot/ (nem ellenőriztem közvetlenül; a
+példák a Spring Boot 3.x dokumentációja alapján készültek).</li>
+<li>PostgreSQL UPSERT (<code>INSERT ... ON CONFLICT</code>) szintaxis:
+https://www.postgresql.org/docs/ (stabil funkció, ellenőrizendő a pontos
+hivatkozás).</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i043.html">← 14.3 A ts-backend váza: REST API és egészségellenőrzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i045.html">15.2 Idősoros adatbázisok és adatmodellezés →</a></div>
+</nav>
+</body>
+</html>

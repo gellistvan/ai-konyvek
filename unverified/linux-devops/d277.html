@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>56.2 CI image, Helm/Kustomize és GitOps delivery – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch56">56 Záróprojekt II: Kubernetes, GitOps és platform operation</a></p>
+<div class="links"><a class="prev" rel="prev" href="d276.html">← 56.1 Platformterv és környezeti contract</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d278.html">56.3 Network, volume, observability és platform rutin →</a></div>
+</nav>
+<h2 data-number="56.2" id="d277"><span
+class="header-section-number">56.2</span> CI image, Helm/Kustomize és
+GitOps delivery</h2>
+<p>A d240 pipeline outputja egy natív C++ release artifact és egy
+container image, de a deployment szempontjából a tag nem identitás. A
+d277 célja, hogy a konténerartifactot változatlan digesttel vigye végig
+a környezeteken, és minden lépéshez mérhető bizonyítékot kapcsoljon. A
+fejlesztői szempont ismerős: ha egy release buildet minden környezetre
+újrafordítanánk, az olyan, mintha egy megosztott könyvtárnak minden
+fogyasztónál más-más <code>build-id</code>-je lenne; a diagnosztika, a
+visszafejtés és a rollback is megszűnik reprodukálhatónak lenni.</p>
+<h3 data-number="56.2.1" id="definíció-és-működés"><span
+class="header-section-number">56.2.1</span> Definíció és működés</h3>
+<p>A delivery lánc itt a natív build/bináris artifact előállításától a
+futó podig terjed. A cél egy olyan bizonyítéklánc, amely megválaszolja:
+milyen forrásból, milyen bemenetekkel, milyen tesztekkel, melyik image
+digestből és milyen environment konfigurációval lett a clusterben
+ténylegesen futó processz.</p>
+<p>A kulcsfogalmak:</p>
+<ul>
+<li><strong>Immutable artifact promotion</strong>: az artifact egy
+tartalomalapú azonosítóval — itt container image digest, a natív
+binárisnál a tartalom SHA-256 és a build-id — utazik a környezetek
+között. A tag csak emberi név, a digest a hivatkozás.</li>
+<li><strong>GitOps reconcile</strong>: a cluster desired state-ét egy
+Git repository tartalmazza, a GitOps agent pedig folyamatosan
+kiegyenlíti az observed state-et a desired state-hez. A kézi
+<code>kubectl apply</code> nem része a promotionnek.</li>
+<li><strong>Release evidence</strong>: a kiadást leíró, verziózott,
+lehetőleg aláírt bizonyítékcsomag; tartalmazza a source revisiont,
+pipeline futást, binary hasheket, SBOM-ot, attestationt, rendered
+manifest digestet, policy validation eredményt és rollout
+eredményt.</li>
+<li><strong>Data-compatible rollback</strong>: olyan visszaállítás, ahol
+a régebbi bináris a jelenlegi adat- és konfigurációformátumot még
+kezelni tudja. A config migration ezért expand/contract mintát igényel:
+az új kód először olvassa a régi formátumot, a régi kódot addig nem
+cseréljük le, amíg minden új fogyasztó stabil nem lett.</li>
+</ul>
+<p>A lánc lépései:</p>
+<ol type="1">
+<li><strong>Native test/build/image pipeline</strong>: a
+forrásrevisionből egyetlen Linux amd64 release binárist készítünk,
+teszteket és sanitizer vizsgálatot futtatunk. A binárist tömörített
+archívumba csomagoljuk, és SHA-256-tal azonosítjuk. A build rögzíti a
+build-id-t, a libc és a linker környezetet, mert egy natív C++ service
+ABI-függőségei a konténer runtime image-től is függenek.</li>
+<li><strong>SBOM, digest, attestation és registry</strong>: a konténer
+build ugyanezt a binárist helyezi egy minimal runtime rétegbe. A build
+nem második fordítást végez, hanem artifactot telepít. A registry-be
+push során a rendszer SBOM-ot (software bill of materials) és provenance
+attestationt készít. A promotion hivatkozás mindig
+<code>@sha256:...</code> formátumú.</li>
+<li><strong>Rendered manifest/policy validation</strong>: a Helm chart
+vagy Kustomize overlay a környezeti values-szal rendered manifestet
+állít elő. Ezt API séma-szinten (<code>kubeconform</code>) és
+policy-szinten (<code>conftest</code>, OPA/Gatekeeper) ellenőrizzük, még
+a GitOps sync előtt.</li>
+<li><strong>GitOps reconcile és environment promotion</strong>: a
+promotion nem közvetlen cluster művelet, hanem Git commit a megfelelő
+environment path-on. A <code>staging</code> sikeres kiértékelése után
+ugyanaz az image digest jelenik meg a <code>prod</code> desired
+state-ben.</li>
+<li><strong>Probe, rollout, PDB, canary</strong>: a Deployment rolling
+update során readiness/liveness probe-okkal, PodDisruptionBudgettel és
+opcionálisan canary lépésekkel biztosítjuk, hogy a forgalom csak
+egészséges podokra kerüljön. A canary részletes gyakorlatát a <a
+href="d245.html">Progressive delivery és recovery labor</a>
+tartalmazza.</li>
+<li><strong>Release evidence és config migration</strong>: a kiadás csak
+akkor nevezhető késznek, ha a release evidence fájl létrejött, és a
+configVersion váltás kompatibilitási feltételeit ellenőriztük.</li>
+</ol>
+<h3 data-number="56.2.2" id="kidolgozott-példa"><span
+class="header-section-number">56.2.2</span> Kidolgozott példa</h3>
+<p>A példa labtargetjei: <code>gitops-lab-control</code> (UID 1000),
+cluster context <code>lab-staging</code>, később <code>lab-prod</code>,
+namespace <code>lab-payment</code>, Argo CD app
+<code>lab-payment-staging</code>. A service neve
+<code>payment-srv</code>, a repository <code>platform-deploy</code>. A
+product repository <code>payment-srv</code> tartalmazza a C++ forrást és
+a pipeline-t. A dummy digestek helyettesítők; a laborban a tényleges
+pipeline generálja őket.</p>
+<p>A natív CI pipeline releváns része (nem futtatott minta):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">name</span><span class="kw">:</span><span class="at"> release-payment-srv</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">on</span><span class="kw">:</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">push</span><span class="kw">:</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">tags</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;release/payment-srv/*&quot;</span><span class="kw">]</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">permissions</span><span class="kw">:</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">contents</span><span class="kw">:</span><span class="at"> read</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">id-token</span><span class="kw">:</span><span class="at"> write</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">jobs</span><span class="kw">:</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">build-test</span><span class="kw">:</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">runs-on</span><span class="kw">:</span><span class="at"> ubuntu-24.04</span><span class="co"> # lab-fixture: runner verzió rögzítendő</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">steps</span><span class="kw">:</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/checkout@lab-pinned-checkout</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cache dependency fixture</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/cache@lab-pinned-cache</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">with</span><span class="kw">:</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">path</span><span class="kw">:</span><span class="at"> .cache</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">key</span><span class="kw">:</span><span class="at"> payment-srv-fixture-${{ hashFiles(&#39;fixtures/**&#39;) }}</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> configure</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>          cmake -S . -B build \</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>            -DCMAKE_BUILD_TYPE=RelWithDebInfo \</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            -DPAYMENT_PLATFORM=linux-amd64 \</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>            -DPAYMENT_ENABLE_SANITIZERS=ON</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> build</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">run</span><span class="kw">:</span><span class="at"> cmake --build build --target payment-srv</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> test</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">run</span><span class="kw">:</span><span class="at"> ctest --test-dir build --output-on-failure</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> package binary</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>          tar --zstd -cf build/payment-srv-linux-amd64.tar.zst \</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>            -C build/bin payment-srv</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>          sha256sum build/payment-srv-linux-amd64.tar.zst \</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>            &gt; build/payment-srv-linux-amd64.tar.zst.sha256</span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> store binary artifact</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/upload-artifact@lab-pinned-upload</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">with</span><span class="kw">:</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">name</span><span class="kw">:</span><span class="at"> payment-srv-linux-amd64</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">path</span><span class="kw">:</span><span class="at"> build/payment-srv-linux-amd64.tar.zst</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">retention-days</span><span class="kw">:</span><span class="at"> </span><span class="dv">14</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">needs</span><span class="kw">:</span><span class="at"> build-test</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">runs-on</span><span class="kw">:</span><span class="at"> ubuntu-24.04</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">steps</span><span class="kw">:</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">uses</span><span class="kw">:</span><span class="at"> actions/checkout@lab-pinned-checkout</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> build and push image</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">IMAGE</span><span class="kw">:</span><span class="at"> ghcr.io/lab-org/payment-srv</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>          docker buildx build \</span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>            --platform linux/amd64 \</span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>            --sbom=true \</span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>            --provenance=mode=min \</span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>            -t &quot;${IMAGE}:v0.4.2&quot; \</span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>            --push .</span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> resolve digest</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">IMAGE</span><span class="kw">:</span><span class="at"> ghcr.io/lab-org/payment-srv</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>          digest=&quot;$(docker buildx imagetools inspect &quot;${IMAGE}:v0.4.2&quot; \</span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>            --format &#39;{{ .Manifest.Digest }}&#39;)&quot;</span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>          {</span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>            echo &quot;IMAGE_DIGEST=${digest}&quot;</span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>            echo &quot;IMAGE_REF=${IMAGE}@${digest}&quot;</span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>          } &gt;&gt; &quot;${GITHUB_ENV}&quot;</span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> sign image</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">IMAGE</span><span class="kw">:</span><span class="at"> ghcr.io/lab-org/payment-srv</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>          cosign sign --yes \</span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>            --oidc-issuer https://token.actions.githubusercontent.com \</span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a>            &quot;${IMAGE}@${IMAGE_DIGEST}&quot;</span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> attest provenance</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">IMAGE</span><span class="kw">:</span><span class="at"> ghcr.io/lab-org/payment-srv</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a><span class="fu">        run</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>          cosign attest --yes \</span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>            --type slsaprovenance \</span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>            --predicate build/payment-srv-attestation.json \</span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>            &quot;${IMAGE}@${IMAGE_DIGEST}&quot;</span></code></pre></div>
+<p>A workflow a release tagből
+<code>ghcr.io/lab-org/payment-srv:v0.4.2</code> taget is képez, de a
+promotionben a <code>payment-srv</code> chart csak a <code>digest</code>
+mezőt használja. A <code>v0.4.2</code> kényelmi cím, nem biztonsági
+hivatkozás.</p>
+<p>A Helm values a staging környezethez:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># config/staging/values.yaml</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">image</span><span class="kw">:</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">repository</span><span class="kw">:</span><span class="at"> ghcr.io/lab-org/payment-srv</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">digest</span><span class="kw">:</span><span class="at"> sha256:1111111111111111111111111111111111111111111111111111111111111111</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pullPolicy</span><span class="kw">:</span><span class="at"> IfNotPresent</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="fu">replicaCount</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="fu">configVersion</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;2&quot;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 100m</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 128Mi</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> 500m</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> 512Mi</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="fu">probes</span><span class="kw">:</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">readinessPath</span><span class="kw">:</span><span class="at"> /healthz</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">livenessPath</span><span class="kw">:</span><span class="at"> /healthz</span></span></code></pre></div>
+<p>A <code>digest</code> dummy; a labor a
+<code>docker buildx imagetools inspect</code> vagy a registry API által
+visszaadott értéket rögzíti.</p>
+<p>A chart Deployment és PDB része:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># charts/payment-srv/templates/deployment.yaml</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> payment-srv</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Release.Namespace </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.replicaCount </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">strategy</span><span class="kw">:</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">type</span><span class="kw">:</span><span class="at"> RollingUpdate</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">rollingUpdate</span><span class="kw">:</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">maxUnavailable</span><span class="kw">:</span><span class="at"> </span><span class="dv">0</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">maxSurge</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> payment-srv</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> payment-srv</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">config-version</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;{{ .Values.configVersion }}&quot;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> payment-srv</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">image</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;{{ .Values.image.repository }}@{{ .Values.image.digest }}&quot;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">containerPort</span><span class="kw">:</span><span class="at"> </span><span class="dv">8080</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">readinessProbe</span><span class="kw">:</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">path</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.probes.readinessPath </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">port</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">timeoutSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">failureThreshold</span><span class="kw">:</span><span class="at"> </span><span class="dv">3</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">livenessProbe</span><span class="kw">:</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">httpGet</span><span class="kw">:</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">path</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.probes.livenessPath </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">port</span><span class="kw">:</span><span class="at"> http</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">periodSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">15</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">timeoutSeconds</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">failureThreshold</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">requests</span><span class="kw">:</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.resources.requests.cpu </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.resources.requests.memory </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">limits</span><span class="kw">:</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">cpu</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.resources.limits.cpu </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">memory</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Values.resources.limits.memory </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a><span class="pp">---</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> policy/v1</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> PodDisruptionBudget</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> payment-srv</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> </span><span class="kw">{</span><span class="at">{ .Release.Namespace </span><span class="kw">}</span><span class="at">}</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minAvailable</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> payment-srv</span></span></code></pre></div>
+<p>A rendered manifest validálása a promotion commit előtt:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: gitops-lab-control, UID=1000</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> platform-deploy</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">helm</span> lint ./charts/payment-srv <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--values</span> ./config/staging/values.yaml</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="va">image_digest</span><span class="op">=</span><span class="st">&quot;1111111111111111111111111111111111111111111111111111111111111111&quot;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="ex">helm</span> template lab-payment ./charts/payment-srv <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--namespace</span> lab-payment <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--values</span> ./config/staging/values.yaml <span class="dt">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--set</span> image.digest=<span class="st">&quot;</span><span class="va">${image_digest}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> build/payment-srv-staging-rendered.yaml</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="ex">kubeconform</span> <span class="at">-strict</span> <span class="at">-summary</span> <span class="dt">\</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">-kubernetes-version</span> lab-pinned-k8s <span class="dt">\</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">-ignore-missing-schemas</span> <span class="dt">\</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>  build/payment-srv-staging-rendered.yaml</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="ex">conftest</span> test <span class="at">--policy</span> ./policy/rendered <span class="dt">\</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>  <span class="at">--namespace</span> payment.srv <span class="dt">\</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>  build/payment-srv-staging-rendered.yaml</span></code></pre></div>
+<p>Várható kimenet: a <code>helm lint</code> nem jelez hibát; a
+<code>kubeconform</code> összegzésben <code>valid</code> állapotot ír; a
+<code>conftest</code> kilépési kódja nulla, és a policy tesztek
+<code>PASS</code> eredményt adnak. Ha a values-ban a
+<code>configVersion</code> nem string, a Helm render figyelmeztet, a
+policy pedig elutasíthatja a régi formátumú ConfigMap miatt.</p>
+<p>A promotion commit a staging desired state módosítása:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> platform-deploy</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout <span class="at">-b</span> promote/payment-srv/staging-v0.4.2</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># A values.yaml digest mező frissítése a fenti sha256 értékre.</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add config/staging/values.yaml build/payment-srv-staging-rendered.yaml</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-s</span> <span class="at">-m</span> <span class="st">&quot;promote payment-srv v0.4.2 digest to staging&quot;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin promote/payment-srv/staging-v0.4.2</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># PR után a main merge:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">argocd</span> app sync lab-payment-staging <span class="at">--revision</span> main</span></code></pre></div>
+<p>Argo CD szinkron után ellenőrzés:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get deployment payment-srv <span class="dt">\</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.spec.template.spec.containers[0].image}{&quot;\n&quot;}&#39;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment rollout status deployment/payment-srv</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get pods <span class="at">-l</span> app=payment-srv <span class="dt">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> wide <span class="at">--watch</span></span></code></pre></div>
+<p>Várt kimenet: az image mező pontosan
+<code>ghcr.io/lab-org/payment-srv@sha256:1111...</code> formátumú; a
+rollout <code>successfully rolled out</code> üzenetet ad; három pod
+<code>Running</code> és <code>Ready</code> állapotú.</p>
+<p>A release evidence fájl rögzíti a staging kiadást:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> payment-srv</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&gt;</span> build/release-evidence-staging-v0.4.2.json <span class="op">&lt;&lt;&#39;JSON&#39;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="st">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;service&quot;: &quot;payment-srv&quot;,</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;environment&quot;: &quot;staging&quot;,</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;git_revision&quot;: &quot;&lt;release-sha&gt;&quot;,</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;ci_run_url&quot;: &quot;https://ci.lab.example/lab-org/payment-srv/actions/runs/&lt;run-id&gt;&quot;,</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;binary_artifact&quot;: {</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;name&quot;: &quot;payment-srv-linux-amd64.tar.zst&quot;,</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;sha256&quot;: &quot;sha256:lab-binary-digest&quot;,</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;build_id&quot;: &quot;lab-build-id&quot;,</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;config_version&quot;: &quot;2&quot;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="st">  },</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;image&quot;: {</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;repository&quot;: &quot;ghcr.io/lab-org/payment-srv&quot;,</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;digest&quot;: &quot;sha256:1111111111111111111111111111111111111111111111111111111111111111&quot;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="st">  },</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;sbom&quot;: {</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;url&quot;: &quot;https://ci.lab.example/sbom/payment-srv-v0.4.2.spdx.json&quot;,</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;digest&quot;: &quot;sha256:lab-sbom-digest&quot;</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="st">  },</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;attestation&quot;: {</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;type&quot;: &quot;slsaprovenance&quot;,</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;url&quot;: &quot;https://ci.lab.example/attestations/payment-srv-v0.4.2.att.json&quot;</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="st">  },</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;rendered_manifest_digest&quot;: &quot;sha256:lab-rendered-digest&quot;,</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;policy_validation&quot;: {</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;kubeconform&quot;: &quot;valid&quot;,</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="st">    &quot;conftest&quot;: &quot;PASS&quot;</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="st">  },</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="st">  &quot;rollout_status&quot;: &quot;successfully rolled out&quot;</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a><span class="op">JSON</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> build/release-evidence-staging-v0.4.2.json <span class="dt">\</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> build/release-evidence-staging-v0.4.2.json.sha256</span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a><span class="ex">cosign</span> sign <span class="at">--yes</span> build/release-evidence-staging-v0.4.2.json</span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a><span class="ex">cosign</span> verify <span class="at">--certificate-identity</span> lab-pipeline <span class="dt">\</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>  build/release-evidence-staging-v0.4.2.json</span></code></pre></div>
+<p>A <code>configVersion: "2"</code> migration feltétele: a
+<code>payment-srv:v0.4.2</code> bináris mind v1, mind v2 config
+formátumot olvas. Amíg stagingben és prodban is csak v2 pod fut, a
+ConfigMap v2-t ír. A rollbackhez a v1 binárisnak is ismernie kell a v2
+configot, vagy a rollback commitnak a v1 values-szal kell
+visszaállnia.</p>
+<p>A prod promotion ugyanezt a digestet használja:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> platform-deploy</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout <span class="at">-b</span> promote/payment-srv/prod-v0.4.2</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Ugyanaz az image.digest, de prod values: replicaCount, probe threshold, nodeSelector,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># PDB minAvailable, storage és backup policy szerint.</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add config/prod/values.yaml</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-s</span> <span class="at">-m</span> <span class="st">&quot;promote payment-srv v0.4.2 digest to prod&quot;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin promote/payment-srv/prod-v0.4.2</span></code></pre></div>
+<p>A környezetek közötti különbség csak a <code>config/</code> alatti
+environment-specific values; a chart és a digest azonos. A rendered
+manifestet a prod promotion előtt is le kell generálni, mert a
+<code>replicaCount</code> vagy a <code>nodeSelector</code>
+változhat.</p>
+<p>A rollout biztonsági paraméterei: <code>maxUnavailable: 0</code> és
+PDB <code>minAvailable: 2</code> együtt biztosítják, hogy
+karbantartáskor is legalább két pod elérhető. A readiness probe az új
+podot csak akkor engedi a Service mögé, ha a <code>/healthz</code>
+válaszol. Ha valamelyik pod lassan indul, a
+<code>minReadySeconds</code>-t a platformterv szerint érdemes
+beállítani.</p>
+<p>Canary esetben a staging és prod között a d245 progressive delivery
+lépései használhatók: a digest először egy kis súlyú canary Deploymentbe
+vagy Argo Rollouts lépésbe kerül, majd SLO- és telemetria jelekkel
+növeljük a forgalmat. Itt a GitOps commit ugyanaz, de a platform chart a
+rollout stratégia mezőt is environment values-szal vezérli.</p>
+<h3 data-number="56.2.3" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">56.2.3</span> Tipikus hibák és
+ellenpróbák</h3>
+<p><strong>A tag promotálása digest helyett.</strong> Tünet: a
+klusterben lévő pod image mezője <code>payment-srv:v0.4.2</code>, és a
+<code>git log</code> szerint a promotion sikeres, mégis más kód fut.
+Hipotézis: a registryben a tagot időközben újratolták. Adatgyűjtés:
+<code>docker buildx imagetools inspect</code> a tag digestjére, és
+<code>kubectl get pod -l app=payment-srv -o jsonpath='{.items[0].status.containerStatuses[0].imageID}'</code>
+összehasonlítás. Ellenpróba: a desired state-ben tag szerepel, nem
+<code>@sha256</code>. Javítás: a values <code>image.digest</code> mezőre
+áll át, a taget csak CI kényelemként használjuk. Verifikáció: a pod
+<code>imageID</code> digestje megegyezik a release evidence image
+digestjével.</p>
+<p><strong>A rendered manifest nincs a GitOps repositoryban.</strong>
+Tünet: a CI-ben a <code>helm template</code> más eredményt ad, mint amit
+az Argo CD szinkronizál, mert a clusterben egy korábbi
+<code>kubectl apply</code> maradt. Hipotézis: a GitOps source nem a
+teljes desired state, hanem részleges overlay. Adatgyűjtés:
+<code>argocd app diff lab-payment-staging</code> és
+<code>kubectl get all -n lab-payment -o yaml</code> összehasonlítása.
+Ellenpróba: a diff a <code>payment-srv</code> Deployment image digest
+mezőben eltér. Javítás: minden módosítást a Git repository path-on kell
+commitolni, és az app sync policy <code>automated</code> +
+<code>self-heal</code>. Verifikáció: az <code>argocd app diff</code>
+üres, a <code>kubectl apply</code>-t nem használjuk.</p>
+<p><strong>A config migration egyirányú.</strong> Tünet: a v2 release
+rollout közben a régebbi pod <code>ConfigMap</code> parse hibát logol, a
+readiness probe nem válaszol. Hipotézis: a v2 config mezőneveket
+átneveztük, de a régi bináris nem ismeri őket. Adatgyűjtés:
+<code>kubectl logs -l app=payment-srv --tail=50</code>, a ConfigMap
+<code>kubectl get cm payment-srv-config -n lab-payment -o yaml</code>.
+Ellenpróba: a <code>configVersion</code> mező <code>2</code>, de a
+deployment podjai között még v1 image fut. Javítás: először a v2
+binárisnak kell tudnia olvasni a v1 configot; a rollout után átállunk v2
+configra; rollback esetén a v1 binárisnak is olvasnia kell v2-t, vagy a
+config értéket a revert commit is visszaállítja. Az adatbázis séma
+esetén hasonló expand/contract migráció kell: az új séma először
+write-compatible, destruktív oszloptörlés csak a stabil lefutás
+után.</p>
+<p><strong>A rollout a PDB-t megsérti.</strong> Tünet:
+<code>kubectl rollout status</code> hosszan fut, a
+<code>kubectl get pods</code> egy pod <code>Pending</code>. Hipotézis: a
+<code>maxUnavailable: 0</code> és a <code>maxSurge: 1</code> ellenére a
+cluster nem tud új podot ütemezni, mert az adott nodeSelector vagy
+resource request túl magas. Adatgyűjtés:
+<code>kubectl get events -n lab-payment --sort-by=.metadata.creationTimestamp | tail -20</code>,
+<code>kubectl get rs -n lab-payment</code>,
+<code>kubectl explain pod.spec</code>. Ellenpróba: a PDB szerint
+legalább két pod egészségesnek kell lennie, de a scheduler nem talál
+szabad erőforrást. Javítás: a deployment resource requestjét a platform
+capacity budgethez igazítjuk, vagy a promotion előtt a
+<code>kubectl top nodes</code> és a
+<code>kubectl describe nodes | grep -A5 Allocated</code> értékeket
+ellenőrizzük. Verifikáció: a rollout <code>maxSurge</code> többlet podja
+ténylegesen elindul, a PDB status <code>Allowed disruptions</code>
+értéke nem csökken.</p>
+<p>A hibakeresés során egy változtatást érdemes egyszerre végezni:
+először a digestet rögzítjük, utána a configVersion feltételt, végül a
+resource requestet. A GitOps diff és a release evidence minden lépésben
+megmondja, mi változott.</p>
+<h3 data-number="56.2.4" id="feladatok"><span
+class="header-section-number">56.2.4</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> Adott ez a deployment
+hivatkozás: <code>ghcr.io/lab-org/payment-srv:v0.4.2</code>. Magyarázza
+el, miért nem elegendő ez a promotion azonosító, és milyen bizonyíték
+hiányzik ahhoz, hogy a forrástól a futó podig egyértelmű legyen a lánc.
+Listázza a hiányzó mezőket, és adjon meg egy helyes image hivatkozást a
+dummy digesttel.</p></li>
+<li><p><strong>Adminisztrációs feladat.</strong> A
+<code>platform-deploy</code> repositoryban a staging values jelenleg
+<code>image.digest: sha256:old-digest</code>. Készítse elő a
+<code>v0.4.2</code> promotion commitot egy fiktív új digesttel.
+Renderelje le a manifestet, futtassa a <code>kubeconform</code> és
+<code>conftest</code> validálást, majd Argo CD sync parancsot adjon a
+staging alkalmazásra. A kimenetben mutassa be a várható image mezőt és a
+rollout státuszt.</p></li>
+<li><p><strong>Diagnosztikai/failure feladat.</strong> A staging rollout
+után a podok <code>Running</code> állapotúak, de <code>Ready</code> nem
+lesznek. A naplóban
+<code>Config parse error: unknown key settings.retry.milliseconds</code>
+látszik. A rollout előtti pod még v1 image volt, a ConfigMap v2-t ír.
+Határozza meg a kiváltó okot, dolgozzon ki adatgyűjtési lépéseket, és
+hajtsa végre a data-compatible rollbacket a Git rebase/revert és Argo CD
+sync segítségével.</p></li>
+</ol>
+<h3 data-number="56.2.5" id="megoldások"><span
+class="header-section-number">56.2.5</span> Megoldások</h3>
+<ol type="1">
+<li><p>A tag nem tartalomazonosító; ugyanahhoz a taghez tartozó
+manifestet bárki újratolhat. A promotion csak akkor reprodukálható, ha a
+desired state <code>@sha256:1111...</code> digestet használ. A hiányzó
+bizonyítékok: binary artifact SHA-256, build-id, SBOM digest,
+attestation URL, rendered manifest digest, policy validation eredmény,
+rollout status. Helyes hivatkozás:
+<code>ghcr.io/lab-org/payment-srv@sha256:1111111111111111111111111111111111111111111111111111111111111111</code>.
+Postcondition: a pod <code>imageID</code> digestje egyezik a release
+evidence digestjével, és a tag nem jelenik meg a desired
+state-ben.</p></li>
+<li><p>A megoldás lépései:</p></li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> platform-deploy</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> checkout <span class="at">-b</span> promote/payment-srv/staging-v0.4.2</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="va">new_digest</span><span class="op">=</span><span class="st">&quot;1111111111111111111111111111111111111111111111111111111111111111&quot;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># A config/staging/values.yaml image.digest mező frissítése.</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">helm</span> lint ./charts/payment-srv <span class="at">--values</span> ./config/staging/values.yaml</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">helm</span> template lab-payment ./charts/payment-srv <span class="dt">\</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--namespace</span> lab-payment <span class="dt">\</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--values</span> ./config/staging/values.yaml <span class="dt">\</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--set</span> image.digest=<span class="st">&quot;</span><span class="va">${new_digest}</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> build/payment-srv-staging-rendered.yaml</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="ex">kubeconform</span> <span class="at">-strict</span> <span class="at">-summary</span> build/payment-srv-staging-rendered.yaml</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a><span class="ex">conftest</span> test <span class="at">--policy</span> ./policy/rendered build/payment-srv-staging-rendered.yaml</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add config/staging/values.yaml build/payment-srv-staging-rendered.yaml</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-s</span> <span class="at">-m</span> <span class="st">&quot;promote payment-srv v0.4.2 digest to staging&quot;</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin promote/payment-srv/staging-v0.4.2</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="co"># PR merge után:</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="ex">argocd</span> app sync lab-payment-staging <span class="at">--revision</span> main</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get deployment payment-srv <span class="dt">\</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> jsonpath=<span class="st">&#39;{.spec.template.spec.containers[0].image}{&quot;\n&quot;}&#39;</span></span></code></pre></div>
+<p>Várt kimenet: a <code>kubeconform</code> <code>valid</code>, a
+<code>conftest</code> <code>PASS</code>, az image mező
+<code>ghcr.io/lab-org/payment-srv@sha256:1111...</code>, a rollout
+<code>successfully rolled out</code>. Postcondition: a staging desired
+state-ben a digest a release evidence-szel egyezik, a cluster observed
+state-e pedig a GitOps sync után <code>Synced</code>.</p>
+<ol start="3" type="1">
+<li>A kiváltó ok: a rollout egyszerre váltotta a configverziót és az
+image verziót, de a régi bináris nem olvassa a v2 configot. A helyes
+eljárás adatgyűjtés:</li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get pods <span class="at">-l</span> app=payment-srv <span class="at">-o</span> wide</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get cm payment-srv-config <span class="at">-o</span> yaml</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment logs <span class="at">-l</span> app=payment-srv <span class="at">--tail</span><span class="op">=</span>30</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment describe deployment payment-srv</span></code></pre></div>
+<p>Az ellenőrzés megmutatja, hogy a <code>configVersion</code>
+<code>2</code>, de a readiness probe hibát jelez. A rollback:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> platform-deploy</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> log <span class="at">--oneline</span> <span class="at">-5</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co"># A promotion commit SHA: lab-promote-commit</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> revert <span class="at">--no-edit</span> lab-promote-commit</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin main</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">argocd</span> app sync lab-payment-staging <span class="at">--revision</span> main</span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment rollout status deployment/payment-srv</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-staging <span class="at">-n</span> lab-payment get pods <span class="at">-l</span> app=payment-srv <span class="at">-o</span> wide</span></code></pre></div>
+<p>A rollback akkor elfogadható, ha a v1 bináris a konfigurációt v1
+formátumban kapja, és az adatbázisban nem történt olyan séma módosítás,
+amelyet a v1 már nem tud olvasni. Postcondition: a staging deployment
+image digestje visszaáll a korábbi release digestre, a podok
+<code>Ready</code> állapotúak, a ConfigMap <code>configVersion</code>
+<code>1</code>, és az Argo CD app <code>Synced</code>.</p>
+<h3 data-number="56.2.6" id="rövid-összefoglaló"><span
+class="header-section-number">56.2.6</span> Rövid összefoglaló</h3>
+<p>A d277 a CI artifacttól a cluster desired state-ig vezethető
+immutable láncot tanítja. A natív C++ build egyetlen binary artifactot
+állít elő; a container build azt telepíti, SBOM-mal, digestsztel és
+attestationnel látja el. A GitOps promotion ugyanazt a digestet mozgatja
+environmentek között, a környezeti különbséget a rendered manifest
+values adja. A rollout biztonságát probe-ok, PDB és rolling/canary
+stratégia adja; a rollback csak akkor érvényes, ha a config és data
+migration visszafelé is kompatibilis. Továbbhasznált definíciók:
+<strong>immutable artifact promotion</strong>, <strong>GitOps
+reconcile</strong>, <strong>data-compatible rollback</strong>.</p>
+<h3 data-number="56.2.7" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">56.2.7</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi hivatkozások a fejezet kiindulópontjai, de ebben a kérésben
+nem áll rendelkezésre webes kutatás, és a support verziókat nem
+ellenőriztem:</p>
+<ul>
+<li><a href="https://opengitops.dev/">OpenGitOps</a></li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/">Argo CD
+Documentation</a></li>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+Documentation</a></li>
+<li><a href="https://opentelemetry.io/docs/">OpenTelemetry
+Documentation</a></li>
+<li><a href="https://sre.google/books/">SRE Books</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a konkrét <code>actions/*</code> verziók,
+<code>docker buildx</code> SBOM/provenance flag támogatás,
+<code>cosign</code> aláírás parancssori formátuma,
+<code>kubeconform</code> és <code>conftest</code> policy sémák, Argo CD
+sync paraméterek, valamint a Kubernetes RollingUpdate és PDB pontos API
+verziója a lab inventoryban rögzítendő. A dummy digestek, fixture URL-ek
+és várt kimenetek illusztratív adatok, nem futtatott laberedmények.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d276.html">← 56.1 Platformterv és környezeti contract</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d278.html">56.3 Network, volume, observability és platform rutin →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>15.2 Idősoros adatbázisok és adatmodellezés – IoT-rendszerek és
+szoftverkomponensek – az eszköztől a felhőig, programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Backend és enterprise integráció</a> › <a href="index.html#ich14">15 Ingest és adattárolás</a></p>
+<div class="links"><a class="prev" rel="prev" href="i044.html">← 15.1 Ingest: MQTT-ből a backendbe, idempotensen</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i046.html">15.3 Megőrzés, ritkítás és tárolási költség →</a></div>
+</nav>
+<h2 data-number="15.2" id="i045"><span
+class="header-section-number">15.2</span> Idősoros adatbázisok és
+adatmodellezés</h2>
+<h3 data-number="15.2.1" id="motiváció"><span
+class="header-section-number">15.2.1</span> Motiváció</h3>
+<p>A ts-backend az <a href="i044.html">Ingest: MQTT-ből a backendbe,
+idempotensen</a> alfejezetben már beérkező üzenetenként feldolgozza a
+TerraSense telemetriát, de ez önmagában kevés: a méréseket úgy kell
+tárolni, hogy a későbbi lekérdezések ne lassuljanak le a több millió
+soros tábla növekedésével. Egy hagyományos PostgreSQL-tábla eleinte
+működik, de az idő szerinti szűrés, az óránkénti átlag, a percenként
+beérkező ezres írási sebesség és a hosszú megőrzési idő hamar
+szétfeszíti a naiv megoldást. Az üvegházakban elhelyezett szenzorok
+folyamatosan küldenek adatot; ha a rendszer nem skálázódik, a dashboard
+lassú lesz, a riasztások késnek, és a tárolási költség megnő.</p>
+<p>Ez az alfejezet azt mutatja be, hogyan tervezzük meg a TerraSense
+mérések idősoros tábláit, hogy a TimescaleDB hatékonyan kezelje az
+írásintenzív terhelést, az időablakos lekérdezéseket és az eszközönkénti
+utolsó értékeket.</p>
+<h3 data-number="15.2.2" id="fogalmak-és-működés"><span
+class="header-section-number">15.2.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció.</strong> Az idősoros adat olyan rekord, amelyben
+minden sorhoz egy időbélyeg tartozik, és a lekérdezések dominánsan
+időintervallumokra, sorrendre, csúcsértékre vagy aggregált értékre
+vonatkoznak. Az IoT-mérések tipikus idősoros adatok: a hőmérsékletet,
+páratartalmat és talajnedvességet időpontonként rögzítjük, és a kérdés
+gyakran az, hogy „mi volt az átlaghőmérséklet az elmúlt 24 órában” vagy
+„mikor lépte át utoljára a 30 °C-ot”.</p>
+<p><strong>Definíció.</strong> A TimescaleDB a PostgreSQL egy
+kiterjesztése, amely egy hagyományos táblából ún. hypertable-t hoz
+létre. A hypertable-t a TimescaleDB automatikusan kisebb, idő szerint
+particionált részekre (chunk) bontja, miközben a felhasználó továbbra is
+szabványos SQL-lekérdezéseket ír. A particionálás gyorsítja az
+időablakos szűrést, a tömörítést és a későbbi adatmegőrzési
+műveleteket.</p>
+<p>A TimescaleDB-ben a hypertable-t jellemzően az eseményidő oszlopra
+hozzuk létre. A <code>ts</code> oszlop tehát nem csak egy mező, hanem a
+tárolás elsődleges szerveződési tengelye. A beérkező üzenetek az
+append-only jelleget követik: ritkán frissítünk, gyakran szúrunk be, a
+múltbeli adatot inkább tömörítjük vagy ritkítjuk.</p>
+<p>A TerraSense telemetria a <a href="i032.html">Adatformátumok: JSON,
+CBOR, Protocol Buffers, SenML</a> alfejezetben véglegesített séma
+szerint egy <code>measurements</code> listát tartalmaz. Egyetlen
+MQTT-üzenet tehát több mérést is hozhat:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;schema_version&quot;</span><span class="fu">:</span> <span class="st">&quot;1.0&quot;</span><span class="fu">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;node_id&quot;</span><span class="fu">:</span> <span class="st">&quot;n001&quot;</span><span class="fu">,</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">42</span><span class="fu">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="dv">1735689600000</span><span class="fu">,</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;measurements&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;temperature&quot;</span><span class="fu">,</span> <span class="dt">&quot;value&quot;</span><span class="fu">:</span> <span class="fl">22.5</span><span class="fu">,</span> <span class="dt">&quot;unit&quot;</span><span class="fu">:</span> <span class="st">&quot;Cel&quot;</span><span class="fu">,</span> <span class="dt">&quot;valid&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;humidity&quot;</span><span class="fu">,</span> <span class="dt">&quot;value&quot;</span><span class="fu">:</span> <span class="fl">60.2</span><span class="fu">,</span> <span class="dt">&quot;unit&quot;</span><span class="fu">:</span> <span class="st">&quot;%RH&quot;</span><span class="fu">,</span> <span class="dt">&quot;valid&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;soil_moisture&quot;</span><span class="fu">,</span> <span class="dt">&quot;value&quot;</span><span class="fu">:</span> <span class="fl">35.0</span><span class="fu">,</span> <span class="dt">&quot;unit&quot;</span><span class="fu">:</span> <span class="st">&quot;%&quot;</span><span class="fu">,</span> <span class="dt">&quot;valid&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">}</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Ebből a normalizálás három táblasort készít. A <code>ts</code> értéke
+epoch ms UTC, amit az adatbázisban <code>timestamptz</code> típusra
+alakítunk. Emellett tároljuk a <code>server_ts</code> feldolgozási időt
+is, hogy később vizsgálható legyen a hálózati késleltetés vagy a gateway
+offline pufferelésének hatása.</p>
+<figure>
+<img src="assets/i045-diagram-1.png"
+alt="Telemetria útja az idősoros táblába - Az ingest réteg a JSON üzenetet normalizálja, a repository kötegelve írja a hypertable-be." />
+<figcaption aria-hidden="true">Telemetria útja az idősoros táblába - Az
+ingest réteg a JSON üzenetet normalizálja, a repository kötegelve írja a
+hypertable-be.</figcaption>
+</figure>
+<p>Az ábrán látható folyamatban a <code>TelemetryRepository</code>
+kötegelt beszúrást használ: nem soronként, hanem néhány száz elemű
+batch-ekben ír, így csökken a hálózati és tranzakciós overhead.</p>
+<h3 data-number="15.2.3" id="döntési-szempontok"><span
+class="header-section-number">15.2.3</span> Döntési szempontok</h3>
+<p>Az idősoros tároló kiválasztásakor a TerraSense esetében a
+TimescaleDB mellett az InfluxDB a leggyakrabban felmerülő
+alternatíva.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>TimescaleDB</th>
+<th>InfluxDB</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Adatmodell</td>
+<td>PostgreSQL-táblák, SQL</td>
+<td>saját adatmodell, bucket/measurement/tag/field</td>
+</tr>
+<tr class="even">
+<td>Lekérdezési nyelv</td>
+<td>SQL, PostgreSQL-ökoszisztéma</td>
+<td>InfluxQL vagy Flux (verziófüggő)</td>
+</tr>
+<tr class="odd">
+<td>Tranzakciók</td>
+<td>teljes ACID a PostgreSQL miatt</td>
+<td>korlátozottabb</td>
+</tr>
+<tr class="even">
+<td>Üzemeltetés</td>
+<td>meglévő PostgreSQL-ismeret előny</td>
+<td>külön motor, saját működtetés</td>
+</tr>
+<tr class="odd">
+<td>Skálázás</td>
+<td>vertikális + kiterjesztések, chunkok</td>
+<td>elosztott klaszterezés lehetősége</td>
+</tr>
+<tr class="even">
+<td>Integráció</td>
+<td>Spring JDBC/JPA egyszerű</td>
+<td>saját kliens vagy API</td>
+</tr>
+</tbody>
+</table>
+<p>A TerraSense-ben a TimescaleDB-t választjuk, mert a ts-backend
+Java/Spring környezetben amúgy is PostgreSQL felé integrál, a csapat
+ismeri az SQL-t, és a TimescaleDB a mérési adatok mellett az
+eszköznyilvántartást is ugyanabban az adatbázisban tarthatja. Az
+InfluxDB erős versenyző, ha nagy elosztott klaszterre vagy speciális
+idősoros funkciókra van szükség, de jelen üvegházas méretben a bevált
+PostgreSQL-alap a fontosabb. A pontos verzió- és funkcióösszevetést a
+telepített TimescaleDB- és InfluxDB-verzió dokumentációjában ellenőrizni
+kell.</p>
+<p>Az adatmodell tervezésénél két fő forma van:</p>
+<ul>
+<li><strong>Széles tábla</strong>: minden méréstípus külön oszlop
+(<code>temperature</code>, <code>humidity</code>,
+<code>soil_moisture</code>). Előnye, hogy egy sor egy időpontot ír le,
+és a lekérdezés egyszerű. Hátránya, hogy új szenzortípus esetén
+sémamódosítás kell, és a hiányzó mérések NULL-okat szülnek.</li>
+<li><strong>Hosszú tábla</strong>: egy <code>measurement_type</code> és
+egy <code>value</code> oszlop van, minden mérés egy sor. Előnye a
+rugalmasság és az idősoros indexelés hatékonysága. Hátránya, hogy egy
+eszköz időpillanatnyi állapotának összeállítása több sor egyesítését
+igényli.</li>
+</ul>
+<p>A TerraSense a hosszú táblát választja, mert a telemetria JSON eleve
+mérési listát tartalmaz, és a jövőben új mérések (például
+széndioxid-koncentráció) séma-módosítás nélkül illeszthetők be. A
+<code>site</code> és <code>node_id</code> címkeként (label), a
+<code>measurement_type</code> és <code>value</code> pedig mérésként
+(metric) viselkedik.</p>
+<h3 data-number="15.2.4"
+id="kidolgozott-példa-a-terrasense-táblaszerkezete"><span
+class="header-section-number">15.2.4</span> Kidolgozott példa: a
+TerraSense táblaszerkezete</h3>
+<p>A tábla definíciója a labor <code>schema.sql</code> fájljában:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> EXTENSION <span class="cf">IF</span> <span class="kw">NOT</span> <span class="kw">EXISTS</span> timescaledb;</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> telemetry (</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    server_ts        timestamptz <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> now(),</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    ts               timestamptz <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    site             text        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    node_id          text        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    seq              bigint      <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    boot_id          text,</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    schema_version   text        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    measurement_type text        <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="fu">value</span>            <span class="dt">double</span> <span class="dt">precision</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    unit             text,</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    valid            <span class="dt">boolean</span>     <span class="kw">NOT</span> <span class="kw">NULL</span> <span class="kw">DEFAULT</span> <span class="kw">true</span>,</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">UNIQUE</span> (node_id, seq, measurement_type, ts)</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> create_hypertable(<span class="st">&#39;telemetry&#39;</span>, <span class="st">&#39;ts&#39;</span>,</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>       chunk_time_interval <span class="op">=&gt;</span> <span class="dt">interval</span> <span class="st">&#39;7 days&#39;</span>);</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">INDEX</span> <span class="kw">ON</span> telemetry (node_id, ts <span class="kw">DESC</span>);</span></code></pre></div>
+<p><strong>Továbbvitt eredmény.</strong> Ez a <code>telemetry</code>
+táblaszerkezet, a <code>(node_id, seq, measurement_type, ts)</code>
+egyedi kulcs és a <code>hypertable</code> particionálás a <a
+href="i046.html">Megőrzés, ritkítás és tárolási költség</a> alapját
+adja. Ugyanezt a táblát használja a <a href="i051.html">Dashboardok
+Grafanával</a> a grafikonok mögötti lekérdezésekhez, és a <a
+href="i066.html">Záróprojekt: a teljes TerraSense rendszer összeállítása
+és átvétele</a> a végleges adatrétegként.</p>
+<p>Az egyedi kényszer biztosítja az idempotens beszúrást: ha ugyanaz a
+<code>(node_id, seq, measurement_type, ts)</code> négyes ismét
+beérkezik, az <code>ON CONFLICT DO NOTHING</code> eldobja a
+duplikátumot. A <code>boot_id</code> segít az eszköz újraindulásakor a
+sorrend elemzésében; a <code>ts</code> bevonása az egyedi kulcsba azért
+fontos, mert a <code>seq</code> az újraindulás után nulláról indulhat, a
+<code>ts</code> viszont monotonabb viselkedést mutat az
+eseményidőben.</p>
+<p>A beszúrást a Spring <code>JdbcTemplate</code> kötegelt API-jával
+végezzük:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">class</span> TelemetryRepository <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="dt">final</span> JdbcTemplate jdbc<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">TelemetryRepository</span><span class="op">(</span>JdbcTemplate jdbc<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>        <span class="kw">this</span><span class="op">.</span><span class="fu">jdbc</span> <span class="op">=</span> jdbc<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">insertBatch</span><span class="op">(</span><span class="bu">List</span><span class="op">&lt;</span>TelemetryRow<span class="op">&gt;</span> rows<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        <span class="bu">String</span> sql <span class="op">=</span> <span class="st">&quot;&quot;&quot;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="st">            INSERT INTO telemetry</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="st">                (server_ts, ts, site, node_id, seq, boot_id,</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="st">                 schema_version, measurement_type, value, unit, valid)</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="st">            VALUES (now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="st">            ON CONFLICT (node_id, seq, measurement_type, ts) DO NOTHING</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="st">            &quot;&quot;&quot;</span><span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        jdbc<span class="op">.</span><span class="fu">batchUpdate</span><span class="op">(</span>sql<span class="op">,</span> rows<span class="op">,</span> <span class="dv">500</span><span class="op">,</span> <span class="op">(</span>ps<span class="op">,</span> row<span class="op">)</span> <span class="op">-&gt;</span> <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setTimestamp</span><span class="op">(</span><span class="dv">1</span><span class="op">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>                <span class="bu">Timestamp</span><span class="op">.</span><span class="fu">from</span><span class="op">(</span>Instant<span class="op">.</span><span class="fu">ofEpochMilli</span><span class="op">(</span>row<span class="op">.</span><span class="fu">tsEpochMs</span><span class="op">())));</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">2</span><span class="op">,</span> row<span class="op">.</span><span class="fu">site</span><span class="op">());</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">3</span><span class="op">,</span> row<span class="op">.</span><span class="fu">nodeId</span><span class="op">());</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setLong</span><span class="op">(</span><span class="dv">4</span><span class="op">,</span> row<span class="op">.</span><span class="fu">seq</span><span class="op">());</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>row<span class="op">.</span><span class="fu">bootId</span><span class="op">()</span> <span class="op">==</span> <span class="kw">null</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>                ps<span class="op">.</span><span class="fu">setNull</span><span class="op">(</span><span class="dv">5</span><span class="op">,</span> <span class="bu">Types</span><span class="op">.</span><span class="fu">VARCHAR</span><span class="op">);</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>                ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">5</span><span class="op">,</span> row<span class="op">.</span><span class="fu">bootId</span><span class="op">());</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">6</span><span class="op">,</span> row<span class="op">.</span><span class="fu">schemaVersion</span><span class="op">());</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">7</span><span class="op">,</span> row<span class="op">.</span><span class="fu">measurementType</span><span class="op">());</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setDouble</span><span class="op">(</span><span class="dv">8</span><span class="op">,</span> row<span class="op">.</span><span class="fu">value</span><span class="op">());</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setString</span><span class="op">(</span><span class="dv">9</span><span class="op">,</span> row<span class="op">.</span><span class="fu">unit</span><span class="op">());</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">.</span><span class="fu">setBoolean</span><span class="op">(</span><span class="dv">10</span><span class="op">,</span> row<span class="op">.</span><span class="fu">valid</span><span class="op">());</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="op">});</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>batchUpdate</code> 500 soronként fűz ki egy adagot, és a
+JDBC-driver általában ezt egyetlen round-tripben küldi. A
+<code>TelemetryRow</code> egy rekord típus a normalizált mezőkkel.</p>
+<p>A fenti konkrét JSON-üzenetből a repository három sort hoz létre,
+például:</p>
+<table>
+<thead>
+<tr class="header">
+<th>node_id</th>
+<th>seq</th>
+<th>ts</th>
+<th>measurement_type</th>
+<th>value</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>n001</td>
+<td>42</td>
+<td>2025-01-01 00:00:00+00</td>
+<td>temperature</td>
+<td>22.5</td>
+</tr>
+<tr class="even">
+<td>n001</td>
+<td>42</td>
+<td>2025-01-01 00:00:00+00</td>
+<td>humidity</td>
+<td>60.2</td>
+</tr>
+<tr class="odd">
+<td>n001</td>
+<td>42</td>
+<td>2025-01-01 00:00:00+00</td>
+<td>soil_moisture</td>
+<td>35.0</td>
+</tr>
+</tbody>
+</table>
+<p>Az időbélyeg <code>1735689600000</code> ms, ami
+<code>2025-01-01T00:00:00Z</code>-nek felel meg.</p>
+<h3 data-number="15.2.5"
+id="labor-timescaledb-táblák-létrehozása-és-lekérdezése"><span
+class="header-section-number">15.2.5</span> Labor: TimescaleDB-táblák
+létrehozása és lekérdezése</h3>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i045 <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> ~/iot-labor/i045</span></code></pre></div>
+<p>Előfeltétel: a <a href="i044.html">Ingest: MQTT-ből a backendbe,
+idempotensen</a> laborban elkészített ingest és a <a
+href="i032.html">Adatformátumok: JSON, CBOR, Protocol Buffers, SenML</a>
+alfejezetben elfogadott telemetria-séma.</p>
+<p>Először bővítsük a közös <code>~/iot-labor/stack/compose.yaml</code>
+fájlt a TimescaleDB szolgáltatással. A <code>services:</code> alá
+illesszük a következőket:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lab-timescaledb</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> timescale/timescaledb:latest-pg16</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">container_name</span><span class="kw">:</span><span class="at"> lab-timescaledb</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">environment</span><span class="kw">:</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_USER</span><span class="kw">:</span><span class="at"> terra</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_PASSWORD</span><span class="kw">:</span><span class="at"> lab-password</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">POSTGRES_DB</span><span class="kw">:</span><span class="at"> terrasense</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;5432:5432&quot;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> lab-timescaledb-data:/var/lib/postgresql/data</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">healthcheck</span><span class="kw">:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">test</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="st">&quot;CMD-SHELL&quot;</span><span class="kw">,</span><span class="at"> </span><span class="st">&quot;pg_isready -U terra -d terrasense&quot;</span><span class="kw">]</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">interval</span><span class="kw">:</span><span class="at"> 10s</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">timeout</span><span class="kw">:</span><span class="at"> 5s</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">retries</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span></span></code></pre></div>
+<p>A <code>volumes:</code> szekcióba pedig:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lab-timescaledb-data</span><span class="kw">:</span></span></code></pre></div>
+<p>A jelszó kizárólag a helyi laborhoz használt, nem éles környezetbe
+való.</p>
+<p>Indítsuk el a szolgáltatást:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml up <span class="at">-d</span> lab-timescaledb</span></code></pre></div>
+<p>Írjuk meg a <code>~/iot-labor/i045/schema.sql</code> fájlt a fenti
+tábladefinícióval, majd a <code>~/iot-labor/i045/seed.sql</code> fájlt a
+tesztadatokkal:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> telemetry</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    (ts, site, node_id, seq, boot_id, schema_version,</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>     measurement_type, <span class="fu">value</span>, unit, valid)</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">VALUES</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735689600.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">42</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;temperature&#39;</span>, <span class="fl">22.5</span>, <span class="st">&#39;Cel&#39;</span>, <span class="kw">true</span>),</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735689600.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">42</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;humidity&#39;</span>, <span class="fl">60.2</span>, <span class="st">&#39;%RH&#39;</span>, <span class="kw">true</span>),</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735689600.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">42</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;soil_moisture&#39;</span>, <span class="fl">35.0</span>, <span class="st">&#39;%&#39;</span>, <span class="kw">true</span>),</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735689900.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">43</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;temperature&#39;</span>, <span class="fl">22.8</span>, <span class="st">&#39;Cel&#39;</span>, <span class="kw">true</span>),</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735690200.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">44</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;temperature&#39;</span>, <span class="fl">23.1</span>, <span class="st">&#39;Cel&#39;</span>, <span class="kw">true</span>),</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    (<span class="fu">to_timestamp</span>(<span class="fl">1735690500.0</span>), <span class="st">&#39;gh1&#39;</span>, <span class="st">&#39;n001&#39;</span>, <span class="dv">45</span>, <span class="st">&#39;boot-1&#39;</span>, <span class="st">&#39;1.0&#39;</span>,</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>     <span class="st">&#39;temperature&#39;</span>, <span class="fl">22.9</span>, <span class="st">&#39;Cel&#39;</span>, <span class="kw">true</span>);</span></code></pre></div>
+<p>A <code>seed.sql</code> bejátszása után futtassuk a
+<code>~/iot-labor/i045/queries.sql</code> lekérdezéseit:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">-- 1) óránkénti átlaghőmérséklet az n001 eszközre</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> time_bucket(<span class="st">&#39;1 hour&#39;</span>, ts) <span class="kw">AS</span> bucket,</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>       <span class="fu">round</span>(<span class="fu">avg</span>(<span class="fu">value</span>):<span class="ch">:numeric</span>, <span class="dv">2</span>) <span class="kw">AS</span> avg_temp</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> telemetry</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> node_id <span class="op">=</span> <span class="st">&#39;n001&#39;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> measurement_type <span class="op">=</span> <span class="st">&#39;temperature&#39;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> bucket</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> bucket;</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="co">-- 2) utolsó érték minden méréstípusra, eszközönként</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">DISTINCT</span> <span class="kw">ON</span> (node_id, measurement_type)</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>       node_id,</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>       measurement_type,</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>       <span class="fu">value</span>,</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>       ts</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> telemetry</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> site <span class="op">=</span> <span class="st">&#39;gh1&#39;</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> node_id, measurement_type, ts <span class="kw">DESC</span>;</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a><span class="co">-- 3) hiányzó órás intervallumok kitöltése standard SQL-lel</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> hourly <span class="kw">AS</span> (</span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> time_bucket(<span class="st">&#39;1 hour&#39;</span>, ts) <span class="kw">AS</span> bucket,</span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>           <span class="fu">avg</span>(<span class="fu">value</span>) <span class="kw">AS</span> avg_temp</span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> telemetry</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">WHERE</span> node_id <span class="op">=</span> <span class="st">&#39;n001&#39;</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>      <span class="kw">AND</span> measurement_type <span class="op">=</span> <span class="st">&#39;temperature&#39;</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">GROUP</span> <span class="kw">BY</span> bucket</span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>),</span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a>grid <span class="kw">AS</span> (</span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> generate_series(</span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a>               date_trunc(<span class="st">&#39;hour&#39;</span>, <span class="fu">min</span>(bucket)),</span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>               date_trunc(<span class="st">&#39;hour&#39;</span>, <span class="fu">max</span>(bucket)),</span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>               <span class="dt">interval</span> <span class="st">&#39;1 hour&#39;</span>) <span class="kw">AS</span> bucket</span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> hourly</span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> grid.bucket, hourly.avg_temp</span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> grid</span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a><span class="kw">LEFT</span> <span class="kw">JOIN</span> hourly <span class="kw">USING</span> (bucket)</span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> grid.bucket;</span></code></pre></div>
+<p>Futtassuk a szkripteket a konténerben:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-i</span> lab-timescaledb psql <span class="at">-U</span> terra <span class="at">-d</span> terrasense <span class="op">&lt;</span> schema.sql</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-i</span> lab-timescaledb psql <span class="at">-U</span> terra <span class="at">-d</span> terrasense <span class="op">&lt;</span> seed.sql</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> exec <span class="at">-i</span> lab-timescaledb psql <span class="at">-U</span> terra <span class="at">-d</span> terrasense <span class="op">&lt;</span> queries.sql</span></code></pre></div>
+<p><strong>Várt kimenet</strong> (a harmadik lekérdezésnél
+rövidítve):</p>
+<pre class="text"><code>        bucket         | avg_temp
+-----------------------+----------
+ 2025-01-01 00:00:00+00 |  22.65
+ 2025-01-01 00:05:00+00 |  22.80
+...
+ node_id | measurement_type | value |           ts
+---------+------------------+-------+------------------------
+ n001    | humidity         |  60.2 | 2025-01-01 00:00:00+00
+ n001    | soil_moisture    |  35.0 | 2025-01-01 00:00:00+00
+ n001    | temperature      |  22.9 | 2025-01-01 00:05:00+00</code></pre>
+<p>A harmadik lekérdezés a hiányzó órákra <code>NULL</code> értéket ad,
+amit a dashboard később megszakításként vagy <code>0</code>-ként
+jeleníthet meg.</p>
+<p><strong>Takarítás:</strong> a labor csak a saját konténerét és
+volume-át érinti:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose <span class="at">-f</span> ~/iot-labor/stack/compose.yaml stop lab-timescaledb</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> volume rm lab-timescaledb-data</span></code></pre></div>
+<p>A <code>lab-timescaledb</code> konténer nevét és a
+<code>lab-timescaledb-data</code> volume-ot takaríthatjuk, más
+szolgáltatást nem.</p>
+<h3 data-number="15.2.6" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">15.2.6</span> Ellenőrzés és
+hibakeresés</h3>
+<p>Ellenőrizzük, hogy a TimescaleDB kiterjesztés aktív, és a hypertable
+létrejött:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> extname <span class="kw">FROM</span> pg_extension <span class="kw">WHERE</span> extname <span class="op">=</span> <span class="st">&#39;timescaledb&#39;</span>;</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> hypertable_name, num_chunks</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> timescaledb_information.hypertables</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> hypertable_name <span class="op">=</span> <span class="st">&#39;telemetry&#39;</span>;</span></code></pre></div>
+<p>Hibatünetek és megoldások:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>function create_hypertable does not exist</code></td>
+<td>nincs betöltve a kiterjesztés</td>
+<td><code>CREATE EXTENSION IF NOT EXISTS timescaledb;</code></td>
+</tr>
+<tr class="even">
+<td><code>relation "telemetry" does not exist</code></td>
+<td>a schema.sql nem futott le</td>
+<td>futtassuk a <code>schema.sql</code>-t a megfelelő adatbázisban</td>
+</tr>
+<tr class="odd">
+<td>duplikált sorok jelennek meg</td>
+<td>hiányzik az <code>ON CONFLICT</code> a Java kódból</td>
+<td>adjuk hozzá az egyedi kulcsra hivatkozó <code>ON CONFLICT</code>
+záradékot</td>
+</tr>
+<tr class="even">
+<td>lassú az idő szerinti szűrés</td>
+<td>nincs hypertable vagy rossz az index</td>
+<td>ellenőrizzük a <code>create_hypertable</code> hívást és a
+<code>ts</code> oszlopot</td>
+</tr>
+<tr class="odd">
+<td>a <code>time_bucket</code> hibát ad</td>
+<td>nem TimescaleDB-környezetben fut</td>
+<td>a lekérdezést a TimescaleDB konténerben futtassuk</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="15.2.7" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">15.2.7</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><strong>Az epoch ms értéket másodpercként értelmezik.</strong> A
+<code>to_timestamp(1735689600000)</code> hibás, mert a PostgreSQL az
+argumentumot másodpercnek veszi. Mindig osszuk el 1000-rel, vagy a Java
+oldalon már <code>Instant.ofEpochMilli</code>-vel alakítsuk
+<code>Timestamp</code>-re.</li>
+<li><strong>Minden mérést külön táblába tesznek.</strong> Ez
+felrobbantja a sémát és a lekérdezések bonyolultságát. A hosszú tábla
+egy <code>measurement_type</code> oszloppal rugalmasabb és jobban
+illeszkedik a TimescaleDB-hez.</li>
+<li><strong>Nincs egyedi kulcs az idempotens beszúráshoz.</strong> Ha az
+MQTT-ingest legalább egyszer kézbesít, az újra érkező üzenetek
+duplikátumokat szülnek. Az <code>UNIQUE</code> és az
+<code>ON CONFLICT DO NOTHING</code> az idempotencia adatbázis-szintű
+biztosítéka.</li>
+<li><strong>A <code>server_ts</code>-t használják
+eseményidőként.</strong> A <code>server_ts</code> a beérkezés ideje, a
+<code>ts</code> az eseményé. A gateway offline pufferelésekor a kettő
+eltérhet; a mérési grafikonokat és az aggregációkat a <code>ts</code>
+szerint kell készíteni.</li>
+</ol>
+<h3 data-number="15.2.8" id="feladatok"><span
+class="header-section-number">15.2.8</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Fogalmi/döntési feladat.</strong> Milyen szempontok alapján
+választanál InfluxDB-t a TimescaleDB helyett, és milyen esetben lenne a
+széles tábla előnyös a TerraSense-ben?</li>
+<li><strong>Számolási feladat.</strong> Tételezz fel 1000 csomópontot,
+csomópontonként percenként 3 mérést. Hány telemetria-sor keletkezik
+naponta? Mennyi tárhelyet foglal ez egy év alatt, ha egy sor átlagosan
+120 B, és az első évben nincs tömörítés?</li>
+<li><strong>Implementációs feladat.</strong> Egészítsd ki a labor
+<code>queries.sql</code> fájlját egy olyan lekérdezéssel, amely az
+utolsó órában a talajnedvesség maximumát adja csomópontonként.</li>
+<li><strong>Hibakeresési/kiterjesztési feladat.</strong> A dashboard azt
+mutatja, hogy az n001 hőmérséklet-görbéje órás bontásban hiányos, mert a
+szenzor néha kimarad. Készíts lekérdezést, amely a hiányzó órákat
+<code>NULL</code> helyett az előző mért értékkel tölti ki, és magyarázd
+el, miért lehet ez félrevezető riasztások esetén.</li>
+</ol>
+<h3 data-number="15.2.9" id="megoldások"><span
+class="header-section-number">15.2.9</span> Megoldások</h3>
+<ol type="1">
+<li><p>Az InfluxDB előnyös, ha elosztott, nagy skálázású idősoros
+klasztert akarunk, vagy a csapat kifejezetten a Flux/InfluxQL nyelvet
+preferálja. A széles tábla akkor lehet előnyös, ha minden eszköz minden
+mérést mindig ugyanabban az időpontban küld, és az oszlopkészlet stabil;
+ekkor egy sorba kerül az összes érték, és az összetartozó mérések
+lekérése gyorsabb.</p></li>
+<li><p>A napi sorok száma:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>×</mo><mn>3</mn><mo>×</mo><mn>60</mn><mo>×</mo><mn>24</mn><mo>=</mo><mn>4</mn><mspace width="0.167em"></mspace><mn>320</mn><mspace width="0.167em"></mspace><mn>000</mn></mrow><annotation encoding="application/x-tex">1000 \times 3 \times 60 \times 24 = 4\,320\,000</annotation></semantics></math>
+Az éves nyers méret:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mspace width="0.167em"></mspace><mn>320</mn><mspace width="0.167em"></mspace><mn>000</mn><mo>×</mo><mn>365</mn><mo>×</mo><mn>120</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">B</mtext><mo>≈</mo><mn>189</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GB</mtext></mrow><annotation encoding="application/x-tex">4\,320\,000 \times 365 \times 120\ \text{B} \approx 189\ \text{GB}</annotation></semantics></math>
+Ezért fontos a TimescaleDB tömörítése és a ritkítás, amit a <a
+href="i046.html">Megőrzés, ritkítás és tárolási költség</a>
+tárgyal.</p></li>
+<li><p>Például:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> node_id,</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>       <span class="fu">max</span>(<span class="fu">value</span>) <span class="kw">AS</span> max_humidity</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> telemetry</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> measurement_type <span class="op">=</span> <span class="st">&#39;humidity&#39;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> ts <span class="op">&gt;=</span> now() <span class="op">-</span> <span class="dt">interval</span> <span class="st">&#39;1 hour&#39;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="kw">GROUP</span> <span class="kw">BY</span> node_id</span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> node_id;</span></code></pre></div></li>
+<li><p>A kitöltés standard SQL-lel:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode sql"><code class="sourceCode sql"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">WITH</span> last_known <span class="kw">AS</span> (</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> <span class="kw">DISTINCT</span> <span class="kw">ON</span> (bucket)</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>           bucket,</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>           <span class="fu">value</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> (</span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>        <span class="kw">SELECT</span> time_bucket(<span class="st">&#39;1 hour&#39;</span>, ts) <span class="kw">AS</span> bucket,</span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>               <span class="fu">value</span>,</span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>               ts</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>        <span class="kw">FROM</span> telemetry</span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">WHERE</span> node_id <span class="op">=</span> <span class="st">&#39;n001&#39;</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>          <span class="kw">AND</span> measurement_type <span class="op">=</span> <span class="st">&#39;temperature&#39;</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    ) sub</span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">ORDER</span> <span class="kw">BY</span> bucket, ts <span class="kw">DESC</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>),</span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>grid <span class="kw">AS</span> (</span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">SELECT</span> generate_series(</span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>               date_trunc(<span class="st">&#39;hour&#39;</span>, <span class="fu">min</span>(bucket)),</span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>               date_trunc(<span class="st">&#39;hour&#39;</span>, <span class="fu">max</span>(bucket)),</span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>               <span class="dt">interval</span> <span class="st">&#39;1 hour&#39;</span>) <span class="kw">AS</span> bucket</span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">FROM</span> last_known</span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> grid.bucket,</span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>       <span class="fu">coalesce</span>(last_known.<span class="fu">value</span>,</span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a>                <span class="fu">lag</span>(last_known.<span class="fu">value</span>) <span class="kw">OVER</span> (<span class="kw">ORDER</span> <span class="kw">BY</span> grid.bucket))</span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a>           <span class="kw">AS</span> filled_temp</span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> grid</span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a><span class="kw">LEFT</span> <span class="kw">JOIN</span> last_known <span class="kw">USING</span> (bucket)</span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> grid.bucket;</span></code></pre></div>
+<p>Az előző értékkel való kitöltés alkalmas a megjelenítésre, de
+riasztásoknál félrevezető lehet, mert úgy tűnik, mintha folyamatosan
+érkezett volna adat. A riasztási logikának a <code>valid</code> jelzőt
+és a hiányzó adatot külön kell kezelnie, nem pedig csendben
+interpolálni.</p></li>
+</ol>
+<h3 data-number="15.2.10" id="rövid-összefoglaló"><span
+class="header-section-number">15.2.10</span> Rövid összefoglaló</h3>
+<p>Az alfejezet bevezette az idősoros adat tárolásának alapelveit, és a
+TerraSense-hez a TimescaleDB-t választotta, mert az a PostgreSQL-re
+épül, és a meglévő Spring/JDBC-környezetbe jól illeszkedik. A
+<code>telemetry</code> tábla hosszú formát használ: minden mérés külön
+sor, <code>measurement_type</code> és <code>value</code> oszlopokkal. A
+<code>create_hypertable</code> a <code>ts</code> eseményidőre
+particionálja a táblát, az egyedi kulcs
+<code>(node_id, seq, measurement_type, ts)</code> pedig idempotens
+beszúrást biztosít <code>ON CONFLICT DO NOTHING</code>-gal. A laborban
+létrehoztuk a <code>~/iot-labor/i045/schema.sql</code>,
+<code>seed.sql</code> és <code>queries.sql</code> fájlokat, valamint a
+közös compose-fájlban a <code>lab-timescaledb</code> szolgáltatást.
+<strong>Továbbvitt eredmény.</strong> Ezt a táblaszerkezetet, indexeit
+és lekérdezéseit használja a <a href="i046.html">Megőrzés, ritkítás és
+tárolási költség</a>, a <a href="i051.html">Dashboardok Grafanával</a>
+és a <a href="i066.html">Záróprojekt: a teljes TerraSense rendszer
+összeállítása és átvétele</a>.</p>
+<h3 data-number="15.2.11" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">15.2.11</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>TimescaleDB dokumentáció: hypertable, <code>time_bucket</code>,
+<code>time_bucket_gapfill</code> — az aktuális verzióban elérhető pontos
+függvénynevek és paraméterek ellenőrizendők.</li>
+<li>InfluxDB dokumentáció: az aktuális 2.x/3.x query nyelv és a
+TimescaleDB-vel való összevetés részletei verziófüggők.</li>
+<li>Spring Framework dokumentáció: <code>JdbcTemplate.batchUpdate</code>
+pontos aláírása a használt Spring Boot 3.x verzióban ellenőrizendő.</li>
+<li>A <code>timescale/timescaledb:latest-pg16</code> konténerkép
+elérhetősége és a <code>latest-pg16</code> címke frissítési politikája
+ellenőrizendő a labor futtatása előtt.</li>
+<li>A laborban használt <code>lab-password</code> kizárólag helyi,
+eldobható jelszó; éles rendszerben soha ne használjuk.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i044.html">← 15.1 Ingest: MQTT-ből a backendbe, idempotensen</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i046.html">15.3 Megőrzés, ritkítás és tárolási költség →</a></div>
+</nav>
+</body>
+</html>

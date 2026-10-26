@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>52.5 Supply-chain és secret incident labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch52">52 DevSecOps, supply chain és policy</a></p>
+<div class="links"><a class="prev" rel="prev" href="d259.html">← 52.4 Policy-as-code, audit és security operation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d261.html">53.1 Database kapcsolatok, resource és health →</a></div>
+</nav>
+<h2 data-number="52.5" id="d260"><span
+class="header-section-number">52.5</span> Supply-chain és secret
+incident labor</h2>
+<h3 data-number="52.5.1" id="motiváció"><span
+class="header-section-number">52.5.1</span> Motiváció</h3>
+<p>Egy szenior fejlesztőből DevOps mérnökké váló szakembernek
+előbb-utóbb szembe kell néznie azzal, hogy egy látszólag sikeres deploy
+mögött olyan artifact futhat, amelynek eredete, tartalma vagy
+konfigurációja nem felel meg a platform biztonsági elvárásainak. A
+supply-chain labor célja nem az, hogy valódi támadást hajtsunk végre,
+hanem hogy izolált, dummy credentialökkel és artefaktumokkal teszteljük
+a policy-vezérelt felismerést, a verifikációt, a rotationt, a patch
+promotiont, a rollbacket és az auditot. A d260-as alfejezet a d259-ben
+tanult policy-as-code és audit alapokra épül, de itt a hangsúly a
+laborban végigvitt incident recovery folyamaton van. A labor kimenete
+nemcsak egy hibabejelentés, hanem egy ellenőrzött, reprodukálható
+postmortem és bizonyíték arra, hogy a védelmi lánc egy pontjának
+meghibásodása hogyan kezelhető.</p>
+<h3 data-number="52.5.2" id="definíció-és-működés"><span
+class="header-section-number">52.5.2</span> Definíció és működés</h3>
+<p><strong>Supply-chain incident</strong> alatt olyan eseményt értünk,
+amelyben a source-to-runtime lánc valamelyik állomásán az artifact vagy
+credential eltér a rögzített desired state-től. Az eltérés lehet:
+hiányzó vagy érvénytelen digitális aláírás, rossz vagy elavult SBOM, nem
+megbízható builderből származó provenance, lejárt vagy kiszivárgott
+secret, illetve olyan sebezhető image, amelyet a policy egyébként
+blokkolna.</p>
+<p>A laborban az alábbi bizonyítékokat kezeljük:</p>
+<ul>
+<li><strong>Digest</strong>: az artifact tartalom-azonosítója, például
+SHA-256. A digest publikálása után a tartalom megváltoztatása új
+digestet eredményez.</li>
+<li><strong>SBOM</strong> (Software Bill of Materials): az artifact
+összetevőinek géppel olvasható listája, amelyből a
+sérülékenység-ellenőrzés és a licencek kiindulnak. A d256-ban tanultak
+szerint az SBOM-ot az image build során kell előállítani.</li>
+<li><strong>Signature</strong> (aláírás): az artifact digestjének vagy
+egy attestation állításnak a build kulccsal való aláírása. A verifikáció
+bizonyítja az integritást és a build aláíró kilétét, amennyiben a
+publikus kulcsot megbízható csatornán terjesztettük.</li>
+<li><strong>Provenance</strong> (eredetigazolás): a buildre vonatkozó,
+aláírt állítás, például SLSA-provenance, amely tartalmazza a buildert, a
+forrásreverziót, a pipeline-t és az inputokat. A megbízható builderből
+származó provenance csökkenti a tampering kockázatát.</li>
+<li><strong>Policy deny</strong>: a policy engine vagy admission
+controller akkor utasítja el a deployt, ha a fenti bizonyítékok
+hiányoznak vagy nem felelnek meg az előírt kritériumoknak.</li>
+<li><strong>Controlled exception</strong>: dokumentált, korlátozott
+időre szóló, jól körülhatárolt kivétel a policy alól. Célja a
+szolgáltatás visszaállítása vagy egy vészhelyzeti rollout, amíg a
+megfelelő javítás elkészül. A kivételt mindig audit logban kell
+rögzíteni, és automatikus lejáratot kell hozzárendelni.</li>
+</ul>
+<p>A labor adatútja a következő rétegeket érinti:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Réteg</th>
+<th>Objektum</th>
+<th>Bizonyíték / ellenőrzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Forrás</td>
+<td>Git repository</td>
+<td>commit, branch, tag, source rev</td>
+</tr>
+<tr class="even">
+<td>Build</td>
+<td>CI runner, builder</td>
+<td>SLSA-provenance, SBOM</td>
+</tr>
+<tr class="odd">
+<td>Artifact</td>
+<td>OCI image</td>
+<td>digest, signature, attestation</td>
+</tr>
+<tr class="even">
+<td>Policy</td>
+<td>Admission controller</td>
+<td>deny/allow, exception</td>
+</tr>
+<tr class="odd">
+<td>Runtime</td>
+<td>Kubernetes deployment</td>
+<td>Pod, Secret, ConfigMap</td>
+</tr>
+<tr class="even">
+<td>Audit</td>
+<td>Log platform</td>
+<td>deny esemény, exception record, rotation</td>
+</tr>
+</tbody>
+</table>
+<p>A laborban minden credential és secret <strong>dummy adat</strong>. A
+<code>lab-</code> prefixszel ellátott objektumok elkülönítik a labor
+erőforrásait. A labort a következő környezetben futtatjuk:</p>
+<ul>
+<li>Labhost: <code>lab-sec-1</code> (SSH-val elérhető,
+<code>labuser</code> UID 1000)</li>
+<li>Kubernetes context: <code>lab-cluster</code></li>
+<li>Namespace: <code>lab-supply</code></li>
+<li>Registry: <code>lab-registry:5000</code></li>
+<li>Policy engine: <code>kyverno</code> vagy <code>OPA Gatekeeper</code>
+a d259-ben rögzített support matrix szerint; a példában a Kyverno
+szintaxisát használjuk, de a d259-ben tanult koncepciók bármelyik
+motorral működnek.</li>
+<li>Image nevek: <code>lab-registry:5000/lab/cpp-svc</code> különböző
+tagekkel.</li>
+</ul>
+<h3 data-number="52.5.3" id="kidolgozott-példa"><span
+class="header-section-number">52.5.3</span> Kidolgozott példa</h3>
+<p>A példa egy fiktív <code>cpp-svc</code> szolgáltatást használ,
+amelynek image-ei három állapotot képviselnek:</p>
+<ol type="1">
+<li><code>v0.1-unsigned</code>: nincs aláírás, nincs SBOM, nem
+megbízható builderből jött. A policy ezt mindenképpen letiltja.</li>
+<li><code>v0.2-signed-old</code>: van aláírás és SBOM, a provenance is
+megvan, de a d257-ben tanult patch SLA szerint ismert, kritikus CVE-t
+tartalmaz. A policy deny követelmény miatt nem mehet prod-ba.</li>
+<li><code>v0.3-signed-patched</code>: a CVE javítását tartalmazó,
+megbízható CI-ből származó, aláírt, SBOM-mal és provenance-szel
+rendelkező image. Ez felel meg a kívánt állapotnak.</li>
+</ol>
+<p>A labor elején a <code>v0.2-signed-old</code> fut a
+<code>lab-supply</code> namespace-ben, de a policy update után már nem
+engedélyezett. A cél a sebezhető image lecserélése patchelttel, miközben
+egy secret leak gyanú is felmerül.</p>
+<h4 data-number="52.5.3.1"
+id="lépés-verifikáció-és-elutasítás-megfigyelése"><span
+class="header-section-number">52.5.3.1</span> 1. Lépés: Verifikáció és
+elutasítás megfigyelése</h4>
+<p>Előfeltétel: a <code>lab-supply-key.pub</code> publikus kulcs a
+<code>lab-sec-1</code> labhoston elérhető, a policy deployolva van.</p>
+<p>Ellenőrizzük a <code>v0.1-unsigned</code> image aláírását:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cosign</span> verify <span class="at">--key</span> lab-supply-key.pub <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  lab-registry:5000/lab/cpp-svc:v0.1-unsigned</span></code></pre></div>
+<p>Várható kimenet: hibát jelez, mert nincs érvényes aláírás. A
+<code>cosign</code> az aláírás hiányát explicit hibával jelzi.</p>
+<p>Ezután próbáljuk meg deployolni ezt a manifestet:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-svc-unsigned</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-supply</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> cpp-svc-unsigned</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> cpp-svc-unsigned</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-svc</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> lab-registry:5000/lab/cpp-svc:v0.1-unsigned</span></span></code></pre></div>
+<p>A <code>kubectl apply -f undeploy-unsigned.yaml</code> parancsnak a
+policy engine által blokkolt kimenettel kell zárulnia. A deny esemény
+<code>deny</code> okkal kerül a Kubernetes API audit logjába.</p>
+<h4 data-number="52.5.3.2"
+id="lépés-untrusted-builder-és-régi-image"><span
+class="header-section-number">52.5.3.2</span> 2. Lépés: Untrusted
+builder és régi image</h4>
+<p>A <code>v0.2-signed-old</code> esetén az aláírás érvényes, de a
+provenance egy nem megbízható builderre mutat, és a CVE ismert. A policy
+ellenőrzi a SLSA-provenance-et:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cosign</span> verify-attestation <span class="at">--key</span> lab-supply-key.pub <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--type</span> slsaprovenance <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  lab-registry:5000/lab/cpp-svc:v0.2-signed-old</span></code></pre></div>
+<p>A kimenet jelzi, hogy a builder nem szerepel a megbízható listán. A
+policy deny kimenete a deploymentre:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> apply <span class="at">-f</span> deploy-v0.2-signed-old.yaml</span></code></pre></div>
+<p>A policy válasza:</p>
+<pre class="text"><code>denied by policy: image provenance builder is not trusted; image contains known CVE CVE-2024-XXXX</code></pre>
+<p>A <code>CVE-2024-XXXX</code> itt dummy azonosító; a laborban a
+d257-ben rögzített hivatalos CVE-adatbázisból kell választani.</p>
+<h4 data-number="52.5.3.3" id="lépés-secret-leak-szimuláció"><span
+class="header-section-number">52.5.3.3</span> 3. Lépés: Secret leak
+szimuláció</h4>
+<p>A laborban egy dummy secretet szivárogtatunk ki egy ConfigMapbe,
+amelyet egy fejlesztő hibásan hozott létre. A cél a detektálás és a
+rotation.</p>
+<p>A ConfigMap:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ConfigMap</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-secret-leak</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-supply</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">api-token</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;dummy-secret-token-v1&quot;</span></span></code></pre></div>
+<p>A policy engine vagy egy secret scanner ezt detektálja, mert a
+<code>ConfigMap</code> mezője titokra emlékeztető mintát tartalmaz. A
+valós incidentet szimuláló lépés: a pattern scanner riasztást küld a log
+platformra.</p>
+<p>A rotation lépései:</p>
+<ol type="1">
+<li>Új dummy token generálása a deployment számára:</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> create secret generic cpp-svc-token <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from-literal</span><span class="op">=</span>token=<span class="st">&quot;dummy-secret-token-v2&quot;</span> <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dry-run</span><span class="op">=</span>client <span class="at">-o</span> yaml <span class="kw">|</span> <span class="ex">kubectl</span> apply <span class="at">-f</span> <span class="at">-</span></span></code></pre></div>
+<ol start="2" type="1">
+<li>A deployment frissítése, hogy az új secretet használja:</li>
+</ol>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout restart deployment/cpp-svc</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<ol start="3" type="1">
+<li>A kiszivárgott <code>lab-secret-leak</code> ConfigMap törlése:</li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> delete configmap lab-secret-leak <span class="at">-n</span> lab-supply</span></code></pre></div>
+<ol start="4" type="1">
+<li>A laborban kizárólag dummy adatokat használunk, így a valódi
+credential visszavonás és újragenerálás a d258-ban tanult federation és
+rotation policy szerint történik; jelen laborban a dummy secret cseréje
+elegendő.</li>
+</ol>
+<h4 data-number="52.5.3.4"
+id="lépés-policy-deny-a-régi-image-miatt-controlled-exception"><span
+class="header-section-number">52.5.3.4</span> 4. Lépés: Policy deny a
+régi image miatt, controlled exception</h4>
+<p>Mivel a futó <code>cpp-svc</code> deployment még a
+<code>v0.2-signed-old</code> image-et használja, és a policy már
+letiltja a sebezhető image-et, a <code>v0.3-signed-patched</code>
+rollout közben a pod crashloopba kerül egy konfigurációs hiba miatt
+(például rosszul beállított environment). Ekkor az azonnali rollback a
+korábbi <code>v0.2-signed-old</code> verzióra policy deny miatt nem
+lehetséges. A rehab megoldás: <strong>controlled exception</strong>
+létrehozása.</p>
+<p>Példa Kyverno exception a régi image ideiglenes engedélyezésére a
+<code>lab-supply</code> namespace-ben, 15 percre:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> kyverno.io/v1</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Policy</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-controlled-exception</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-supply</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rules</span><span class="kw">:</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> allow-old-image-15min</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">match</span><span class="kw">:</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">any</span><span class="kw">:</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">kinds</span><span class="kw">:</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> Deployment</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">exclude</span><span class="kw">:</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">any</span><span class="kw">:</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> </span><span class="fu">resources</span><span class="kw">:</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">namespaces</span><span class="kw">:</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="kw">-</span><span class="at"> kube-system</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">validate</span><span class="kw">:</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">message</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Controlled exception: allow v0.2-signed-old until hotfix&quot;</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">pattern</span><span class="kw">:</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="kw">-</span><span class="at"> </span><span class="fu">image</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;lab-registry:5000/lab/cpp-svc:v0.2-signed-old&quot;</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="co">      # A lejáratot külső audit mechanizmus biztosítja, a laborban manuálisan 15 perc után töröljük.</span></span></code></pre></div>
+<p>A kivétel után a rollback elvégezhető:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout undo deployment/cpp-svc</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<p>A kivételt az audit logban rögzítjük, és a 15 perces lejáratot a
+labor state manifestben követjük. A labor tanulsága: a controlled
+exception nem szünteti meg a deny policy-t, csak időben korlátozott,
+dokumentált bypass-t ad.</p>
+<h4 data-number="52.5.3.5" id="lépés-patch-promotion-és-rollback"><span
+class="header-section-number">52.5.3.5</span> 5. Lépés: Patch promotion
+és rollback</h4>
+<p>A <code>v0.3-signed-patched</code> image-ből létrehozunk egy hotfixet
+<code>v0.3.1-signed-patched</code> néven, amely a konfigurációs hibát is
+javítja. A build pipeline az alábbi bizonyítékokat állítja elő:</p>
+<ul>
+<li>digest: <code>sha256:...</code></li>
+<li>SBOM</li>
+<li>SLSA-provenance</li>
+<li>signature</li>
+</ul>
+<p>A policy ezt már ellenőrzi és engedélyezi. A deploy:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-svc</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-supply</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> cpp-svc</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="fu">app</span><span class="kw">:</span><span class="at"> cpp-svc</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-svc</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> lab-registry:5000/lab/cpp-svc:v0.3.1-signed-patched</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">env</span><span class="kw">:</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="at">            </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> API_TOKEN</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a><span class="at">              </span><span class="fu">valueFrom</span><span class="kw">:</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="at">                </span><span class="fu">secretKeyRef</span><span class="kw">:</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-svc-token</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="at">                  </span><span class="fu">key</span><span class="kw">:</span><span class="at"> token</span></span></code></pre></div>
+<p>A rollout:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> apply <span class="at">-f</span> deploy-v0.3.1-signed-patched.yaml</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<p>Ha a <code>v0.3.1</code> is hibásnak bizonyulna, a rollback a
+<code>v0.3-signed-patched</code> verzióra történhet, mert az is megfelel
+a policynek:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout undo deployment/cpp-svc</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<p>A kontrollált exception a v0.2-re vonatkozóan a 15 perc letelte előtt
+lejár, és a deny policy ismét blokkolja a sebezhető image-et.</p>
+<h4 data-number="52.5.3.6" id="lépés-audit-és-postmortem"><span
+class="header-section-number">52.5.3.6</span> 6. Lépés: Audit és
+postmortem</h4>
+<p>A labor bizonyítékait a következőképpen rögzítjük:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Esemény</th>
+<th>Időpont</th>
+<th>Bizonyíték</th>
+<th>Döntés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>v0.1-unsigned</code> deny</td>
+<td>lab időbélyeg</td>
+<td>policy log, audit</td>
+<td>elutasítás</td>
+</tr>
+<tr class="even">
+<td><code>v0.2-signed-old</code> deny</td>
+<td>lab időbélyeg</td>
+<td>policy log, CVE</td>
+<td>elutasítás</td>
+</tr>
+<tr class="odd">
+<td>Secret leak detektálás</td>
+<td>lab időbélyeg</td>
+<td>scanner alert</td>
+<td>rotation</td>
+</tr>
+<tr class="even">
+<td>Controlled exception</td>
+<td>lab időbélyeg</td>
+<td>exception record</td>
+<td>ideiglenes engedélyezés</td>
+</tr>
+<tr class="odd">
+<td>Hotfix promotion</td>
+<td>lab időbélyeg</td>
+<td>SBOM, provenance, signature</td>
+<td>engedélyezés</td>
+</tr>
+<tr class="even">
+<td>Rollback</td>
+<td>lab időbélyeg</td>
+<td>rollout undo, audit</td>
+<td>elfogadás</td>
+</tr>
+</tbody>
+</table>
+<p>A postmortem sablonja a d005-ben tanult runbook szerint készül, itt
+csak a critical evidence rögzül.</p>
+<h3 data-number="52.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">52.5.4</span> Hibák és ellenpróbák</h3>
+<p>Gyakori hibák:</p>
+<ol type="1">
+<li><strong>Policy scope rossz</strong>: a deny rule nem a megfelelő
+namespace-re vagy deploymentre vonatkozik, így a nem kívánt artifact
+átcsúszik. Ellenőrzés: <code>kubectl get clusterpolicy</code> és
+tesztdeploy.</li>
+<li><strong>Digest ellenőrzés kihagyása</strong>: a tagre hivatkozunk,
+nem a digestre, így a policy a tag frissítése után már nem garantálja az
+azonos artifactot. Megoldás: a deploymentben mindig immutable digestet
+használjunk, vagy a policy kényszerítse ki.</li>
+<li><strong>Controlled exception túl széles</strong>: a kivétel minden
+image-re vagy hosszú időre szól. A laborban mindig időkorlát és szűk
+scope kell.</li>
+<li><strong>Secret cleanup elmarad</strong>: a kiszivárgott ConfigMap
+törlése után is maradhat másolat a logban vagy a git historyban. A
+laborban a dummy secret cseréje nem elegendő; a valódi incidensnél
+revoke szükséges.</li>
+<li><strong>Audit hiánya</strong>: a deny esemény és a controlled
+exception nem kerül logolásra, így a postmortem nem reprodukálható.</li>
+</ol>
+<p>Tünetből hipotézis, adatgyűjtés, egy változtatás, verifikáció:</p>
+<ul>
+<li><strong>Tünet</strong>: a <code>v0.3-signed-patched</code> deploy
+deny-t kap, bár az image aláírt.</li>
+<li><strong>Hipotézis</strong>: a policy a provenance buildert nem
+ismeri megbízhatónak.</li>
+<li><strong>Adatgyűjtés</strong>: <code>cosign verify-attestation</code>
+kimenete, policy log.</li>
+<li><strong>Egy változtatás</strong>: a megbízható builder listájához
+hozzáadjuk a CI runner nevét.</li>
+<li><strong>Verifikáció</strong>: újra <code>kubectl apply</code>, ha a
+deny eltűnik, a hipotézis igazolt.</li>
+</ul>
+<h3 data-number="52.5.5" id="feladatok"><span
+class="header-section-number">52.5.5</span> Feladatok</h3>
+<h4 data-number="52.5.5.1"
+id="feladat-magyarázó-verifikációs-bizonyítékok-értelmezése"><span
+class="header-section-number">52.5.5.1</span> 1. Feladat – Magyarázó:
+verifikációs bizonyítékok értelmezése</h4>
+<p>Adott a következő kimenet a labhostról:</p>
+<pre class="text"><code>cosign verify --key lab-supply-key.pub lab-registry:5000/lab/cpp-svc:v0.2-signed-old
+Error: no matching signatures found</code></pre>
+<p>Magyarázza el, miért fordulhat elő ez a hiba, és milyen policy-t kell
+beállítani ahhoz, hogy az ilyen artifactot a deployment admission
+controller automatikusan elutasítsa. Válaszolja meg, miért nem elég a
+digest megléte.</p>
+<p><strong>Megoldás</strong>:</p>
+<p>Ez a hiba azt jelzi, hogy az image-nek nincs érvényes aláírása a
+<code>lab-supply-key.pub</code> publikus kulccsal. A policy-nek
+includeolni kell egy olyan rule-t, amely a <code>cosign.verify</code>
+vagy hasonló admission check segítségével előírja, hogy minden image
+rendelkezzen az adott publikus kulccsal ellenőrzött aláírással. A digest
+önmagában csak a tartalom integritását biztosítja, de nem bizonyítja,
+hogy a buildet a megbízható pipeline hozta létre; ehhez aláírás és
+provenance kell.</p>
+<h4 data-number="52.5.5.2"
+id="feladat-adminisztrációskonfigurációs-secret-rotation-és-policy-deny"><span
+class="header-section-number">52.5.5.2</span> 2. Feladat –
+Adminisztrációs/konfigurációs: secret rotation és policy deny</h4>
+<p>A laborban a <code>cpp-svc</code> deployment jelenleg a
+<code>v0.2-signed-old</code> image-et használja, és a
+<code>cpp-svc-token</code> secret a kiszivárgott
+<code>dummy-secret-token-v1</code> értéket tartalmazza. Hajtsa végre a
+következő lépéseket:</p>
+<ol type="1">
+<li>Új dummy secret létrehozása <code>cpp-svc-token</code> néven
+<code>dummy-secret-token-v2</code> értékkel a <code>lab-supply</code>
+namespace-ben.</li>
+<li>A deployment átállítása az új secretre.</li>
+<li>A sebezhető image policy deny-jének érvényre juttatása, majd a
+patched image <code>v0.3.1-signed-patched</code> deployolása.</li>
+</ol>
+<p>Írja le a szükséges parancsokat, és adja meg az elvárt
+postconditiont.</p>
+<p><strong>Megoldás</strong>:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Új dummy secret</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> create secret generic cpp-svc-token <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--from-literal</span><span class="op">=</span>token=<span class="st">&quot;dummy-secret-token-v2&quot;</span> <span class="dt">\</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--dry-run</span><span class="op">=</span>client <span class="at">-o</span> yaml <span class="kw">|</span> <span class="ex">kubectl</span> apply <span class="at">-f</span> <span class="at">-</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Deployment frissítése (image és secret)</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> apply <span class="at">-f</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="st">apiVersion: apps/v1</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="st">kind: Deployment</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="st">metadata:</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="st">  name: cpp-svc</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="st">  namespace: lab-supply</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="st">spec:</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a><span class="st">  replicas: 1</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="st">  selector:</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a><span class="st">    matchLabels:</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a><span class="st">      app: cpp-svc</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a><span class="st">  template:</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="st">    metadata:</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a><span class="st">      labels:</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a><span class="st">        app: cpp-svc</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a><span class="st">    spec:</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a><span class="st">      containers:</span></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a><span class="st">        - name: cpp-svc</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a><span class="st">          image: lab-registry:5000/lab/cpp-svc:v0.3.1-signed-patched</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a><span class="st">          env:</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a><span class="st">            - name: API_TOKEN</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a><span class="st">              valueFrom:</span></span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a><span class="st">                secretKeyRef:</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a><span class="st">                  name: cpp-svc-token</span></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a><span class="st">                  key: token</span></span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<p>Postcondition: a deployment a <code>lab-supply</code> namespace-ben
+<code>v0.3.1-signed-patched</code> image-et használ, a secret értéke
+<code>dummy-secret-token-v2</code>, és a policy deny nem lép fel. A régi
+<code>dummy-secret-token-v1</code> értéket nem használja többé a
+deployment.</p>
+<h4 data-number="52.5.5.3"
+id="feladat-diagnosztikaifailurerecovery-policy-deny-és-controlled-exception"><span
+class="header-section-number">52.5.5.3</span> 3. Feladat –
+Diagnosztikai/failure/recovery: policy deny és controlled exception</h4>
+<p>A patched image <code>v0.3-signed-patched</code> deployolása után a
+pod crashloopba kerül. Az azonnali rollback a
+<code>v0.2-signed-old</code> verzióra policy deny miatt nem lehetséges.
+Hozzon létre egy controlled exceptiont a <code>v0.2-signed-old</code>
+image-hez, hajtsa végre a rollbacket, majd a hotfix
+<code>v0.3.1-signed-patched</code> elkészülte után szüntesse meg a
+kivételt, és frissítse a deploymentet a hotfixre. Adja meg a
+postconditiont.</p>
+<p><strong>Megoldás</strong>:</p>
+<ol type="1">
+<li>Controlled exception policy létrehozása (lásd a korábbi példát) a
+<code>v0.2-signed-old</code> image-hez, maximum 15 percre.</li>
+<li>Rollback:</li>
+</ol>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout undo deployment/cpp-svc</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<ol start="3" type="1">
+<li>A kivétel törlése, miután a <code>v0.3.1-signed-patched</code>
+kész:</li>
+</ol>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> delete policy lab-controlled-exception <span class="at">-n</span> lab-supply</span></code></pre></div>
+<ol start="4" type="1">
+<li>Deploy a hotfixre:</li>
+</ol>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> apply <span class="at">-f</span> deploy-v0.3.1-signed-patched.yaml</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/cpp-svc</span></code></pre></div>
+<p>Postcondition: a deployment a legfrissebb patched image-et futtatja,
+a controlled exception már nem aktív, a policy ismét blokkol minden
+sebezhető image-et, és az audit log tartalmazza a kivétel létrehozását
+és törlését.</p>
+<h3 data-number="52.5.6" id="rövid-összefoglaló"><span
+class="header-section-number">52.5.6</span> Rövid összefoglaló</h3>
+<p>A d260 labor célja a supply-chain incident elleni védelmi lánc
+gyakorlati tesztelése izolált, dummy adatokkal. A laborban elvégeztük az
+SBOM/digest/signature/provenance verifikálást, megfigyeltük a policy
+deny-t untrusted builder és régi image esetén, lejátszottunk egy secret
+leaket, elvégeztük a rotationt, és megtanultuk a controlled exception és
+a patch promotion/rollback közötti egyensúlyt. A folyamatot audit loggal
+és postmortemmel zártuk.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>Controlled exception</strong>: időben korlátozott,
+dokumentált policy kivétel, amely nem szünteti meg az általános deny
+szabályt.</li>
+<li><strong>Provenance</strong>: megbízható builderből származó, aláírt
+állítás az artifact eredetéről.</li>
+<li><strong>Rotation</strong>: credential újragenerálása és a régi érték
+visszavonása úgy, hogy a futó szolgáltatás átállása is ellenőrzött
+legyen.</li>
+</ul>
+<h3 data-number="52.5.7" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">52.5.7</span> Források és ellenőrzési
+hiányok</h3>
+<p>A d260 elkészítésekor nem végeztünk webes kutatást, és nem állítjuk,
+hogy az alábbi hivatkozásokat olvastuk volna. Az aktuális verziók,
+support matrixok és hivatalos dokumentációk ellenőrzése a d256–d259
+fejezetekben rögzített források és a labor support matrix feladata. A
+példákban szereplő <code>kyverno</code>, <code>cosign</code>,
+<code>SLSA</code> és <code>CVE-2024-XXXX</code> elemek illusztratívak; a
+gyakorlatban a rögzített verzió-lockolt eszközöket és a hivatalos
+CVE-adatbázist kell használni.</p>
+<p>A könyvtérkép által biztosított kiindulópontok:</p>
+<ul>
+<li><a href="https://slsa.dev/spec/">SLSA Specification</a></li>
+<li><a href="https://docs.sigstore.dev/">Sigstore Documentation</a></li>
+<li><a href="https://docs.github.com/en/actions">GitHub Actions
+Documentation</a></li>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+Documentation</a></li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d259.html">← 52.4 Policy-as-code, audit és security operation</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d261.html">53.1 Database kapcsolatok, resource és health →</a></div>
+</nav>
+</body>
+</html>

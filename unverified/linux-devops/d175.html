@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>35.5 VM provision és recovery zárólabor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch35">35 VM tárolás, hálózat, image és lifecycle</a></p>
+<div class="links"><a class="prev" rel="prev" href="d174.html">← 35.4 Provision, migration, upgrade és shutdown</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d176.html">36.1 Process, namespace és konténerizoláció →</a></div>
+</nav>
+<h2 data-number="35.5" id="d175"><span
+class="header-section-number">35.5</span> VM provision és recovery
+zárólabor</h2>
+<h3 data-number="35.5.1" id="motiváció"><span
+class="header-section-number">35.5.1</span> Motiváció</h3>
+<p>A VM-provision és recovery zárólabor célja, hogy egyetlen,
+reprodukálható forrásból újraépítsünk egy működő virtuális gépet, és egy
+host failure szimulációja után bizonyítsuk a helyreállítás képességét.
+Szenior fejlesztőként a resource lifetime fogalma ismerős: a VM is egy
+erőforrás, amelynek létrehozását, állapotát, failure domainjét és
+felszabadítását explicit szerződéssel kell kezelni. A laborban nem
+programozási, hanem üzemeltetési döntéseket hozunk: image, hálózat,
+storage, backup és restore sorrendje mind a VM életciklusát határozza
+meg.</p>
+<h3 data-number="35.5.2" id="definíciók"><span
+class="header-section-number">35.5.2</span> Definíciók</h3>
+<ul>
+<li><strong>Source profile:</strong> a VM létrehozásához szükséges
+összes, versioned input: golden image referencia (URI és checksum),
+cloud-init sablonok, domain XML spec, hálózati és storage paraméterek,
+valamint a backup repository azonosítója. Ez a desired state
+forrása.</li>
+<li><strong>Recovery manifest:</strong> gépi ellenőrzésre alkalmas YAML,
+amely a désiré state-et postconditionökkel írja le, és a restore lépések
+függőségeit, ellenőrzéseit rögzíti.</li>
+<li><strong>Smoke check:</strong> minimális, de a kritikus útvonalat
+lefedő ellenőrzés: boot, hálózat, DNS, SSH, felhasználó és szolgáltatás
+állapota.</li>
+<li><strong>Artifact provenance:</strong> minden artifactra (image, seed
+ISO, domain XML, backup snapshot) rögzített verzió, checksum vagy
+commit, amely a létrehozás inputját egyértelműen azonosítja.</li>
+</ul>
+<h3 data-number="35.5.3" id="rétegek-és-működési-elv"><span
+class="header-section-number">35.5.3</span> Rétegek és működési elv</h3>
+<p>A VM-provision három rétegen halad át:</p>
+<ol type="1">
+<li><strong>Host réteg:</strong> libvirt storage pool, network bridge,
+golden image könyvtár, backup hozzáférhetőség.</li>
+<li><strong>VM spec réteg:</strong> domain XML, cloud-init seed ISO,
+disk volume (thin-provisioned backing file), hálózati csatolás.</li>
+<li><strong>Guest réteg:</strong> felhasználói identitás, csomagok,
+szolgáltatások, alkalmazásadatok, backup kliens.</li>
+</ol>
+<p>A recovery azért több, mint a domain újradefiniálása, mert a guest
+belső állapotát is vissza kell állítani. A munkafolyamat:</p>
+<pre class="text"><code>source profile (git commit)
+  -&gt; golden image ellenőrzés (checksum)
+  -&gt; cloud-init seed ISO build
+  -&gt; qcow2 disk volume létrehozás backing file-ból
+  -&gt; libvirt domain define + start
+  -&gt; cloud-init smoke check
+  -&gt; backup restore (ha van adat)
+  -&gt; postcondition check
+  -&gt; artifact provenance rögzítés</code></pre>
+<p>A desired state a profilban van; a tényleges observed state a
+<code>virsh</code>, <code>ssh</code> és guest parancsokból. A recovery
+rehearsal során a kettőt összehasonlítjuk.</p>
+<h3 data-number="35.5.4" id="kidolgozott-példa"><span
+class="header-section-number">35.5.4</span> Kidolgozott példa</h3>
+<p>A labor fix topológiája:</p>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 24%" />
+<col style="width: 27%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Név</th>
+<th>Szerep</th>
+<th>Hálózat</th>
+<th>IP / DNS</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>labhost0</td>
+<td>KVM host, backup repo, DNS (dnsmasq)</td>
+<td>lab-net0 bridge</td>
+<td>10.13.0.1, labhost0.lab.internal</td>
+</tr>
+<tr class="even">
+<td>labvm0</td>
+<td>működtetett VM</td>
+<td>lab-net0</td>
+<td>10.13.0.10, labvm0.lab.internal</td>
+</tr>
+<tr class="odd">
+<td>labbackup</td>
+<td>restic SFTP user a hoston</td>
+<td>—</td>
+<td>10.13.0.1</td>
+</tr>
+</tbody>
+</table>
+<p>A source profile a <code>~/lab-profiles/d175-profile.yaml</code>:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">version</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">vm</span><span class="kw">:</span><span class="at"> labvm0</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">source</span><span class="kw">:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;file:///var/lib/libvirt/images/base/ubuntu-24.04-minimal-cloudimg-amd64.img&quot;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">image_sha256</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;a1b2c3... rögzített, laborban ellenőrzött&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">cloud_init_user</span><span class="kw">:</span><span class="at"> labadmin</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">cloud_init_ssh_pub</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;ssh-ed25519 AAAAC3... labuser@labhost0&quot;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">disk</span><span class="kw">:</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">pool</span><span class="kw">:</span><span class="at"> lab-vms</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">size_gb</span><span class="kw">:</span><span class="at"> </span><span class="dv">10</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="fu">network</span><span class="kw">:</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">bridge</span><span class="kw">:</span><span class="at"> lab-net0</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">mac</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;52:54:00:12:34:01&quot;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">hostname</span><span class="kw">:</span><span class="at"> labvm0.lab.internal</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="fu">cloud_init</span><span class="kw">:</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">user_data</span><span class="kw">:</span><span class="at"> user-data.yaml</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">network_config</span><span class="kw">:</span><span class="at"> network-config.yaml</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">metadata</span><span class="kw">:</span><span class="at"> metadata.yaml</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="fu">backup</span><span class="kw">:</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">repo</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;sftp:labbackup@10.13.0.1:restic/labvm0&quot;</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">password_file</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;/etc/lab-backup-pass&quot;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rto_s</span><span class="kw">:</span><span class="at"> </span><span class="dv">900</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">rpo_s</span><span class="kw">:</span><span class="at"> </span><span class="dv">3600</span></span></code></pre></div>
+<p>A <code>user-data.yaml</code>:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">#cloud-config</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">hostname</span><span class="kw">:</span><span class="at"> labvm0</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">fqdn</span><span class="kw">:</span><span class="at"> labvm0.lab.internal</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="fu">preserve_hostname</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="fu">users</span><span class="kw">:</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> labadmin</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">gecos</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;Lab admin&quot;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">sudo</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;ALL=(ALL) NOPASSWD:ALL&quot;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">shell</span><span class="kw">:</span><span class="at"> /bin/bash</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ssh_authorized_keys</span><span class="kw">:</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;ssh-ed25519 AAAAC3... labuser@labhost0&quot;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="fu">packages</span><span class="kw">:</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> qemu-guest-agent</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> restic</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="fu">runcmd</span><span class="kw">:</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="kw">[</span><span class="at"> systemctl</span><span class="kw">,</span><span class="at"> enable</span><span class="kw">,</span><span class="at"> --now</span><span class="kw">,</span><span class="at"> qemu-guest-agent </span><span class="kw">]</span></span></code></pre></div>
+<p>A <code>network-config.yaml</code>:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">version</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ethernets</span><span class="kw">:</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">enp1s0</span><span class="kw">:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">dhcp4</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">dhcp4-overrides</span><span class="kw">:</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">hostname</span><span class="kw">:</span><span class="at"> labvm0</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">use-dns</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span></span></code></pre></div>
+<p>A <code>metadata.yaml</code>:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">instance-id</span><span class="kw">:</span><span class="at"> labvm0-001</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">local-hostname</span><span class="kw">:</span><span class="at"> labvm0</span></span></code></pre></div>
+<p>A provision parancsok a labhost0-n, <code>labadmin</code>
+felhasználóval, sudo-val:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0. Előfeltétel ellenőrzés</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system pool-info lab-vms</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system net-info lab-net0</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link show lab-net0</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Golden image checksum ellenőrzés</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /var/lib/libvirt/images/base/ubuntu-24.04-minimal-cloudimg-amd64.img</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Cloud-init seed ISO build</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="ex">cloud-localds</span> /var/lib/libvirt/images/base/labvm0-seed.img <span class="dt">\</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>  user-data.yaml network-config.yaml metadata.yaml</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. Thin-provisioned disk volume létrehozás backing file-ból</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> create <span class="dt">\</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">-f</span> qcow2 <span class="dt">\</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">-F</span> qcow2 <span class="dt">\</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> backing_file=/var/lib/libvirt/images/base/ubuntu-24.04-minimal-cloudimg-amd64.img,backing_fmt=qcow2 <span class="dt">\</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>  /var/lib/libvirt/images/lab-vms/labvm0.qcow2 10G</span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. Domain XML definiálás és indítás</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system define labvm0-domain.xml</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system start labvm0</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. IP lekérdezés DHCP bérletből</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system net-dhcp-leases lab-net0 <span class="kw">|</span> <span class="fu">grep</span> labvm0</span></code></pre></div>
+<p>A domain XML (<code>labvm0-domain.xml</code>):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode xml"><code class="sourceCode xml"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">domain</span><span class="ot"> type=</span><span class="st">&#39;kvm&#39;</span>&gt;</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">name</span>&gt;labvm0&lt;/<span class="kw">name</span>&gt;</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">memory</span><span class="ot"> unit=</span><span class="st">&#39;MiB&#39;</span>&gt;2048&lt;/<span class="kw">memory</span>&gt;</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">vcpu</span>&gt;2&lt;/<span class="kw">vcpu</span>&gt;</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">os</span>&gt;</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">type</span><span class="ot"> arch=</span><span class="st">&#39;x86_64&#39;</span><span class="ot"> machine=</span><span class="st">&#39;q35&#39;</span>&gt;hvm&lt;/<span class="kw">type</span>&gt;</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">boot</span><span class="ot"> dev=</span><span class="st">&#39;hd&#39;</span>/&gt;</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">os</span>&gt;</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">devices</span>&gt;</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">disk</span><span class="ot"> type=</span><span class="st">&#39;file&#39;</span><span class="ot"> device=</span><span class="st">&#39;disk&#39;</span>&gt;</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">driver</span><span class="ot"> name=</span><span class="st">&#39;qemu&#39;</span><span class="ot"> type=</span><span class="st">&#39;qcow2&#39;</span>/&gt;</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">source</span><span class="ot"> file=</span><span class="st">&#39;/var/lib/libvirt/images/lab-vms/labvm0.qcow2&#39;</span>/&gt;</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">target</span><span class="ot"> dev=</span><span class="st">&#39;vda&#39;</span><span class="ot"> bus=</span><span class="st">&#39;virtio&#39;</span>/&gt;</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    &lt;/<span class="kw">disk</span>&gt;</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">disk</span><span class="ot"> type=</span><span class="st">&#39;file&#39;</span><span class="ot"> device=</span><span class="st">&#39;cdrom&#39;</span>&gt;</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">source</span><span class="ot"> file=</span><span class="st">&#39;/var/lib/libvirt/images/base/labvm0-seed.img&#39;</span>/&gt;</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">target</span><span class="ot"> dev=</span><span class="st">&#39;sdb&#39;</span><span class="ot"> bus=</span><span class="st">&#39;sata&#39;</span>/&gt;</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">readonly</span>/&gt;</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    &lt;/<span class="kw">disk</span>&gt;</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">interface</span><span class="ot"> type=</span><span class="st">&#39;bridge&#39;</span>&gt;</span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">source</span><span class="ot"> bridge=</span><span class="st">&#39;lab-net0&#39;</span>/&gt;</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">mac</span><span class="ot"> address=</span><span class="st">&#39;52:54:00:12:34:01&#39;</span>/&gt;</span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>      &lt;<span class="kw">model</span><span class="ot"> type=</span><span class="st">&#39;virtio&#39;</span>/&gt;</span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    &lt;/<span class="kw">interface</span>&gt;</span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">serial</span><span class="ot"> type=</span><span class="st">&#39;pty&#39;</span>/&gt;</span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">console</span><span class="ot"> type=</span><span class="st">&#39;pty&#39;</span>/&gt;</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">devices</span>&gt;</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">domain</span>&gt;</span></code></pre></div>
+<p>A smoke check:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># DNS</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">dig</span> +short labvm0.lab.internal @10.13.0.1</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># SSH + user + service ellenőrzés</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> <span class="at">-o</span> BatchMode=yes labadmin@labvm0.lab.internal <span class="dt">\</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  <span class="st">&#39;id; hostname --fqdn; systemctl is-active qemu-guest-agent; df -h /; cat /etc/cloud/build.info&#39;</span></span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>10.13.0.10
+uid=1000(labadmin) gid=1000(labadmin) groups=1000(labadmin),4(adm),27(sudo)
+labvm0.lab.internal
+active</code></pre>
+<p>Disk expansion:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Host oldal</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system shutdown labvm0</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system undefine labvm0 <span class="at">--nvram</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> resize /var/lib/libvirt/images/lab-vms/labvm0.qcow2 20G</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system define labvm0-domain.xml</span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system start labvm0</span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Guest oldal</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> labadmin@labvm0 <span class="st">&#39;sudo growpart /dev/vda 1 &amp;&amp; sudo resize2fs /dev/vda1 &amp;&amp; df -h /&#39;</span></span></code></pre></div>
+<p>Várható: a root filesystem 10G-ről 20G-ra nő, a cloud-init nem fut
+ismét, a korábbi adatok megmaradnak.</p>
+<p>Restore rehearsal és host failure fixture:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Adatkészlet a VM-en</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> labadmin@labvm0 <span class="st">&#39;sudo sh -c &quot;echo dbdata &gt; /srv/labdata/db.txt; date &gt; /srv/labdata/created_at&quot;&#39;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Backup a VM-ről a host restic repojába</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> labadmin@labvm0 <span class="st">&#39;sudo restic -r sftp:labbackup@10.13.0.1:restic/labvm0 \</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="st">  --password-file /etc/lab-backup-pass backup /srv/labdata&#39;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Host failure szimuláció: domain és disk törlése</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system destroy labvm0 <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system undefine labvm0 <span class="at">--remove-all-storage</span> <span class="at">--nvram</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Újraépítés a profilból (a fenti provision lépések ismétlése)</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co"># Restore a guestre</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> labadmin@labvm0 <span class="st">&#39;sudo mkdir -p /srv/labdata &amp;&amp; sudo restic \</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="st">  -r sftp:labbackup@10.13.0.1:restic/labvm0 \</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="st">  --password-file /etc/lab-backup-pass restore latest --target / &amp;&amp; \</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="st">  cat /srv/labdata/db.txt&#39;</span></span></code></pre></div>
+<p>A <code>--remove-all-storage</code> törli a labvm0 qcow2 diskjét is,
+így a recovery tiszta inputból és backupból történik. A golden image
+backing file megmarad, a restic repo a hoston van.</p>
+<p>Guest+host diagnosztikai report:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env bash</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="bu">set</span> <span class="at">-euo</span> pipefail</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="va">REPORT_DIR</span><span class="op">=</span><span class="st">&quot;/var/tmp/lab-reports/d175-</span><span class="va">$(</span><span class="fu">date</span> +%Y%m%d-%H%M%S<span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">&quot;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system dumpxml labvm0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">/domain.xml&quot;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> info /var/lib/libvirt/images/lab-vms/labvm0.qcow2 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">/disk-info.txt&quot;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system domiflist labvm0 <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">/iflist.txt&quot;</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> labadmin@labvm0 <span class="st">&#39;ip addr; ip route; systemctl --failed --no-pager&#39;</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">/guest-network-and-failed.txt&quot;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">&quot;</span>/<span class="pp">*</span> <span class="op">&gt;</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">/SHA256SUMS&quot;</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$REPORT_DIR</span><span class="st">&quot;</span></span></code></pre></div>
+<p>A report a source profile commit hash-ével és a restic snapshot
+ID-val együtt artifact provenance-t ad. A cleanup csak a lab objektumait
+törli:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system destroy labvm0 <span class="dv">2</span><span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="fu">true</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">virsh</span> <span class="at">-c</span> qemu:///system undefine labvm0 <span class="at">--remove-all-storage</span> <span class="at">--nvram</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-f</span> /var/lib/libvirt/images/base/labvm0-seed.img</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> <span class="at">-rf</span> /var/tmp/lab-reports/d175-<span class="pp">*</span>  <span class="co"># csak a saját report</span></span></code></pre></div>
+<h3 data-number="35.5.5" id="hibák-és-ellenpróbák"><span
+class="header-section-number">35.5.5</span> Hibák és ellenpróbák</h3>
+<table>
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 18%" />
+<col style="width: 21%" />
+<col style="width: 28%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Hipotézis</th>
+<th>Adatgyűjtés</th>
+<th>Egy változtatás</th>
+<th>Ellenőrzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A VM nem kap IP-címet</td>
+<td>A seed ISO hiányos, vagy a bridge nem engedi a DHCP-t</td>
+<td><code>virsh net-dhcp-leases lab-net0</code>,
+<code>virsh console labvm0</code>, guest
+<code>journalctl -u cloud-init</code></td>
+<td>A seed ISO újragenerálása network-config-tal, a domain
+újraindítása</td>
+<td><code>ip addr show enp1s0</code> a guestben mutat IP-t</td>
+</tr>
+<tr class="even">
+<td>A cloud-init nem futtatja a usert</td>
+<td>A meta-data <code>instance-id</code> hiányzik</td>
+<td><code>cat /var/lib/cloud/instance/instance-id</code>,
+<code>cloud-init status --wait</code></td>
+<td><code>metadata.yaml</code>-ben <code>instance-id</code> hozzáadása,
+seed ISO újraépítés</td>
+<td><code>id labadmin</code> a guestben sikeres</td>
+</tr>
+<tr class="odd">
+<td>Disk resize után a filesystem kicsi marad</td>
+<td>A partition tábla nem nőtt, a resize2fs a partícióra nem
+vonatkozik</td>
+<td><code>lsblk</code>, <code>df -h</code>,
+<code>parted /dev/vda print</code></td>
+<td><code>growpart /dev/vda 1</code>, majd
+<code>resize2fs /dev/vda1</code></td>
+<td><code>df -h /</code> a guestben 20G</td>
+</tr>
+<tr class="even">
+<td>Restore után a db.txt hiányzik</td>
+<td>A restic repo path vagy password rossz, a snapshot nem tartalmazza
+az adatot</td>
+<td><code>restic snapshots --group-by host</code>,
+<code>restic ls latest /srv/labdata</code></td>
+<td>A repo path javítása a profilban, backup ismétlése</td>
+<td><code>cat /srv/labdata/db.txt</code></td>
+</tr>
+<tr class="odd">
+<td>SSH key nem enged be</td>
+<td>A cloud-init user config nem került a seedbe, vagy a key formátuma
+rossz</td>
+<td><code>ssh -vvv labadmin@...</code>, guest
+<code>cloud-init status --long</code></td>
+<td>A user-data <code>ssh_authorized_keys</code> javítása, seed
+újragenerálás</td>
+<td><code>ssh -o BatchMode=yes</code> sikeres</td>
+</tr>
+<tr class="even">
+<td>A domain define hibát ad: file not found</td>
+<td>A disk pool path vagy a seed ISO elérési útja rossz</td>
+<td><code>ls -l /var/lib/libvirt/images/...</code>,
+<code>virsh pool-list --all</code></td>
+<td>Az XML-ben a teljes elérési út javítása a pool-ön belül</td>
+<td><code>virsh define</code> sikeres</td>
+</tr>
+</tbody>
+</table>
+<p>Gyakori hiba, hogy a <code>--remove-all-storage</code> a
+thin-provisioned backing file-t is törli, mert a golden image a pool
+volume-listájában van. Ezt úgy kerüljük ki, hogy a golden image a
+<code>base</code> könyvtárban él, a pool-ban csak a volume-ok.</p>
+<h3 data-number="35.5.6" id="feladatok"><span
+class="header-section-number">35.5.6</span> Feladatok</h3>
+<h4 data-number="35.5.6.1"
+id="feladat-source-profile-és-recovery-manifest-összeállítása"><span
+class="header-section-number">35.5.6.1</span> 1. feladat: Source profile
+és recovery manifest összeállítása</h4>
+<p>Készíts saját <code>~/lab-profiles/d175-profile.yaml</code>-t a fenti
+minta alapján, és írj hozzá egy <code>recovery-manifest.yaml</code>-t,
+amely a desired state-et (VM, hálózat, DNS, backup) és a
+postconditionöket tartalmazza. Magyarázd el, miért kell különválasztani
+a golden image-et a thin-provisioned disk volume-tól.</p>
+<h4 data-number="35.5.6.2"
+id="feladat-újraépítés-és-disk-expansion"><span
+class="header-section-number">35.5.6.2</span> 2. feladat: Újraépítés és
+disk expansion</h4>
+<p>A labhost0-n építsd újra a labvm0-at a profilból, futtasd le a smoke
+checket, bővítsd a disket 20G-ra, és ellenőrizd a filesystem méretét.
+Rögzítsd a parancsokat és a kimeneteket.</p>
+<h4 data-number="35.5.6.3"
+id="feladat-failure-fixture-report-és-cleanup"><span
+class="header-section-number">35.5.6.3</span> 3. feladat: Failure
+fixture, report és cleanup</h4>
+<p>Indítsd a VM-et, hozz létre adatot a <code>/srv/labdata</code> alatt,
+készíts restic backupot, majd szimulálj host failure-t a domain és a
+disk törlésével. A profilból és a backupból állítsd helyre a VM-et,
+futtasd a diagnosztikai report scriptet, ellenőrizd az adatot, majd
+töröld a lab objektumokat.</p>
+<h3 data-number="35.5.7" id="megoldások"><span
+class="header-section-number">35.5.7</span> Megoldások</h3>
+<h4 data-number="35.5.7.1" id="feladat-megoldása"><span
+class="header-section-number">35.5.7.1</span> 1. feladat megoldása</h4>
+<p>A profil a teljes specifikáció, a manifest a recovery gép által
+feldolgozható ellenőrzéseit tartalmazza. Példa manifest:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">postconditions</span><span class="kw">:</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;domain-defined&quot;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;virsh -c qemu:///system list --all | grep -q labvm0&quot;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;vm-ssh&quot;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;ssh -o BatchMode=yes -o ConnectTimeout=5 labadmin@labvm0.lab.internal &#39;exit 0&#39;&quot;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;dns&quot;</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;dig +short labvm0.lab.internal @10.13.0.1 | grep -q &#39;^10</span><span class="sc">\\</span><span class="st">.13</span><span class="sc">\\</span><span class="st">.0</span><span class="sc">\\</span><span class="st">.10$&#39;&quot;</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;data-file&quot;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">command</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;ssh labadmin@labvm0 &#39;cat /srv/labdata/db.txt&#39; | grep -q dbdata&quot;</span></span></code></pre></div>
+<p>A golden image és a disk volume szétválasztása azért fontos, mert a
+recovery során a disk volume törölhető, de a golden image-nek
+változatlannak kell maradnia. A thin-provisioned backing file nem
+másolja az image tartalmát, csak hivatkozik rá. Ha a golden image a
+pool-ban élne, a <code>--remove-all-storage</code> tévedésből
+megsemmisíthetné.</p>
+<h4 data-number="35.5.7.2" id="feladat-megoldása-1"><span
+class="header-section-number">35.5.7.2</span> 2. feladat megoldása</h4>
+<p>A parancsok a kidolgozott példában szerepelnek. A postcondition:
+<code>virsh list --all</code> mutatja a labvm0-t, <code>df -h /</code> a
+guestben 20G, <code>dig +short labvm0.lab.internal @10.13.0.1</code>
+10.13.0.10, az SSH smoke sikeres.</p>
+<h4 data-number="35.5.7.3" id="feladat-megoldása-2"><span
+class="header-section-number">35.5.7.3</span> 3. feladat megoldása</h4>
+<p>Az adat és backup a restore rehearsal parancsokkal. A failure után a
+recovery: a profilból új domain és disk, majd a guestre restic restore.
+A report scriptet futtatva a <code>guest-network-and-failed.txt</code>
+üres (nincs failed unit), és a <code>db.txt</code> tartalma
+<code>dbdata</code>. A cleanup után <code>virsh list --all</code> nem
+tartalmazza a labvm0-t, a disk fájl és a seed ISO nem létezik.</p>
+<h3 data-number="35.5.8" id="rövid-összefoglaló"><span
+class="header-section-number">35.5.8</span> Rövid összefoglaló</h3>
+<p>A VM provision és recovery zárólabor a source profile-ból indított
+reprodukálható építést és a backupból való helyreállítást gyakorolja. A
+golden image és a thin-provisioned disk szétválasztása lehetővé teszi a
+teljes recoveryt a domain és a disk elvesztése után is. A cloud-init
+seed ISO a felhasználói, hálózati és identitás konfigurációt szállítja,
+a smoke check pedig a DNS, SSH és szolgáltatás állapotot ellenőrzi. A
+diagnosztikai report és az artifact provenance bizonyítja, hogy a
+desired state a manifest szerint teljesült. A cleanup csak a lab-prefixű
+objektumokat törli, a baseline image és a backup repo megmarad.</p>
+<p><strong>Továbbhasznált definíciók:</strong><br />
+- <strong>Source profile:</strong> a VM létrehozásához és működtetéséhez
+szükséges versioned inputok együttese.<br />
+- <strong>Recovery manifest:</strong> a desired state postconditionöket
+és a restore lépéseket gépi ellenőrzésre leíró specifikáció.<br />
+- <strong>Smoke check:</strong> minimális, kritikus útvonalat lefedő
+ellenőrzés.</p>
+<h3 data-number="35.5.9" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">35.5.9</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok (nem olvasott bizonyítékok ebben a
+kérésben):</p>
+<ul>
+<li><a href="https://libvirt.org/docs.html">Libvirt
+documentation</a></li>
+<li><a href="https://www.qemu.org/docs/master/">QEMU
+documentation</a></li>
+<li><a href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a></li>
+<li><a href="https://cloudinit.readthedocs.io/">cloud-init
+documentation</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a <code>cloud-localds</code>,
+<code>qemu-img</code>, <code>virsh</code> és <code>restic</code>
+parancsok pontos kimenete, a cloud-init aktuális formátumai és a golden
+image letöltési URI-ja az Ubuntu 24.04 LTS kiadástól függ; a példában
+használt checksum, IP-cím, SSH kulcs és restic password dummy/lab érték.
+A libvirt/QEMU verzió pontos viselkedését a lab környezetben ellenőrizni
+kell.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d174.html">← 35.4 Provision, migration, upgrade és shutdown</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d176.html">36.1 Process, namespace és konténerizoláció →</a></div>
+</nav>
+</body>
+</html>

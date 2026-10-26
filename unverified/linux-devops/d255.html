@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>51.5 SLO, incident és recovery game day – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch51">51 SRE: SLO, error budget és incident management</a></p>
+<div class="links"><a class="prev" rel="prev" href="d254.html">← 51.4 Toil, resilience és operation maturity</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d256.html">52.1 Source-to-runtime trust és provenance →</a></div>
+</nav>
+<h2 data-number="51.5" id="d255"><span
+class="header-section-number">51.5</span> SLO, incident és recovery game
+day</h2>
+<h3 data-number="51.5.1" id="motiváció-és-definíció"><span
+class="header-section-number">51.5.1</span> Motiváció és definíció</h3>
+<p>Egy éles SRE-csapatnak két, egymással ütköző célja van: gyorsan
+kiadni változásokat, és eléggé megbízható szolgáltatást üzemeltetni. A
+<strong>game day</strong> (incidens- és helyreállítási gyakorlat) ezt a
+konfliktust biztonságos, izolált környezetben teszi gyakorolhatóvá. A
+cél nem egy konkrét tool megtanulása, hanem az, hogy a tanuló előre
+rögzített SLO és telemetria alapján döntést hozzon, hatást mérjen,
+mitigáljon, majd visszamérhető céllal igazolja a javítást.</p>
+<p><strong>Definíció:</strong> a game day olyan, előre deklarált,
+vezérelt hibabefecskendezéses gyakorlat, amelyben a csapat a valós
+üzemeltetési eszköztárral (metrics, logs, alert, runbook, CI/CD, backup)
+egy szimulált incidenst dolgoz fel. A gyakorlat nem bemutató, hanem
+döntési kényszert teremt: a mért hiba hatásából kell kitalálni a
+réteget, a hatásmértékből a prioritást, a hipotézisből a mitigációt. A
+d255 labor ezért a korábbi d245 progressive delivery kanárijait és a
+d100 restore manifestjét futtatja össze: a labservice-ünkben
+SLO-riasztás indul, és nekünk kell bizonyítékalapú lépésekben
+visszahozni a szolgáltatást.</p>
+<p>A kiinduló state hármas szerződést követ: - <strong>Desired
+state:</strong> a kanári deployment a <code>canary</code> súlycsoportban
+fut, a stabil <code>stable</code> Deployment sértetlen, a Prometheus
+alert a <code>game-day-slo</code> szabályt használja.<br />
+- <strong>Observed state:</strong> a <code>lab-service</code> p95
+latency és hibaszázalék bizonyos időablakban megsérti az SLO-t, a
+budget-burn-riasztás <code>FIRING</code>.<br />
+- <strong>Config-source state:</strong> a GitOps repository
+<code>lab-demo</code> branchjában lévő manifestek definiálják a
+Deploymentet és a Service-t.</p>
+<p>A gyakorlathoz explicit, verziózárt labkörnyezet kell. A továbbiakban
+az <code>ub2404-sre-gd</code> labnév, <code>lab-cluster</code>
+Kubernetes context, <code>sre-game</code> namespace és a
+<code>lab-vm</code> VM a target. A példában a konkrét verziókat
+(Prometheus, Argo CD, image digest) ellenőrizni kell a labor
+inventoryban; a generálás most nem tekinti azokat aktuálisan
+ellenőrzöttnek.</p>
+<h3 data-number="51.5.2" id="slobudget-riasztási-minták"><span
+class="header-section-number">51.5.2</span> SLO/budget riasztási
+minták</h3>
+<p>A game day első eleme: oda-vissza olvasható SLO-riasztás. A d255-ben
+a fiktív labservice-re a következő SLO-t rögzítjük:</p>
+<ul>
+<li><strong>SLI:</strong> a <code>lab-service</code> API összes
+HTTP-kérésére számított jó válaszok aránya; a jó válasz 5xx-től eltérő
+válasz, és a p95 latency &lt; 300 ms.<br />
+</li>
+<li><strong>SLO:</strong> 30 napos gördülő ablakban 99,5%
+elérhetőség.<br />
+</li>
+<li><strong>Error budget:</strong> 0,5% hiba, azaz havonta legfeljebb
+kb. 129 perc kiesés.<br />
+</li>
+<li><strong>Alert:</strong> ha az elmúlt 60 percben a hibaarány 0,2%-nál
+nagyobb, és a budget burn rate 14 felett van, akkor
+<code>warning</code>; ha a burn rate 100 felett van, akkor
+<code>critical</code>.</li>
+</ul>
+<p>Az alábbi Prometheus szabály nem az éles Prometheus dokumentációjából
+készült verzió, hanem a labor fixture, amely az SLO-mintát demonstrálja.
+A <code>job="game-day-service"</code> metricset a labservice custom
+exportere szolgáltatja. A <code>rate()</code> és a
+<code>sum(rate(...))</code> arány számítása feltételezi, hogy a metrics
+endpoint elérhető; ha az exporter hibás, az önmagában is egy incident
+tünet.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># config/prometheus/slo-alerts.yaml</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> ConfigMap</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> prometheus-game-day-slo</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> sre-game</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="fu">  game-day-slo.yml</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    groups:</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    - name: game-day-service</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>      rules:</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>      - record: job:lab_service_request_duration_seconds:p95_labservice</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        expr: histogram_quantile(0.95,</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>          sum(rate(lab_service_request_duration_seconds_bucket{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;}[5m]))</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>            by (le))</span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>      - alert: LabServiceSLOBudgetBurn</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>        expr: |</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>          (</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>            sum(rate(lab_service_requests_total{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;,status=~&quot;5..&quot;}[60m]))</span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>            /</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>            sum(rate(lab_service_requests_total{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;}[60m]))</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>          ) &gt; 0.002</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>          and</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>          (</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>            (</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>              sum(rate(lab_service_requests_total{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;,status=~&quot;5..&quot;}[60m]))</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>              /</span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>              sum(rate(lab_service_requests_total{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;}[60m]))</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>            )</span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>            / 0.005</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>          ) * 1440 &gt; 14</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>        for: 5m</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>        labels:</span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>          severity: warning</span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>          slo_period: 30d</span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>          target_slo: &quot;99.5&quot;</span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>        annotations:</span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>          summary: &quot;lab-service budget burn is above 14 in the last hour&quot;</span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>          runbook: &quot;https://gitlab.example.invalid/sre/runbooks/game-day-slo.md&quot;</span></code></pre></div>
+<p>Az <code>and</code> kifejezésben szereplő <code>*1440</code> a 30
+napot percre alakító közelítés; a pontos burn rate képlete a multiwindow
+burn rate módszertant követné, itt a lab célja a döntési mechanizmus
+gyakorlása. A <code>example.invalid</code> dokumentációs célú
+hostnév.</p>
+<h3 data-number="51.5.3" id="kidolgozott-game-day-példa"><span
+class="header-section-number">51.5.3</span> Kidolgozott game day
+példa</h3>
+<p>A kidolgozott példa három fázist mutat: hibafecskendezés, üzemi
+válasz, utóteszt.</p>
+<h4 data-number="51.5.3.1" id="input-és-hibafecskendezés"><span
+class="header-section-number">51.5.3.1</span> 1. Input és
+hibafecskendezés</h4>
+<p>A lab inventory rögzíti, hogy a <code>lab-service</code> két image
+digesttel fut:</p>
+<ul>
+<li><code>stable</code> Deployment:
+<code>lab-service:stable-feed</code><br />
+</li>
+<li><code>canary</code> Deployment:
+<code>lab-service:canary-feed</code></li>
+</ul>
+<p>A <strong>deployment fixture</strong> egy <code>canary</code> verziót
+bevezető GitOps commit, amely a <code>canary</code> Deploymentben egy
+rosszul konfigurált storage mountot ad: a mount elérési út
+<code>/data/cache</code> helyett <code>/tmp/cache-missing</code> lett,
+így a service bizonyos kéréseknél <code>EISDIR</code> hibát ad, és a p95
+latency megugrik. A hálózati oldal nem változik; az SLO azért élesedik,
+mert a canary verzió a kérések egy részét kapja. A konkrét image digest
+a lab inventoryban ellenőrizendő; az alábbi példa dummy érték.</p>
+<pre class="text"><code>lab-service stable:  ghcr.io/lab/stable@sha256:aaaa1111...
+lab-service canary:  ghcr.io/lab/stable@sha256:bbbb2222...
+stab_responses:      200, 200, 200, 200, 200
+canary_response:     500, 200, 500, 200, 500</code></pre>
+<p>A hiba tehát nem teljes outage, hanem <strong>partial
+degradation</strong>, amely a budgetet égeti, de a szolgáltatás nem hal
+meg azonnal. Ez a legveszélyesebb eset, mert a tünet lassan, zajban
+jelentkezik.</p>
+<h4 data-number="51.5.3.2" id="észlelés-és-triage"><span
+class="header-section-number">51.5.3.2</span> 2. Észlelés és triage</h4>
+<p>Az on-call a <code>LabServiceSLOBudgetBurn</code> alertet kapja. Első
+lépés a tünet visszamérése a Grafana panelben: a
+<code>lab_service_requests_total</code> 5xx aránya az elmúlt 15 percben
+0,8%, a p95 410 ms. A <code>kubectl</code> lekérdezés a canary podok
+naplójában <code>read-only file system</code> és <code>EISDIR</code>
+hibát mutat. A döntés: a canary súlycsoportot azonnal ki kell vonni.</p>
+<p>A <strong>mitigáció</strong> explicit, egyetlen változtatást
+tartalmazó parancs:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cluster context, sre-game namespace, UID: operator, labhost: lab-vm</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a canary és stable Deployment létezik, a Service a canary-t súlyozza.</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> sre-game scale deployment lab-service-canary <span class="at">--replicas</span><span class="op">=</span>0</span></code></pre></div>
+<p>A változtatás után a <code>stable</code> Deployment marad az egyetlen
+aktív. Az utóteszt a <code>lab_service_requests_total</code> 5xx
+arányának visszaesését várja 0,1% alá, és a p95 latency 250 ms alá. A
+parancs célja nem a root cause megszüntetése, hanem a user-facing hatás
+megszüntetése.</p>
+<h4 data-number="51.5.3.3" id="timelineevidence"><span
+class="header-section-number">51.5.3.3</span> 3. Timeline/evidence</h4>
+<p>A d255 game dayhez a timeline táblázat a bizonyítékokkal együtt
+szerepeljen a runbookban. A példa illusztratív, a tényleges
+időbélyegeket a labben rögzíteni kell.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Idő (UTC, fiktív)</th>
+<th>Esemény</th>
+<th>Bizonyíték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>09:00</td>
+<td>GitOps commit: new canary weight 20%</td>
+<td>git commit <code>aaaa111</code></td>
+</tr>
+<tr class="even">
+<td>09:04</td>
+<td>Warning alert firing</td>
+<td>Prometheus <code>ALERTS</code></td>
+</tr>
+<tr class="odd">
+<td>09:06</td>
+<td>On-call ack</td>
+<td>pagerduty/alertmanager</td>
+</tr>
+<tr class="even">
+<td>09:08</td>
+<td>Diagnosis: p95 &gt; SLO, 5xx arány nő</td>
+<td>Grafana panel, kubectl logs</td>
+</tr>
+<tr class="odd">
+<td>09:09</td>
+<td>Mitigáció: canary replicas=0</td>
+<td><code>kubectl get deployment</code></td>
+</tr>
+<tr class="even">
+<td>09:10</td>
+<td>Utóteszt: latency csökken, 5xx eltűnik</td>
+<td>Prometheus query</td>
+</tr>
+<tr class="odd">
+<td>09:20</td>
+<td>Postincident review</td>
+<td>jegyzet</td>
+</tr>
+</tbody>
+</table>
+<p>A timeline azért is fontos, mert az <strong>error budget</strong>
+döntést is rögzítünk: a 0,5%-os havi budgetből a hiba kb. 10 percet
+használt, így a maradék budget 119 perc. A
+<code>LabServiceSLOBudgetBurn</code> alert a mitigáció után
+<code>RESOLVED</code> állapotba kerül.</p>
+<h4 data-number="51.5.3.4" id="rollback-döntés"><span
+class="header-section-number">51.5.3.4</span> 4. Rollback döntés</h4>
+<p>A hosszú távú javítás kettős: a GitOps repositoryban a canary
+manifest <code>env</code> blokkjában a
+<code>MOUNT_PATH=/tmp/cache-missing</code> hibát kijavítjuk, majd a
+canary-t fokozatosan visszük vissza. Ha a hibát nem találjuk, a
+<strong>restore</strong> lehetőség is mérlegelendő. A d255-ben a git
+revert az elsődleges rollback, mert a d245 progressive delivery szabálya
+szerint a canary nem lehet jóváhagyott state. A git revert a GitOps
+desired state-ét is visszaállítja, így a reconciliation a
+<code>stable</code> commitot szinkronizálja.</p>
+<p>A képzeletbeli revert parancs nem futtatható, mert a repository
+tartalma a labben ellenőrzendő. A lényeg: a rollback egyetlen,
+verzióellenőrzött művelet, és a postcondition a Deployment spec ismét a
+<code>stable</code> digestre mutat.</p>
+<h3 data-number="51.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">51.5.4</span> Hibák és ellenpróbák</h3>
+<p>A leggyakoribb hiba egy game dayben: a csapat a diagnózis előtt a
+<code>delete pod</code> műveletet hajtja végre, hátha a pod újraindul.
+Ez a tünetet törli, de a root cause-t megtartja. A
+<strong>countermeasure</strong>: a riasztási szabály mellett a
+<code>kubectl diff</code> a GitOps repositoryval mutatja meg, hogy a
+canary és a stable manifest közötti különbség volt a hiba forrása. A pod
+restart a hibás manfesztből indul újra, így a tünet visszatér.</p>
+<p>Másik tipikus hiba: a csapat a <strong>SLO-budgetet</strong> nem a
+felhasználói hatásra, hanem a deploymentre fókuszál. A canary
+visszavonása <code>replicas=0</code>-ra igazolható, ha a 5xx arány
+ténylegesen a canaryból jön, de ha a hálózati policy miatt a stable is
+hibázna, a <code>replicas=0</code> nem elegendő. A döntés előfeltétele a
+metrics hipotézis: a canary pod azonositojában lévő kérések aránya
+jelentős, a stable podban alacsony.</p>
+<p>Harmadik ellenpróba: a <strong>postmortem</strong> nem a hibáztatás,
+hanem a rendszer akcióinak követése. A d255-ben a canary image nem
+<code>bad image</code>; a hiba a mount config commitból jött. A
+postmortem tehát a <strong>config review</strong> gate hiányát rögzíti,
+nem pedig egy fejlesztőt.</p>
+<h3 data-number="51.5.5" id="feladatok"><span
+class="header-section-number">51.5.5</span> Feladatok</h3>
+<h4 data-number="51.5.5.1"
+id="magyarázó-feladat-slo-fixture-értelmezése"><span
+class="header-section-number">51.5.5.1</span> 1. Magyarázó feladat:
+SLO-fixture értelmezése</h4>
+<p>Olvasd el a fenti <code>prometheus-game-day-slo</code> ConfigMapet.
+Válaszold meg, miért igaz a következő állítás: ha a 60 perces hibaarány
+0,3%, és a target SLO 99,5%, az alert <code>warning</code> szintű, de
+egy 15 perces 2%-os kiugrás esetén is csak <code>warning</code> lehet,
+ha a 60 perces átlag 0,4%. Írd le a burn rate számítását, és jelöld,
+melyik rész a szabályban a rosszul riasztott eset.</p>
+<h4 data-number="51.5.5.2"
+id="adminisztrációskonfigurációs-feladat-új-riasztási-küszöb"><span
+class="header-section-number">51.5.5.2</span> 2.
+Adminisztrációs/konfigurációs feladat: új riasztási küszöb</h4>
+<p>A game dayben a <code>LabServiceSLOBudgetBurn</code> rule nem elég
+érzékeny a storage mount hibára. Készíts egy második riasztási szabályt,
+amely a mount path hibájára utaló
+<code>kubelet_volume_stats_current_errors</code> metricet használja, ha
+az elmúlt 10 percben a hibaarány 0,5% felett van, és a
+<code>severity=critical</code>. Írd le a ConfigMap módosítást
+<code>kubectl apply --context lab-cluster -n sre-game -f ...</code>
+formában, és indokold, miért ez a jobb detektálási szint.</p>
+<h4 data-number="51.5.5.3"
+id="diagnosztikaifelrecovery-feladat-helyes-rollback"><span
+class="header-section-number">51.5.5.3</span> 3.
+Diagnosztikai/felrecovery feladat: helyes rollback</h4>
+<p>A labservice canary Deploymentben a
+<code>MOUNT_PATH=/tmp/cache-missing</code> hibát javítani kell. A
+<code>kubectl diff -n sre-game</code> kimenet a canary Deployment
+specben és a <code>ConfigMap</code> <code>env</code> részében mutat
+eltérést. Hogyan döntöd el, hogy a git revert a stable manifestre, vagy
+a canary manifest kijavított változatának <code>kubectl apply</code>-ja
+a megfelelő? Add meg a parancssort, az elvárt postconditiont (a canary
+visszakerül 20%-ra, a p95 &lt; 300 ms), és a rollback cleanup
+parancsot.</p>
+<h3 data-number="51.5.6" id="megoldások"><span
+class="header-section-number">51.5.6</span> Megoldások</h3>
+<h4 data-number="51.5.6.1" id="megoldás"><span
+class="header-section-number">51.5.6.1</span> 1. megoldás</h4>
+<p>Az állítás azért igaz, mert a burn rate a hibaarány és a budget
+normalizált hányadosa. A 0,3%-os, 60 perces hibaarány az
+0,003/0,005<em>1440 = 864 burn rate, ami &gt;14, így warning. A 2%-os,
+15 perces kiugrás a 60 perces átlagban 0,5%-ot növel, ha előtte nulla
+volt, de a 60 perces átlag még mindig 0,4%, tehát burn rate =
+0,004/0,005</em>1440 = 1152, ami szintén warning. A kritikus hiánya a
+hosszú időablak miatt van: a large time window a rövid éles hibát
+elmossa. A szabály valódi hiánya, hogy a rövid, hirtelen
+hibaarány-növekedést túl későn érzékeli.</p>
+<h4 data-number="51.5.6.2" id="megoldás-1"><span
+class="header-section-number">51.5.6.2</span> 2. megoldás</h4>
+<p>A kiegészítő szabály a volume mount hibát közvetlen metricre köti,
+ami hamarabb jelez, mint az SLO-budget. Az új szabály:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">-</span><span class="at"> </span><span class="fu">alert</span><span class="kw">:</span><span class="at"> LabServiceVolumeMountError</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">  expr</span><span class="kw">: </span><span class="ch">|</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    sum(rate(kubelet_volume_stats_current_errors{persistentvolumeclaim=~&quot;lab-service-.*&quot;,namespace=&quot;sre-game&quot;}[10m]))</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>      / sum(rate(kubelet_volume_stats_total{persistentvolumeclaim=~&quot;lab-service-.*&quot;,namespace=&quot;sre-game&quot;}[10m])) &gt; 0.005</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">for</span><span class="kw">:</span><span class="at"> 3m</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">labels</span><span class="kw">:</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">severity</span><span class="kw">:</span><span class="at"> critical</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">annotations</span><span class="kw">:</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">summary</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;lab-service volume mount errors in the last 10 minutes&quot;</span></span></code></pre></div>
+<p>A
+<code>kubectl apply --context lab-cluster -n sre-game -f config/prometheus/volume-alert.yaml</code>
+után a Prometheus config reload szükséges. A logika: a mount hiba
+gyorsabban korrelál a tünettel, mint a felhasználói 5xx arány. A
+<code>critical</code> azért indokolt, mert a mount hiba azonnali
+adatvesztési kockázatot jelenthet.</p>
+<h4 data-number="51.5.6.3" id="megoldás-2"><span
+class="header-section-number">51.5.6.3</span> 3. megoldás</h4>
+<p>A döntési szempont: a canary hiba oka a config commit volt, nem a
+stable Deployment. A <code>stable</code> manifest nem változott; a git
+revert visszaállítja a desired state-et, de a canary commitban a rossz
+<code>MOUNT_PATH</code> a hiba. Először a canary manifestben javítsd ki
+az env részt, commitold, majd a GitOps sync állítsa vissza a canary-t
+20%-ra. A parancssor:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cluster context, sre-game namespace, UID: operator, labhost: lab-vm</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Javítás a canary Deployment env részében:</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> sre-game patch deployment lab-service-canary <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--type</span><span class="op">=</span>strategic <span class="at">-p</span> <span class="st">&#39;{&quot;spec&quot;:{&quot;template&quot;:{&quot;spec&quot;:{&quot;containers&quot;:[{&quot;name&quot;:&quot;lab-service&quot;,&quot;env&quot;:[{&quot;name&quot;:&quot;MOUNT_PATH&quot;,&quot;value&quot;:&quot;/data/cache&quot;}]}]}}}}&#39;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Postcondition ellenőrzése:</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> sre-game rollout status deployment/lab-service-canary</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Rollback cleanup, ha a patch rossz:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> sre-game rollout undo deployment/lab-service-canary</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Utóteszt: p95 és hibaarány lekérdezése a Prometheus API-ból</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&#39;http://prometheus.sre-game.svc:9090/api/v1/query?query=histogram_quantile(0.95,sum(rate(lab_service_request_duration_seconds_bucket{service=&quot;lab-service&quot;,namespace=&quot;sre-game&quot;}[5m])) by (le))&#39;</span></span></code></pre></div>
+<p>Az elvárt postcondition: a canary Deployment 20%-os replikával fut, a
+p95 latency 300 ms alatt van, és a <code>LabServiceSLOBudgetBurn</code>
+<code>RESOLVED</code> állapotba kerül. A cleanup a patch után a game day
+végén a <code>kubectl delete</code> a canary és stable Deploymentre,
+majd a namespace törlése, de csak explicit, névvel felsorolt
+labobjektumokra.</p>
+<h3 data-number="51.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">51.5.7</span> Rövid összefoglaló</h3>
+<p>A d255 game day az SLO-t használja döntési alapként: a riasztás a
+budget burnből, a mitigáció a hatás csökkentéséből, az utóteszt a
+visszamért SLI-ből áll. A gyakorlat bizonyítja, hogy a partial
+degradation különösen veszélyes, mert lassan égeti a budgetet, és a pod
+restart önmagában nem oldja meg a config hibát. A timeline és az
+evidence-kezelés a postmortem feltétele; a rollback akkor biztonságos,
+ha a GitOps desired state-ét verzióellenőrzött módon állítjuk vissza. A
+mérési és alerting-határokat mindig a labor fixtureben rögzített,
+ellenőrzött metrikákkal kell kalibrálni.</p>
+<p><strong>Továbbhasznált definíciók:</strong><br />
+- <strong>Burn rate:</strong> az SLO hibaarány és az error budget
+normalizált fogyasztási sebessége.<br />
+- <strong>Partial degradation:</strong> olyan meghibásodás, amelyben a
+szolgáltatás egy része hibás, de a teljes outage nem áll fenn.<br />
+- <strong>Utóteszt:</strong> a mitigáció után végrehajtott, előre
+deklarált mérés, amely a kívánt SLI-visszatérét ellenőrzi.</p>
+<h3 data-number="51.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">51.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok (nem olvasott, nem ellenőrzött bizonyítékok
+ebben a kérésben):</p>
+<ul>
+<li><a href="https://sre.google/books/">Google SRE Books</a></li>
+<li><a href="https://prometheus.io/docs/">Prometheus
+Documentation</a></li>
+<li><a href="https://dora.dev/guides/dora-metrics/">DORA Metrics
+Guides</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a Prometheus alerting rule pontos szintaxisa és
+a <code>histogram_quantile</code> viselkedése a labor Prometheus
+verziójától függ; a <code>kubelet_volume_stats_current_errors</code>
+metric pontos neve és elérhetősége a kubelet verziójától függ. A labben
+a konkrét image digest, a GitOps repository tartalma és a kubectl CLI
+verzió rögzítendő. A példában szereplő IP, hostnév és időbélyeg
+dokumentációs célú, tényleges labértékekkel helyettesítendő.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d254.html">← 51.4 Toil, resilience és operation maturity</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d256.html">52.1 Source-to-runtime trust és provenance →</a></div>
+</nav>
+</body>
+</html>

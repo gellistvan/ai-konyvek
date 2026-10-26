@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.1 C ABI: extern "C", repr(C), bindgen és cbindgen – Rust
+programozás C++-fejlesztőknek – a nulláról a mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – Haladó Rust: unsafe, FFI, makrók, típusrendszer, teljesítmény</a> › <a href="index.html#rch18">19 FFI: C és C++ együttműködés</a></p>
+<div class="links"><a class="prev" rel="prev" href="r043.html">← 18.2 Biztonságos absztrakció unsafe alapon</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r045.html">19.2 C++-együttműködés a cxx crate-tel és a fokozatos migráció →</a></div>
+</nav>
+<h2 data-number="19.1" id="r044"><span
+class="header-section-number">19.1</span> C ABI: extern “C”, repr(C),
+bindgen és cbindgen</h2>
+<h3 data-number="19.1.1" id="motiváció"><span
+class="header-section-number">19.1.1</span> Motiváció</h3>
+<p>Egy évtizedes C++-kódbázis ritkán cserélhető le egyik napról a
+másikra Rustra. A gyakorlatban a két nyelv ugyanabban a folyamatban él:
+meglévő C vagy C++ könyvtárat hívunk Rustból, vagy egy új Rust
+komponenst teszünk elérhetővé a régi C++ kliens számára. A közös nevező
+a C ABI: a C függvényhívási konvenció, a C adatszerkezetek és a C
+stringek. A Rust nem beszéli a C++ osztályok, túlterhelt függvények,
+kivételek vagy sablonok nyelvét, de a C ABI-n keresztül bármilyen C++
+kód elérhető, ha <code>extern "C"</code> függvényekbe csomagoljuk.</p>
+<p>Az rkv mintaprojektben most azt a hidat építjük meg, amelyen a
+későbbi C++ kliens átkelhet: az <code>rkv-ffi</code> crate egy C API-t
+exportál, amelyet a <a href="r045.html">C++-együttműködés a cxx
+crate-tel és a fokozatos migráció</a> alfejezet használ tovább, a
+záróprojektben pedig a teljes rendszer része lesz.</p>
+<h3 data-number="19.1.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">19.1.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> Az <em>ABI</em> (application binary
+interface) az a bináris szerződés, amely meghatározza, hogyan adjuk át
+az argumentumokat, hogyan rendezzük a struktúrákat, és hogyan nevezzük a
+szimbólumokat. A Rust alapértelmezett ABI-ja nem stabil, ezért C-vel
+való együttműködésnél mindig explicit <code>extern "C"</code> blokkot
+használunk.</p>
+<p><strong>Definíció.</strong> A <code>#[repr(C)]</code> attribútum
+C-kompatibilis memóriaelrendezést ad a Rust típusoknak: a mezők
+sorrendje megegyezik a deklaráció sorrendjével, nincs újrarendezés, és a
+padding a C szabályait követi. A <code>#[repr(Rust)]</code> (az
+alapértelmezett) esetén a fordító szabadon átrendezheti a mezőket, ezért
+C-nek átadott struktúrákhoz mindig <code>#[repr(C)]</code> kell.</p>
+<p><strong>Szabály.</strong> A Rust referencia (<code>&amp;T</code>,
+<code>&amp;mut T</code>) nem C-kompatibilis típus; C-ből nyers mutatók
+jönnek (<code>*const T</code>, <code>*mut T</code>). A C ABI határán
+mindig nyers mutatókat használunk, és a hívóval egyértelműen
+megállapodunk az ownership átadásáról.</p>
+<p><strong>Szabály.</strong> A pánik nem léphet át a C határon. A Rust
+<code>panic!</code> egy <code>extern "C"</code> függvényből kilépve
+<code>abort</code>-hoz vagy undefined behaviorhez vezethet; ezért minden
+C-be exportált függvényben <code>catch_unwind</code>-del kell védeni a
+Rust kódot.</p>
+<p><strong>Szabály.</strong> A <code>#[no_mangle]</code> attribútum
+megakadályozza a szimbólum átnevezését, így a függvény neve a C linker
+számára látható marad. A Rust 2024-es editionben ez az attribútum az
+unsafe attribútumok közé került, ezért <code>#[unsafe(no_mangle)]</code>
+formában kell írni; a 2021-es editionben a <code>#[no_mangle]</code>
+továbbra is működik. <em>(Ellenőrzési igény: a pontos szintaxis a
+telepített toolchain verziójától függ.)</em></p>
+<h3 data-number="19.1.3"
+id="c-hívása-rustból-extern-blokk-és-bindgen"><span
+class="header-section-number">19.1.3</span> C hívása Rustból: extern
+blokk és bindgen</h3>
+<p>Egy meglévő C könyvtár legegyszerűbb hívása kézzel írt
+<code>extern</code> blokkal történik:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// mylib.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> add<span class="op">(</span><span class="dt">int</span> a<span class="op">,</span> <span class="dt">int</span> b<span class="op">);</span></span></code></pre></div>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Kézzel írt kötés</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> add(a<span class="op">:</span> <span class="dt">i32</span><span class="op">,</span> b<span class="op">:</span> <span class="dt">i32</span>) <span class="op">-&gt;</span> <span class="dt">i32</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a C függvénynek nincs előfeltétele, és a hívás nem sért Rust-invariánst.</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> sum <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> add(<span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>) <span class="op">};</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;{sum}&quot;</span>)<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A linkeléshez a <code>build.rs</code>-ben meg kell adni a könyvtárat:
+<code>println!("cargo:rustc-link-lib=mylib");</code>. Nagyobb C
+fejléchez azonban a kézi fordítás hibalehetőség; erre való a
+<code>bindgen</code>, amely a C fejlécből generálja a Rust kötést.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// build.rs</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;cargo:rustc-link-lib=mylib&quot;</span>)<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">&quot;cargo:rerun-if-changed=wrapper.h&quot;</span>)<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> bindings <span class="op">=</span> <span class="pp">bindgen::Builder::</span><span class="kw">default</span>()</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>header(<span class="st">&quot;wrapper.h&quot;</span>)</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>generate()</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>expect(<span class="st">&quot;bindgen hiba&quot;</span>)<span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    bindings</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>write_to_file(<span class="st">&quot;src/bindings.rs&quot;</span>)</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>expect(<span class="st">&quot;bindings írása nem sikerült&quot;</span>)<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A generált <code>bindings.rs</code>-t a forrásban
+<code>include!("bindings.rs");</code> módon illesztjük be. A bindgen
+által generált függvények <code>unsafe extern "C"</code> blokkba
+kerülnek, mert a Rust nem tudja ellenőrizni a C oldal biztonságát. A C++
+fejlesztő számára ez ismerős: a <code>extern "C"</code> a C++-ban is a
+névmanipuláció kikapcsolását jelenti, de ott a hívás biztonságáért a
+programozó felel, míg a Rust ezt az <code>unsafe</code> kulcsszóval
+teszi explicitté.</p>
+<h3 data-number="19.1.4" id="stringek-a-határon-cstr-és-cstring"><span
+class="header-section-number">19.1.4</span> Stringek a határon: CStr és
+CString</h3>
+<p>A C string null-terminált bájtsorozat; a Rust <code>String</code>
+heap-en allokált, hossz- és kapacitásmezőkkel ellátott UTF-8 puffert. A
+kettő között a <code>std::ffi</code> modul típusai konvertálnak:</p>
+<ul>
+<li><code>CStr</code>: kölcsönzött C string, mint a
+<code>&amp;str</code>, de bájt-alapú és null-terminált.</li>
+<li><code>CString</code>: birtokolt C string, mint a
+<code>String</code>, de null-terminált, és nem tartalmazhat belső null
+bájtot.</li>
+</ul>
+<figure>
+<img src="assets/r044-diagram-1.png"
+alt="CString és CStr a memóriában - A CString birtokolja a null-terminált puffert; a CStr csak egy kölcsönzött nézet." />
+<figcaption aria-hidden="true">CString és CStr a memóriában - A CString
+birtokolja a null-terminált puffert; a CStr csak egy kölcsönzött
+nézet.</figcaption>
+</figure>
+<p>A <code>CStr::from_ptr</code> unsafe függvény, mert a mutatónak
+érvényes, null-terminált stringre kell mutatnia. A
+<code>CString::new</code> ellenőrzi, hogy nincs-e belső null bájt, és
+<code>NulError</code>-t ad vissza, ha van. A C++-ban a
+<code>std::string::c_str()</code> automatikusan null-terminált mutatót
+ad; a Rustban ezt explicit konverzióval és hibakezeléssel kell
+megtenni.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="at">extern</span> <span class="st">&quot;C&quot;</span> <span class="dt">void</span> c_library_set<span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> key<span class="op">,</span> <span class="at">const</span> <span class="dt">char</span><span class="op">*</span> value<span class="op">,</span> <span class="dt">size_t</span> value_len<span class="op">);</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> set_value<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> key<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    c_library_set<span class="op">(</span>key<span class="op">.</span>c_str<span class="op">(),</span> value<span class="op">.</span>data<span class="op">(),</span> value<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::ffi::</span>CString<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::raw::</span><span class="dt">c_char</span><span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="op">{</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> c_library_set(key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span> value<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span> value_len<span class="op">:</span> <span class="dt">usize</span>)<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> set_value(key<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> value<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="pp">std::ffi::</span>NulError<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> key <span class="op">=</span> <span class="pp">CString::</span>new(key)<span class="op">?;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> value <span class="op">=</span> <span class="pp">CString::</span>new(value)<span class="op">?;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a CString érvényes, null-terminált puffert ad, és a hívás alatt él.</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        c_library_set(key<span class="op">.</span>as_ptr()<span class="op">,</span> value<span class="op">.</span>as_ptr()<span class="op">,</span> value<span class="op">.</span>as_bytes()<span class="op">.</span>len())<span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A különbség: a C++ automatikusan kezeli a null-terminálást, de a
+Rustban a <code>CString</code> explicit, és a belső null bájt hibát
+okoz. Bináris adatoknál (mint az rkv <code>Vec&lt;u8&gt;</code> értékei)
+ezért nem null-terminált stringet, hanem mutató + hossz párt adunk át,
+és a Rust oldalon <code>std::slice::from_raw_parts</code>-szel
+rekonstruáljuk a slice-ot.</p>
+<h3 data-number="19.1.5" id="ownership-a-határon"><span
+class="header-section-number">19.1.5</span> Ownership a határon</h3>
+<p>A C ABI-n nincs Rust tulajdonjog: a hívó és a hívott közötti
+megállapodás határozza meg, ki szabadít fel. A leggyakoribb minták:</p>
+<ul>
+<li>A Rust oldal allokál, és a C hívó szabadítja fel:
+<code>Box::into_raw</code> a Rust oldalon, a C oldalon egy dedikált
+felszabadító függvény hívása.</li>
+<li>A C oldal allokál, és a Rust oldal szabadítja fel: a Rust oldal
+<code>CString::from_raw</code>-val veszi át, és a <code>CString</code>
+drop-ja felszabadítja a Rust allokátorral létrehozott memóriát.</li>
+</ul>
+<p><strong>Fontos csapda:</strong> a <code>CString::from_raw</code> csak
+olyan mutatót fogadhat, amelyet a <code>CString::into_raw</code> hozott
+létre. Ha a C kód <code>malloc</code>-kal allokált mutatót ad át, és a
+Rust <code>CString::from_raw</code>-t hív rá, az undefined behavior. A
+C-ből érkező mutatót a Rust oldalon <code>CStr::from_ptr</code>-ként
+kezeljük, és nem szabadítjuk fel, kivéve ha a szerződés szerint a Rust-é
+a felszabadítás.</p>
+<p>A <code>Box::into_raw</code> elveszi a Rust <code>Box</code>-ot, és
+visszaadja a nyers mutatót; a memória felszabadításához
+<code>Box::from_raw</code> kell. Ez a minta biztosítja, hogy a Rust
+allocator párosuljon a Rust deallokátorral.</p>
+<h3 data-number="19.1.6" id="panic-és-hibakódok"><span
+class="header-section-number">19.1.6</span> Panic és hibakódok</h3>
+<p>A Rust pánik nem hagyhatja el a <code>extern "C"</code> függvényt. A
+<code>catch_unwind</code> elfogja a pánikot, és hibakódot adunk vissza.
+A visszatérési érték tipikusan <code>c_int</code>: <code>0</code> a
+siker, <code>1</code> az általános hiba, <code>2</code> a pánik. A C
+hívó így tudja kezelni a hibát anélkül, hogy a Rust futásidő
+megszakadna.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::panic::</span><span class="op">{</span>catch_unwind<span class="op">,</span> AssertUnwindSafe<span class="op">};</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> rust_code_can_panic() <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="pp">rkv_core::</span><span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> call_with_panic_guard() <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> result <span class="op">=</span> catch_unwind(AssertUnwindSafe(rust_code_can_panic))<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> result <span class="op">{</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Ok</span>(())) <span class="op">=&gt;</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Err</span>(_)) <span class="op">=&gt;</span> <span class="dv">1</span><span class="op">,</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(_) <span class="op">=&gt;</span> <span class="dv">2</span><span class="op">,</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>catch_unwind</code> feltételezi, hogy a profilban a pánik nem
+<code>abort</code>; C ABI határán ezért általában
+<code>panic = "unwind"</code> beállítást használunk. A pánik elkapása
+nem helyettesíti a hibakezelést, de megvédi a C hívót a Rust futásidő
+váratlan leállásától.</p>
+<h3 data-number="19.1.7"
+id="labor-rkv-ffi-c-abi-val-és-cbindgen-headerrel"><span
+class="header-section-number">19.1.7</span> Labor: rkv-ffi C ABI-val és
+cbindgen headerrel</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/rkv/</code></p>
+<p>Ebben a laborban létrehozzuk az <code>rkv-ffi</code> crate-et, amely
+C API-t exportál az <code>rkv-core</code> <code>MemStore</code>
+implementációjához, <code>cbindgen</code>-nel generáljuk a C headert, és
+egy C klienst fordítunk rá.</p>
+<ol type="1">
+<li><strong>Hozzuk létre az <code>rkv-ffi</code> crate-et:</strong></li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> new <span class="at">--lib</span> rkv-ffi</span></code></pre></div>
+<ol start="2" type="1">
+<li><strong>Adjuk hozzá a workspace tagjaihoz</strong> (ha a gyökér
+<code>Cargo.toml</code> <code>members</code> listája még nem tartalmazza
+automatikusan):</li>
+</ol>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># rkv/Cargo.toml (részlet)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[workspace]</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="dt">members</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;rkv-core&quot;</span><span class="op">,</span> <span class="st">&quot;rkv-cli&quot;</span><span class="op">,</span> <span class="st">&quot;rkv-server&quot;</span><span class="op">,</span> <span class="st">&quot;rkv-ffi&quot;</span><span class="op">]</span></span></code></pre></div>
+<ol start="3" type="1">
+<li><strong>Szerkesszük az
+<code>rkv-ffi/Cargo.toml</code>-t:</strong></li>
+</ol>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[package]</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="dt">name</span> <span class="op">=</span> <span class="st">&quot;rkv-ffi&quot;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="dt">version</span> <span class="op">=</span> <span class="st">&quot;0.1.0&quot;</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="dt">edition</span> <span class="op">=</span> <span class="st">&quot;2024&quot;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="kw">[lib]</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="dt">crate-type</span> <span class="op">=</span> <span class="op">[</span><span class="st">&quot;cdylib&quot;</span><span class="op">,</span> <span class="st">&quot;staticlib&quot;</span><span class="op">]</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="kw">[dependencies]</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="dt">rkv-core</span> <span class="op">=</span> <span class="op">{ </span><span class="dt">path</span><span class="op"> =</span> <span class="st">&quot;../rkv-core&quot;</span><span class="op"> }</span></span></code></pre></div>
+<p>A <code>cdylib</code> dinamikus C könyvtárat, a
+<code>staticlib</code> statikus könyvtárat állít elő; így a C kliens
+mindkét formában linkelhet.</p>
+<ol start="4" type="1">
+<li><strong>Írjuk meg az <code>src/lib.rs</code>-t:</strong></li>
+</ol>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span><span class="bu">Error</span><span class="op">,</span> MemStore<span class="op">,</span> Storage<span class="op">};</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::ffi::</span><span class="op">{</span>CStr<span class="op">,</span> CString<span class="op">};</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::raw::</span><span class="op">{</span><span class="dt">c_char</span><span class="op">,</span> <span class="dt">c_int</span><span class="op">};</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::panic::</span><span class="op">{</span>catch_unwind<span class="op">,</span> AssertUnwindSafe<span class="op">};</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>ptr<span class="op">;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> OK<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> ERR_GENERAL<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> ERR_PANIC<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_new() <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> MemStore <span class="op">{</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>into_raw(<span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">MemStore::</span>new()))</span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_free(store<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> MemStore) <span class="op">{</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> store<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó a rkv_store_new által adott mutatót adja át, és nem használja utána.</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>        drop(<span class="dt">Box</span><span class="pp">::</span>from_raw(store))<span class="op">;</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_set(</span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> MemStore<span class="op">,</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>    key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    value<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    value_len<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> store<span class="op">.</span>is_null() <span class="op">||</span> key<span class="op">.</span>is_null() <span class="op">||</span> value<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_GENERAL<span class="op">;</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> result <span class="op">=</span> catch_unwind(AssertUnwindSafe(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a hívó érvényes, null-terminált C stringet ad át.</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> key <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">CStr::</span>from_ptr(key) <span class="op">}</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>to_str()</span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> <span class="bu">Error</span><span class="pp">::</span>InvalidCommand(<span class="st">&quot;nem UTF-8 kulcs&quot;</span><span class="op">.</span>into()))<span class="op">?;</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a hívó legalább value_len bájtot garantál a value mutató mögött.</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> value <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts(value <span class="kw">as</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">u8</span><span class="op">,</span> value_len) <span class="op">}.</span>to_vec()<span class="op">;</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a store mutató a rkv_store_new-ból származik, és érvényes.</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">*</span>store <span class="op">}.</span>set(key<span class="op">.</span>to_string()<span class="op">,</span> value)</span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">;</span></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> result <span class="op">{</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Ok</span>(())) <span class="op">=&gt;</span> OK<span class="op">,</span></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Err</span>(_)) <span class="op">=&gt;</span> ERR_GENERAL<span class="op">,</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(_) <span class="op">=&gt;</span> ERR_PANIC<span class="op">,</span></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_get(store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> MemStore<span class="op">,</span> key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">c_char</span> <span class="op">{</span></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> store<span class="op">.</span>is_null() <span class="op">||</span> key<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="pp">ptr::</span>null_mut()<span class="op">;</span></span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> result <span class="op">=</span> catch_unwind(AssertUnwindSafe(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a hívó érvényes, null-terminált C stringet ad át.</span></span>
+<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> key <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">CStr::</span>from_ptr(key) <span class="op">}</span></span>
+<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>to_str()</span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> <span class="bu">Error</span><span class="pp">::</span>InvalidCommand(<span class="st">&quot;nem UTF-8 kulcs&quot;</span><span class="op">.</span>into()))<span class="op">?;</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a store mutató a rkv_store_new-ból származik, és érvényes.</span></span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="op">&amp;*</span>store <span class="op">}.</span>get(key)</span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">;</span></span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> result <span class="op">{</span></span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Ok</span>(<span class="cn">Some</span>(value))) <span class="op">=&gt;</span> <span class="cf">match</span> <span class="pp">CString::</span>new(value) <span class="op">{</span></span>
+<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(s) <span class="op">=&gt;</span> s<span class="op">.</span>into_raw()<span class="op">,</span></span>
+<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> <span class="pp">ptr::</span>null_mut()<span class="op">,</span></span>
+<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb10-72"><a href="#cb10-72" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Ok</span>(<span class="cn">None</span>)) <span class="op">=&gt;</span> <span class="pp">ptr::</span>null_mut()<span class="op">,</span></span>
+<span id="cb10-73"><a href="#cb10-73" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Err</span>(_)) <span class="op">=&gt;</span> <span class="pp">ptr::</span>null_mut()<span class="op">,</span></span>
+<span id="cb10-74"><a href="#cb10-74" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(_) <span class="op">=&gt;</span> <span class="pp">ptr::</span>null_mut()<span class="op">,</span></span>
+<span id="cb10-75"><a href="#cb10-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-76"><a href="#cb10-76" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-77"><a href="#cb10-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-78"><a href="#cb10-78" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb10-79"><a href="#cb10-79" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_string_free(ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">c_char</span>) <span class="op">{</span></span>
+<span id="cb10-80"><a href="#cb10-80" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> ptr<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb10-81"><a href="#cb10-81" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb10-82"><a href="#cb10-82" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-83"><a href="#cb10-83" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó a rkv_get által visszaadott mutatót adja át, és nem használja utána.</span></span>
+<span id="cb10-84"><a href="#cb10-84" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb10-85"><a href="#cb10-85" aria-hidden="true" tabindex="-1"></a>        drop(<span class="pp">CString::</span>from_raw(ptr))<span class="op">;</span></span>
+<span id="cb10-86"><a href="#cb10-86" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-87"><a href="#cb10-87" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>MemStore</code> és a <code>Storage</code> trait metódusai a
+korábbi fejezetekben rögzített szignatúrájúak; ha a pontos név vagy
+visszatérési típus eltér, a laborban igazítani kell. A
+<code>CString::new(value)</code> a <code>Vec&lt;u8&gt;</code>-ból készít
+C stringet; ha az érték belső null bájtot tartalmaz, a <code>get</code>
+null mutatót ad vissza. A termelési kódban ezért gyakran mutató + hossz
+kimeneti paramétereket használunk.</p>
+<ol start="5" type="1">
+<li><strong>Készítsünk <code>cbindgen.toml</code>-t</strong> az
+<code>rkv-ffi</code> könyvtárban:</li>
+</ol>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="dt">language</span> <span class="op">=</span> <span class="st">&quot;C&quot;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">include_guard</span> <span class="op">=</span> <span class="st">&quot;RKV_FFI_H&quot;</span></span></code></pre></div>
+<ol start="6" type="1">
+<li><strong>Generáljuk a C headert:</strong></li>
+</ol>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> install cbindgen</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv/rkv-ffi</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cbindgen</span> <span class="at">--config</span> cbindgen.toml <span class="at">--crate</span> rkv-ffi <span class="at">--output</span> rkv_ffi.h</span></code></pre></div>
+<p>A generált <code>rkv_ffi.h</code> deklarálja a <code>MemStore</code>
+opaque típust (mivel a Rust <code>MemStore</code> nem
+<code>#[repr(C)]</code>, a cbindgen csak előre deklarálja), és a
+<code>rkv_store_new</code>, <code>rkv_store_free</code>,
+<code>rkv_set</code>, <code>rkv_get</code>, <code>rkv_string_free</code>
+függvényeket.</p>
+<ol start="7" type="1">
+<li><strong>Fordítsuk le a Rust könyvtárat:</strong></li>
+</ol>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> build <span class="at">--release</span> <span class="at">-p</span> rkv-ffi</span></code></pre></div>
+<ol start="8" type="1">
+<li><strong>Írjunk C klienst</strong> a
+<code>~/rust-labor/rkv/cpp-client/</code> könyvtárba (a
+<code>rkv_ffi.h</code> másolása után):</li>
+</ol>
+<div class="sourceCode" id="cb14"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;rkv_ffi.h&quot;</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    MemStore <span class="op">*</span>store <span class="op">=</span> rkv_store_new<span class="op">();</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rkv_set<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">,</span> <span class="st">&quot;piros&quot;</span><span class="op">,</span> <span class="dv">5</span><span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;SET hiba</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> <span class="op">*</span>value <span class="op">=</span> rkv_get<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">);</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;VALUE </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> value<span class="op">);</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>        rkv_string_free<span class="op">(</span>value<span class="op">);</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;NOTFOUND</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb14-16"><a href="#cb14-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-17"><a href="#cb14-17" aria-hidden="true" tabindex="-1"></a>    rkv_store_free<span class="op">(</span>store<span class="op">);</span></span>
+<span id="cb14-18"><a href="#cb14-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb14-19"><a href="#cb14-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="9" type="1">
+<li><strong>Fordítsuk és linkeljük a C klienst:</strong></li>
+</ol>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/rust-labor/rkv/cpp-client</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cc</span> <span class="at">-I.</span> <span class="at">-L..</span>/target/release <span class="at">-lrkv_ffi</span> <span class="at">-o</span> rkv-c-client main.c</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="va">LD_LIBRARY_PATH</span><span class="op">=</span>../target/release <span class="ex">./rkv-c-client</span></span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code>VALUE piros</code></pre>
+<p>A <code>cpp-client</code> későbbi C++ kódja ugyanezt a headert
+használja, csak <code>.cpp</code> kiterjesztéssel és C++ fordítóval.</p>
+<h3 data-number="19.1.8" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">19.1.8</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><strong>Rust <code>String</code> átadása C-nek.</strong> A
+<code>String</code> belső elrendezése nem C-kompatibilis; közvetlenül
+soha ne adjuk át. Mindig <code>CString</code>-et és
+<code>into_raw</code>-t vagy <code>as_ptr</code>-t használjunk.</li>
+<li><strong>A hívó felszabadításának elmulasztása.</strong> A
+<code>rkv_get</code> által visszaadott mutatót a C hívónak kell
+felszabadítania a <code>rkv_string_free</code>-vel. Ha ezt elmulasztja,
+memóriaszivárgás; ha kétszer hívja, double free.</li>
+<li><strong>Panik átengedése a határon.</strong> A <code>rkv_get</code>
+<code>catch_unwind</code> nélkül, ha a Rust kód pánikol, a folyamat
+abortálhat vagy undefined behavior. Minden C-be exportált függvényben
+használjunk <code>catch_unwind</code>-öt.</li>
+<li><strong><code>CString::from_raw</code> rossz mutatóra.</strong> A
+<code>rkv_string_free</code> csak olyan mutatót fogadhat, amelyet a
+<code>CString::into_raw</code> hozott létre. Ha a C kód
+<code>malloc</code>-kal allokált mutatót ad át, az undefined
+behavior.</li>
+<li><strong>Nem <code>#[repr(C)]</code> struktúra átadása
+C-nek.</strong> Az <code>rkv-ffi</code>-ben a <code>MemStore</code>
+opaque típus, ezért nem kell <code>#[repr(C)]</code>, de ha a C kód
+hozzáfér a mezőkhöz, akkor kötelező.</li>
+</ol>
+<h3 data-number="19.1.9" id="feladatok"><span
+class="header-section-number">19.1.9</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Fogalmi kérdés:</strong> Miért nem lehet a Rust
+<code>&amp;str</code>-et közvetlenül C függvénynek átadni? Milyen típust
+használunk helyette, és miért?</li>
+<li><strong>C++ kód átírása:</strong> Írjon C++ függvényt, amely
+<code>std::string</code>-et fogad, és egy C könyvtárnak adja át
+<code>char*</code>-ként. Írja meg a Rust megfelelőjét, amely
+<code>CString</code>-et használ és <code>into_raw</code>-val adja át, ha
+a C könyvtár tárolja a mutatót.</li>
+<li><strong>Implementációs feladat:</strong> Egészítse ki az
+<code>rkv-ffi</code> crate-et egy <code>rkv_delete</code> függvénnyel,
+amely törli a kulcsot a <code>MemStore</code>-ból, és hibakódot ad
+vissza. Generálja újra a headert, és tesztelje a C kliensből.</li>
+<li><strong>Tervezési döntés:</strong> A <code>rkv_get</code> jelenleg
+null mutatót ad vissza, ha a kulcs nincs meg vagy hiba történt. Hogyan
+lehetne megkülönböztetni a két esetet? Tervezzen egy
+<code>rkv_get_ex</code> függvényt, amely kimeneti paraméterben adja
+vissza a hibakódot, és indokolja a választást.</li>
+</ol>
+<h3 data-number="19.1.10" id="megoldások"><span
+class="header-section-number">19.1.10</span> Megoldások</h3>
+<ol type="1">
+<li>A <code>&amp;str</code> nem null-terminált, és fat pointer
+(adatmutató + hossz). A C egy <code>char*</code>-ot vár, null-terminált
+bájtsorozatot. A <code>CString</code> biztosítja a null-terminált,
+birtokolt puffert; a <code>&amp;CStr</code> a kölcsönzött nézetet.</li>
+<li>C++ oldal:
+<code>std::string s = "alma"; c_library_set_takes_ownership(strdup(s.c_str()));</code>
+— itt a hívó ad át tulajdonjogot. Rust oldal:</li>
+</ol>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::ffi::</span>CString<span class="op">;</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::os::raw::</span><span class="dt">c_char</span><span class="op">;</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="op">{</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> c_library_set_takes_ownership(key<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">c_char</span>)<span class="op">;</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> set_value(key<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="pp">std::ffi::</span>NulError<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> key <span class="op">=</span> <span class="pp">CString::</span>new(key)<span class="op">?;</span></span>
+<span id="cb17-10"><a href="#cb17-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a CString.into_raw átadja a tulajdonjogot; a C könyvtár felszabadítja.</span></span>
+<span id="cb17-11"><a href="#cb17-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> c_library_set_takes_ownership(key<span class="op">.</span>into_raw()) <span class="op">};</span></span>
+<span id="cb17-12"><a href="#cb17-12" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb17-13"><a href="#cb17-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ol start="3" type="1">
+<li>A <code>rkv_delete</code> implementációja:</li>
+</ol>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_delete(store<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> MemStore<span class="op">,</span> key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> store<span class="op">.</span>is_null() <span class="op">||</span> key<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ERR_GENERAL<span class="op">;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> result <span class="op">=</span> catch_unwind(AssertUnwindSafe(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a hívó érvényes, null-terminált C stringet ad át.</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> key <span class="op">=</span> <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">CStr::</span>from_ptr(key) <span class="op">}</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>to_str()</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> <span class="bu">Error</span><span class="pp">::</span>InvalidCommand(<span class="st">&quot;nem UTF-8 kulcs&quot;</span><span class="op">.</span>into()))<span class="op">?;</span></span>
+<span id="cb18-11"><a href="#cb18-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a store mutató a rkv_store_new-ból származik, és érvényes.</span></span>
+<span id="cb18-12"><a href="#cb18-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">*</span>store <span class="op">}.</span>delete(key)</span>
+<span id="cb18-13"><a href="#cb18-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">;</span></span>
+<span id="cb18-14"><a href="#cb18-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">match</span> result <span class="op">{</span></span>
+<span id="cb18-15"><a href="#cb18-15" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Ok</span>(())) <span class="op">=&gt;</span> OK<span class="op">,</span></span>
+<span id="cb18-16"><a href="#cb18-16" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(<span class="cn">Err</span>(_)) <span class="op">=&gt;</span> ERR_GENERAL<span class="op">,</span></span>
+<span id="cb18-17"><a href="#cb18-17" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(_) <span class="op">=&gt;</span> ERR_PANIC<span class="op">,</span></span>
+<span id="cb18-18"><a href="#cb18-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb18-19"><a href="#cb18-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A headert újra kell generálni, és a C kliensben hívni.</p>
+<ol start="4" type="1">
+<li>A <code>rkv_get_ex</code> tervezése: a függvény
+<code>c_int</code>-et ad vissza, és a kimeneti értéket egy
+<code>char**</code> és <code>size_t*</code> paraméterben adja vissza. A
+hívó ellenőrzi a visszatérési kódot, és ha az <code>OK</code>, akkor a
+kimeneti mutatót és hosszt használja. Ez lehetővé teszi a hibakód és az
+érték egyértelmű szétválasztását, bár a hívónak kell felszabadítania a
+puffert. A mutató + hossz minta a <a href="r044.html">C ABI: extern “C”,
+repr(C), bindgen és cbindgen</a> alfejezetben bemutatott elvet
+követi.</li>
+</ol>
+<h3 data-number="19.1.11" id="rövid-összefoglaló"><span
+class="header-section-number">19.1.11</span> Rövid összefoglaló</h3>
+<p>A C ABI a Rust és C/C++ együttműködés alapja. A Rust
+<code>extern "C"</code> blokkokkal hív C függvényeket, amelyeket a
+<code>bindgen</code> generálhat C fejlécekből; a
+<code>#[unsafe(no_mangle)]</code> (2024 editionben) és a
+<code>pub extern "C" fn</code> exportálja a Rust függvényeket C számára.
+A <code>#[repr(C)]</code> attribútum C-kompatibilis elrendezést ad a
+struktúráknak. A stringeknél a <code>CStr</code> és <code>CString</code>
+típusok biztosítják a null-terminált konverziót; bináris adatoknál
+mutató + hossz szerződést használunk. Az ownership a határon:
+<code>Box::into_raw</code> és <code>Box::from_raw</code> a Rust
+allokáció átadásához; a C-ből érkező mutatót soha nem szabadítjuk fel,
+hacsak a szerződés nem mondja ki. A pánikot
+<code>catch_unwind</code>-del fogjuk el, és hibakódot adunk vissza. A
+laborban létrehoztuk az <code>rkv-ffi</code> crate-et
+<code>cdylib</code> és <code>staticlib</code> típusokkal, a
+<code>rkv_store_new</code>, <code>rkv_store_free</code>,
+<code>rkv_set</code>, <code>rkv_get</code>, <code>rkv_string_free</code>
+exportált függvényekkel, <code>cbindgen</code>-nel generáltuk az
+<code>rkv_ffi.h</code> headert, és C klienst fordítottunk rá.
+<strong>Továbbvitt eredmény:</strong> ez a C API az alapja a <a
+href="r045.html">C++-együttműködés a cxx crate-tel és a fokozatos
+migráció</a> és a <a href="r051.html">Záróprojekt: az rkv teljes
+rendszerként</a> alfejezeteknek.</p>
+<h3 data-number="19.1.12" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">19.1.12</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>A Rust Reference és a Nomicon C ABI fejezetei a stabil nyelvi
+szabályok forrásai. A <code>std::ffi::CStr</code>/<code>CString</code>,
+<code>Box::into_raw</code>/<code>from_raw</code>,
+<code>catch_unwind</code> a standard könyvtár stabil API-i.</li>
+<li>A <code>bindgen</code> és <code>cbindgen</code> eszközök aktuális
+verzióit és pontos parancssori opcióit a docs.rs-en és a hivatalos
+GitHub-oldalakon ellenőrizni kell. A példák a bindgen 0.69+ és cbindgen
+0.26+ főverziókra épülnek.</li>
+<li>A Rust 2024 editionben az <code>unsafe</code> attribútumok
+szintaxisa (<code>#[unsafe(no_mangle)]</code>) a Rust 1.82-től stabil; a
+2021-es editionben a <code>#[no_mangle]</code> továbbra is működik, de a
+2024-es editionben az <code>unsafe</code> jelölés kötelező. Ezt a
+telepített toolchainen ellenőrizni kell.</li>
+<li>A <code>MemStore</code> és a <code>Storage</code> trait pontos
+metódus-szignatúrái az <code>rkv-core</code> korábbi fejezeteiben
+rögzítettek; a laborban használt <code>set</code>, <code>get</code>,
+<code>delete</code> feltételezi a
+<code>Result&lt;..., rkv_core::Error&gt;</code> visszatérést.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r043.html">← 18.2 Biztonságos absztrakció unsafe alapon</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r045.html">19.2 C++-együttműködés a cxx crate-tel és a fokozatos migráció →</a></div>
+</nav>
+</body>
+</html>

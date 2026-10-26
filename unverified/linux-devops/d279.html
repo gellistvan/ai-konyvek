@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>56.4 Platform game day és recovery – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch56">56 Záróprojekt II: Kubernetes, GitOps és platform operation</a></p>
+<div class="links"><a class="prev" rel="prev" href="d278.html">← 56.3 Network, volume, observability és platform rutin</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d280.html">56.5 VM és Kubernetes operation összehasonlítás →</a></div>
+</nav>
+<h2 data-number="56.4" id="d279"><span
+class="header-section-number">56.4</span> Platform game day és
+recovery</h2>
+<h3 data-number="56.4.1" id="motiváció-és-definíció"><span
+class="header-section-number">56.4.1</span> Motiváció és definíció</h3>
+<p>A d278-ban felépített platform már rendelkezik GitOps deliveryvel,
+observabilityvel, network policyvel és állapotmentéssel. A d279 game day
+célja, hogy ezeket a képességeket ne dokumentációból, hanem ellenőrzött
+hibainjektálással tesztelje. A gyakorlat során a csapat előre definiált
+hibafixture-öket kap, és az a feladata, hogy a tüneteket a megfelelő
+rendszerréteghez rendelje, adatokkal igazolja a hipotézist, majd
+egyetlen változtatással hajtsa végre a controlled recoveryt. A game day
+nem az “ügyeskedés” versenye, hanem a runbook, a timeline és a
+postmortem minőségének auditja.</p>
+<p><strong>Definíciók:</strong></p>
+<ul>
+<li><p><strong>Game day (platform game day):</strong> szimulált, előre
+megtervezett hibagyakorlat, amelyben a produkciószerű környezetet
+izolált labclusteren, kontrollált blast radius mellett terhelik. Minden
+injektált hiba visszafordítható, és a gyakorlat után a teljes
+erőforráskészlet cleanup alá esik.</p></li>
+<li><p><strong>Controlled recovery:</strong> olyan helyreállítás, amely
+nem egyetlen sürgős művelet, hanem döntési pontokkal tagolt folyamat:
+tünet rögzítése, hipotézis, adatgyűjtés, egy változtatás, verification,
+és szükség esetén rollback. A döntést az SLO és az adatállapot
+együttesen vezérli, nem a “minél gyorsabban bármit” elv.</p></li>
+<li><p><strong>Fixture:</strong> a game day előre elkészített hibás
+állapota, amelyet a gyakorlatvezető vagy a pipeline aktivál. A fixture
+nem production adatot használ, hanem lab- prefixű, eldobható
+erőforrásokat.</p></li>
+</ul>
+<p>A tünetek rétegbe sorolása a Kubernetes verem mentén:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Réteg</th>
+<th>Példa tünet</th>
+<th>Elsődleges diagnosztikai objektum</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Node/runtime</td>
+<td>NotReady, OOMKilled, CrashLoopBackOff, ImagePullBackOff</td>
+<td><code>kubectl describe node</code>,
+<code>kubectl get events -n ...</code>, kubelet log</td>
+</tr>
+<tr class="even">
+<td>Network</td>
+<td>Pending, Gateway 503, DNS timeout, MTU frag, policy drop</td>
+<td><code>kubectl get endpoints</code>,
+<code>kubectl describe httproute</code>, <code>kubectl exec</code> +
+tcpdump</td>
+</tr>
+<tr class="odd">
+<td>Storage</td>
+<td>PVC Pending, attach error, volume corruption, capacity full</td>
+<td><code>kubectl describe pvc</code>, csi driver log,
+<code>kubectl exec</code> + fsck/checksum</td>
+</tr>
+<tr class="even">
+<td>Policy/identity</td>
+<td>RBAC denied, admission rejected, secret rotation hiba</td>
+<td><code>kubectl auth can-i</code>, admission event,
+<code>kubectl describe secret</code></td>
+</tr>
+<tr class="odd">
+<td>Control plane</td>
+<td>API lassú, etcd quorum loss, scheduler leáll</td>
+<td><code>kubectl get --raw=/readyz</code>, etcdctl endpoint health</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="56.4.2"
+id="kidolgozott-példa-canary-image-pull-secret-rotation"><span
+class="header-section-number">56.4.2</span> Kidolgozott példa: canary
+image pull + secret rotation</h3>
+<p><strong>Környezet</strong></p>
+<p>A labcluster a <code>lab-platform</code> context, a workload a
+<code>lab-app</code> namespace. A stabil <code>lab-cpp-service</code>
+Deployment 3 replikát futtat, a canary
+<code>lab-cpp-service-canary</code> Deployment 1 replikát kap, és a
+Gateway API HTTPRoute a canary súlyát 10%-ra állítja. A d278 óta a
+canary az <code>v2.1.0-rc.1</code> image taget húzza, a registry
+hitelesítéshez <code>lab-registry-cred</code> Secretet használ.</p>
+<p><strong>A hiba beinjektálása</strong></p>
+<p>A game day vezető a canary Deployment manifestjében a
+<code>spec.template.spec.containers[0].image</code> mezőt
+<code>registry.lab.example/lab-cpp-service:v2.1.0-rc.1</code>-ről
+<code>registry.lab.example/lab-cpp-service:v2.1.0-rc.2</code>-re
+módosítja, de az új tag nem létezik a registryben. Emellett a secret
+rotációt is elrontja: a registry credential lejárt, de a GitOps repo-ban
+a <code>lab-registry-cred</code> Secret <code>.dockerconfigjson</code>
+értéke még a régi tokent tartalmazza. A clusterben a Secret frissült, de
+a Deploymentben hivatkozott <code>imagePullSecrets</code> név nem
+változott; a hibát a manifest változat okozza.</p>
+<p><strong>Tünet</strong></p>
+<p>A canary pod <code>ImagePullBackOff</code> állapotba kerül, a Gateway
+5xx-et ad vissza a canary útvonalon. Húsz másodperc alatt a
+<code>kubectl get pods -n lab-app</code> ezt mutatja:</p>
+<pre class="text"><code>NAME                                      READY   STATUS             RESTARTS   AGE
+lab-cpp-service-7d5f9c8b-abc1            1/1     Running            0          10m
+lab-cpp-service-7d5f9c8b-def2            1/1     Running            0          10m
+lab-cpp-service-7d5f9c8b-ghi3            1/1     Running            0          10m
+lab-cpp-service-canary-6f4d8c9-xyz7      0/1     ImagePullBackOff   0          80s</code></pre>
+<p>A csapat a tünetet a runtime réteghez rendeli, mert a pod nem indul
+el. Az első hipotézis: az image tag rossz. A helyes döntés előtt
+ellenőrizni kell a registry credential állapotát is, mert a Secret
+rotáció ebben a fixtureben párhuzamosan fut.</p>
+<p><strong>Adatgyűjtés</strong></p>
+<p>A pod eseményei:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app describe pod lab-cpp-service-canary-6f4d8c9-xyz7</span></code></pre></div>
+<p>Várható kimenetrészlet:</p>
+<pre class="text"><code>Events:
+  Type     Reason     Age                From               Message
+  ----     ------     ----               ----               -------
+  Normal   Scheduled  90s                default-scheduler  Successfully assigned lab-app/lab-cpp-service-canary-6f4d8c9-xyz7 to lab-node-2
+  Normal   Pulling    89s                kubelet            Pulling image &quot;registry.lab.example/lab-cpp-service:v2.1.0-rc.2&quot;
+  Warning  Failed     82s                kubelet            Failed to pull image &quot;registry.lab.example/lab-cpp-service:v2.1.0-rc.2&quot;: rpc error: code = NotFound desc = failed to resolve reference &quot;registry.lab.example/lab-cpp-service:v2.1.0-rc.2&quot;: not found
+  Warning  Failed     82s                kubelet            Error: ErrImagePull
+  Normal   BackOff    75s                kubelet            Back-off pulling image &quot;registry.lab.example/lab-cpp-service:v2.1.0-rc.2&quot;
+  Warning  Failed     75s                kubelet            Error: ImagePullBackOff</code></pre>
+<p>A Secret ellenőrzése:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app get secret lab-registry-cred <span class="at">-o</span> jsonpath=<span class="st">&#39;{.data.\.dockerconfigjson}&#39;</span> <span class="kw">|</span> <span class="fu">base64</span> <span class="at">-d</span></span></code></pre></div>
+<p>Várhatóan a lejárt token szerepel. A diagnózis megerősíti, hogy két
+hiba együtt áll fenn: a kép nem létezik és a credential sem
+érvényes.</p>
+<p><strong>Controlled recovery döntés</strong></p>
+<p>A canary a forgalom 10%-át kapja, így a user-facing SLI romlik: a 5xx
+arány 0,1%-ról 3%-ra nő, a burn rate az SLO szerint 58-szoros
+(hipotetikus, lab fixtureből számított érték). A d255-ben tanultak
+szerint ez egyértelmű rollback trigger. A recovery nem a registry image
+létrehozása, hanem a canary visszaállítása a stabil revisionre. Emellett
+a Secret rotációt a GitOps repo-ban javítani kell, hogy a jövőbeli
+promotion ne ütközzön ugyanebbe.</p>
+<p>A változtatás a GitOps repository <code>lab-platform-gitops</code>
+<code>apps/lab-cpp-service/canary.yaml</code> fájljában:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> apps/v1</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Deployment</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-service-canary</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">replicas</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">template</span><span class="kw">:</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">imagePullSecrets</span><span class="kw">:</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-registry-cred</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">containers</span><span class="kw">:</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> cpp-service</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="fu">image</span><span class="kw">:</span><span class="at"> registry.lab.example/lab-cpp-service:v2.1.0-rc.1</span></span></code></pre></div>
+<p>A Secret javítása a <code>secrets/lab-registry-cred.yaml</code>
+fájlban a friss tokennel (dummy érték):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> Secret</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-registry-cred</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="fu">type</span><span class="kw">:</span><span class="at"> kubernetes.io/dockerconfigjson</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="fu">data</span><span class="kw">:</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">.dockerconfigjson</span><span class="kw">:</span><span class="at"> eyJhdXRocyI6eyJyZWdpc3RyeS5sYWIuZXhhbXBsZSI6eyJ1c2VybmFtZSI6ImxhYi1kZXBsb3kiLCJwYXNzd29yZCI6ImxhYi1kdW1teS10b2tlbiIsImVtYWlsIjoiZGVwbG95QGxhYi5leGFtcGxlIiwiYXV0aCI6ImJHbGlMV1JsY0d4dmVTMTBiMjFsIn19fQ==</span></span></code></pre></div>
+<p>A commit után az Argo CD szinkronizál:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">argocd</span> app sync lab-cpp-service <span class="at">--context</span> lab-platform <span class="at">--force</span></span></code></pre></div>
+<p>A verification:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app rollout status deployment/lab-cpp-service-canary</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app get pods <span class="at">-n</span> lab-app</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app get httproute lab-cpp-service-route <span class="at">-o</span> yaml</span></code></pre></div>
+<p>A rollout sikeres, a canary pod <code>Running</code>, a Gateway újra
+csak a stabil backendre irányít. A Secret rotáció utáni image pull
+teszt:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app create job lab-pull-test <span class="at">--image</span><span class="op">=</span>registry.lab.example/lab-cpp-service:v2.1.0-rc.1 <span class="at">--dry-run</span><span class="op">=</span>client <span class="at">-o</span> yaml <span class="kw">|</span> <span class="ex">kubectl</span> apply <span class="at">-f</span> <span class="at">-</span></span></code></pre></div>
+<p>A postcondition: a canary Deployment a stabil image taget használja,
+a Secret érvényes, az SLI visszaáll a baseline-ra. A timeline rögzíti a
+tünet észlelésétől a rollout befejezéséig eltelt időt.</p>
+<h3 data-number="56.4.3" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">56.4.3</span> Tipikus hibák és
+ellenpróbák</h3>
+<ol type="1">
+<li><p><strong>Réteg-attribúció nélküli “mindent megpróbálok”</strong> –
+A CrashLoopBackOff esetén a csapat először skáláz, töröl podot,
+újraindít node-ot, de a root cause egy admission vagy secret hiba. Az
+ellenpróba: minden beavatkozás előtt explicit hipotézis és az ahhoz
+tartozó, egyetlen megfigyelhető adat.</p></li>
+<li><p><strong>A GitOps desired state figyelmen kívül hagyása</strong> –
+A canary manifest kézzel <code>kubectl edit</code>-tel javítva drifthez
+vezet. Az Argo CD a következő sync során felülírja a javítást, mert a
+Git repository a source of truth. A d241 szerint a GitOps reconciliation
+a desired state-ből indul. Az ellenpróba: a változtatást csak a Git
+repository-ban, commit + sync formában hajtjuk végre.</p></li>
+<li><p><strong>Az etcd restore túlzott alkalmazása</strong> – Amikor
+egyetlen deployment hibás, az etcd restore az összes névtér állapotát
+visszaállítja, és az utána keletkezett adatok elvesznek. Az adatállapot
+döntésnél a blast radius a döntő. Az ellenpróba: először a hiba
+hatókörét mérjük fel; az etcd restore csak a control plane korrupció
+vagy quorum loss esetén indokolt.</p></li>
+<li><p><strong>A volume integritás ellenőrzésének kihagyása</strong> – A
+restore után a pod fut, de az adat checksum hibás. A PVC restore akkor
+sikeres, ha az alkalmazás szintű integritásellenőrzés (pl.
+<code>sha256sum</code>, <code>pg_dumpall</code>) zöld. Az ellenpróba: a
+restore verification mindig tartalmaz alkalmazásbeli read és checksum
+műveletet.</p></li>
+<li><p><strong>Timeline nélküli game day</strong> – A gyakorlat során a
+csapat nem rögzíti az időpontokat, ezért a postmortem nem tudja
+megmondani, hogy az MTTR javult-e. Az ellenpróba: a game day script
+minden lépést <code>date -u +%FT%TZ</code>-vel pecsétel.</p></li>
+</ol>
+<h3 data-number="56.4.4" id="feladatok"><span
+class="header-section-number">56.4.4</span> Feladatok</h3>
+<h4 data-number="56.4.4.1"
+id="feladat-magyarázó-tünet-rétegbe-sorolása-és-döntési-sorrend"><span
+class="header-section-number">56.4.4.1</span> 1. feladat (magyarázó):
+Tünet rétegbe sorolása és döntési sorrend</h4>
+<p>Adottak az alábbi tünetek a <code>lab-platform</code> clusterben,
+<code>lab-app</code> namespace-ben. Rendelje minden tünetet a megfelelő
+réteghez, és indokolja, hogy az SLO és adatállapot alapján mi legyen az
+első döntés: rollback, restore vagy diagnosis first.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Megfigyelt állapot</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A <code>lab-db-0</code> StatefulSet pod
+<code>CrashLoopBackOff</code>, a log
+<code>corrupted block at pg_tblspc</code> üzenetet mutat</td>
+<td>A <code>lab-app-db</code> PVC létrejött, a pod nem tud
+csatlakozni</td>
+</tr>
+<tr class="even">
+<td>A <code>lab-cpp-service-canary</code> pod
+<code>ImagePullBackOff</code></td>
+<td>A Gateway 5xx-et ad a canary útvonalon</td>
+</tr>
+<tr class="odd">
+<td>Egy <code>kubectl get pods</code> API hívás 30 másodpercig
+timeoutol</td>
+<td>A <code>lab-platform</code> cluster control plane <code>etcd</code>
+quorum loss</td>
+</tr>
+<tr class="even">
+<td>A <code>lab-frontend</code> pod <code>Pending</code>, a describe
+<code>0/3 nodes are available: 3 Insufficient cpu</code></td>
+<td>A cluster 3 node-ja <code>Ready</code>, de a CPU request 500m, a
+limit 750m, a node kapacitás 2 vCPU</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="56.4.4.2"
+id="feladat-konfigurációs-node-failure-és-poddisruptionbudget-gyakorlat"><span
+class="header-section-number">56.4.4.2</span> 2. feladat
+(konfigurációs): Node failure és PodDisruptionBudget gyakorlat</h4>
+<p>A <code>lab-app</code> namespace-ben a <code>lab-cpp-service</code>
+Deployment 3 replikát futtat, és van egy
+<code>lab-cpp-service-pdb</code> PodDisruptionBudget
+<code>minAvailable: 2</code>. A gyakorlat célja, hogy a csapat a
+<code>lab-node-1</code> node-ot <code>kubectl cordon</code>-nal kivonja,
+majd <code>kubectl drain</code>-nel leürítse. A drain során a PDB miatt
+a drain blokkolhat, ha a replikák száma a megengedett minimum alá esne.
+A feladat: állítsa be a PDB-t úgy, hogy a drain sikeres legyen, miközben
+a szolgáltatás SLO-ja nem sérül. Használja a
+<code>kubectl --context lab-platform</code> parancsot. A megoldás után a
+node <code>SchedulingDisabled</code> állapotú, a podok
+<code>Running</code>-ok a másik két node-on.</p>
+<h4 data-number="56.4.4.3"
+id="feladat-diagnosztikairecovery-pvc-adatvesztés-és-restore-integritással"><span
+class="header-section-number">56.4.4.3</span> 3. feladat
+(diagnosztikai/recovery): PVC adatvesztés és restore integritással</h4>
+<p>A <code>lab-app</code> namespace-ben a <code>lab-data</code>
+StatefulSet egy 1 GiB-os PVC-t használ, a PVC a
+<code>lab-data-snapshot</code> VolumeSnapshotból állítható helyre. A
+feladat: szimuláljon adatvesztést a <code>lab-data-0</code> podban a
+<code>/data/important.txt</code> fájl törlésével. Ezután a
+VolumeSnapshotból hozzon létre egy új PVC-t
+<code>lab-data-restored</code> néven, csatolja egy ideiglenes podhoz,
+ellenőrizze a fájl checksumját, és ha sikeres, a StatefulSetet állítsa
+át a helyreállított PVC-re. A megoldás során ne törölje az eredeti PVC-t
+addig, amíg a restore integritásellenőrzése nem zöld. A parancsok
+<code>kubectl --context lab-platform --namespace lab-app</code>
+targettel fussanak.</p>
+<h3 data-number="56.4.5" id="megoldások"><span
+class="header-section-number">56.4.5</span> Megoldások</h3>
+<h4 data-number="56.4.5.1" id="feladat-megoldása"><span
+class="header-section-number">56.4.5.1</span> 1. feladat megoldása</h4>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Réteg</th>
+<th>Indoklás és döntés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>lab-db-0</code> CrashLoop, <code>corrupted block</code></td>
+<td>Storage + runtime</td>
+<td>Az adatállapot sérült; az SLO még lehet zöld, de a data integrity
+megsérült, ezért a restore előbbre való, mint a diagnosis first. A
+döntés: azonnali restore a VolumeSnapshotból, miközben a primary írás
+leáll.</td>
+</tr>
+<tr class="even">
+<td><code>lab-cpp-service-canary</code> ImagePull</td>
+<td>Runtime + policy (secret)</td>
+<td>A canary a forgalom 10%-át kapja, az SLI romlik, a burn rate gyorsan
+nő. A döntés: canary rollback a stabil revisionre, mert a promotion
+hibás.</td>
+</tr>
+<tr class="odd">
+<td>API hívás timeout</td>
+<td>Control plane</td>
+<td>A <code>kubectl get --raw=/readyz</code> mutatja az etcd quorum
+loss-t. A döntés: az etcd restore, mert a platform szintű hiba minden
+munkaterhelést érint.</td>
+</tr>
+<tr class="even">
+<td>Pod Pending, insufficient cpu</td>
+<td>Node/runtime</td>
+<td>A node-ok Ready-k, de a CPU request túl nagy. A döntés: diagnosis
+first, mert az SLI nem feltétlenül romlik; a HPA vagy a request
+csökkentése elég.</td>
+</tr>
+</tbody>
+</table>
+<p>A pontozás: minden sor helyes réteg +1, minden döntés indoklása
++1.</p>
+<h4 data-number="56.4.5.2" id="feladat-megoldása-1"><span
+class="header-section-number">56.4.5.2</span> 2. feladat megoldása</h4>
+<p>A PDB jelenleg:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> policy/v1</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> PodDisruptionBudget</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-service-pdb</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">minAvailable</span><span class="kw">:</span><span class="at"> </span><span class="dv">2</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-cpp-service</span></span></code></pre></div>
+<p>A drain futtatása:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform cordon lab-node-1</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform drain lab-node-1 <span class="at">--ignore-daemonsets</span> <span class="at">--delete-emptydir-data</span></span></code></pre></div>
+<p>A drain blokkol, mert a PDB szerint legalább 2 podnak futnia kell, de
+a node leürítésekor a 3 replikából 2 maradna, ami elfogadható, ha a PDB
+<code>minAvailable: 2</code>. A hiba gyakran abból adódik, hogy a PDB
+<code>maxUnavailable: 1</code>-re van állítva, ami a drain során a
+node-on lévő összes pod eltávolítását blokkolja. A megoldás a PDB
+módosítása <code>maxUnavailable: 1</code>-re, hogy egyszerre legfeljebb
+egy pod essen ki. A GitOps repo-ban a
+<code>apps/lab-cpp-service/pdb.yaml</code> frissül:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> policy/v1</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">kind</span><span class="kw">:</span><span class="at"> PodDisruptionBudget</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">metadata</span><span class="kw">:</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-service-pdb</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">namespace</span><span class="kw">:</span><span class="at"> lab-app</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="fu">spec</span><span class="kw">:</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">maxUnavailable</span><span class="kw">:</span><span class="at"> </span><span class="dv">1</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">selector</span><span class="kw">:</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">matchLabels</span><span class="kw">:</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">app</span><span class="kw">:</span><span class="at"> lab-cpp-service</span></span></code></pre></div>
+<p>A sync után a drain újra:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform drain lab-node-1 <span class="at">--ignore-daemonsets</span> <span class="at">--delete-emptydir-data</span> <span class="at">--force</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform get pods <span class="at">-n</span> lab-app <span class="at">-o</span> wide</span></code></pre></div>
+<p>Postcondition: a <code>lab-node-1</code>
+<code>SchedulingDisabled</code>, a podok a másik két node-on futnak, a
+<code>kubectl get pdb lab-cpp-service-pdb -n lab-app -o jsonpath='{.status.disruptionsAllowed}'</code>
+értéke 1 vagy több.</p>
+<h4 data-number="56.4.5.3" id="feladat-megoldása-2"><span
+class="header-section-number">56.4.5.3</span> 3. feladat megoldása</h4>
+<p>Adatvesztés szimulálása:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app exec lab-data-0 <span class="at">--</span> rm /data/important.txt</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Ellenőrzés</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app exec lab-data-0 <span class="at">--</span> ls <span class="at">-l</span> /data/important.txt</span></code></pre></div>
+<p>Várható: <code>No such file or directory</code>.</p>
+<p>Restore a VolumeSnapshotból:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app apply <span class="at">-f</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="st">apiVersion: v1</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="st">kind: PersistentVolumeClaim</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="st">metadata:</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="st">  name: lab-data-restored</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="st">  namespace: lab-app</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="st">spec:</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a><span class="st">  accessModes:</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a><span class="st">    - ReadWriteOnce</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a><span class="st">  resources:</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a><span class="st">    requests:</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a><span class="st">      storage: 1Gi</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="st">  dataSource:</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="st">    name: lab-data-snapshot</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a><span class="st">    kind: VolumeSnapshot</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a><span class="st">    apiGroup: snapshot.storage.k8s.io</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a><span class="st">  storageClassName: lab-csi</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span></code></pre></div>
+<p>Ideiglenes pod a restore ellenőrzéséhez:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app apply <span class="at">-f</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="st">apiVersion: v1</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="st">kind: Pod</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="st">metadata:</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="st">  name: lab-restore-check</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="st">  namespace: lab-app</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="st">spec:</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="st">  containers:</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="st">    - name: checker</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="st">      image: busybox:1.36</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="st">      command: [&quot;sh&quot;, &quot;-c&quot;, &quot;sha256sum /mnt/important.txt &amp;&amp; sleep 3600&quot;]</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="st">      volumeMounts:</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="st">        - name: restored</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a><span class="st">          mountPath: /mnt</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="st">  volumes:</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a><span class="st">    - name: restored</span></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a><span class="st">      persistentVolumeClaim:</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a><span class="st">        claimName: lab-data-restored</span></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a><span class="st">  restartPolicy: Never</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app logs lab-restore-check</span></code></pre></div>
+<p>A checksum egyezik a backupban rögzített
+<code>e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855</code>
+(üres fájl esetén) vagy a tényleges tartalommal. Ha a checksum zöld, a
+StatefulSet átállítása a <code>lab-data-restored</code> PVC-re a
+volumeClaimTemplates módosításával a GitOps repo-ban. A döntés előtt az
+eredeti PVC megőrzése: a StatefulSet törlése után a régi PVC-t
+átnevezzük <code>lab-data-old</code>-ra, majd az új PVC-t
+hozzákapcsoljuk. A GitOps sync után:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app rollout status statefulset/lab-data</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-platform <span class="at">--namespace</span> lab-app exec lab-data-0 <span class="at">--</span> ls <span class="at">-l</span> /data/important.txt</span></code></pre></div>
+<p>Postcondition: a <code>lab-data</code> StatefulSet pod
+<code>Running</code>, a <code>lab-data-restored</code> PVC
+<code>Bound</code>, az <code>important.txt</code> létezik és checksum
+egyezik, a <code>lab-data-old</code> PVC megmarad a manuális
+cleanupig.</p>
+<h3 data-number="56.4.6" id="timeline-runbook-és-postmortem"><span
+class="header-section-number">56.4.6</span> Timeline, runbook és
+postmortem</h3>
+<p>A game day során a csapat egy közös timeline dokumentumot vezet,
+amely minden beavatkozást időbélyeggel rögzít. A timeline minimális
+mezői: <code>time_utc</code>, <code>actor</code>, <code>target</code>,
+<code>command</code>, <code>observed_state</code>,
+<code>hypothesis</code>, <code>decision</code>. A d005 runbook
+konvenciói szerint a timeline a postmortem elsődleges inputja. A game
+day után a postmortem a d255-ben tanult template-et követi: rövid
+összefoglaló, timeline, root cause, hatás, recovery, megelőzés. A
+cleanup a lab erőforrásokra terjed ki: a <code>lab-app</code> namespace
+minden fixture erőforrása, a <code>lab-registry-cred</code> Secret dummy
+verziója, az ideiglenes pod és PVC, a cordonozott node visszavonása (ha
+szükséges). A
+<code>kubectl --context lab-platform delete namespace lab-app --wait</code>
+csak akkor futtatható, ha a namespace lab által létrehozott, és a
+backup/restore demonstration sikeres volt.</p>
+<h3 data-number="56.4.7" id="rövid-összefoglaló"><span
+class="header-section-number">56.4.7</span> Rövid összefoglaló</h3>
+<p>A d279 game day a platform operation csúcspontja: a tüneteket
+node/runtime/network/storage/policy rétegekhez rendeli, majd az SLO burn
+rate és az adatállapot alapján dönt a controlled recoveryről. A
+gyakorlat során a canary rollback, a node drain, a PVC restore és az
+etcd quorum loss mind ugyanazt a folyamatot követi: tünet, hipotézis,
+adatgyűjtés, egy változtatás, verification, postcondition. A GitOps
+desired state és a timeline a runbook gerince; a cleanup csak sikeres
+restore után hajtható végre. A game day sikere az, ha a csapat nem
+improvizál, hanem a működtetési szerződést bizonyítja.</p>
+<p><strong>Továbbhasznált definíciók:</strong></p>
+<ul>
+<li><strong>Controlled recovery:</strong> döntési pontokkal tagolt
+helyreállítás, amely az SLO-t és az adatállapotot együttesen veszi
+figyelembe.</li>
+<li><strong>Fixture:</strong> előre elkészített, izolált hibás állapot a
+game day gyakorlathoz.</li>
+<li><strong>Timeline:</strong> időbélyegzett beavatkozáslista, amely a
+postmortem és az MTTR mérés alapja.</li>
+</ul>
+<h3 data-number="56.4.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">56.4.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Forráskiindulópontok (nem olvasott, nem ellenőrzött bizonyítékok
+ebben a kérésben):</p>
+<ul>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+Documentation</a></li>
+<li><a href="https://opengitops.dev/">OpenGitOps</a></li>
+<li><a href="https://argo-cd.readthedocs.io/en/stable/">Argo CD
+Documentation</a></li>
+<li><a href="https://opentelemetry.io/docs/">OpenTelemetry
+Documentation</a></li>
+<li><a href="https://sre.google/books/">Google SRE Books</a></li>
+</ul>
+<p>Ellenőrzési hiányok: a <code>kubectl</code> pontos kimeneti formátuma
+a cluster verziójától függ; az <code>argocd app sync --force</code>
+viselkedése az Argo CD verziójától függ; a VolumeSnapshot restore
+elérhetősége a CSI driver és a snapshot controller verziójától függ; az
+etcd restore pontos lépései a cluster telepítési módjától (kubeadm,
+managed) függenek; a lab registry credential base64 értéke dummy, nem
+production token. A fenti példák várt kimenetei illusztratívak, a
+tényleges futtatás előtt a lab verzióprofiljában rögzíteni kell a pontos
+outputokat.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d278.html">← 56.3 Network, volume, observability és platform rutin</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d280.html">56.5 VM és Kubernetes operation összehasonlítás →</a></div>
+</nav>
+</body>
+</html>

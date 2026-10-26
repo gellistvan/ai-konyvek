@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>43.5 Cluster restore és nodefailure labor – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch43">43 Kubernetes telepítés, upgrade és cluster üzemeltetés</a></p>
+<div class="links"><a class="prev" rel="prev" href="d214.html">← 43.4 Node/control-plane health és cluster incident</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d216.html">44.1 Region, zone, account és shared responsibility →</a></div>
+</nav>
+<h2 data-number="43.5" id="d215"><span
+class="header-section-number">43.5</span> Cluster restore és nodefailure
+labor</h2>
+<h3 data-number="43.5.1" id="motiváció"><span
+class="header-section-number">43.5.1</span> Motiváció</h3>
+<p>Egy Kubernetes cluster üzemeltetésében a node-ok kiesése és az etcd
+adatbázis sérülése eltérő helyreállítási utat igényel. Ha összekeverjük
+a control plane állapot (cluster objektumok, Deployment, Service, RBAC)
+és az alkalmazásadatok (PVC, PV, külső adatbázis) recovery-jét, akkor
+inkonzisztens állapotot hozunk létre, vagy adatvesztést okozunk. A labor
+célja, hogy egy eldobható clusterben gyakoroljuk a nodekiesés és az etcd
+snapshot restore következményeinek ellenőrzését, valamint a restaurálás
+utáni smoke tesztek futtatását.</p>
+<p>A gyakorlat során külön igazoljuk a cluster és az alkalmazásadat
+helyreállítását: az etcd snapshot a Kubernetes API objektumok állapotát
+rögzíti, de a PersistentVolume-okban tárolt felhasználói adatokat nem
+tartalmazza. Ezért a restore előtt inventory-t készítünk, és a restore
+után külön ellenőrizzük a workload, a DNS, a volume és a hozzáférési
+rétegeket.</p>
+<h3 data-number="43.5.2" id="definíció-és-működés"><span
+class="header-section-number">43.5.2</span> Definíció és működés</h3>
+<p>A laborban három réteget különböztetünk meg:</p>
+<ul>
+<li><strong>Control plane inventory:</strong> etcd memberek, API server,
+scheduler, controller manager, certificate és kubeconfig állapot.</li>
+<li><strong>Workload inventory:</strong> Deployment, StatefulSet,
+PodDisruptionBudget (PDB), Service és EndpointSlice objektumok.</li>
+<li><strong>Data inventory:</strong> PersistentVolumeClaim (PVC),
+PersistentVolume (PV), StorageClass és a ténylegesen csatolt
+volume.</li>
+</ul>
+<p>Az <strong>etcd snapshot restore</strong> a Kubernetes dokumentáció
+által támogatott út a control plane állapot visszaállítására. A restore
+során az etcd adatbázist egy korábbi konzisztens állapotba állítjuk
+vissza. Ez nem érinti a node-okon futó kubelet állapotát és a volume-ok
+tartalmát, ezért a restore után újra kell egyeztetni a kubelet és az API
+server állapotát. A restore nem helyettesíti az alkalmazásadatok
+biztonsági mentését; ahhoz VolumeSnapshot vagy storage-szintű backup
+szükséges.</p>
+<p>A <strong>Node NotReady</strong> állapot azt jelzi, hogy a kubelet
+nem tudja jelenteni a node állapotát az API servernek. Ennek oka lehet a
+node leállítása, hálózati szakadás vagy a kubelet processz összeomlása.
+A <strong>DiskPressure</strong> condition akkor jelenik meg, ha a
+kubelet által figyelt fájlrendszer (nodefs vagy imagefs) kihasználtsága
+meghaladja a küszöbértéket. Ekkor a kubelet pod-evictiont hajthat végre,
+hogy felszabadítson helyet.</p>
+<p>A <strong>PodDisruptionBudget (PDB)</strong> korlátozza, hogy egy
+önkéntes drain során hány replikát lehet egyidejűleg elérhetetlenné
+tenni. Ha a PDB túl szigorú, a <code>kubectl drain</code> blokkolódik,
+és ezt fel kell oldani a karbantartási ablakban.</p>
+<p>A <strong>certificate/access recovery</strong> akkor válik
+szükségessé, ha az etcd restore után a tanúsítványok lejártak vagy a CA
+nem egyezik. Ilyenkor a kubeadm alapú clusterben a
+<code>kubeadm certs renew</code> paranccsal újítjuk meg a komponensek
+tanúsítványait, majd újraindítjuk a static podokat.</p>
+<h3 data-number="43.5.3" id="kidolgozott-példa"><span
+class="header-section-number">43.5.3</span> Kidolgozott példa</h3>
+<p>A példa egy három node-os eldobható labclustert feltételez:
+<code>lab-cp</code> (control plane), <code>lab-w1</code> és
+<code>lab-w2</code> (workerek). A cluster verziója a lab support matrix
+szerint ellenőrizendő; a példa Kubernetes 1.29.x-et feltételez. A
+parancsokban a <code>lab-admin@lab-cluster</code> context és a
+<code>lab-ns</code> namespace szerepel. A műveletekhez <code>sudo</code>
+jogosultság szükséges a control plane node-on.</p>
+<h4 data-number="43.5.3.1" id="inventory-készítése"><span
+class="header-section-number">43.5.3.1</span> Inventory készítése</h4>
+<p>Első lépésként rögzítjük a kiindulási állapotot:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp (control plane), user: lab-admin, UID: 1000</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: kubectl hozzáférés a lab-admin kubeconfigjával</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster get nodes <span class="at">-o</span> wide</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get deploy,rs,pods,pdb,svc,endpointslices</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get pvc,pv,storageclass</span></code></pre></div>
+<p>Várható kimenet (illusztratív):</p>
+<pre class="text"><code>NAME      STATUS   ROLES           AGE   VERSION
+lab-cp    Ready    control-plane   2d    v1.29.x
+lab-w1    Ready    &lt;none&gt;          2d    v1.29.x
+lab-w2    Ready    &lt;none&gt;          2d    v1.29.x
+
+NAME                     READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/lab-app  3/3     3            3           1d
+
+NAME                                          STATUS   VOLUME   CAPACITY
+persistentvolumeclaim/lab-data                 Bound    pv-lab   1Gi</code></pre>
+<h4 data-number="43.5.3.2" id="etcd-snapshot-mentése"><span
+class="header-section-number">43.5.3.2</span> etcd snapshot mentése</h4>
+<p>A control plane node-on az etcdctl elérhető a kubeadm által
+telepített konténerből vagy a host parancssorból. A snapshot mentéséhez
+a következő parancsot használjuk:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp, user: root, UID: 0</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: /backup könyvtár létezik és írható</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ETCDCTL_API=3 etcdctl <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cacert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/ca.crt <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.crt <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.key <span class="dt">\</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  snapshot save /backup/etcd-snapshot-<span class="va">$(</span><span class="fu">date</span> +%Y%m%d<span class="va">)</span>.db</span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>Snapshot saved at /backup/etcd-snapshot-20250101.db</code></pre>
+<p>Ellenőrzés: a fájl mérete nagyobb, mint 0, és a
+<code>snapshot status</code> parancs megmutatja a konzisztenciát.</p>
+<h4 data-number="43.5.3.3" id="node-notready-fixture"><span
+class="header-section-number">43.5.3.3</span> Node NotReady fixture</h4>
+<p>A <code>lab-w1</code> node kiesését szimuláljuk egy drain és
+leállítás kombinációjával:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp, user: lab-admin, UID: 1000</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster cordon lab-w1</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: a lab-w1 node Ready, a PDB engedi a drain-t</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster drain lab-w1 <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--ignore-daemonsets</span> <span class="at">--delete-emptydir-data</span> <span class="at">--timeout</span><span class="op">=</span>120s</span></code></pre></div>
+<p>Várható kimenet:</p>
+<pre class="text"><code>node/lab-w1 cordoned
+node/lab-w1 drained</code></pre>
+<p>Ezután leállítjuk a node-ot (például SSH-n keresztül
+<code>sudo shutdown -h now</code>). Az API serverben a node állapota
+néhány tíz másodperc után <code>NotReady</code> lesz:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster get nodes</span></code></pre></div>
+<pre class="text"><code>NAME      STATUS     ROLES           AGE   VERSION
+lab-cp    Ready      control-plane   2d    v1.29.x
+lab-w1    NotReady   &lt;none&gt;          2d    v1.29.x
+lab-w2    Ready      &lt;none&gt;          2d    v1.29.x</code></pre>
+<h4 data-number="43.5.3.4" id="diskpressure-fixture"><span
+class="header-section-number">43.5.3.4</span> DiskPressure fixture</h4>
+<p>A <code>lab-w2</code> node-on a kubelet által figyelt nodefs
+kihasználtságát ideiglenesen megnöveljük egy nagy fájl létrehozásával.
+Ez a node filesystem szintjén történik, nem a Kubernetes volume-ban:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-w2, user: root, UID: 0</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: legalább 1 GiB szabad hely a nodefs-en</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/tmp/fill-disk bs=1M count=1024</span></code></pre></div>
+<p>A kubelet rövid időn belül frissíti a node conditiont:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster describe node lab-w2 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A5</span> Conditions</span></code></pre></div>
+<p>Várható kimenet (illusztratív):</p>
+<pre class="text"><code>Conditions:
+  Type             Status  LastHeartbeatTime                 LastTransitionTime                Reason                       Message
+  ----             ------  -----------------                 ------------------                ------                       -------
+  MemoryPressure   False   ...
+  DiskPressure     True    ...                               2025-01-01T10:00:00Z             KubeletHasDiskPressure       kubelet has disk pressure</code></pre>
+<p>A kubelet pod-evictiont hajthat végre, ha a disk pressure meghaladja
+a küszöböt. A teszt után a fájlt töröljük:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /tmp/fill-disk</span></code></pre></div>
+<h4 data-number="43.5.3.5" id="etcd-snapshot-restore"><span
+class="header-section-number">43.5.3.5</span> etcd snapshot restore</h4>
+<p>Feltételezzük, hogy a control plane etcd adatbázisa sérült, és a
+snapshotból állítjuk helyre. A restore előtt leállítjuk a kubeletet,
+hogy a static podok ne írjanak az etcd-be:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp, user: root, UID: 0</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop kubelet</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Az etcd adatkönyvtárat elmentjük biztonsági okból</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mv /var/lib/etcd /var/lib/etcd.bak</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Restore az adott snapshotból</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-snapshot-20250101.db <span class="dt">\</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-cp <span class="dt">\</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--data-dir</span><span class="op">=</span>/var/lib/etcd <span class="dt">\</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster</span> lab-cp=https://127.0.0.1:2380 <span class="dt">\</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-advertise-peer-urls</span> https://127.0.0.1:2380 <span class="dt">\</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--initial-cluster-token</span> lab-etcd-cluster</span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Jogosultság beállítása és indítás</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> chown <span class="at">-R</span> etcd:etcd /var/lib/etcd</span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start kubelet</span></code></pre></div>
+<p>Várható kimenet: a kubelet elindítja a static podokat, és az etcd
+csatlakozik. Ellenőrzés:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ETCDCTL_API=3 etcdctl <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="dt">\</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cacert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/ca.crt <span class="dt">\</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.crt <span class="dt">\</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.key endpoint health</span></code></pre></div>
+<h4 data-number="43.5.3.6" id="deploymentpdbdnsvolume-smoke-tests"><span
+class="header-section-number">43.5.3.6</span> Deployment/PDB/DNS/volume
+smoke tests</h4>
+<p>A restore után ellenőrizzük a workload és az adat réteget:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp, user: lab-admin, UID: 1000</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get deploy lab-app</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get pdb lab-app-pdb</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get svc lab-app-svc</span></code></pre></div>
+<p>DNS teszt egy ideiglenes pod segítségével:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns run dns-test <span class="at">--image</span><span class="op">=</span>busybox:1.36 <span class="at">--rm</span> <span class="at">-it</span> <span class="at">--</span> nslookup lab-app-svc</span></code></pre></div>
+<p>A volume adat integritását egy egyszerű írás/olvasás ciklussal
+ellenőrizzük:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns exec deploy/lab-app <span class="at">--</span> sh <span class="at">-c</span> <span class="st">&#39;echo test &gt; /data/test.txt &amp;&amp; cat /data/test.txt&#39;</span></span></code></pre></div>
+<h4 data-number="43.5.3.7" id="certificate-és-access-recovery"><span
+class="header-section-number">43.5.3.7</span> Certificate és access
+recovery</h4>
+<p>Ha a restore után a tanúsítványok lejártak vagy a kubeconfig nem
+érvényes, a kubeadm parancsokat használjuk:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Target: lab-cp, user: root, UID: 0</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> kubeadm certs renew all</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart kubelet</span></code></pre></div>
+<p>A kubeconfig frissítése a <code>kubeadm init</code> által létrehozott
+admin.conf alapján történik, ha szükséges. A hozzáférés ellenőrzése:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster auth can-i get nodes</span></code></pre></div>
+<h3 data-number="43.5.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">43.5.4</span> Hibák és ellenpróbák</h3>
+<ul>
+<li><strong>Az etcd snapshot nem tartalmazza a felhasználói
+adatokat.</strong> Ha valaki a volume-ok tartalmát az etcd restore-tól
+várja, adatvesztés következik be. A production adatokhoz VolumeSnapshot
+vagy storage-szintű backup szükséges, és az alkalmazásadat restore-t
+külön kell igazolni.</li>
+<li><strong>A restore után a node-ok és pod-ok állapota nem
+automatikusan konvergens.</strong> A node-ok a kubelet újraindulásakor
+újra regisztrálódnak, de ha a snapshot a node törlése előtt készült, a
+törölt node objektum visszaállhat, és a rajta lévő podok
+<code>Terminating</code> vagy <code>Unknown</code> állapotban
+ragadhatnak. Ilyenkor a node-ot újra kell törölni és a podokat
+újraütemezni.</li>
+<li><strong>A PDB blokkolhatja a drain-t.</strong> Ha a PDB
+<code>maxUnavailable</code> értéke túl alacsony, a
+<code>kubectl drain</code> timeoutot kap. A megoldás a PDB átmeneti
+módosítása vagy a karbantartási ablakban a replikák számának növelése,
+de ezt a change jegyzőkönyvben rögzíteni kell.</li>
+<li><strong>A DiskPressure eviction nem érinti a
+PersistentVolume-t.</strong> A kubelet csak az ephemeral tárolót
+(emptyDir, log) takarítja, a PVC-k tartalmát nem törli. Ha a volume-on
+lévő adat sérült, az más root cause, például a CSI driver hibája.</li>
+<li><strong>A tanúsítványok lejárata a restore után is
+fennállhat.</strong> Az etcd snapshot visszaállít egy régi állapotot, de
+ha a tanúsítványok a snapshot készítésekor már közel jártak a
+lejárathoz, a restore után azonnal lejárhatnak. Ilyenkor a
+<code>kubeadm certs renew</code> és a static podok újraindítása
+szükséges.</li>
+</ul>
+<h3 data-number="43.5.5" id="feladatok"><span
+class="header-section-number">43.5.5</span> Feladatok</h3>
+<h4 data-number="43.5.5.1"
+id="f1-inventory-és-recovery-modell-magyarázata"><span
+class="header-section-number">43.5.5.1</span> F1 – Inventory és recovery
+modell magyarázata</h4>
+<p>Készítsen inventory-t az adott labclusterben: sorolja fel a control
+plane etcd membereket, a workload Deployment/PDB/Service objektumokat és
+a data PVC/PV/StorageClass elemeket. Magyarázza el, miért nem elegendő
+az etcd snapshot a felhasználói adatok helyreállításához, és milyen
+kiegészítő mentés szükséges.</p>
+<h4 data-number="43.5.5.2"
+id="f2-node-notready-és-drain-adminisztráció"><span
+class="header-section-number">43.5.5.2</span> F2 – Node NotReady és
+drain adminisztráció</h4>
+<p>Egy worker node-on hajtson végre cordon és drain műveletet, majd
+állítsa le a node-ot. Ellenőrizze, hogy a node <code>NotReady</code>
+állapotba kerül, és a rajta lévő podok a PDB szabályai szerint
+újraütemeződnek. A drain során tapasztalt esetleges PDB blokkolást oldja
+fel indoklással. A végén törölje a node-ot a clusterből, és ellenőrizze
+a deployment replikák számát.</p>
+<h4 data-number="43.5.5.3"
+id="f3-diskpressure-és-etcd-restore-diagnosztika"><span
+class="header-section-number">43.5.5.3</span> F3 – DiskPressure és etcd
+restore diagnosztika</h4>
+<p>A másik worker node-on idézzen elő <code>DiskPressure</code>
+állapotot a nodefs feltöltésével. Figyelje meg a kubelet eviction
+viselkedését, majd szüntesse meg a nyomást. Ezután a control plane
+node-on készítsen etcd snapshotot, szimuláljon etcd adatbázis sérülést
+(például a <code>/var/lib/etcd</code> tartalmának áthelyezése), és
+hajtsa végre a snapshot restore-t. Futtassa a Deployment/PDB/DNS/volume
+smoke teszteket, és készítsen rövid post-incident review-t a lépésekről
+és a helyreállítási időkről.</p>
+<h3 data-number="43.5.6" id="megoldások"><span
+class="header-section-number">43.5.6</span> Megoldások</h3>
+<h4 data-number="43.5.6.1" id="f1-megoldás"><span
+class="header-section-number">43.5.6.1</span> F1 megoldás</h4>
+<p>Az inventory parancsok:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster get nodes <span class="at">-o</span> wide</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ETCDCTL_API=3 etcdctl <span class="at">--endpoints</span><span class="op">=</span>https://127.0.0.1:2379 <span class="dt">\</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cacert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/ca.crt <span class="dt">\</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--cert</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.crt <span class="dt">\</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--key</span><span class="op">=</span>/etc/kubernetes/pki/etcd/server.key member list</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get deploy,pdb,svc,pvc,pv</span></code></pre></div>
+<p><strong>Indoklás:</strong> Az etcd snapshot a Kubernetes API
+objektumait (Deployment, Service, PVC, RBAC) tartalmazza, de a
+PersistentVolume-okban lévő adatokat nem. A PVC/PV csak hivatkozás a
+storage backendre; a tényleges adat a storage rendszerben van. Ezért
+szükséges a VolumeSnapshot vagy a storage-szintű replikáció/backup, és
+ezek restore-ja külön igazolandó.</p>
+<p><strong>Postcondition:</strong> Az inventory dokumentált, és a
+recovery modellben a control plane és adat réteg elkülönítve
+szerepel.</p>
+<h4 data-number="43.5.6.2" id="f2-megoldás"><span
+class="header-section-number">43.5.6.2</span> F2 megoldás</h4>
+<p>A parancsok:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster cordon lab-w1</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster drain lab-w1 <span class="at">--ignore-daemonsets</span> <span class="at">--delete-emptydir-data</span> <span class="at">--timeout</span><span class="op">=</span>120s</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="fu">ssh</span> lab-w1 <span class="st">&#39;sudo shutdown -h now&#39;</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster get nodes</span></code></pre></div>
+<p>Ha a drain blokkolódik a PDB miatt, ellenőrizzük a PDB
+<code>maxUnavailable</code> értékét, és indokolt esetben a replikák
+számát ideiglenesen növeljük, vagy a PDB-t módosítjuk. A drain után a
+node leáll, és a kubelet nem jelent állapotot, így a node
+<code>NotReady</code> lesz. A podok a PDB által engedett mértékben
+átütemeződnek a maradék node-ra. A node törlése:</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster delete node lab-w1</span></code></pre></div>
+<p><strong>Postcondition:</strong> A <code>lab-w1</code> node törölve, a
+deployment replikái mind <code>Ready</code> állapotúak a megmaradt
+node-okon, a PDB továbbra is érvényes.</p>
+<h4 data-number="43.5.6.3" id="f3-megoldás"><span
+class="header-section-number">43.5.6.3</span> F3 megoldás</h4>
+<p>DiskPressure előidézése:</p>
+<div class="sourceCode" id="cb23"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> dd if=/dev/zero of=/tmp/fill-disk bs=1M count=1024</span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster describe node lab-w2 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-A5</span> Conditions</span></code></pre></div>
+<p>A kubelet <code>DiskPressure=True</code> conditiont állít, és
+pod-evictiont hajthat végre. Ezután:</p>
+<div class="sourceCode" id="cb24"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /tmp/fill-disk</span></code></pre></div>
+<p>Az etcd restore lépései a fenti kidolgozott példában szerepelnek. A
+smoke tesztek:</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns get deploy lab-app</span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns run dns-test <span class="at">--image</span><span class="op">=</span>busybox:1.36 <span class="at">--rm</span> <span class="at">-it</span> <span class="at">--</span> nslookup lab-app-svc</span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-admin@lab-cluster <span class="at">-n</span> lab-ns exec deploy/lab-app <span class="at">--</span> sh <span class="at">-c</span> <span class="st">&#39;echo test &gt; /data/test.txt &amp;&amp; cat /data/test.txt&#39;</span></span></code></pre></div>
+<p><strong>Postcondition:</strong> A cluster API elérhető, a deployment
+telepítve, a DNS feloldás működik, a volume írható/olvasható. A
+post-incident review dokumentálja a restore időt, a snapshot korát és az
+adatvesztés mértékét.</p>
+<h3 data-number="43.5.7" id="rövid-összefoglaló"><span
+class="header-section-number">43.5.7</span> Rövid összefoglaló</h3>
+<p>Az etcd snapshot restore a cluster control plane állapotát állítja
+vissza, de nem helyettesíti az alkalmazásadatok mentését. A nodekiesés
+és a disk pressure különböző tüneteket okoz: a NotReady a kubelet
+kapcsolat megszakadását, a DiskPressure a nodefs telítettségét jelzi. A
+restore után a workload, DNS és volume smoke tesztekkel igazoljuk a
+rétegek működését. A PDB korlátozza a drain során elérhetetlenné váló
+replikákat, a tanúsítványok lejárata pedig a
+<code>kubeadm certs renew</code> paranccsal kezelhető. A post-incident
+review a root cause-t és a helyreállítási időt dokumentálja.</p>
+<ul>
+<li><strong>etcd snapshot:</strong> a Kubernetes API objektumok egy
+időpontra vonatkozó konzisztens mentése.</li>
+<li><strong>DiskPressure:</strong> node condition, amely a nodefs túl
+magas kihasználtságát jelzi, és evictiont válthat ki.</li>
+<li><strong>Smoke test:</strong> gyors, alapvető ellenőrzés a rendszer
+fő útvonalainak működésére.</li>
+</ul>
+<h3 data-number="43.5.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">43.5.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>A forráskiindulópontok nem ellenőrzött dokumentációk; a konkrét
+lépések a labkörnyezet verziójától függenek.</p>
+<ul>
+<li><a href="https://kubernetes.io/docs/">Kubernetes
+dokumentáció</a></li>
+<li><a href="https://etcd.io/docs/">etcd dokumentáció</a></li>
+<li><a href="https://libvirt.org/docs.html">libvirt
+dokumentáció</a></li>
+<li><a href="https://sre.google/books/">SRE könyvek</a></li>
+</ul>
+<p><strong>Ellenőrzési hiányok:</strong> a Kubernetes és etcd pontos
+verziója, a kubeadm restore lépéseinek hivatalos dokumentációja, a
+DiskPressure küszöbértékek alapértelmezett értékei, a kubelet eviction
+pontos viselkedése. A példában használt verziók és kimenetek
+hipotetikusak, a lab support matrixban ellenőrizendők.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d214.html">← 43.4 Node/control-plane health és cluster incident</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d216.html">44.1 Region, zone, account és shared responsibility →</a></div>
+</nav>
+</body>
+</html>

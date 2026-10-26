@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.2 A ts-gw szolgáltatás C++-ban: protokollfordítás MQTT-re –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Edge és gateway</a> › <a href="index.html#ich11">12 A gateway</a></p>
+<div class="links"><a class="prev" rel="prev" href="i035.html">← 12.1 A gateway szerepe: híd, puffer, biztonsági határ</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i037.html">12.3 Store-and-forward: offline működés és visszatöltés →</a></div>
+</nav>
+<h2 data-number="12.2" id="i036"><span
+class="header-section-number">12.2</span> A ts-gw szolgáltatás C++-ban:
+protokollfordítás MQTT-re</h2>
+<h3 data-number="12.2.1" id="motiváció"><span
+class="header-section-number">12.2.1</span> Motiváció</h3>
+<p>A <a href="i003.html">TerraSense architektúrájában</a> a
+<code>ts-node</code> szenzorcsomópont önmagában nem mindig képes
+közvetlenül MQTT-t küldeni a brokernek. Valós hardveren gyakran BLE
+GATT-értesítéssel adja át az adatot, a szimulációs laborokban pedig egy
+egyszerű UDP-datagrammal. A <code>ts-gw</code> az a Linux-gateway, amely
+ezt a heterogén eszközoldali forgalmat egységes MQTT-üzenetté alakítja a
+felhő felé. Ez a protokollfordítás nem csupán szintaktikai konverzió: a
+gateway normalizálja a mezőneveket, kiegészíti az időbélyeget és a
+<code>seq</code> sorszámot, elvégzi az alapvető
+duplikátum-/sorrendellenőrzést, majd a <a href="i028.html">i028-ban</a>
+már bevezetett
+<code>terrasense/&lt;site&gt;/&lt;node&gt;/telemetry</code> topicra
+publikál. Az alábbiakban egy adapter-alapú, RAII-t használó C++17
+gateway-vázat építünk fel, amelyet a későbbi alfejezetek a <a
+href="i037.html">store-and-forward</a>, az <a
+href="i038.html">üzemeltetés</a>, a <a href="i039.html">helyi
+feldolgozás</a>, a <a href="i057.html">biztonság</a> és a <a
+href="i066.html">záróprojekt</a> során bővítenek.</p>
+<h3 data-number="12.2.2" id="fogalmak-és-működés"><span
+class="header-section-number">12.2.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció (input adapter).</strong> Az input adapter a
+gateway bemeneti protokollját elszigetelő, lecserélhető
+programkomponens. Feladata, hogy egy adott forrásból (UDP, BLE GATT,
+soros port) nyers kereteket fogadjon, azokat előfeldolgozza, és az
+egységes belépési ponton adja át a gateway többi részének. A többi
+komponens csak az adapter által kikényszerített absztrakciót ismeri, így
+a protokollcsere nem érinti a normalizálót vagy a MQTT-publikálót.</p>
+<p><strong>Definíció (normalizált telemetria-minta).</strong> A gateway
+belső eseménye egy olyan, a nyers protokolltól független adatstruktúra,
+amely már a TerraSense telemetria-sémát tükrözi: <code>node_id</code>,
+monoton <code>seq</code>, UTC eseményidő epoch ms-ban, valamint a mért
+értékek. A normalizált minta a belső eseménysoron keresztül éri el az
+MQTT-publikáló réteget.</p>
+<p><strong>Definíció (belső eseménysor).</strong> A belső eseménysor egy
+szálbiztos FIFO sor, amely az egyik szálon érkező normalizált mintákat
+pufferként átadja egy másik szálnak. A gatewayben ez a sor választja
+szét a blokkoló hálózati fogadást a hálózati küldéstől, és lehetővé
+teszi a feldolgozás ideiglenes túlterhelésének korlátozott
+kezelését.</p>
+<p>A <code>ts-gw</code> belső adatútja az alábbi lépésekből áll:</p>
+<figure>
+<img src="assets/i036-diagram-1.png"
+alt="A ts-gw belső adatútja - Az UDP-adaptertől az MQTT-publikálásig tartó lánc. Hiba esetén a minta elutasításra kerül, a kapcsolat újraépül." />
+<figcaption aria-hidden="true">A ts-gw belső adatútja - Az
+UDP-adaptertől az MQTT-publikálásig tartó lánc. Hiba esetén a minta
+elutasításra kerül, a kapcsolat újraépül.</figcaption>
+</figure>
+<p>A folyamatot a következő komponensek valósítják meg:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Komponens</th>
+<th>Felelősség</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>InputAdapter</code></td>
+<td>absztrakt bemeneti interfész</td>
+<td>a <code>UdpInputAdapter</code> ebből származik</td>
+</tr>
+<tr class="even">
+<td><code>Normalizer</code></td>
+<td>nyers szöveg → <code>TelemetrySample</code></td>
+<td>mezők szétválasztása, <code>seq</code> ellenőrzés</td>
+</tr>
+<tr class="odd">
+<td><code>EventQueue&lt;T&gt;</code></td>
+<td>szálbiztos sor</td>
+<td><code>std::mutex</code>, <code>std::condition_variable</code></td>
+</tr>
+<tr class="even">
+<td><code>MqttPublisher</code></td>
+<td>MQTT-kapcsolat és publikálás</td>
+<td>Paho MQTT C kliens, újracsatlakozás</td>
+</tr>
+<tr class="odd">
+<td><code>main</code></td>
+<td>életciklus, SIGINT-kezelés</td>
+<td>adapter indítása, fő eseményhurok</td>
+</tr>
+</tbody>
+</table>
+<p>A szálak és eseményhurok viszonya a következő. Az UDP-adapter saját
+<code>std::thread</code>-ben fut: blokkoló <code>recvfrom()</code>
+hívással várja a kereteket, majd normalizálás után a
+<code>std::function&lt;void(const TelemetrySample&amp;)&gt;</code>
+visszahívón keresztül a fő eseményhurok által figyelt sorba teszi a
+mintát. A fő szál <code>wait_pop_for()</code> hívással várakozik a
+sorra, és minden mintát azonnal publikál. Ez a szétválasztás azért
+hasznos, mert a hálózati küldés idejére az UDP-fogadó nem blokkolódik,
+illetve a későbbi store-and-forward bővítéskor a sor mögé tartós puffer
+is beiktatható. A megoldás szándékosan hasonlít a klasszikus
+producer–consumer mintára; a különbség az, hogy itt a fogyasztó oldal
+egy MQTT-kliens.</p>
+<p>A C++-os RAII itt nem szlogen, hanem a gateway-hibakezelés alapja. A
+socket lezárása a <code>UdpInputAdapter</code> destruktorában, a
+MQTT-kliens felszabadítása a <code>MqttPublisher</code> destruktorában,
+a szálak joinolása a <code>running_</code> atomi logikai változó és a
+<code>stop()</code> metódus együttes használatával biztosítja, hogy
+<code>SIGINT</code>-re a folyamat ne hagyjon hátra erőforrást. A
+<code>stop()</code> a socket lezárásával felébreszti a blokkoló
+<code>recvfrom()</code> hívást, így a munkaszál ki tud lépni.</p>
+<p>A laborban UDP-adaptert használunk, mert az <code>native_sim</code>
+ts-node szimulátorból a legegyszerűbben UDP-datagramot küldhetünk. Valós
+hardveren a <code>BleInputAdapter</code> ugyanezt az interfészt
+implementálhatja a BlueZ D-Bus API-jával: a GATT-értesítések adatait
+kell normalizált mintává alakítani. A D-Bus-kód bonyolultsága miatt itt
+csak a vázat és a döntési szempontot tárgyaljuk; a labor a szimulált
+UDP-adapterre épül.</p>
+<h3 data-number="12.2.3" id="döntési-szempontok"><span
+class="header-section-number">12.2.3</span> Döntési szempontok</h3>
+<p>Az alábbi táblázat a gateway implementációjának fő dilemmáit foglalja
+össze.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kérdés</th>
+<th>Választás a laborban</th>
+<th>Indoklás / alternatíva</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Szálak vagy async I/O</td>
+<td><code>std::thread</code> + blokkoló hívások</td>
+<td>egyszerű, átlátható; nagy forgalomnál Boost.Asio vagy
+<code>poll</code>/<code>epoll</code></td>
+</tr>
+<tr class="even">
+<td>Paho C vagy C++ kliens</td>
+<td>Paho C, <code>MQTTClient.h</code></td>
+<td>kevesebb függőség a laborban; a C++ wrapper később bevezethető</td>
+</tr>
+<tr class="odd">
+<td>JSON-előállítás</td>
+<td>kézi formázás, mert csak számokat írunk</td>
+<td>valós string mezőknél <code>nlohmann/json</code> vagy
+CBOR-kódoló</td>
+</tr>
+<tr class="even">
+<td>UDP vagy BLE</td>
+<td>UDP a laborban</td>
+<td>hardver nélkül BLE-t nem tudunk futtatni; az absztrakció lehetővé
+teszi a cserét</td>
+</tr>
+<tr class="odd">
+<td>Sor mérete</td>
+<td>korlátlan a vázban</td>
+<td>éles rendszerben felső korlát, elutasítás / lassítás, mert a memória
+nem végtelen</td>
+</tr>
+<tr class="even">
+<td>Újracsatlakozás</td>
+<td>exponenciális backoff 1–8 s</td>
+<td>a <code>ts-node</code>-hoz hasonló; a gateway hosszú életű, ezért
+kötelező</td>
+</tr>
+</tbody>
+</table>
+<p>A BLE-adapter esetén a legfontosabb döntés, hogy a GATT-értesítések
+érkezési sorrendje önmagában nem garantálja a <code>seq</code>
+monotonitását, ezért a normalizáló rétegnek a <code>seq</code>
+ellenőrzést akkor is el kell végeznie. Az UDP-adapteren ugyanez az
+ellenőrzés a szimulált csomagok hibás sorrendjét szűri ki.</p>
+<h3 data-number="12.2.4"
+id="kidolgozott-példa-a-ts-gw-udp-adapterrel"><span
+class="header-section-number">12.2.4</span> Kidolgozott példa: a ts-gw
+UDP-adapterrel</h3>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i036/src ~/iot-labor/i036/scripts</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i036</span></code></pre></div>
+<p>A labor előfeltétele, hogy a <a href="i028.html">MQTT a gyakorlatban:
+Zephyr-kliens és Mosquitto</a> alfejezetben bevezetett
+<code>lab-broker</code> Mosquitto fut a
+<code>~/iot-labor/stack/compose.yaml</code> alapján, és a 1883-as porton
+hallgat. A <code>ts-gw</code> a <code>paho-mqtt3c</code> könyvtárat
+használja; Ubuntu 24.04 alatt a pontos csomagnév ellenőrizendő (a
+példában <code>libpaho-mqtt-dev</code>-et feltételezünk).</p>
+<p>A belső adattípus a <code>TelemetrySample</code>:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/TelemetryTypes.h</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> TelemetrySample <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>string node_id<span class="op">{</span><span class="st">&quot;n001&quot;</span><span class="op">};</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">uint32_t</span> seq<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int64_t</span> ts_epoch_ms<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">double</span> temperature_c<span class="op">{</span><span class="bu">std::</span>nan<span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">)};</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>  <span class="dt">double</span> humidity_rh<span class="op">{</span><span class="bu">std::</span>nan<span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">)};</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>  <span class="dt">double</span> soil_moisture_pct<span class="op">{</span><span class="bu">std::</span>nan<span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">)};</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>Az input adapter absztrakciója:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/InputAdapter.h</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;TelemetryTypes.h&quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;functional&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> InputAdapter <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="kw">using</span> SampleHandler <span class="op">=</span> <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">(</span><span class="at">const</span> TelemetrySample<span class="op">&amp;)&gt;;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="kw">virtual</span> <span class="op">~</span>InputAdapter<span class="op">()</span> <span class="op">=</span> <span class="cf">default</span><span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="kw">virtual</span> <span class="dt">void</span> start<span class="op">(</span>SampleHandler handler<span class="op">)</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">virtual</span> <span class="dt">void</span> stop<span class="op">()</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>A <code>UdpInputAdapter</code> a konstruktorban nyitja a socketet, a
+destruktorában lezárja. A <code>run()</code> metódus a háttérszálban
+addig fut, amíg <code>running_</code> igaz. A <code>recvfrom()</code>
+blokkoló hívása a <code>stop()</code>-ban lezárt socketre 0 vagy hiba
+visszatéréssel ébred fel.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/UdpInputAdapter.h</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;InputAdapter.h&quot;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> UdpInputAdapter <span class="kw">final</span> <span class="op">:</span> <span class="kw">public</span> InputAdapter <span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  UdpInputAdapter<span class="op">(</span><span class="bu">std::</span>string bind_ip<span class="op">,</span> <span class="dt">uint16_t</span> port<span class="op">);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>UdpInputAdapter<span class="op">()</span> <span class="kw">override</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> start<span class="op">(</span>SampleHandler handler<span class="op">)</span> <span class="kw">override</span><span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> stop<span class="op">()</span> <span class="kw">override</span><span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> run<span class="op">();</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> <span class="va">fd_</span><span class="op">{-</span><span class="dv">1</span><span class="op">};</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>string <span class="va">bind_ip_</span><span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>  <span class="dt">uint16_t</span> <span class="va">port_</span><span class="op">;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>thread <span class="va">worker_</span><span class="op">;</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> <span class="va">running_</span><span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>  SampleHandler <span class="va">handler_</span><span class="op">;</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>A normalizáló a <code>T:23.4;RH:61.2;SM:34;seq:42</code> formátumú
+UDP-keretet alakítja <code>TelemetrySample</code>-lé. A
+<code>std::stod</code> hívás helyett olyan konverziót használunk, amely
+a tizedespontot várja, nem a locale tizedesvesszőt. A <code>seq</code>
+monotonitását a <code>Normalizer</code> tartja nyilván.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/Normalizer.h</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;TelemetryTypes.h&quot;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Normalizer <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="kw">explicit</span> Normalizer<span class="op">(</span><span class="bu">std::</span>string node_id<span class="op">)</span> <span class="op">:</span> <span class="va">node_id_</span><span class="op">(</span><span class="bu">std::</span>move<span class="op">(</span>node_id<span class="op">))</span> <span class="op">{}</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> parse<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> raw<span class="op">,</span> TelemetrySample<span class="op">&amp;</span> out<span class="op">,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>             <span class="bu">std::</span>string<span class="op">&amp;</span> err<span class="op">)</span> <span class="at">const</span><span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> check_seq<span class="op">(</span><span class="dt">uint32_t</span> seq<span class="op">,</span> <span class="bu">std::</span>string<span class="op">&amp;</span> err<span class="op">);</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>string <span class="va">node_id_</span><span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>  <span class="dt">uint32_t</span> <span class="va">last_seq_</span><span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> <span class="va">have_last_seq_</span><span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>A <code>MqttPublisher</code> a Paho C szinkron kliensét csomagolja
+be. A labor céljára elegendő a <code>MQTTClient_create</code>,
+<code>MQTTClient_connect</code>, <code>MQTTClient_publish</code>,
+<code>MQTTClient_disconnect</code>, <code>MQTTClient_destroy</code>
+hívássor. A <code>publish()</code> visszatérési értéke jelzi a
+<code>PUBACK</code> fogadását; a váz itt még nem kezeli az at-least-once
+kézbesítést tartós pufferrel, azt a <a
+href="i037.html">store-and-forward</a> alfejezet vezeti be.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/MqttPublisher.h</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;MQTTClient.h&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> MqttPublisher <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>  MqttPublisher<span class="op">(</span><span class="bu">std::</span>string broker_uri<span class="op">,</span> <span class="bu">std::</span>string client_id<span class="op">);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>  <span class="op">~</span>MqttPublisher<span class="op">();</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> <span class="fu">connect</span><span class="op">();</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> publish<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> topic<span class="op">,</span> <span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> payload<span class="op">,</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>               <span class="dt">int</span> qos <span class="op">=</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> is_connected<span class="op">()</span> <span class="at">const</span><span class="op">;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>  MQTTClient <span class="va">client_</span><span class="op">{</span><span class="kw">nullptr</span><span class="op">};</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>string <span class="va">broker_uri_</span><span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>string <span class="va">client_id_</span><span class="op">;</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> <span class="va">backoff_ms_</span><span class="op">{</span><span class="dv">1000</span><span class="op">};</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>A szálbiztos eseménysor:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/EventQueue.h</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#pragma once</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;condition_variable&gt;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;queue&gt;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> terrasense <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> EventQueue <span class="op">{</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">void</span> push<span class="op">(</span><span class="at">const</span> T<span class="op">&amp;</span> item<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">mutex_</span><span class="op">);</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>      <span class="va">queue_</span><span class="op">.</span>push<span class="op">(</span>item<span class="op">);</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="va">cv_</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>  <span class="dt">bool</span> wait_pop_for<span class="op">(</span>T<span class="op">&amp;</span> item<span class="op">,</span> <span class="bu">std::</span>chrono::milliseconds timeout<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>unique_lock<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">mutex_</span><span class="op">);</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span><span class="va">cv_</span><span class="op">.</span>wait_for<span class="op">(</span>lk<span class="op">,</span> timeout<span class="op">,</span> <span class="op">[</span><span class="kw">this</span><span class="op">]</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">!</span><span class="va">queue_</span><span class="op">.</span>empty<span class="op">();</span> <span class="op">}))</span> <span class="op">{</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>      <span class="cf">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    item <span class="op">=</span> <span class="va">queue_</span><span class="op">.</span>front<span class="op">();</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    <span class="va">queue_</span><span class="op">.</span>pop<span class="op">();</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>mutex <span class="va">mutex_</span><span class="op">;</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>condition_variable <span class="va">cv_</span><span class="op">;</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>queue<span class="op">&lt;</span>T<span class="op">&gt;</span> <span class="va">queue_</span><span class="op">;</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace terrasense</span></span></code></pre></div>
+<p>A <code>main()</code> összerakja a komponenseket, és a fő ciklusban
+publikál. A <code>seq</code> ellenőrzést a normalizáló végzi, de a
+gateway indulásakor az utolsó <code>seq</code> értéke nem ismert; a
+laborban elfogadjuk az első mintát.</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// src/main.cpp</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;EventQueue.h&quot;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;MqttPublisher.h&quot;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;Normalizer.h&quot;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;TelemetryTypes.h&quot;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;UdpInputAdapter.h&quot;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;csignal&gt;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> <span class="kw">namespace</span> terrasense<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> <span class="op">{</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> running<span class="op">{</span><span class="kw">true</span><span class="op">};</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> handle_sigint<span class="op">(</span><span class="dt">int</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>  running <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="co">// namespace</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span><span class="op">**</span> argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="bu">std::</span>string broker_uri <span class="op">=</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>      argc <span class="op">&gt;</span> <span class="dv">1</span> <span class="op">?</span> argv<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">:</span> <span class="st">&quot;tcp://localhost:1883&quot;</span><span class="op">;</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="bu">std::</span>string node_id <span class="op">=</span> argc <span class="op">&gt;</span> <span class="dv">2</span> <span class="op">?</span> argv<span class="op">[</span><span class="dv">2</span><span class="op">]</span> <span class="op">:</span> <span class="st">&quot;n001&quot;</span><span class="op">;</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="bu">std::</span>string bind_ip <span class="op">=</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>      argc <span class="op">&gt;</span> <span class="dv">3</span> <span class="op">?</span> argv<span class="op">[</span><span class="dv">3</span><span class="op">]</span> <span class="op">:</span> <span class="st">&quot;127.0.0.1&quot;</span><span class="op">;</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>  <span class="at">const</span> <span class="dt">uint16_t</span> udp_port <span class="op">=</span> argc <span class="op">&gt;</span> <span class="dv">4</span> <span class="op">?</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">uint16_t</span><span class="op">&gt;(</span><span class="bu">std::</span>stoi<span class="op">(</span>argv<span class="op">[</span><span class="dv">4</span><span class="op">]))</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>                                     <span class="op">:</span> <span class="dv">12345</span><span class="op">;</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>signal<span class="op">(</span>SIGINT<span class="op">,</span> handle_sigint<span class="op">);</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>signal<span class="op">(</span>SIGTERM<span class="op">,</span> handle_sigint<span class="op">);</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>  Normalizer normalizer<span class="op">(</span>node_id<span class="op">);</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>  EventQueue<span class="op">&lt;</span>TelemetrySample<span class="op">&gt;</span> queue<span class="op">;</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>  MqttPublisher publisher<span class="op">(</span>broker_uri<span class="op">,</span> <span class="st">&quot;ts-gw-&quot;</span> <span class="op">+</span> node_id<span class="op">);</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>  UdpInputAdapter udp<span class="op">(</span>bind_ip<span class="op">,</span> udp_port<span class="op">);</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>  <span class="cf">if</span> <span class="op">(!</span>publisher<span class="op">.</span><span class="fu">connect</span><span class="op">())</span> <span class="op">{</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;[ERROR] MQTT connection failed</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;[INFO] MQTT connected</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>  udp<span class="op">.</span>start<span class="op">([&amp;](</span><span class="at">const</span> TelemetrySample<span class="op">&amp;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    queue<span class="op">.</span>push<span class="op">(</span>s<span class="op">);</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>  <span class="op">});</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;[INFO] UDP adapter listening on &quot;</span> <span class="op">&lt;&lt;</span> bind_ip <span class="op">&lt;&lt;</span> <span class="st">&quot;:&quot;</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>            <span class="op">&lt;&lt;</span> udp_port <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>  <span class="cf">while</span> <span class="op">(</span>running<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>    TelemetrySample sample<span class="op">;</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>queue<span class="op">.</span>wait_pop_for<span class="op">(</span>sample<span class="op">,</span> <span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">500</span><span class="op">)))</span> <span class="op">{</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>string err<span class="op">;</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(!</span>normalizer<span class="op">.</span>check_seq<span class="op">(</span>sample<span class="op">.</span>seq<span class="op">,</span> err<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;[WARN] dropped seq=&quot;</span> <span class="op">&lt;&lt;</span> sample<span class="op">.</span>seq <span class="op">&lt;&lt;</span> <span class="st">&quot;: &quot;</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>                  <span class="op">&lt;&lt;</span> err <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>        <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>string topic <span class="op">=</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;terrasense/gh1/&quot;</span> <span class="op">+</span> sample<span class="op">.</span>node_id <span class="op">+</span> <span class="st">&quot;/telemetry&quot;</span><span class="op">;</span></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>string payload <span class="op">=</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;{</span><span class="sc">\&quot;</span><span class="st">node_id</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">\&quot;</span><span class="st">&quot;</span> <span class="op">+</span> sample<span class="op">.</span>node_id <span class="op">+</span> <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">,&quot;</span></span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">seq</span><span class="sc">\&quot;</span><span class="st">:&quot;</span> <span class="op">+</span> <span class="bu">std::</span>to_string<span class="op">(</span>sample<span class="op">.</span>seq<span class="op">)</span> <span class="op">+</span> <span class="st">&quot;,&quot;</span></span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">ts</span><span class="sc">\&quot;</span><span class="st">:&quot;</span> <span class="op">+</span> <span class="bu">std::</span>to_string<span class="op">(</span>sample<span class="op">.</span>ts_epoch_ms<span class="op">)</span> <span class="op">+</span> <span class="st">&quot;,&quot;</span></span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">temperature_c</span><span class="sc">\&quot;</span><span class="st">:&quot;</span> <span class="op">+</span> <span class="bu">std::</span>to_string<span class="op">(</span>sample<span class="op">.</span>temperature_c<span class="op">)</span> <span class="op">+</span> <span class="st">&quot;,&quot;</span></span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">humidity_rh</span><span class="sc">\&quot;</span><span class="st">:&quot;</span> <span class="op">+</span> <span class="bu">std::</span>to_string<span class="op">(</span>sample<span class="op">.</span>humidity_rh<span class="op">)</span> <span class="op">+</span> <span class="st">&quot;,&quot;</span></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>          <span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">soil_moisture_pct</span><span class="sc">\&quot;</span><span class="st">:&quot;</span> <span class="op">+</span></span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a>          <span class="bu">std::</span>to_string<span class="op">(</span>sample<span class="op">.</span>soil_moisture_pct<span class="op">)</span> <span class="op">+</span> <span class="st">&quot;}&quot;</span><span class="op">;</span></span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a>      <span class="cf">if</span> <span class="op">(</span>publisher<span class="op">.</span>publish<span class="op">(</span>topic<span class="op">,</span> payload<span class="op">,</span> <span class="dv">1</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;[INFO] published &quot;</span> <span class="op">&lt;&lt;</span> topic <span class="op">&lt;&lt;</span> <span class="st">&quot; seq=&quot;</span></span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a>                  <span class="op">&lt;&lt;</span> sample<span class="op">.</span>seq <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-73"><a href="#cb8-73" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;[WARN] publish failed, will retry later</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-74"><a href="#cb8-74" aria-hidden="true" tabindex="-1"></a>      <span class="op">}</span></span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>publisher<span class="op">.</span>is_connected<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a>      <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;[WARN] MQTT disconnected, reconnecting...</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a>      publisher<span class="op">.</span><span class="fu">connect</span><span class="op">();</span></span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-80"><a href="#cb8-80" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-81"><a href="#cb8-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-82"><a href="#cb8-82" aria-hidden="true" tabindex="-1"></a>  udp<span class="op">.</span>stop<span class="op">();</span></span>
+<span id="cb8-83"><a href="#cb8-83" aria-hidden="true" tabindex="-1"></a>  <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;[INFO] gateway stopped</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-84"><a href="#cb8-84" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-85"><a href="#cb8-85" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A CMake fájl:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># CMakeLists.txt</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">cmake_minimum_required</span>(<span class="ot">VERSION</span> <span class="dt">3.20</span>)</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="kw">project</span>(ts-gw <span class="ot">CXX</span>)</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">set</span>(<span class="dv">CMAKE_CXX_STANDARD</span> 17)</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="kw">set</span>(<span class="dv">CMAKE_CXX_STANDARD_REQUIRED</span> <span class="ot">ON</span>)</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="kw">find_path</span>(PAHO_MQTT_C_INCLUDE_DIR MQTTClient.h <span class="ot">REQUIRED</span>)</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="kw">find_library</span>(PAHO_MQTT_C_LIBRARY paho-mqtt3c <span class="ot">REQUIRED</span>)</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="kw">add_executable</span>(<span class="bn">ts-gw</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  src/main.cpp</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  src/UdpInputAdapter.cpp</span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>  src/Normalizer.cpp</span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>  src/MqttPublisher.cpp)</span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a><span class="kw">target_include_directories</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span> <span class="dv">${PAHO_MQTT_C_INCLUDE_DIR}</span>)</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a><span class="kw">target_link_libraries</span>(<span class="bn">ts-gw</span> <span class="ot">PRIVATE</span> <span class="dv">${PAHO_MQTT_C_LIBRARY}</span> pthread)</span></code></pre></div>
+<p>A labor kipróbálásához egy egyszerű UDP-küldő szkriptet
+használunk:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># scripts/send_udp.py</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> socket</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>host <span class="op">=</span> <span class="st">&quot;127.0.0.1&quot;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>port <span class="op">=</span> <span class="dv">12345</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>msg <span class="op">=</span> sys.argv[<span class="dv">1</span>] <span class="cf">if</span> <span class="bu">len</span>(sys.argv) <span class="op">&gt;</span> <span class="dv">1</span> <span class="cf">else</span> <span class="op">\</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>      <span class="st">&quot;T:23.4;RH:61.2;SM:34;seq:42&quot;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>sock <span class="op">=</span> socket.socket(socket.AF_INET, socket.SOCK_DGRAM)</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>sock.sendto(msg.encode(), (host, port))</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="ss">f&quot;sent: </span><span class="sc">{</span>msg<span class="sc">}</span><span class="ss">&quot;</span>)</span></code></pre></div>
+<p>A build és futtatás:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i036</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">-S</span> . <span class="at">-B</span> build</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">--build</span> build</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/ts-gw</span> tcp://localhost:1883 n001 127.0.0.1 12345</span></code></pre></div>
+<p>Ezután egy másik terminálban:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_sub</span> <span class="at">-h</span> localhost <span class="at">-p</span> 1883 <span class="at">-t</span> <span class="st">&quot;terrasense/gh1/n001/telemetry&quot;</span> <span class="at">-v</span></span></code></pre></div>
+<p>Majd még egy terminálban:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> ~/iot-labor/i036/scripts/send_udp.py <span class="st">&quot;T:23.4;RH:61.2;SM:34;seq:42&quot;</span></span></code></pre></div>
+<p>A várt kimenet a <code>ts-gw</code> termináljában:</p>
+<pre class="text"><code>[INFO] MQTT connected
+[INFO] UDP adapter listening on 127.0.0.1:12345
+[INFO] published terrasense/gh1/n001/telemetry seq=42</code></pre>
+<p>A <code>mosquitto_sub</code> kimenete pedig hasonló:</p>
+<pre class="text"><code>terrasense/gh1/n001/telemetry {&quot;node_id&quot;:&quot;n001&quot;,&quot;seq&quot;:42,&quot;ts&quot;:1735678900000,&quot;temperature_c&quot;:23.400000,&quot;humidity_rh&quot;:61.200000,&quot;soil_moisture_pct&quot;:34.000000}</code></pre>
+<p>A <code>ts</code> értéke futásonként változik; a laborban az aktuális
+epoch ms jelenik meg.</p>
+<p><strong>Továbbvitt eredmény.</strong> A <code>ts-gw</code> váz az
+<code>~/iot-labor/i036/</code> könyvtárban készül el: az
+<code>InputAdapter</code> interfész, a <code>UdpInputAdapter</code>, a
+<code>Normalizer</code>, az <code>EventQueue</code> és a
+<code>MqttPublisher</code> komponensekkel. A
+<code>terrasense/gh1/n001/telemetry</code> topicra való QoS 1
+publikálás, a <code>node_id</code>/<code>seq</code>/<code>ts</code>
+mezőket tartalmazó JSON payload és az adapter-alapú architektúra az
+alapja a <a href="i037.html">store-and-forward</a>, az <a
+href="i038.html">üzemeltetés</a>, a <a href="i039.html">helyi
+feldolgozás</a>, a <a href="i057.html">biztonságos kapcsolat</a> és a <a
+href="i066.html">záróprojekt</a> alfejezeteknek.</p>
+<h3 data-number="12.2.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">12.2.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A labor működését a fenti <code>mosquitto_sub</code> előfizetéssel
+ellenőrizzük. Ha a subscriber nem kap üzenetet, a következő táblázat
+segít.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A <code>ts-gw</code> nem indul</td>
+<td>hiányzik a <code>paho-mqtt3c</code> / <code>MQTTClient.h</code></td>
+<td>telepítsük a Paho C klienst; a csomagnév ellenőrizendő</td>
+</tr>
+<tr class="even">
+<td><code>[ERROR] MQTT connection failed</code></td>
+<td>a <code>lab-broker</code> nem fut</td>
+<td><code>docker compose -f ~/iot-labor/stack/compose.yaml up -d lab-broker</code></td>
+</tr>
+<tr class="odd">
+<td>A subscriber nem lát adatot</td>
+<td>a topic vagy a broker-cím hibás</td>
+<td>ellenőrizzük a <code>-t</code> és <code>-h</code>
+argumentumokat</td>
+</tr>
+<tr class="even">
+<td>A <code>ts-gw</code> nem ír <code>[INFO] published</code> sort</td>
+<td>az UDP-küldő nem a megfelelő portra küld</td>
+<td><code>ss -lun | grep 12345</code></td>
+</tr>
+<tr class="odd">
+<td>Duplikált <code>seq</code> üzenet</td>
+<td>a normalizáló <code>last_seq_</code> állapota eltűnt</td>
+<td>ne indítsuk újra a gatewayt a sor tartalma nélkül</td>
+</tr>
+</tbody>
+</table>
+<p>A hálózati forgalom nyomkövetéséhez a
+<code>tcpdump -i lo udp port 12345</code> parancs használható; ezzel a
+laborban a bejövő UDP-keret pontos tartalma ellenőrizhető.</p>
+<h3 data-number="12.2.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">12.2.6</span> Tipikus hibák és
+félreértések</h3>
+<p><strong>A <code>seq</code> ellenőrzés hiánya.</strong> Ha a gateway
+egyszerűen továbbít minden UDP-keretet, a hálózati duplikátumok vagy a
+szimulátor újraindítása miatt a backend kétszer kaphatja ugyanazt a
+<code>seq</code> értéket. A Normalizer <code>check_seq()</code> metódusa
+kiszűri a nem növekvő vagy duplikált sorszámokat, de ezt az állapotot
+tartósítani kell a gateway újraindításakor, egyébként az első minta után
+ismét elfogadható lesz a régi <code>seq</code>.</p>
+<p><strong>A locale-függő <code>std::stod</code>.</strong> A magyar vagy
+más európai rendszerbeállítás mellett a <code>std::stod("23.4")</code>
+nem feltétlenül ugyanazt adja, mint a <code>"23.4"</code>
+tizedesvesszővel. Az IoT-üzenetekben mindig a pont a tizedesjel, ezért a
+normalizálóban explicit konverziót kell használni, nem a globális
+<code>std::locale</code>-ra bízni az értelmezést.</p>
+<p><strong>A blokkoló <code>recvfrom()</code> leállítása
+hiányzik.</strong> Ha a <code>UdpInputAdapter::stop()</code> nem zárja
+le a socketet, a munkaszál örökre várhat a <code>recvfrom()</code>-ban,
+és a folyamat nem tud tisztán kilépni. A destruktorban ezért a
+<code>close(fd_)</code> és a <code>worker_.join()</code> hívásának
+sorrendje kritikus.</p>
+<p><strong>A MQTT-publikálás visszatérési értékének figyelmen kívül
+hagyása.</strong> A QoS 1 publikálás csak akkor tekinthető
+kézbesítettnek, ha a <code>MQTTClient_publish()</code> visszatérési
+értéke sikert jelez, tehát a broker <code>PUBACK</code>-et küldött. Ha a
+hívás hibát ad, a gatewaynek legalább naplóznia kell, és a későbbi <a
+href="i037.html">store-and-forward</a> alfejezetben tartós pufferbe kell
+mentenie a mintát.</p>
+<h3 data-number="12.2.7" id="feladatok"><span
+class="header-section-number">12.2.7</span> Feladatok</h3>
+<ol type="1">
+<li><strong>Fogalmi kérdés.</strong> Magyarázza el, miért jobb az
+<code>InputAdapter</code> absztrakció, mint ha a <code>main()</code>
+közvetlenül az UDP-socketből olvasna, és onnan hívná a
+MQTT-publikálót.</li>
+<li><strong>Tervezési feladat.</strong> Tegyük fel, hogy egy valós
+<code>ts-node</code> BLE GATT-értesítésekkel küldi az adatokat. Írja le
+lépésenként, hogyan implementálna egy <code>BleInputAdapter</code>
+osztályt a meglévő <code>InputAdapter</code> interfész alapján, milyen
+BlueZ D-Bus objektumokat kellene figyelni.</li>
+<li><strong>Implementációs feladat.</strong> Egészítse ki a
+<code>Normalizer::parse()</code> metódust úgy, hogy a hiányzó
+<code>seq</code> mezőt a legutolsó ismert <code>seq</code> + 1 értékkel
+pótolja, és ezt a laborban tesztelje a <code>send_udp.py</code>
+segítségével <code>"T:23.4;RH:61.2;SM:34"</code> bemenettel.</li>
+<li><strong>Hibakeresési feladat.</strong> Indítsa el a
+<code>ts-gw</code>-t, majd a <code>ts-node</code> szimulátor helyett egy
+Python szkriptből küldjön 5 másodpercig folyamatosan növekvő
+<code>seq</code>-ű UDP-kereteket. Állítsa le a brokert, majd indítsa
+újra. Mit tapasztal a publikálás visszatérési értékével, és hogyan
+viselkedik az újracsatlakozás? Javasoljon javítást a tartós puffer
+bevezetésével a <a href="i037.html">store-and-forward</a> alfejezet
+módszere szerint.</li>
+</ol>
+<h3 data-number="12.2.8" id="megoldások"><span
+class="header-section-number">12.2.8</span> Megoldások</h3>
+<ol type="1">
+<li><p><strong>Megoldás.</strong> Az adapter leválasztja a gateway
+magját a bemeneti protokollról. Ha később BLE-re vagy soros portra
+váltunk, csak az adaptert kell kicserélni, a normalizáló és a publikáló
+réteg érintetlen marad. Emellett az adapter határozza meg a nyers adatok
+fogadásának és leállításának életciklusát, így a <code>main()</code> nem
+keveredik a socket-kezelés részleteibe.</p></li>
+<li><p><strong>Megoldás.</strong> A <code>BleInputAdapter</code>
+indulásakor csatlakozni kell a BlueZ D-Bus rendszerbuszhoz, majd a
+<code>org.bluez</code> <code>Adapter1</code> interfészen keresztül a
+megfelelő adaptert, az <code>Device1</code> interfészen a
+<code>ts-node</code> eszközt, végül a <code>GattCharacteristic1</code>
+interfészen a telemetria-karakterisztikát kell megtalálni. Ezután
+<code>StartNotify</code> hívással kell feliratkozni az értesítésekre.
+Minden értesítés nyers bájtjait a <code>Normalizer</code>-rel kell
+feldolgozni, és a <code>SampleHandler</code> visszahívót hívni. A
+leállítás <code>StopNotify</code> hívással és a D-Bus kapcsolat
+lezárásával történik.</p></li>
+<li><p><strong>Megoldás.</strong> A <code>Normalizer</code>-t ki kell
+egészíteni egy <code>last_seq_</code> és <code>have_last_seq_</code>
+tagváltozóval. A <code>parse()</code>-ban, ha nincs <code>seq</code>
+mező, akkor <code>seq = have_last_seq_ ? last_seq_ + 1 : 1;</code>.
+Ezután a <code>check_seq()</code> a szokásos módon ellenőrzi a
+monotonitást. A laborban a <code>send_udp.py</code> hiányzó
+<code>seq</code>-gel küldött üzenete után a gateway
+<code>seq=43</code>-at publikál, feltéve, hogy előtte a
+<code>seq=42</code>-es üzenet már megérkezett.</p></li>
+<li><p><strong>Megoldás.</strong> A folyamatos küldés során a
+<code>MQTTClient_publish()</code> a broker leállása után hibát ad, mert
+a kapcsolat megszakad. A <code>main()</code> ciklusban a
+<code>publisher.is_connected()</code> hamis lesz, és a
+<code>publisher.connect()</code> újra próbálkozik. A hiba alatt a sorba
+beérkező minták nem vesznek el azonnal, mert a sor tartja őket, de a sor
+nem tartós: ha a folyamat közben leáll, az adatok elvesznek. A megoldás
+a <a href="i037.html">store-and-forward</a> alfejezetben tárgyalt tartós
+puffer: a publikálási hiba esetén a mintát fájlba kell menteni, és a
+kapcsolat visszaállása után vissza kell tölteni.</p></li>
+</ol>
+<h3 data-number="12.2.9" id="rövid-összefoglaló"><span
+class="header-section-number">12.2.9</span> Rövid összefoglaló</h3>
+<p>A <code>ts-gw</code> egy adapter-alapú, C++17-ben megvalósított
+Linux-gateway. Az <code>InputAdapter</code> absztrakció mögött a
+<code>UdpInputAdapter</code> fogadja a szimulált <code>ts-node</code>
+UDP-kereteit; valós hardveren ugyanezt az interfészt valósíthatja meg
+egy BlueZ D-Bus <code>BleInputAdapter</code>. A <code>Normalizer</code>
+a nyers <code>T:…;RH:…;SM:…;seq:…</code> szöveget
+<code>TelemetrySample</code>-lé alakítja, <code>seq</code> ellenőrzést
+végez, és a <code>node_id</code>/<code>seq</code>/<code>ts</code>
+mezőket biztosítja. A szálbiztos <code>EventQueue</code> elválasztja a
+blokkoló fogadást a publikálástól. A <code>MqttPublisher</code> Paho
+MQTT C klienst használ QoS 1-gyel, újracsatlakozással. A build
+CMake-kel, a labor teljes lánca UDP-küldéstől a
+<code>terrasense/gh1/n001/telemetry</code> topicig terjed.
+<strong>Továbbvitt eredmény:</strong> a <code>~/iot-labor/i036/</code>
+alatt létrejött <code>ts-gw</code> váz a <a
+href="i037.html">store-and-forward</a>, az <a
+href="i038.html">üzemeltetés</a>, a <a href="i039.html">helyi
+feldolgozás</a>, a <a href="i057.html">biztonság</a> és a <a
+href="i066.html">záróprojekt</a> alapja lesz.</p>
+<h3 data-number="12.2.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">12.2.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Paho MQTT C/C++ kliens dokumentáció: https://eclipse.dev/paho/ – a
+<code>MQTTClient.h</code> függvények pontos szignatúrái és a könyvtárnév
+(<code>paho-mqtt3c</code>) az aktuális Ubuntu-csomagban
+ellenőrizendő.</li>
+<li>Mosquitto dokumentáció: https://mosquitto.org/documentation/ – a
+<code>mosquitto_sub</code> kapcsolói (pl. <code>-v</code>,
+<code>-t</code>) ellenőrizendők a használt verzióban.</li>
+<li>BlueZ D-Bus API: a <code>BleInputAdapter</code> vázlatában említett
+<code>Adapter1</code>, <code>Device1</code>,
+<code>GattCharacteristic1</code>, <code>StartNotify</code>,
+<code>StopNotify</code> objektumnevek a hivatalos BlueZ dokumentációban
+ellenőrizendők.</li>
+<li>CMake dokumentáció: a <code>find_path</code> és
+<code>find_library</code> viselkedése a használt CMake 3.20+ verzióban
+ellenőrizendő.</li>
+<li>A <code>libpaho-mqtt-dev</code> csomagnév az Ubuntu 24.04 LTS
+csomaglistájában ellenőrizendő; a laborban feltételezett név nem
+bizonyított.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i035.html">← 12.1 A gateway szerepe: híd, puffer, biztonsági határ</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i037.html">12.3 Store-and-forward: offline működés és visszatöltés →</a></div>
+</nav>
+</body>
+</html>

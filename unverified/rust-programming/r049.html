@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>22.1 Teljesítmény: mérés, profilozás, allokáció,
+release-beállítások – Rust programozás C++-fejlesztőknek – a nulláról a
+mesterszintig</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – Haladó Rust: unsafe, FFI, makrók, típusrendszer, teljesítmény</a> › <a href="index.html#rch21">22 Teljesítmény</a></p>
+<div class="links"><a class="prev" rel="prev" href="r048.html">← 21.2 API-tervezés Rustban: irányelvek és ergonómia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r050.html">23.1 no_std, embedded-hal és Embassy: Rust mikrovezérlőn →</a></div>
+</nav>
+<h2 data-number="22.1" id="r049"><span
+class="header-section-number">22.1</span> Teljesítmény: mérés,
+profilozás, allokáció, release-beállítások</h2>
+<h3 data-number="22.1.1" id="motiváció"><span
+class="header-section-number">22.1.1</span> Motiváció</h3>
+<p>A C++-fejlesztő ösztönösen tudja, hogy a teljesítményoptimalizálás
+nem hit kérdése: előbb mérünk, aztán profilozunk, és csak utána nyúlunk
+a kódhoz. A Rust ugyanezt a mérnöki fegyelmet kínálja, de a nyelv
+adottságai – a borrow checker, a generikusok monomorfizálása, az
+iterátorok és a release-profil – más optimalizálási utakat nyitnak, mint
+a C++. Ebben az alfejezetben a <code>rkv</code> projektet vesszük elő,
+és a méréstől a kézzelfogható gyorsításig vezetjük végig a folyamatot.
+Kiindulópontunk a <a href="r032.html">Tesztelés és dokumentáció:
+property-alapú tesztelés és benchmark</a> alfejezetben létrehozott
+criterion benchmark, valamint a <a href="r036.html">Párhuzamosság és
+aszinkronitás: adatpárhuzamosság rayonnal</a> alfejezetben elkészült
+<code>parallel_checksum</code> és <code>sequential_checksum</code>
+függvénypár. Most ezekre a mérési alapokra építve megtanuljuk
+azonosítani a forró pontokat, csökkenteni az allokációkat, és a
+release-profil finomhangolásával további nyereséget elérni.</p>
+<h3 data-number="22.1.2" id="fogalmak-és-szabályok"><span
+class="header-section-number">22.1.2</span> Fogalmak és szabályok</h3>
+<p><strong>Definíció.</strong> A <strong>profilozás</strong> (profiling)
+a program futás közbeni megfigyelése annak érdekében, hogy megtudjuk,
+mely függvények, kódsorok vagy erőforrás-műveletek fogyasztják a legtöbb
+időt. A <strong>forró pont</strong> (hot spot) a profilban kiemelkedő, a
+futási idő jelentős részét kitevő kódrész. A <strong>flamegraph</strong>
+a profilozás vizualizációja, amely a hívási láncokat színes sávokkal, a
+szélességet pedig időaránnyal ábrázolja.</p>
+<p><strong>Definíció.</strong> Az <strong>allokáció</strong>
+(allocation) futás közbeni memóriafoglalás a kupacon, például
+<code>Vec::push</code> kapacitásbővítés, <code>String</code> növekedés,
+<code>clone</code>, vagy <code>Box</code> létrehozása. Az allokáció
+csökkentése gyakran nagyobb nyereséget hoz, mint a nyers utasításszám
+csökkentése, mert a <code>malloc</code>/<code>free</code> költsége, a
+cache-miss és a töredezettség együtt hat.</p>
+<p><strong>Szabály.</strong> A mérés-vezérelt optimalizálás ciklusa: (1)
+fogalmazz meg egy hipotézist, (2) mérj egy determinisztikus
+benchmarkkal, (3) profilozz, (4) végezd el a módosítást, (5) mérd újra
+ugyanazzal a benchmarkkal, (6) ha a javulás elhanyagolható, lépj tovább.
+Soha ne optimalizálj mérés nélkül, és soha ne fogadd el a javulást
+visszamérés nélkül.</p>
+<p><strong>Szabály.</strong> A határellenőrzés (bounds check) a Rust
+<code>Index</code> művelet (<code>v[i]</code>) része: a fordító
+futásidejű ellenőrzést szúr be, amely panichoz vezet, ha
+<code>i &gt;= v.len()</code>. Az iterátorok
+(<code>for x in &amp;v</code>) viszont a hossz ismeretében járnak be,
+így a fordító ki tudja optimalizálni a határellenőrzést, és a generált
+kód gyakran gyorsabb. Emiatt idiomatikus Rustban az indexelés helyett az
+iterátor a gyors választás.</p>
+<p><strong>Szabály.</strong> A generikus függvények és típusok
+<strong>monomorfizálódnak</strong>: minden konkrét típusparaméterre a
+fordító külön kódot generál. Ez lehetővé teszi az inline-t és a statikus
+diszpécs miatti devirtualizálást, de növeli a bináris méretét. A
+<code>#[inline]</code> attribútum a fordítót a függvény beillesztésére
+kéri; a <code>lto</code> és a <code>codegen-units</code> ezt a
+lehetőséget erősíti.</p>
+<h3 data-number="22.1.3" id="c-rust-összevetés"><span
+class="header-section-number">22.1.3</span> C++ ↔︎ Rust összevetés</h3>
+<p>C++-ban a Google Benchmark és a <code>std::chrono</code> a mérés, a
+<code>perf</code> és a <code>gprof</code> a profilozás eszköze. Rustban
+a criterion ugyanazt a szerepet tölti be, mint a Google Benchmark:
+statisztikai elemzéssel, konfidenciaintervallummal és
+<code>black_box</code>-szal véd a kihagyástól. A profilozáshoz Linuxon
+ugyanaz a <code>perf</code> működik, a <code>cargo flamegraph</code>
+pedig a perf-et és a flamegraph generálást csomagolja egy parancsba.</p>
+<p>A legfontosabb nyelvi különbség a C++-hoz képest a
+<strong>noalias</strong> információnál jelenik meg. A Rust
+<code>&amp;mut</code> referencia szavatolja, hogy nincs más élő alias
+ugyanarra a memóriára. Ez a fordító számára olyan optimalizálási
+lehetőséget ad, amit C++-ban a <code>restrict</code> kulcsszóval (ami
+nem szabványos, bár a GCC és a Clang támogatja) csak körülményesen
+érhetünk el. A Rust minden <code>&amp;mut</code> paraméternél
+automatikusan érvényesíti a noalias-t, így a vektorizálás, a
+cache-optimalizálás és a konstansok előrehozása agresszívebb lehet.</p>
+<p>A C++ <code>std::vector::operator[]</code> nem végez
+határellenőrzést, míg a Rust <code>v[i]</code> igen. C++-ban a
+biztonságért a <code>at()</code>-et használjuk, amely ellenőriz; Rustban
+a <code>get()</code> a biztonságos alternatíva. Az idiomatikus Rust
+azonban inkább iterátort használ, így egyszerre kapja meg a biztonságot
+és a sebességet.</p>
+<h3 data-number="22.1.4"
+id="kidolgozott-példa-határellenőrzés-és-allokáció"><span
+class="header-section-number">22.1.4</span> Kidolgozott példa:
+határellenőrzés és allokáció</h3>
+<p>Tekintsünk egy függvényt, amely egy <code>Vec&lt;u8&gt;</code>
+XOR-ellenőrző összegét számítja ki. A C++-ban minden további nélkül
+használhatjuk az indexelést:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">uint8_t</span> checksum<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">uint8_t</span><span class="op">&gt;&amp;</span> data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> result <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> data<span class="op">.</span>size<span class="op">();</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>        result <span class="op">^=</span> data<span class="op">[</span>i<span class="op">];</span>  <span class="co">// nincs határellenőrzés</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A Rust változat első közelítésben ugyanezt teszi, de minden
+indexelésnél határellenőrzés van:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> sequential_checksum(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dv">0u8</span><span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="dv">0</span><span class="op">..</span>data<span class="op">.</span>len() <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>        result <span class="op">^=</span> data[i]<span class="op">;</span> <span class="co">// határellenőrzés minden iterációban</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    result</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az idiomatikus Rust iterátort használ, amely elkerüli a
+határellenőrzést, és a generált kód gyakran azonos a C++-al:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> sequential_checksum(data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">-&gt;</span> <span class="dt">u8</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    data<span class="op">.</span>iter()<span class="op">.</span>fold(<span class="dv">0u8</span><span class="op">,</span> <span class="op">|</span>acc<span class="op">,</span> <span class="op">&amp;</span>b<span class="op">|</span> acc <span class="op">^</span> b)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a példa jól mutatja, hogy a Rustban a biztonságos kód nem
+feltétlenül lassabb, ha iterátorokat használunk. Az <a
+href="r036.html">Adatpárhuzamosság rayonnal</a> alfejezetben létrehozott
+<code>sequential_checksum</code> függvényünk is ezt a mintát követi; a
+benchmarkban ezt fogjuk összehasonlítani a párhuzamos változattal.</p>
+<h3 data-number="22.1.5" id="labor-az-rkv-set-optimalizálása"><span
+class="header-section-number">22.1.5</span> Labor: az rkv-set
+optimalizálása</h3>
+<p><strong>Munkakönyvtár:</strong> <code>~/rust-labor/rkv/</code></p>
+<p>Ebben a laborban a meglévő <code>MemStore::set</code> műveletet
+optimalizáljuk. A cél az allokációk csökkentése, és a javulás mérése
+criterionnal. Feltételezzük, hogy a <code>MemStore</code>
+implementációja a <code>rkv-core/src/store.rs</code> fájlban található,
+és a <code>set</code> metódus jelenleg klónozza a kulcsot, mielőtt a
+belső <code>BTreeMap</code>-be helyezné. Ezt a fölösleges
+<code>clone</code> hívást távolítjuk el.</p>
+<p>Első lépésként nézzük meg a jelenlegi kódot, és írjuk meg a
+benchmarkot a <code>set</code> műveletre. A
+<code>rkv-core/benches/benchmark.rs</code> fájlban már van egy
+<code>set</code> benchmark, de most pontosítjuk: egy előre feltöltött
+<code>MemStore</code>-ba szúrunk be új kulcsokat, és a
+<code>criterion</code> minden mintavételnél friss
+<code>MemStore</code>-t hoz létre, hogy a mérést ne befolyásolja a
+meglévő adat.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rkv-core/benches/benchmark.rs</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">criterion::</span><span class="op">{</span>black_box<span class="op">,</span> criterion_group<span class="op">,</span> criterion_main<span class="op">,</span> Criterion<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::store::</span><span class="op">{</span>MemStore<span class="op">,</span> Storage<span class="op">};</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> bench_set(c<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> Criterion) <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    c<span class="op">.</span>bench_function(<span class="st">&quot;MemStore::set&quot;</span><span class="op">,</span> <span class="op">|</span>b<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        b<span class="op">.</span>iter(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>            <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> <span class="pp">MemStore::</span>new()<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>            <span class="co">// black_box a kulcsot és az értéket, hogy ne legyen konstans kihajtva</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>            store<span class="op">.</span>set(black_box(<span class="st">&quot;key&quot;</span><span class="op">.</span>to_string())<span class="op">,</span> black_box(<span class="pp">vec!</span>[<span class="dv">1</span><span class="op">,</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span>]))<span class="op">;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>            store</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">criterion_group!</span>(benches<span class="op">,</span> bench_set)<span class="op">;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="pp">criterion_main!</span>(benches)<span class="op">;</span></span></code></pre></div>
+<p>Futtassuk a benchmarkot release módban:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> bench <span class="at">-p</span> rkv-core</span></code></pre></div>
+<p>A kimenetben egy konfidenciaintervallumot látunk, például
+(illusztratív, gépfüggő): <code>[120.0 ns 125.0 ns 130.0 ns]</code>. Ez
+az alapállapot.</p>
+<p>Most profilozzuk a benchmarkot. A <code>cargo flamegraph</code>
+használatához először telepíteni kell a flamegraph eszközt:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> install flamegraph   <span class="co"># ellenőrizendő: a crate verziója</span></span></code></pre></div>
+<p>Ezután a benchmark profilozása:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> flamegraph <span class="at">--bench</span> benchmark <span class="at">-p</span> rkv-core <span class="at">--</span> MemStore::set</span></code></pre></div>
+<p>A flamegraph megmutatja, hogy a futási idő nagy része a
+<code>BTreeMap::insert</code> környékén, illetve a <code>String</code>
+klónozásában telik. A <code>key.clone()</code> hívás a <code>set</code>
+metódusban fölösleges, mert a <code>key</code> paraméter már a
+tulajdonunkban van.</p>
+<p>Módosítsuk a <code>rkv-core/src/store.rs</code> fájlt. A
+<code>set</code> metódus jelenlegi változata (képzeletbeli, de
+tipikus):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rkv-core/src/store.rs – rossz változat, fölösleges klónozással</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> Storage <span class="cf">for</span> MemStore <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>map<span class="op">.</span>insert(key<span class="op">.</span>clone()<span class="op">,</span> value)<span class="op">;</span> <span class="co">// a clone fölösleges</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(())</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A javított változat:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rkv-core/src/store.rs – javított változat</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> Storage <span class="cf">for</span> MemStore <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> set(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> key<span class="op">:</span> <span class="dt">String</span><span class="op">,</span> value<span class="op">:</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>map<span class="op">.</span>insert(key<span class="op">,</span> value)<span class="op">;</span> <span class="co">// a key már a tulajdonunkban van</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(())</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a módosítás megszüntet egy kupacallokációt és egy memória-másolást
+minden <code>set</code> hívásnál. A <code>BTreeMap::insert</code> a
+kulcsot érték szerint veszi át, így a <code>clone</code> korábban
+fölösleges volt.</p>
+<p>Most adjuk hozzá a release-profil finomhangolást a
+<code>Cargo.toml</code>-hoz. A workspace gyökerében található
+fájlban:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode toml"><code class="sourceCode toml"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cargo.toml (workspace gyökér)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="kw">[profile.release]</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="dt">opt-level</span> <span class="op">=</span> <span class="dv">3</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="dt">lto</span> <span class="op">=</span> <span class="st">&quot;thin&quot;</span>      <span class="co"># vagy &quot;fat&quot;; a thin kevesebb link-idő, a fat jobb optimalizálás</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="dt">codegen-units</span> <span class="op">=</span> <span class="dv">1</span>  <span class="co"># az egész crate egy egységben fordul, jobb inline</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="dt">panic</span> <span class="op">=</span> <span class="st">&quot;abort&quot;</span>    <span class="co"># kisebb bináris, de panic esetén nincs unwinding</span></span></code></pre></div>
+<p>Futtassuk újra a benchmarkot:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> bench <span class="at">-p</span> rkv-core</span></code></pre></div>
+<p>A várt eredmény (illusztratív, gépfüggő): a <code>set</code> futási
+ideje csökken, például <code>[100.0 ns 104.0 ns 108.0 ns]</code>
+értékre. A javulás a <code>clone</code> eltávolításából és a
+release-profil erősebb optimalizálásából adódik.</p>
+<p><strong>Továbbvitt eredmény.</strong> Ez az optimalizált
+<code>MemStore::set</code> implementáció, valamint a release-profil
+beállítások (<code>lto</code>, <code>codegen-units</code>,
+<code>panic</code>) a <a href="r051.html">Záróprojekt: az rkv teljes
+rendszerként</a> alfejezetben a teljes rendszer összeállításakor
+érvényesülnek, és a végső teljesítménymérés alapját képezik.</p>
+<h3 data-number="22.1.6" id="tipikus-hibák-és-átállási-csapdák"><span
+class="header-section-number">22.1.6</span> Tipikus hibák és átállási
+csapdák</h3>
+<ol type="1">
+<li><p><strong>Klónozás a borrow checker „legyőzésére”.</strong> Amikor
+a kölcsönzési szabályok miatt nem férünk hozzá egy értékhez, a gyors
+munka kedvéért <code>clone</code>-t hívunk. Ez azonban elrejti az
+allokációt, és a forró ponton teljesítményromlást okoz. A megoldás:
+vizsgáljuk meg, hogy a <code>clone</code> valóban szükséges-e, vagy
+áthelyezhetjük a tulajdonlást, átadhatunk <code>&amp;str</code>-et
+<code>String</code> helyett, vagy használhatunk
+<code>Cow</code>-t.</p></li>
+<li><p><strong><code>unwrap</code> mindenhol.</strong> A
+<code>unwrap</code> gyors fejlesztést tesz lehetővé, de a hot path-ban a
+panic-elágazás is utasításcsökkentést és növelt bináris méretet okoz. A
+teljesítményérzékeny kódban a <code>Result</code> és <code>?</code>,
+valamint a <code>match</code> jobb választás, mert a hibakezelést
+expliciten tartja, és a fordító jobban optimalizálja.</p></li>
+<li><p><strong>Rc&lt;RefCell&lt;T&gt;&gt; túlhasználata.</strong> A
+referencia-számlálás és a futásidejű kölcsönzés kényelmes, de minden
+<code>borrow()</code> és <code>borrow_mut()</code> hívás atomi műveletet
+és ellenőrzést okoz. A forró ponton a statikus borrow checkerrel,
+tulajdonjog-átadással vagy <code>&amp;mut</code>-tal kell dolgozni, nem
+<code>Rc&lt;RefCell&gt;</code>-lel.</p></li>
+<li><p><strong>Generikus monomorfizálás kiteregetése.</strong> A
+túlzottan generikus kód minden típusra külön példányt hoz létre, ami a
+bináris méretét és a fordítási időt növeli. Ha a típusparaméterek csak
+kevés konkrét típussal fordulnak elő, érdemes megfontolni a
+trait-objektumot (<code>Box&lt;dyn Storage&gt;</code>) a forró ponton
+kívül, ahol a dinamikus diszpécs költsége elhanyagolható. C++-ban
+ugyanez a sablon-kiteregetés problémája, de a Rustban a trait-objektumok
+expliciten jelzik a dinamikus diszpécs szándékát.</p></li>
+</ol>
+<h3 data-number="22.1.7" id="feladatok"><span
+class="header-section-number">22.1.7</span> Feladatok</h3>
+<p><strong>1. Feladat (fogalmi).</strong> Miért nem elegendő a debug
+módú <code>cargo run</code> a teljesítmény mérésére? Magyarázd el, miért
+használunk release módot, <code>black_box</code>-ot és
+konfidenciaintervallumot a criterionban.</p>
+<p><strong>2. Feladat (C++ → Rust átírás).</strong> Adott a következő
+C++ függvény, amely egy <code>std::vector&lt;std::string&gt;</code>
+elemeit fűzi össze szóközökkel elválasztva:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>string join<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>string<span class="op">&gt;&amp;</span> words<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>string result<span class="op">;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> words<span class="op">.</span>size<span class="op">();</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>i <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> result <span class="op">+=</span> <span class="st">&quot; &quot;</span><span class="op">;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>        result <span class="op">+=</span> words<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result<span class="op">;</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Írd át a függvényt idiomatikus Rustra, <code>&amp;[String]</code>
+paraméterrel, iterátorokkal, és legalább <code>with_capacity</code>
+használatával, hogy csökkentsd az allokációk számát. A kód ne klónozza a
+szavakat.</p>
+<p><strong>3. Feladat (implementáció az rkv-ban).</strong> A
+<code>MemStore::set</code> felett dolgozva azonosíts egy további
+allokációs forrást a <code>FileStore::save</code> metódusban, amely
+jelenleg minden kulcsnál <code>String::new()</code>-t hoz létre, és
+<code>push_str</code>-rel építi a naplóbejegyzést. Módosítsd a kódot
+úgy, hogy a <code>write!</code> makróval vagy <code>Vec&lt;u8&gt;</code>
+pufferként közvetlenül írjon, és a lehető legkevesebb allokációval
+dolgozzon. Mutasd be a diff-et és a benchmarkot.</p>
+<p><strong>4. Feladat (tervezési döntés).</strong> A
+<code>Storage</code> trait jelenleg
+<code>fn set(&amp;mut self, key: String, value: Vec&lt;u8&gt;) -&gt; Result&lt;(), Error&gt;</code>.
+Tételezd fel, hogy a hálózati szerver forró hívási láncában a
+<code>set</code> a legtöbbször kis kulcsokkal és értékekkel dolgozik.
+Válaszd ki, hogy a <code>key</code> paramétert <code>String</code>-ről
+<code>&amp;str</code>-re változtatod-e, és indokold a döntést a
+teljesítmény, a tulajdonjog és az API-ergonómia szempontjából. Hogyan
+érinti ez a <code>FileStore</code> implementációt?</p>
+<h3 data-number="22.1.8" id="megoldások"><span
+class="header-section-number">22.1.8</span> Megoldások</h3>
+<p><strong>1. Megoldás.</strong> A debug módban a fordító nem végez
+optimalizálást (<code>opt-level = 0</code>), a határellenőrzések
+megmaradnak, a <code>panic</code> magatartás nem szabadul el, és a
+generált kód lassabb. A release mód (<code>opt-level = 3</code>) a
+fordítói optimalizálások teljes eszköztárát bekapcsolja, így a mért
+adatok a valós használatot tükrözik. A <code>black_box</code> arra
+szolgál, hogy a fordító ne hajtsa ki a konstans kifejezéseket, ne
+inline-olja el a teljes hívást, és ne vegye észre, hogy az eredmény nem
+használt. A konfidenciaintervallum pedig a mérési zaj miatt fontos: a
+criterion újra és újra lefuttatja a benchmarkot, és statisztikai
+elemzéssel ad megbízható tartományt az átlag körül.</p>
+<p><strong>2. Megoldás.</strong></p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> join(words<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">String</span>]) <span class="op">-&gt;</span> <span class="dt">String</span> <span class="op">{</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> result <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>with_capacity(words<span class="op">.</span>len() <span class="op">*</span> <span class="dv">2</span>)<span class="op">;</span> <span class="co">// becslés: szavak + szóközök</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (i<span class="op">,</span> word) <span class="kw">in</span> words<span class="op">.</span>iter()<span class="op">.</span>enumerate() <span class="op">{</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> i <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>            result<span class="op">.</span>push(<span class="ch">&#39; &#39;</span>)<span class="op">;</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>        result<span class="op">.</span>push_str(word)<span class="op">;</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    result</span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>String::with_capacity</code> előre lefoglalja a becsült
+puffert, így a <code>push_str</code> nem okoz ismételt reallokációt. Az
+iterátor elkerüli az indexelést, és a <code>word</code>
+<code>&amp;String</code>-re mutat, nem kell klónozni.</p>
+<p><strong>3. Megoldás.</strong> A <code>FileStore::save</code>
+jelenlegi változata (feltételezett):</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rkv-core/src/file_store.rs – rossz változat</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> save(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">Path</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>new()<span class="op">;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (key<span class="op">,</span> value) <span class="kw">in</span> <span class="kw">self</span><span class="op">.</span>map<span class="op">.</span>iter() <span class="op">{</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> line <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>new()<span class="op">;</span> <span class="co">// minden sor új allokáció</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>        line<span class="op">.</span>push_str(<span class="st">&quot;SET &quot;</span>)<span class="op">;</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>        line<span class="op">.</span>push_str(key)<span class="op">;</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>        line<span class="op">.</span>push(<span class="ch">&#39; &#39;</span>)<span class="op">;</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>        line<span class="op">.</span>push_str(<span class="op">&amp;</span><span class="dt">String</span><span class="pp">::</span>from_utf8_lossy(value))<span class="op">;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">.</span>push_str(<span class="op">&amp;</span>line)<span class="op">;</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">.</span>push(<span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span>)<span class="op">;</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    <span class="pp">std::fs::</span>write(path<span class="op">,</span> buf)<span class="op">?;</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A javított változat <code>write!</code> makróval, egyetlen
+pufferként:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode rust"><code class="sourceCode rust"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">// rkv-core/src/file_store.rs – javított változat</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::fmt::</span><span class="bu">Write</span> <span class="kw">as</span> _<span class="op">;</span> <span class="co">// a write! makró a String-re</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> save(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">Path</span>) <span class="op">-&gt;</span> <span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">,</span> <span class="bu">Error</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> buf <span class="op">=</span> <span class="dt">String</span><span class="pp">::</span>with_capacity(<span class="kw">self</span><span class="op">.</span>map<span class="op">.</span>len() <span class="op">*</span> <span class="dv">64</span>)<span class="op">;</span> <span class="co">// becslés</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> (key<span class="op">,</span> value) <span class="kw">in</span> <span class="kw">self</span><span class="op">.</span>map<span class="op">.</span>iter() <span class="op">{</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// write! a String-be, nem hoz létre új String-et</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">writeln!</span>(buf<span class="op">,</span> <span class="st">&quot;SET {} {}&quot;</span><span class="op">,</span> key<span class="op">,</span> <span class="dt">String</span><span class="pp">::</span>from_utf8_lossy(value))</span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>map_err(<span class="op">|</span>_<span class="op">|</span> <span class="bu">Error</span><span class="pp">::</span>Io)<span class="op">?;</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">std::fs::</span>write(path<span class="op">,</span> buf)<span class="op">?;</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>writeln!</code> makró a <code>fmt::Write</code> trait
+segítségével közvetlenül a <code>String</code>-be ír, nincs soronkénti
+új allokáció. A <code>with_capacity</code> a becsült hosszal előre
+lefoglalja a puffert.</p>
+<p><strong>4. Megoldás.</strong> A <code>key: String</code> megtartása a
+jobb döntés a <code>Storage</code> trait szintjén, mert a
+<code>MemStore::set</code> és a <code>FileStore::set</code> is birtokba
+veszi a kulcsot, és nem akarjuk minden hívónál a klónozást
+kikényszeríteni. Ha <code>key: &amp;str</code>-re változtatnánk, a
+<code>MemStore</code>-nak minden <code>set</code>-nél
+<code>key.to_string()</code>-et kellene hívnia, ami allokációt okozna,
+és a hívó oldalán sem kerülnénk el a <code>String</code> létrehozását. A
+jelenlegi szignatúra lehetővé teszi, hogy a hívó birtokolja az adatot,
+és a <code>set</code> egyszerűen átvegye a tulajdonjogot, ami a forró
+hívási láncban minimális allokációt jelent. A <code>FileStore</code>
+esetén is ugyanez a helyzet: a naplóbejegyzéshez a kulcsot
+áthelyezhetjük, és nem kell klónozni.</p>
+<h3 data-number="22.1.9" id="rövid-összefoglaló"><span
+class="header-section-number">22.1.9</span> Rövid összefoglaló</h3>
+<p>A mérés-vezérelt optimalizálás a criterion benchmark, a
+<code>perf</code>/<code>cargo flamegraph</code> profilozás és a
+release-profil finomhangolásának ciklusára épül. A laborban az
+<code>rkv-core/src/store.rs</code> <code>MemStore::set</code>
+metódusából eltávolítottuk a fölösleges <code>key.clone()</code> hívást,
+így minden <code>set</code> egy allokációval kevesebbet végez. A
+<code>rkv-core/Cargo.toml</code>-ban beállítottuk a
+<code>[profile.release]</code> szekciót: <code>opt-level = 3</code>,
+<code>lto = "thin"</code>, <code>codegen-units = 1</code>,
+<code>panic = "abort"</code>. Az iterátorok használata elkerüli a
+határellenőrzést és a fölösleges allokációt; a <code>write!</code>
+makróval a <code>FileStore::save</code> is kevesebb <code>String</code>
+allokációt végez. A <code>&amp;mut</code> referenciák
+noalias-információja a C++ <code>restrict</code>-hez képest erősebb
+optimalizálást tesz lehetővé. <strong>Továbbvitt eredmény.</strong> Az
+optimalizált <code>MemStore::set</code>, a <code>FileStore::save</code>
+és a release-profil beállítások a <a href="r051.html">Záróprojekt: az
+rkv teljes rendszerként</a> alfejezetben a teljes rendszer végső
+teljesítménytesztjének alapját képezik.</p>
+<h3 data-number="22.1.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">22.1.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>A <code>cargo flamegraph</code>, a <code>perf</code> parancsok
+pontos szintaxisa és a <code>flamegraph</code> crate verziója
+ellenőrizendő a docs.rs-en; a laborban használt parancsok a stabil
+eszközkészletre épülnek, de a pontos kapcsolók verziófüggők.</li>
+<li>A <code>criterion = "0.5"</code> főverzió-megjelölés; a pontos
+alverziót a <code>Cargo.lock</code> rögzíti. A <code>black_box</code> és
+a <code>criterion_group!</code> makrók API-ja ellenőrizendő.</li>
+<li>A <code>Cargo.toml</code> <code>[profile.release]</code> beállítások
+(<code>lto</code>, <code>codegen-units</code>, <code>panic</code>) a
+stabil Rust részei, de a <code>lto = "thin"</code> és <code>"fat"</code>
+viselkedése a linker és a toolchain verziójától függ.</li>
+<li>A <code>MemStore::set</code>, <code>FileStore::save</code> és a
+<code>Storage</code> trait konkrét szignatúráit a korábbi alfejezetek
+rögzítették; ha a jelenlegi kód eltér, a labor feltételezi a <a
+href="r030.html">Vec, HashMap, BTreeMap és társaik; az Entry API</a>
+alfejezetben létrehozott <code>BTreeMap</code>-alapú <code>Store</code>
+struktúrát és az <a href="r029.html">Iterátorok: lusta adapterek és
+saját iterátor</a> alfejezetben definiált <code>Keys</code>
+iterátort.</li>
+<li>A laborban bemutatott futási idők illusztratívak, gépfüggőek, és nem
+tekinthetők mért értéknek. A valódi méréshez a <code>cargo bench</code>
+kimenetét kell alapul venni.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="r048.html">← 21.2 API-tervezés Rustban: irányelvek és ergonómia</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="r050.html">23.1 no_std, embedded-hal és Embassy: Rust mikrovezérlőn →</a></div>
+</nav>
+</body>
+</html>

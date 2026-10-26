@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>53.3 Redis/cache: eviction, persistence és failure – Linux és
+DevOps rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch53">53 Database, cache és messaging működtetése</a></p>
+<div class="links"><a class="prev" rel="prev" href="d262.html">← 53.2 Replication, failover, backup és PITR</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d264.html">53.4 Queue, stream, acknowledgement és delivery →</a></div>
+</nav>
+<h2 data-number="53.3" id="d263"><span
+class="header-section-number">53.3</span> Redis/cache: eviction,
+persistence és failure</h2>
+<h3 data-number="53.3.1" id="motiváció"><span
+class="header-section-number">53.3.1</span> Motiváció</h3>
+<p>Egy szenior C++ szolgáltatás rendszerint nem közvetlenül az
+adatbázist terheli minden olvasásnál, hanem egy memóriaalapú
+gyorsítótárat, jellemzően Redis-t helyez elé. A Redis esetében a
+leggyakoribb termelési hibák nem a Redis kieséséből, hanem abból
+fakadnak, hogy a fejlesztő vagy az operátor nem különbözteti meg a
+<strong>cache</strong> szerepét a <strong>durable source of
+truth</strong> szerepétől. A Redis-ben lévő érték elvesztése nem
+feltétlenül adatvesztés, de nagyon gyorsan adatbázis-túlterhelést
+okozhat, ha a gyorsítótár találati aránya (hit rate) zuhan. Ezt a d008
+várakozási soros modelljével lehet előre jelezni: a Redis hit rate
+csökkenése megnöveli az adatbázisba érkező kérések
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>λ</mi><mrow><mi>d</mi><mi>b</mi></mrow></msub><annotation encoding="application/x-tex">\lambda_{db}</annotation></semantics></math>
+értékét, ami a kihasználtság
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><msub><mi>λ</mi><mrow><mi>d</mi><mi>b</mi></mrow></msub><mi>/</mi><msub><mi>μ</mi><mrow><mi>d</mi><mi>b</mi></mrow></msub></mrow><annotation encoding="application/x-tex">\rho = \lambda_{db}/\mu_{db}</annotation></semantics></math>
+növekedéséhez, majd a várakozási idő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>1</mn><mi>/</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>μ</mi><mrow><mi>d</mi><mi>b</mi></mrow></msub><mo>−</mo><msub><mi>λ</mi><mrow><mi>d</mi><mi>b</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">W = 1/(\mu_{db}-\lambda_{db})</annotation></semantics></math>
+nemlineáris megugrásához vezet. Ebben az alfejezetben a Redis cache
+üzemeltetési szerződését építjük fel: memória, TTL, eviction,
+persistence, replikáció, hitelesítés, bemelegítés és leromlott
+üzemmód.</p>
+<h3 data-number="53.3.2" id="definíció-és-működés"><span
+class="header-section-number">53.3.2</span> Definíció és működés</h3>
+<h4 data-number="53.3.2.1" id="cache-aside-adatút-és-munkahalmaz"><span
+class="header-section-number">53.3.2.1</span> Cache-aside adatút és
+munkahalmaz</h4>
+<p>A tipikus cache-aside adatútban a C++ szolgáltatás először Redis-ből
+olvas. Találat (hit) esetén nem éri az adatbázist; hiba (miss) esetén a
+PostgreSQL-ből olvas, majd visszaírja a Redis-be. Ebben a modellben a
+<strong>source of truth</strong> mindig a PostgreSQL; a Redis tartalma
+reprodukálható másolat. A Redis így nem adattárolási, hanem
+terheléscsökkentési funkcionalitást ad.</p>
+<p>A <strong>working set</strong> (munkahalmaz) azoknak a kulcsoknak a
+halmaza, amelyeket a szolgáltatás egy adott időablakban ténylegesen kér.
+Ha a Redis rendelkezésre álló <code>maxmemory</code> kisebb, mint a
+working set, akkor a Redis folyamatosan kiszorít (evict) kulcsokat, a
+hit rate csökken, és a miss-ek egyre több lekérdezést terhelnek az
+adatbázisra.</p>
+<p>A <strong>time to live (TTL)</strong> az egyes kulcsok érvényességi
+ideje. A Redis kombináltan törli a lejárt kulcsokat: <em>lazy
+expiration</em> során hozzáféréskor veszi észre, <em>active
+expiration</em> során pedig háttérben mintavételez. A TTL megválasztása
+trade-off: rövid TTL friss adatot ad, de több miss-t; hosszú TTL jobb
+hit rate-et ad, de megnő a stale adat kockázata.</p>
+<h4 data-number="53.3.2.2" id="eviction-policy"><span
+class="header-section-number">53.3.2.2</span> Eviction policy</h4>
+<p>A Redis csak akkor kényszerít ki kulcsokat, ha a
+<code>maxmemory</code> limitet eléri. A <code>maxmemory-policy</code>
+adja meg, mit szabad eldobni:</p>
+<ul>
+<li><code>noeviction</code>: írási hiba, ha nincs memória; cache-ként
+általában nem megfelelő.</li>
+<li><code>allkeys-lru</code>: minden kulcs közül a legrégebben
+használtat távolítja el.</li>
+<li><code>allkeys-lfu</code>: minden kulcs közül a legritkábban
+használtat dobja ki.</li>
+<li><code>volatile-lru</code>, <code>volatile-lfu</code>,
+<code>volatile-random</code>, <code>volatile-ttl</code>: csak TTL-es
+kulcsokra hatnak.</li>
+</ul>
+<p>Cache-ként a leggyakoribb, hozzávetőlegesen LRU alapú
+<code>allkeys-lru</code> vagy a frekvenciaalapú
+<code>allkeys-lfu</code>. Az <code>INFO stats</code> mezőjében az
+<code>evicted_keys</code> mutatja a kiszorítások számát, az
+<code>INFO memory</code> <code>maxmemory_human</code> és
+<code>used_memory_human</code> mezője pedig a limitet és a tényleges
+használatot.</p>
+<h4 data-number="53.3.2.3"
+id="cache-stampede-és-request-coalescing"><span
+class="header-section-number">53.3.2.3</span> Cache stampede és request
+coalescing</h4>
+<p>Cache stampede-nek (gyorsítótár-torlódásnak) nevezzük, amikor egy
+népszerű kulcs egyszerre jár le, és sok párhuzamos kérés miss-t okoz.
+Ilyenkor minden kérés egymástól függetlenül betölti ugyanazt az adatot
+az adatbázisból, majd mindegyik ír a Redis-be. A Redis CPU ilyenkor
+alacsony, de a PostgreSQL kapcsolatszáma és kihasználtsága hirtelen
+megnő. A megoldás a <strong>request coalescing</strong>: a kulcsonkénti
+lock segítségével csak egy kérés tölti be az adatot, a többiek rövid
+várakozás után újra próbálnak a Redis-ből olvasni. Emellett segít a
+TTL-jitter (véletlenszerű TTL hozzáadása), hogy a lejárat ne egyszerre
+következzen be.</p>
+<h4 data-number="53.3.2.4" id="rdb-aof-és-persistence-policy"><span
+class="header-section-number">53.3.2.4</span> RDB, AOF és persistence
+policy</h4>
+<p>A Redis két persistence mechanizmust ismer:</p>
+<ul>
+<li><strong>RDB</strong>: időzített point-in-time snapshot
+(<code>save &lt;seconds&gt; &lt;changes&gt;</code>). Kisebb folyamatos
+költség, de az utolsó snapshot után írt adatok elveszhetnek.</li>
+<li><strong>AOF</strong>: minden írás append-elése egy log-fájlba
+(<code>appendonly yes</code>). A <code>appendfsync</code> lehet
+<code>always</code>, <code>everysec</code>, vagy <code>no</code>; a
+<code>everysec</code> jó kompromisszum a tartósság és a teljesítmény
+között.</li>
+</ul>
+<p>Cache szerepben a Redis-t általában <code>save ""</code> és
+<code>appendonly no</code> konfigurációval futtatjuk: a Redis tartalma
+szándékosan nem tartós. Ha a Redis session store-t vagy más, nem
+reprodukálható adatot tárol, akkor már nem tiszta cache, és a
+persistence, replikáció, valamint a failover tartóssági vállalása
+explicit konfigurációt igényel.</p>
+<h4 data-number="53.3.2.5"
+id="replication-sentinel-cluster-capability"><span
+class="header-section-number">53.3.2.5</span> Replication, Sentinel,
+Cluster capability</h4>
+<ul>
+<li><strong>Replication</strong>:
+<code>replicaof &lt;master-ip&gt; &lt;master-port&gt;</code>
+beállítással a másodpéldány read-only másolatot tart fenn. Az adat
+replikáció aszinkron, így master-kieséskor az utolsó írások
+elveszhetnek. Cache-ként ez elfogadható, mert a source of truth a
+PostgreSQL-ben van.</li>
+<li><strong>Sentinel</strong>: replika csoportot monitoroz, quorum
+alapján automatikus failovert hajt végre. A Sentinel nem tárol adatot,
+csak a master kiválasztását vezérli.</li>
+<li><strong>Cluster</strong>: 16384 hash slotra shardingol, beépített
+failoverrel. Akkor hasznos, ha a working set nem fér egy csomópont
+memóriájába.</li>
+</ul>
+<p>Cache-ként a replikáció és a Sentinel/Cluster nem az adattartósságot,
+hanem a hit rate fenntartását és a Redis tier rendelkezésre állását
+növeli.</p>
+<h4 data-number="53.3.2.6"
+id="connection-auth-tls-és-command-scope"><span
+class="header-section-number">53.3.2.6</span> Connection, auth, TLS és
+command scope</h4>
+<p>Egy Redis cache-t nem szabad nyilvános hálózatra nyitni. A
+<code>bind 127.0.0.1</code> és a <code>protected-mode yes</code> az alap
+loopback-szintű védelem. A <code>requirepass</code> egyetlen jelszót ad;
+modern Redis esetén ACL-t használhatunk:</p>
+<pre class="text"><code>ACL SETUSER app on &gt;dummy-password ~cache:* +get +set +del</code></pre>
+<p>A TLS megléte verziófüggő; sok régebbi telepítésben külső proxy,
+például stunnel adja. A command scope tervezésénél kerülendő a blokkoló
+<code>KEYS</code> és a teljes törlést végző <code>FLUSHALL</code>.
+Helyettük <code>SCAN</code> és <code>UNLINK</code> használandó, mert a
+Redis parancsvégrehajtása jellemzően egyetlen szálon fut, és a lassú
+parancs az összes kérés válaszidejét rontja.</p>
+<h4 data-number="53.3.2.7"
+id="cache-warmup-invalidations-és-degraded-operation"><span
+class="header-section-number">53.3.2.7</span> Cache warmup,
+invalidations és degraded operation</h4>
+<ul>
+<li><strong>Warmup</strong>: hideg cache esetén a találati arány
+kezdetben nulla, ezért a Redis indítása után fokozatosan vagy explicit
+prefetch scripttel kell feltölteni a gyakori kulcsokat.</li>
+<li><strong>Invalidation</strong>: write után a cache-ból explicit
+<code>UNLINK</code> vagy <code>DEL</code> szükséges, különben az
+alkalmazás stale adatot olvas. Ha TTL-t használunk, a TTL-t a
+frissességi követelményből kell levezetni.</li>
+<li><strong>Degraded operation</strong>: ha a Redis nem elérhető, a
+szolgáltatás fail-open módon közvetlenül a PostgreSQL-hez fordulhat, de
+circuit breakerrel, hogy a DB túlterhelését elkerülje. Ha a PostgreSQL
+nem elérhető, a Redis cache legfeljebb stale adatot adhat, ezért az
+alkalmazásnak ezt explicit módon kezelnie kell.</li>
+</ul>
+<h3 data-number="53.3.3" id="kidolgozott-példa"><span
+class="header-section-number">53.3.3</span> Kidolgozott példa</h3>
+<p>A cél egy Redis cache konfigurálása laborban, ahol a <strong>source
+of truth</strong> a <code>labdb1</code> PostgreSQL szerver, a Redis
+pedig a <code>labcache1</code> hoston futó cache. A Redis tartalma
+szándékosan nem tartós; minden kulcs a PostgreSQL-ből
+reprodukálható.</p>
+<p>Feltételezések: <code>labcache1</code> Ubuntu Server 24.04 LTS, Redis
+csomag telepítve, de a konkrét verzió és a pontos config-szintaxis
+ellenőrizendő. Az alábbi <code>/etc/redis/redis.conf</code> kivonat
+cache profilt ad:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">bind 127.0.0.1</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">protected-mode yes</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">port 6379</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">requirepass dummy-password</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">maxmemory 64mb</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="dt">maxmemory-policy allkeys-lru</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">save &quot;&quot;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="dt">appendonly no</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="dt">timeout 300</span></span></code></pre></div>
+<p>A <code>save ""</code> és <code>appendonly no</code> itt azért
+helyes, mert a Redis nem source of truth. A PostgreSQL az egyetlen
+tartós állapot, ezért a Redis-ből való adatvesztés nem adatvesztés,
+hanem hideg cache-t jelent.</p>
+<p>Indítás és ellenőrzés:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart redis-server</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> ping</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET maxmemory</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET maxmemory-policy</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET save</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET appendonly</span></code></pre></div>
+<p>Várható kimenet: <code>PONG</code>, a <code>maxmemory</code>
+<code>67108864</code>, a <code>maxmemory-policy</code>
+<code>allkeys-lru</code>, a <code>save</code> üres, az
+<code>appendonly</code> <code>no</code>.</p>
+<p>Adatfeltöltés a memóriakorlát átlépéséhez, illusztratív
+jelleggel:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 20000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> SET <span class="st">&quot;key:</span><span class="va">$i</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$(</span><span class="ex">openssl</span> rand <span class="at">-base64</span> 3072<span class="va">)</span><span class="st">&quot;</span> EX 600 <span class="op">&gt;</span>/dev/null</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A generált érték mérete körülbelül 4 KiB kulcsonként, tehát 20 000
+kulcs nagyjából 80 MiB adatot jelent, ami fölé megy a 64 MiB limitnek. A
+Redis a beérkező írások közben evictál.</p>
+<p>Ellenőrzés:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> INFO memory <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;used_memory_human|maxmemory_human|maxmemory_policy&#39;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> INFO stats <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;evicted_keys|expired_keys|keyspace_hits|keyspace_misses&#39;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> DBSIZE</span></code></pre></div>
+<p>Várt, nem mért kimeneti jellemzők: <code>used_memory_human</code> a
+<code>maxmemory</code> környékén marad, <code>evicted_keys</code>
+nagyobb nullánál, és <code>DBSIZE</code> kisebb 20 000-nél. A
+kiszorított kulcsok a TTL-lejárat előtt eltűnnek a cache-ből, ezért a
+hit rate csökken, és a PostgreSQL felé irányuló kérések száma nő.</p>
+<p>A hit rate és a terhelés összefüggése numerikusan is felírható:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: right;">Cache hit rate</th>
+<th style="text-align: right;">Miss rate</th>
+<th style="text-align: right;">DB-t elérő miss [req/s]</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0.50</td>
+<td style="text-align: right;">0.50</td>
+<td style="text-align: right;">500</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">0.60</td>
+<td style="text-align: right;">0.40</td>
+<td style="text-align: right;">400</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">0.70</td>
+<td style="text-align: right;">0.30</td>
+<td style="text-align: right;">300</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">0.80</td>
+<td style="text-align: right;">0.20</td>
+<td style="text-align: right;">200</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">0.90</td>
+<td style="text-align: right;">0.10</td>
+<td style="text-align: right;">100</td>
+</tr>
+</tbody>
+</table>
+<p>Feltéve, hogy az alkalmazás 1000 req/s sebességgel kérdez, és minden
+cache miss a DB-t terheli:</p>
+<figure>
+<img src="assets/d263-plot-1.png"
+alt="Cache hit-rate és DB load hipotetikus modell - Hipotetikus modell: 1000 alkalmazás req/s, minden miss a DB-t terheli. Nem mért laboreredmény." />
+<figcaption aria-hidden="true">Cache hit-rate és DB load hipotetikus
+modell - Hipotetikus modell: 1000 alkalmazás req/s, minden miss a DB-t
+terheli. Nem mért laboreredmény.</figcaption>
+</figure>
+<p>A Redis-ben tárolt kulcsok ebben a példában csak cache másolatok. Ha
+a <code>FLUSHALL</code> vagy egy node-kiesés miatt az összes cache
+elveszik, a szolgáltatás számára az egyetlen igazság a PostgreSQL; hideg
+cache esetén újra kell tölteni.</p>
+<p>A stampede elleni request coalescing C++ vázlata:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>optional<span class="op">&lt;</span>Row<span class="op">&gt;</span> getRow<span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>string<span class="op">&amp;</span> id<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> cached <span class="op">=</span> redis<span class="op">.</span>get<span class="op">(</span>id<span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>cached<span class="op">)</span> <span class="cf">return</span> decode<span class="op">(*</span>cached<span class="op">);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">// lock a kulcsra, hogy csak egy kérés töltse be a DB-ből</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    redis<span class="op">::</span>guard lock<span class="op">(</span>redis<span class="op">,</span> <span class="st">&quot;lock:row:&quot;</span> <span class="op">+</span> id<span class="op">,</span> <span class="bu">std::</span>chrono::seconds<span class="op">(</span><span class="dv">5</span><span class="op">));</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>lock<span class="op">.</span>acquired<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">20</span><span class="op">));</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        cached <span class="op">=</span> redis<span class="op">.</span>get<span class="op">(</span>id<span class="op">);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cached<span class="op">)</span> <span class="cf">return</span> decode<span class="op">(*</span>cached<span class="op">);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ha még mindig nincs, a hívó eldöntheti, hogy továbbereszti-e a DB-nek</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> row <span class="op">=</span> db<span class="op">.</span>getRow<span class="op">(</span>id<span class="op">);</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    redis<span class="op">.</span>set<span class="op">(</span>id<span class="op">,</span> encode<span class="op">(</span>row<span class="op">),</span> TTL<span class="op">{</span><span class="dv">60</span><span class="bu">s</span><span class="op">});</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> row<span class="op">;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>redis::guard</code> itt
+<code>SET lock:row:&lt;id&gt; token NX EX</code> formában kér lockot,
+így a párhuzamos kérések közül csak egy megy a PostgreSQL-hez. A
+Redis-ben tárolt <code>row</code> továbbra is cache másolat, nem source
+of truth; a lock lejárta vagy a Redis lock elvesztése nem adatvesztést,
+hanem esetleges dupla DB-olvasást okoz.</p>
+<h3 data-number="53.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">53.3.4</span> Hibák és ellenpróbák</h3>
+<p><strong>Tünet:</strong> a Redis írások
+<code>OOM command not allowed when used memory &gt; 'maxmemory'</code>
+hibával elszállnak.<br />
+<strong>Hipotézis:</strong> a <code>maxmemory</code> kisebb a working
+set-nél, és a <code>maxmemory-policy</code>
+<code>noeviction</code>.<br />
+<strong>Adatgyűjtés:</strong> <code>redis-cli INFO memory</code>,
+<code>redis-cli CONFIG GET maxmemory-policy</code>.<br />
+<strong>Egy változtatás:</strong>
+<code>CONFIG SET maxmemory 128mb</code>,
+<code>CONFIG SET maxmemory-policy allkeys-lfu</code>, majd az
+<code>evicted_keys</code> növekedését ellenőrizni.<br />
+<strong>Postcondition:</strong> a Redis cache-ként kiszorít, a forrás
+PostgreSQL-t nem érinti.</p>
+<p><strong>Tünet:</strong> a Redis elérhető, de a PostgreSQL CPU
+hirtelen 100%-ra ugrik.<br />
+<strong>Hipotézis:</strong> cache stampede vagy alacsony hit rate.<br />
+<strong>Adatgyűjtés:</strong> Redis <code>INFO stats</code>
+<code>keyspace_hits</code>/<code>keyspace_misses</code>, PostgreSQL
+<code>pg_stat_statements</code> vagy slow log, a Redis
+<code>slowlog get</code>.<br />
+<strong>Egy változtatás:</strong> request coalescing bevezetése a
+kulcsonkénti lockkal, illetve TTL-jitter.<br />
+<strong>Ellenpróba:</strong> a PostgreSQL kapcsolatszám és a válaszidő
+csökken, a Redis <code>keyspace_hits</code> aránya javul.</p>
+<p><strong>Tünet:</strong> a Redisben lévő érték régebbi, mint a
+PostgreSQL-ben lévő.<br />
+<strong>Hipotézis:</strong> write után nincs explicit invalidálás, vagy
+túl hosszú a TTL.<br />
+<strong>Adatgyűjtés:</strong> a Redis kulcs és a PostgreSQL
+<code>updated_at</code> mező összehasonlítása.<br />
+<strong>Egy változtatás:</strong> write után <code>UNLINK</code> a
+Redis-ből, vagy rövid TTL.<br />
+<strong>Postcondition:</strong> az alkalmazás a következő olvasásnál
+friss source-of-truth adatot kap.</p>
+<p><strong>Tünet:</strong> Sentinel failover után a Redis-ből írások
+tűntek el.<br />
+<strong>Hipotézis:</strong> a Redis-t source of truth-ként használták
+aszinkron replikációval.<br />
+<strong>Egy változtatás:</strong> a Redis-t cache-ként konfigurálják, a
+tartós adatot a PostgreSQL replikáció és backup védi. Ha a Redis tényleg
+forrás, akkor AOF <code>appendfsync always</code>, Sentinel quorum és
+írás confirm szükséges.</p>
+<h3 data-number="53.3.5" id="feladatok"><span
+class="header-section-number">53.3.5</span> Feladatok</h3>
+<h4 data-number="53.3.5.1"
+id="magyarázó-feladat-hit-rate-és-db-load"><span
+class="header-section-number">53.3.5.1</span> 1. Magyarázó feladat: hit
+rate és DB load</h4>
+<p>Egy szolgáltatás 1000 req/s sebességgel olvas. A Redis hit rate 90%,
+minden miss 10 lekérdezést indít a PostgreSQL felé. A PostgreSQL
+kapacitása 1200 query/s. Számítsd ki a DB kihasználtságát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>ρ</mi><annotation encoding="application/x-tex">\rho</annotation></semantics></math>-t.
+Mennyi a DB load, ha a hit rate 70%-ra esik vissza az eviction miatt? Mi
+történik a várakozási idővel a d008 M/M/1 modellje szerint? Milyen Redis
+beavatkozást javasolnál?</p>
+<h4 data-number="53.3.5.2"
+id="adminisztrációs-feladat-cache-config-és-ellenőrzés"><span
+class="header-section-number">53.3.5.2</span> 2. Adminisztrációs
+feladat: cache config és ellenőrzés</h4>
+<p>A <code>labcache1</code> hoston állítsd be a Redis-t úgy, hogy
+<code>maxmemory</code> 128 MiB legyen, <code>maxmemory-policy</code>
+<code>allkeys-lru</code>, persistence kikapcsolva, requirepass
+<code>dummy-password</code>, a Redis csak loopbackon figyeljen.
+Dokumentáld, hogy a Redis nem source of truth, és írd meg a
+konfigurációt, az újraindítást és az ellenőrző parancsokat.</p>
+<h4 data-number="53.3.5.3"
+id="diagnosztikaifailure-feladat-cold-cache-és-degraded-operation"><span
+class="header-section-number">53.3.5.3</span> 3. Diagnosztikai/failure
+feladat: cold cache és degraded operation</h4>
+<p>A laborban állítsd le a Redis-t
+(<code>sudo systemctl stop redis-server</code>). A szolgáltatás
+fail-open üzemmódban közvetlenül a PostgreSQL-hez fordul. Fogalmazd meg
+a várható hatást a DB kihasználtságára, és tervezd meg a Redis indítás
+utáni warmup scriptet és egy circuit breakeres degraded operation
+policy-t. Mi a postcondition: a Redis hideg cache, a PostgreSQL a
+forrás, és a szolgáltatás tovább működik.</p>
+<h3 data-number="53.3.6" id="megoldások"><span
+class="header-section-number">53.3.6</span> Megoldások</h3>
+<h4 data-number="53.3.6.1" id="megoldás"><span
+class="header-section-number">53.3.6.1</span> 1. Megoldás</h4>
+<p>A miss rate 0.10, tehát miss-ek száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>100</mn><annotation encoding="application/x-tex">100</annotation></semantics></math>
+req/s. Minden miss 10 query, így a DB terhelése
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mo>⋅</mo><mn>10</mn><mo>=</mo><mn>1000</mn></mrow><annotation encoding="application/x-tex">100 \cdot 10 = 1000</annotation></semantics></math>
+query/s. A DB kihasználtsága
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mn>1000</mn><mi>/</mi><mn>1200</mn><mo>≈</mo><mn>0.83</mn></mrow><annotation encoding="application/x-tex">\rho = 1000/1200 \approx 0.83</annotation></semantics></math>.
+Ha a hit rate 70%-ra romlik, a miss rate 0.30, a miss-ek
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>300</mn><annotation encoding="application/x-tex">300</annotation></semantics></math>
+req/s, a DB terhelése
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>3000</mn><annotation encoding="application/x-tex">3000</annotation></semantics></math>
+query/s, a kihasználtság
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>=</mo><mn>3000</mn><mi>/</mi><mn>1200</mn><mo>=</mo><mn>2.5</mn></mrow><annotation encoding="application/x-tex">\rho = 3000/1200 = 2.5</annotation></semantics></math>,
+ami túlterhelést jelent. Az M/M/1 várakozási idő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>1</mn><mi>/</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>μ</mi><mo>−</mo><mi>λ</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">W = 1/(\mu-\lambda)</annotation></semantics></math>;
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ρ</mi><mo>&gt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">\rho&gt;1</annotation></semantics></math>
+miatt a modell már instabil, a gyakorlatban a sor hossza és a válaszidő
+drasztikusan nő. Beavatkozás: növelni kell a Redis memóriát,
+optimalizálni a TTL-t, eviction policy-t, és szükség esetén request
+coalescinget bevezetni, hogy a forró kulcsok ne egyszerre járjanak
+le.</p>
+<h4 data-number="53.3.6.2" id="megoldás-1"><span
+class="header-section-number">53.3.6.2</span> 2. Megoldás</h4>
+<p><code>/etc/redis/redis.conf</code>:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">bind 127.0.0.1</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="dt">protected-mode yes</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="dt">port 6379</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">requirepass dummy-password</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="dt">maxmemory 128mb</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="dt">maxmemory-policy allkeys-lru</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="dt">save &quot;&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="dt">appendonly no</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="dt">timeout 300</span></span></code></pre></div>
+<p>Ellenőrző parancsok:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart redis-server</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> ping</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET maxmemory</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET maxmemory-policy</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> CONFIG GET requirepass</span></code></pre></div>
+<p>Postcondition: a Redis a loopbackon hallgat, cache-ként működik, a
+Redis-ből való adatvesztés nem adatvesztés, mert a forrás a
+PostgreSQL.</p>
+<h4 data-number="53.3.6.3" id="megoldás-2"><span
+class="header-section-number">53.3.6.3</span> 3. Megoldás</h4>
+<p>A <code>sudo systemctl stop redis-server</code> után a Redis nem
+elérhető. A szolgáltatás cache-miss-t lát minden kulcsra, ezért minden
+kérést a PostgreSQL-hez továbbít. A DB load a miss rate 100%-os értékre
+nő, a kihasználtság ugrik. A warmup script indításkor beolvashatja a
+legnagyobb forgalmú kulcsokat:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> id <span class="kw">in</span> <span class="va">$(</span><span class="fu">cat</span> /etc/labcache/warmup-keys.txt<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>  <span class="va">REDISCLI_AUTH</span><span class="op">=</span>dummy-password <span class="ex">redis-cli</span> SET <span class="st">&quot;row:</span><span class="va">$id</span><span class="st">&quot;</span> <span class="st">&quot;</span><span class="va">$(</span><span class="ex">psql</span> <span class="at">-h</span> labdb1 <span class="at">-U</span> app <span class="at">-d</span> app <span class="at">-t</span> <span class="at">-c</span> <span class="st">&quot;SELECT encode(row_to_json(t)::text, &#39;base64&#39;) FROM rows WHERE id = &#39;</span><span class="va">$id</span><span class="st">&#39;&quot;</span><span class="va">)</span><span class="st">&quot;</span> EX 600 <span class="op">&gt;</span>/dev/null</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A circuit breaker lényege: ha a Redis pillanatnyi hibaaránya
+meghaladja a küszöböt, a szolgáltatás rövid ideig közvetlen DB-olvasást
+végez, de a kelleténél több ideig nem terheli a DB-t. A Redis tartalma
+hideg cache; a PostgreSQL továbbra is az igazság forrása.</p>
+<h3 data-number="53.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">53.3.7</span> Rövid összefoglaló</h3>
+<p>A Redis cache-ként a PostgreSQL előtti olvasási terhelést csökkenti,
+de nem source of truth. A <strong>working set</strong> a ténylegesen
+kért kulcsok halmaza; ha nagyobb a <code>maxmemory</code>-nál, a Redis
+evictál, és a hit rate csökken. A <strong>cache stampede</strong> akkor
+lép fel, amikor egy népszerű kulcs lejárta után sok kérés egyszerre
+olvas a DB-ből; a megoldás a request coalescing. A <strong>persistence
+policy</strong> cache-ként <code>save ""</code> és
+<code>appendonly no</code>, míg source-of-truth szerepben RDB/AOF és
+replikáció szükséges. A Sentinel/Cluster a Redis rendelkezésre állást és
+kapacitást növeli, de az adattartósságot a forrásrendszer
+garantálja.</p>
+<h3 data-number="53.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">53.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://redis.io/docs/latest/">Redis documentation</a> –
+kiindulópont, nem ellenőrzött olvasott forrás.</li>
+<li><a href="https://www.postgresql.org/docs/">PostgreSQL
+documentation</a> – a d262 forrásigazság szerepéhez.</li>
+<li><a href="https://sre.google/books/">SRE Book</a> – túlterhelés,
+cache és degraded operation általános SRE összefüggésekhez.</li>
+</ul>
+<p>Ellenőrzési hiányok: az aktuális Redis szerver pontos verziója, a
+<code>maxmemory-policy</code>, Sentinel/Cluster és TLS konfiguráció
+verziófüggő szintaxisa nem ellenőrzött. A lab parancsok nem futtatottak,
+a számított várt értékek illusztratívak. Ubuntu Server 24.04 csomagjában
+lévő Redis konkrét viselkedését külön release-note ellenőrzéssel kell
+megerősíteni. A PostgreSQL és Redis közötti forgalmi adatok
+hipotetikusak, nem valódi mérésből származnak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d262.html">← 53.2 Replication, failover, backup és PITR</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d264.html">53.4 Queue, stream, acknowledgement és delivery →</a></div>
+</nav>
+</body>
+</html>

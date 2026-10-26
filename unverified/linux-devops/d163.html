@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>33.3 VXLAN/EVPN, underlay és SDN – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch33">33 Adatközponti hálózat, overlay és routing control plane</a></p>
+<div class="links"><a class="prev" rel="prev" href="d162.html">← 33.2 BGP, OSPF és route policy</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d164.html">33.4 VRF, tenant, network policy és service fabric →</a></div>
+</nav>
+<h2 data-number="33.3" id="d163"><span
+class="header-section-number">33.3</span> VXLAN/EVPN, underlay és
+SDN</h2>
+<h3 data-number="33.3.1" id="motiváció"><span
+class="header-section-number">33.3.1</span> Motiváció</h3>
+<p>Egy klasszikus, kizárólag VLAN-alapú adatközponti hálózatban a
+második réteg (L2) kiterjed, ahogy a munkaterhelést vagy a bérlőt
+szolgáló VLAN-t több switchen átvezetjük. A VLAN-azonosító 12 bites
+mezője legfeljebb 4094 hálózatot enged meg, a nagy L2
+broadcast-tartomány pedig flappoló MAC-táblát, loopveszélyt és széles
+hiba-tartományt hoz létre. A spine–leaf IP-fabric ezzel szemben stabil,
+jól méretezhető és ECMP-alapú, de a kiszolgálók néha a kiinduló switchen
+kívülre kerülnek, és a bérlői L2-szegmenseket mégsem akarjuk minden
+levélen VLAN-ként üzemeltetni. A VXLAN–EVPN ezt a két igényt köti össze:
+az <em>underlay</em> (a fizikai IP-hálózat) csak a tunnel végpontok
+elérését biztosítja, az <em>overlay</em> pedig a bérlői kereteket
+szállítja az L3-hálózaton keresztül, VNI-vel elkülönítve.</p>
+<p>Szenior C++ fejlesztőként itt is tulajdonviszony- és
+adatút-modellezésről van szó: az underlay route tábla azt mondja meg,
+<em>hogyan érhető el</em> egy másik VTEP; az overlay route/MAC-tábla
+pedig azt, hogy az adott bérlői cél <em>melyik</em> VTEP mögött van. A
+hibakereséskor ezt a két tulajdonost mindig külön kell vizsgálni, mert a
+tünet gyakran keveredik.</p>
+<h3 data-number="33.3.2" id="definíció-és-működés"><span
+class="header-section-number">33.3.2</span> Definíció és működés</h3>
+<p><strong>Underlay</strong> alatt azt a fizikai vagy fizikailag
+route-olt IP-hálózatot értjük, amely a loopback- vagy VTEP-címek
+elérését biztosítja. Az underlay lehet OSPF, IS-IS vagy eBGP alapú;
+jelen fejezetben számunkra az a lényeg, hogy a VTEP-IP-k között stabil
+IP-route létezik, és a keret az adott MTU-val fragmentálás vagy eldobás
+nélkül átfér. <strong>Overlay</strong> alatt a bérlői L2/L3 forgalom
+olyan továbbítását értjük, amely egy beágyazott (encapsulated) csomagban
+halad az underlay felett.</p>
+<p>A <strong>VXLAN</strong> (Virtual eXtensible LAN) egy UDP-alapú
+beágyazási protokoll. A bérlői Ethernet-keretet egy VXLAN-fejléccel,
+majd UDP-fejléccel, majd külső IP-fejléccel látjuk el. A
+<strong>VNI</strong> (VXLAN Network Identifier) 24 bites azonosító,
+tehát elméletileg körülbelül 16 millió szegmens lehetséges. A
+<strong>VTEP</strong> (VXLAN Tunnel Endpoint) az az eszköz, amely a
+beágyazást és kicsomagolást végzi. A VTEP lehet Linux kernel, Open
+vSwitch, hypervisor vswitch vagy fizikai switch.</p>
+<p>A VXLAN csomag felépítése:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Réteg</th>
+<th>Mező</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Underlay L2</td>
+<td>külső Ethernet-fejléc</td>
+<td>A kábel/switch L2-címei</td>
+</tr>
+<tr class="even">
+<td>Underlay L3</td>
+<td>külső IP-fejléc</td>
+<td>Forrás/cél IP: VTEP-IP-k</td>
+</tr>
+<tr class="odd">
+<td>Transport</td>
+<td>UDP</td>
+<td>Általában célport 4789</td>
+</tr>
+<tr class="even">
+<td>Overlay header</td>
+<td>VXLAN</td>
+<td>8 bájt: flags + VNI</td>
+</tr>
+<tr class="odd">
+<td>Overlay L2</td>
+<td>belső Ethernet-keret</td>
+<td>Az eredeti bérlői keret, beleértve a belső MAC-címeket</td>
+</tr>
+</tbody>
+</table>
+<p>Amikor egy bérlői MAC-cím ismeretlen, a VXLAN adatsík vagy
+broadcast/multicast/unicast replikációval küld BUM-forgalmat, vagy a
+control plane már ismeri a MAC–VTEP hozzárendelést. A statikus
+VXLAN-konfigurációban kézzel töltjük a bridge FDB-t <code>remote</code>
+bejegyzésekkel. A flood-and-learn modell törékeny: ismeretlen unicast
+elárasztást, ARP-elárasztást és nagy broadcast-tartományt örököl. Az
+<strong>EVPN</strong> ezt BGP-vel oldja meg.</p>
+<p>Az <strong>EVPN</strong> (Ethernet VPN) nem új adatsík, hanem
+<em>control plane</em>: a VTEP-ek MP-BGP-n keresztül hirdetik a bérlői
+MAC/IP-ket és a VNI-hozzárendelést. A BGP EVPN address family a
+következő főbb route-típusokat használja:</p>
+<ul>
+<li>Route Type 2: MAC/IP advertisement – adott MAC és opcionálisan IP a
+VTEP-től.</li>
+<li>Route Type 3: Inclusive Multicast Ethernet Tag route –
+BUM-replikációs lista.</li>
+<li>Route Type 5: IP prefix route – L3 elérés az overlayben.</li>
+</ul>
+<p>Az RT (Route Target) biztosítja a VNI/tenant import/export
+szétválasztást. Így a VNI-hez tartozó route-állapot és az underlay
+route-állapot külön BGP-táblákban él: az underlay címek a globális
+IPv4/IPv6 unicast AF-ben, az overlay címek az EVPN AF-ben.</p>
+<p>Az <strong>SDN controller</strong> és a <strong>datapath</strong>
+kapcsolata ugyanezt a szétválasztást magasabb szinten ismétli. A
+controller a kívánt végpont-térképet és policy-t egy nyílt vagy zárt
+API-n keresztül programozza; a datapath (kernel, OVS, smartNIC, eBPF) a
+tényleges csomagokat továbbítja. A Linux bridge, az Open vSwitch és a
+CNI-ek (például Cilium, Calico, Flannel) különböző datapath/control
+plane kombinációkat valósítanak meg:</p>
+<ul>
+<li>Linux bridge + static FDB: egyszerű, tanulásra alkalmas, de nem
+skálázódik.</li>
+<li>Linux bridge + EVPN (FRR): kernel datapath, BGP control plane.</li>
+<li>OVS + OpenFlow/OVN: flow-alapú datapath, SDN controller.</li>
+<li>Kernel eBPF + Cilium: programozott datapath policy-val.</li>
+</ul>
+<p>A konténer- és Kubernetes-hálózatban gyakran ugyanez a VXLAN/GENEVE
+technika fut, de a CNI plugin automatikusan kezeli a VTEP-eket, VNI-ket,
+route-okat és MTU-t. A kézi labor ezért nem a modern platform
+helyettesítése, hanem a láthatóvá tétel eszköze.</p>
+<h3 data-number="33.3.3" id="kidolgozott-példa"><span
+class="header-section-number">33.3.3</span> Kidolgozott példa</h3>
+<p>A labort két Linux hoszton hozzuk létre, ahol minden hoszt egy VTEP
+és egy bérlői bridge. Az underlay OSPF helyett a lab kedvéért statikus
+route-ot használunk; a proof csak a VXLAN-rétegek ellenőrzésére
+szolgál.</p>
+<p><strong>Topológia</strong></p>
+<table>
+<thead>
+<tr class="header">
+<th>Elem</th>
+<th>Interface</th>
+<th>IP</th>
+<th>Szerep</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>lab-leaf1</code></td>
+<td><code>eth0</code></td>
+<td>192.0.2.10/24</td>
+<td>underlay leaf1</td>
+</tr>
+<tr class="even">
+<td><code>lab-leaf1</code></td>
+<td><code>lo</code></td>
+<td>10.0.0.1/32</td>
+<td>VTEP IP</td>
+</tr>
+<tr class="odd">
+<td><code>lab-leaf2</code></td>
+<td><code>eth0</code></td>
+<td>192.0.2.20/24</td>
+<td>underlay leaf2</td>
+</tr>
+<tr class="even">
+<td><code>lab-leaf2</code></td>
+<td><code>lo</code></td>
+<td>10.0.0.2/32</td>
+<td>VTEP IP</td>
+</tr>
+<tr class="odd">
+<td><code>lab-tenant-a1</code></td>
+<td><code>veth</code></td>
+<td>192.0.2.101/24</td>
+<td>bérlő végpont VNI 10001</td>
+</tr>
+<tr class="even">
+<td><code>lab-tenant-a2</code></td>
+<td><code>veth</code></td>
+<td>192.0.2.102/24</td>
+<td>bérlő végpont VNI 10001</td>
+</tr>
+</tbody>
+</table>
+<p>Az underlay MTU-t 1550 bájtra emeljük a használt interface-en, hogy a
+1500 bájtos belső IP-csomag ne fragmentálódjon. Ezt a lab VLAN/interface
+típusától függően a switch oldalon is engedélyezni kell; a lab
+ellenőrzése előtt <code>ping -M do -s 1472</code> próba szükséges.</p>
+<p><strong>Parancsok <code>lab-leaf1</code>-en</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># TARGET: lab-leaf1, UID: root (vagy sudo -n)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Előfeltétel: eth0 192.0.2.10/24, lo 10.0.0.1/32, underlay route 10.0.0.2 felé</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add vxlan100 type vxlan id 10001 remote 10.0.0.2 dev eth0 dstport 4789</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add br100 type bridge</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set vxlan100 master br100</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set lab-tenant-a1 master br100</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set vxlan100 up</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set br100 up</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set lab-tenant-a1 up</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="ex">bridge</span> fdb show dev vxlan100</span></code></pre></div>
+<p>Várható kimenet a statikus remote után:</p>
+<pre class="text"><code>00:00:00:00:00:00 dst 10.0.0.2 self permanent</code></pre>
+<p><strong>Parancsok <code>lab-leaf2</code>-n</strong></p>
+<p>Ugyanez, csak a remote IP az <code>10.0.0.1</code>, és a
+<code>lab-tenant-a2</code> port kerül a <code>br100</code>
+bridge-be.</p>
+<p><strong>Ellenőrzés</strong></p>
+<p>A <code>lab-tenant-a1</code> névtérből pingeljük a
+<code>lab-tenant-a2</code> IP-t. Mivel a két bérlői IP azonos
+L2-szegmensbe tartozik, a bridge flood-and-learn módon megtanulja a
+MAC–VTEP hozzárendelést. A <code>bridge fdb show br100</code> várt
+sorai:</p>
+<pre class="text"><code>&lt;MAC-cím&gt; dev vxlan100 dst 10.0.0.2 self
+&lt;helyi MAC-cím&gt; dev lab-tenant-a1 master br100</code></pre>
+<p>A csomagfogás a <code>lab-leaf1</code> <code>eth0</code>
+interfészén:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tcpdump</span> <span class="at">-n</span> <span class="at">-i</span> eth0 udp port 4789 <span class="at">-c</span> 2</span></code></pre></div>
+<p>Várt csomag:</p>
+<pre class="text"><code>IP 192.0.2.10.xxxxx &gt; 192.0.2.20.4789: UDP, length 106</code></pre>
+<p>A belső MAC-címeket és a VXLAN-fejlécet a
+<code>tcpdump -nn -i eth0 udp port 4789 -vv</code> mutatja, de a
+részletes bontáshoz Wireshark vagy <code>tshark -V</code> szükséges. A
+kulcsminta az outer IP <code>192.0.2.x</code>, az UDP-port 4789, a VXLAN
+<code>VNI 10001</code>, valamint a belső Ethernet-fejlécben a bérlői
+MAC-címek.</p>
+<p><strong>MTU-ellenőrzés</strong></p>
+<p>A bérlői névtérben:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-M</span> do <span class="at">-s</span> 1472 <span class="at">-c</span> 2 192.0.2.102</span></code></pre></div>
+<p>A <code>-s 1472</code> 1500 bájtos IP-csomagot jelent (1472 + 20 IP +
+8 ICMP). Ha az underlay útvonalon bármely eszköz 1500-as klasszikus
+IP-MTU-val dolgozik, a külső UDP-datagram túl nagy lesz, és a DF bit
+miatt a válasz <code>Frag needed</code> lehet. A megoldás vagy a belső
+MTU csökkentése, vagy az underlay MTU emelése. A pillanatnyi alagút
+használhatóságát <code>ip -d link show vxlan100</code> is jelzi.</p>
+<h3 data-number="33.3.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">33.3.4</span> Hibák és ellenpróbák</h3>
+<p>Az overlay hibáknál először mindig az underlay elérhetőséget és MTU-t
+zárjuk ki, mert a VXLAN csak ezután kerülhet szóba.</p>
+<p><strong>Underlay unreachable</strong></p>
+<p>Tünet: a VXLAN-interface felmegy, de a távoli bérlő nem elérhető; a
+<code>bridge fdb</code> bejegyzés ott van. Ellenőrzés:
+<code>ping 10.0.0.2</code> és <code>ip route get 10.0.0.2</code>. Ha az
+underlay route hiányzik, a külső IP-csomag nem hagyja el a hosztot.
+Javítás: route hozzáadása a <code>lab-leaf1</code>-en:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> route add 10.0.0.2/32 via 192.0.2.1 dev eth0</span></code></pre></div>
+<p>Ellenpróba: traceroute <code>10.0.0.2</code>; ha a következő hop nem
+a spine, akkor policy-routing hibát keresünk.</p>
+<p><strong>MTU black hole</strong></p>
+<p>Tünet: kis ping (64 bájt) működik, nagy (1472) nem; a TCP-kapcsolat a
+handshake után elakad. Ellenőrzés: <code>ping -M do -s 1472</code> a
+bérlő azonos szegmensben. Hipotézis: az underlay MTU túl alacsony, vagy
+a tunnel overhead rosszul van beállítva. Javítás: a belső MTU-t
+csökkentjük, például 1450 bájtra, hogy legalább 1400 bájtos belső IP-t
+tartsunk, vagy az underlay fizikai MTU-t emeljük. A d158 szerint az ICMP
+<code>Frag needed</code> elvesztése miatt a hiba méretfüggő elakadásként
+jelentkezik; a VXLAN esetén az underlay DF-válaszát a külső IP-fejre
+kapjuk, és a kernel ezt nem feltétlenül írja vissza a belső
+socketre.</p>
+<p><strong>Stale FDB</strong></p>
+<p>Tünet: a ping csak az egyik irányba működik, vagy hosszú flood után
+sem épül fel a forgalom. Ellenőrzés: <code>bridge fdb show br100</code>.
+Ha a távoli MAC <code>dst</code> mezője régi VTEP-re mutat, a keret
+rossz helyre megy. Javítás: statikus FDB-t törölni és újraprogramozni,
+vagy EVPN-est használni, ahol a BGP frissíti. A bridge tanulás
+flood-and-learn korlátaira itt nem szabad globális megoldásként
+hivatkozni.</p>
+<p><strong>VNI mismatch</strong></p>
+<p>Tünet: a VTEP-ek elérik egymást, de a csomagok a fogadó oldalon
+nincsenek a bridge-ben; <code>tcpdump</code> mutatja a VXLAN-t, de a
+bérlő nem kap. Ellenőrzés: <code>bridge -d link show vxlan100</code>
+mindkét oldalon; a VNI-k azonosak-e. Javítás: az interface újra
+létrehozása a helyes <code>id</code> értékkel. Ez a hiba az EVPN RT
+import/export félrekonfigurálásához hasonlít: a datapath felépül, de a
+tenant-állapot nem találkozik.</p>
+<h3 data-number="33.3.5" id="feladatok"><span
+class="header-section-number">33.3.5</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat</strong><br />
+Rajzolja fel a csomagok rétegezését: belső Ethernet, VNI, UDP, outer IP,
+underlay L2. Határozza meg, melyik mező melyik tulajdonoshoz tartozik,
+és mi történik, ha az outer IP-cím nem egyezik a VTEP
+loopback-kel.</p></li>
+<li><p><strong>Konfigurációs feladat</strong><br />
+A <code>lab-leaf1</code> és <code>lab-leaf2</code> hosztokon hozzon
+létre VNI 10002 alagutat a 10.0.0.1 és 10.0.0.2 VTEP-ek között. A bérlői
+bridge <code>br200</code>, a bérlő végpontok IP-je
+<code>192.0.2.111/24</code> és <code>192.0.2.112/24</code>. Ellenőrizze
+pinggel, <code>bridge fdb show</code>-val és <code>tcpdump</code>-pal.
+Az MTU-t úgy állítsa, hogy 1400 bájtos belső IP-csomag ne
+fragmentálódjon.</p></li>
+<li><p><strong>Diagnosztikai feladat</strong><br />
+A bérlői ping <code>destination host unreachable</code> hibát ad, de a
+VTEP-ek közötti ping működik. Gyűjtsön bizonyítékot:
+<code>ip route get 10.0.0.2</code>, <code>bridge fdb show</code>,
+<code>ip -d link show vxlan100</code>, és határozza meg a hibát.
+Próbálja ki azt a hibainjekciót is, hogy a VNI-t az egyik oldalon
+<code>10099</code>-re állítja.</p></li>
+</ol>
+<h3 data-number="33.3.6" id="megoldások"><span
+class="header-section-number">33.3.6</span> Megoldások</h3>
+<ol type="1">
+<li><p>A csomag rétegei kívülről befelé: underlay L2, outer IP
+(VTEP-IP-k), UDP (4789), VXLAN fejléc (VNI), belső Ethernet-fejléc. Az
+outer IP az underlay tulajdona; a VNI és a belső Ethernet a bérlő
+tulajdona. Ha az outer IP nem a VTEP loopback, az underlay route-tábla
+tévesen többé-kevésbé elérhetővé teheti, de a return traffic a hibás
+címet fogja használni forrásként, és a másik fél
+<code>no such VNI</code> vagy RPF hibát adhat.</p></li>
+<li><p>A <code>lab-leaf1</code>-en:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add vxlan200 type vxlan id 10002 remote 10.0.0.2 dev eth0 dstport 4789</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set vxlan200 mtu 1450</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link add br200 type bridge</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set vxlan200 master br200</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set lab-tenant-b1 master br200</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set vxlan200 up</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set br200 up</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set lab-tenant-b1 up</span></code></pre></div>
+<p>A <code>lab-leaf2</code>-n ugyanez a <code>remote 10.0.0.1</code>
+IP-vel. Ellenőrzés: <code>ping -M do -s 1372 -c 2 192.0.2.112</code> (az
+1372 + 28 = 1400). A <code>tcpdump</code> mutatja az UDP 4789 csomagot.
+A <code>bridge fdb show br200</code> tartalmazza a távoli
+<code>dst</code> bejegyzést.</p></li>
+<li><p>A VTEP-ek elérhetők, de a bérlő nem, tehát az overlay adatsíkban
+vagy a bridge-ben van hiba. <code>ip route get 10.0.0.2</code> igazolja
+az underlay route-ot. <code>bridge fdb show</code> hiányzó vagy téves
+bejegyzést mutathat. <code>ip -d link show vxlan100</code> megmutatja a
+VNI-t. Ha a VNI az egyik oldalon 10099, a másik oldal a 10001 csomagot
+nem fogadja be a <code>br100</code>-ba. Javítás: a VNI-t mindkét oldalon
+azonos értékre állítani, majd <code>bridge fdb</code> ellenőrzés. A
+teszt végén pontosan a labor által létrehozott <code>vxlan100</code>,
+<code>br100</code>, <code>vxlan200</code> objektumokat töröljük; a
+labhost más konfigurációját nem módosítjuk.</p></li>
+</ol>
+<h3 data-number="33.3.7" id="rövid-összefoglaló"><span
+class="header-section-number">33.3.7</span> Rövid összefoglaló</h3>
+<p>A VXLAN a bérlői Ethernet-keretet UDP-be ágyazza, és a VNI-vel
+különíti el a tenantokat. Az underlay route felelős a VTEP-IP-k
+eléréséért; az overlay route/MAC-tábla felelős azért, hogy melyik VTEP
+mögött van a bérlői cél. A kettő közötti MTU-eltérés a belső csomagok
+méretfüggő eldobását okozhatja, ezért az underlay MTU-t a belső MTU
+plusz VXLAN/outer IP/UDP overhead fölé kell emelni, vagy a belső MTU-t
+csökkenteni. Az EVPN ezt a MAC/IP–VTEP hozzárendelést BGP-n hirdeti, így
+a flood-and-learn korlátokat megszünteti. A Linux bridge, OVS és CNI-k
+ugyanezt a modellt valósítják meg különböző control plane-ekkel.</p>
+<ul>
+<li><strong>VNI:</strong> 24 bites VXLAN tenant-azonosító.</li>
+<li><strong>VTEP:</strong> a VXLAN beágyazást és kicsomagolást végző
+végpont.</li>
+<li><strong>Underlay/overlay:</strong> a fizikai IP-elérés és a bérlői
+beágyazott forgalom rétege.</li>
+</ul>
+<h3 data-number="33.3.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">33.3.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Az alábbi kiindulópontok a fejezettérképből származnak; ebben a
+munkafolyamatban nem történt webes forrásolvasás vagy laborfuttatás,
+ezért a pontos szintaxis, a támogatott kernel-verzió és a friss
+implementációs viselkedés ellenőrzése külön kutatást igényel:</p>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc7348">RFC 7348 – Virtual
+eXtensible Local Area Network (VXLAN)</a><br />
+</li>
+<li><a href="https://www.rfc-editor.org/rfc/rfc8365">RFC 8365 – A
+Network Virtualization Overlay Solution using Ethernet VPN
+(EVPN)</a><br />
+</li>
+<li><a href="https://docs.kernel.org/networking/vxlan.html">Linux kernel
+– VXLAN dokumentáció</a><br />
+</li>
+<li><a href="https://docs.frrouting.org/en/latest/evpn.html">FRRouting –
+EVPN dokumentáció</a><br />
+</li>
+<li><a href="https://docs.cilium.io/en/stable/network/">Cilium –
+Networking and datapath</a></li>
+</ul>
+<p>Ellenőrizendő: a használt <code>iproute2</code>/kernel
+VXLAN-szintaxis, a bridge FDB <code>remote</code> viselkedése, a BGP
+EVPN route-type támogatás a pontos FRR-verzióban, valamint a CNI
+pluginek aktuális MTU- és VNI-alapértékei.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d162.html">← 33.2 BGP, OSPF és route policy</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d164.html">33.4 VRF, tenant, network policy és service fabric →</a></div>
+</nav>
+</body>
+</html>

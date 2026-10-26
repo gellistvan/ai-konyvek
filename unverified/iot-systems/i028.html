@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.3 MQTT a gyakorlatban: Zephyr-kliens és Mosquitto –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Kommunikáció: rádiók, hálózatok, protokollok, adatformátumok</a> › <a href="index.html#ich09">10 Üzenetkezelési protokollok</a></p>
+<div class="links"><a class="prev" rel="prev" href="i027.html">← 10.2 MQTT QoS, munkamenetek, retain, Last Will és MQTT 5</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i029.html">10.4 CoAP: REST UDP fölött, Observe és blokkátvitel →</a></div>
+</nav>
+<h2 data-number="10.3" id="i028"><span
+class="header-section-number">10.3</span> MQTT a gyakorlatban:
+Zephyr-kliens és Mosquitto</h2>
+<h3 data-number="10.3.1" id="motiváció"><span
+class="header-section-number">10.3.1</span> Motiváció</h3>
+<p>A <a href="i027.html">MQTT QoS, munkamenetek, retain, Last Will és
+MQTT 5</a> alfejezetben elméletben már ismerjük az MQTT fogalmait, de a
+TerraSense-rendszer egyetlen rétege sem működik, ha a
+<code>ts-node</code> nem tud valódi MQTT-üzenetet eljuttatni az
+üzenetközvetítőhöz (brokerhez). Ebben az alfejezetben végre összekötjük
+a korábban felépített labor-elemeket: a Zephyr <code>native_sim</code>
+célon futtatott <code>ts-node</code> felépít egy újracsatlakozó
+MQTT-publikálót, a Dockerben futó Mosquitto brokert a <a
+href="i004.html">A labor felállítása: Linux host, Docker, Zephyr,
+Mosquitto, Java</a> alfejezetben létrehozott compose-vázból indítjuk, és
+Linux oldalon egy C-ből használt Paho-előfizetővel ellenőrizzük a teljes
+láncot. Ezzel a lánccal később a gateway (<a href="i036.html">A ts-gw
+szolgáltatás C++-ban: protokollfordítás MQTT-re</a>), a biztonságos
+kommunikáció (<a href="i057.html">Biztonságos kapcsolat: TLS 1.3, mTLS
+és DTLS az MQTT/CoAP alatt</a>) és a záróprojekt (<a
+href="i066.html">Záróprojekt: a teljes TerraSense rendszer összeállítása
+és átvétele</a>) is erre épít.</p>
+<h3 data-number="10.3.2" id="fogalmak-és-működés"><span
+class="header-section-number">10.3.2</span> Fogalmak és működés</h3>
+<p>A Zephyr MQTT-kliens API-ja a Zephyr saját hálózati stackjére és a
+socket API-ra épül. A kliens nem külön szálat indít, hanem az alkalmazás
+felelős az úgynevezett <em>input/live loop</em> futtatásáért. A
+kapcsolat felépítése után a <code>mqtt_input()</code> feldolgozza a
+bejövő MQTT-vezérlő csomagokat, a <code>mqtt_live()</code> pedig a
+keepalive időzítést és az újraküldést kezeli.</p>
+<p><strong>Definíció.</strong> <strong>Input/live loop:</strong> az
+MQTT-kliens könyvtár által megkövetelt, az alkalmazás ciklusában
+ismételten hívott eljáráspár. Az <code>mqtt_input()</code> olvassa a
+socketről a bejövő bájtokat, és meghívja az eseménykezelőt; az
+<code>mqtt_live()</code> karbantartja a kapcsolat állapotát: keepalive
+ping, PUBACK-várakozás, újracsatlakozás előkészítése. Ha a loop kimarad,
+a broker a keepalive-időtúllépés után lezárja a kapcsolatot.</p>
+<p><strong>Definíció.</strong> <strong>Exponenciális backoff:</strong>
+újracsatlakozási stratégia, amelyben két próba közötti várakozási idő a
+sikertelen kísérletek számával exponenciálisan nő, általában felső
+korláttal. Alakja:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Δ</mi><mi>t</mi><mo>=</mo><mo>min</mo><mrow><mo stretchy="true" form="prefix">(</mo><msup><mn>2</mn><mi>n</mi></msup><mo>⋅</mo><mi>b</mi><mi>a</mi><mi>s</mi><mi>e</mi><mo>,</mo><mi>m</mi><mi>a</mi><mi>x</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\Delta t = \min(2^n \cdot base, max)</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>n</mi><annotation encoding="application/x-tex">n</annotation></semantics></math>
+a sikertelen próbák száma. Ez megelőzi a hálózati vihart és kíméli az
+akkumulátort.</p>
+<p>A Paho MQTT C kliens ezzel szemben egy Linux-host könyvtár, amely
+szinkron vagy aszinkron módon is használható. A laborban a szinkron
+API-t vesszük igénybe: <code>MQTTClient_create()</code>,
+<code>MQTTClient_connect()</code>, <code>MQTTClient_subscribe()</code>,
+majd egy <code>MQTTClient_receive()</code> ciklusban várakozunk az
+üzenetekre.</p>
+<p>Az alábbi sorrenddiagram a labor MQTT-láncát mutatja.</p>
+<figure>
+<img src="assets/i028-diagram-1.png"
+alt="Az MQTT-lánc a laborban - A ts-node a Zephyr native_sim-ben fut, a Mosquitto konténerben, a Paho-sub a Linux hoston. A dashed nyilak nyugták." />
+<figcaption aria-hidden="true">Az MQTT-lánc a laborban - A ts-node a
+Zephyr native_sim-ben fut, a Mosquitto konténerben, a Paho-sub a Linux
+hoston. A dashed nyilak nyugták.</figcaption>
+</figure>
+<p>Az ábra szöveges összefoglalása: a <code>ts-node</code> csatlakozik a
+brokerhez, a Linux <code>paho-sub</code> feliratkozik a
+<code>terrasense/+/+/telemetry</code> wildcard topicra. A
+<code>ts-node</code> publikál egy QoS 1 üzenetet, a broker nyugtázza,
+majd továbbítja a feliratkozott kliensnek.</p>
+<h3 data-number="10.3.3" id="döntési-szempontok"><span
+class="header-section-number">10.3.3</span> Döntési szempontok</h3>
+<p>A laborban az MQTT 3.1.1-et használjuk, mert a Zephyr kliens ezt
+stabilan támogatja (ellenőrzési igény: a konkrét API és a támogatott
+protokollverzió a Zephyr kiadásától függhet). A production rendszerben
+az MQTT 5 bevezethető, ha a property-k és a munkamenet-kezelés előnyeit
+ki akarjuk használni, de a jelen tananyag a 3.1.1-re épül.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Döntés</th>
+<th>Választás a laborban</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Hol fut az MQTT-kliens?</td>
+<td>A <code>ts-node</code>-on</td>
+<td>A <a href="i025.html">IP az eszközön</a> alfejezetben bemutatott
+modell szerint a csomópont közvetlenül a brokerhez beszél.</td>
+</tr>
+<tr class="even">
+<td>MQTT protokollverzió</td>
+<td>3.1.1</td>
+<td>Széles körű kompatibilitás; a Zephyr kliens ezt biztosítja.</td>
+</tr>
+<tr class="odd">
+<td>QoS telemetriához</td>
+<td>1 (at least once)</td>
+<td>A későbbi idempotens ingest (<a href="i044.html">Ingest: MQTT-ből a
+backendbe, idempotensen</a>) megköveteli az üzenetek legalább egyszeri
+kézbesítését.</td>
+</tr>
+<tr class="even">
+<td>Clean session</td>
+<td>true</td>
+<td>A <code>native_sim</code>-eszköznek nincs szüksége a munkamenet
+újrafelvételére; a valós eszköznél ezt a <a href="i027.html">MQTT QoS,
+munkamenetek, retain, Last Will és MQTT 5</a> alfejezetben tárgyalt
+szempontok szerint állítjuk be.</td>
+</tr>
+<tr class="odd">
+<td>Autentikáció</td>
+<td>anonim (labor)</td>
+<td>TLS és jelszó/tanúsítvány a <a href="i057.html">Biztonságos
+kapcsolat: TLS 1.3, mTLS és DTLS az MQTT/CoAP alatt</a> alfejezetben
+kerül be.</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="10.3.4" id="kidolgozott-példa-és-labor"><span
+class="header-section-number">10.3.4</span> Kidolgozott példa és
+labor</h3>
+<p>A labor célja: a <code>ts-node</code> Zephyrben MQTT-n publikál a
+<code>terrasense/gh1/n001/telemetry</code> topicra, a Mosquitto a
+Dockerben fogadja, és egy Linuxon futó Paho C előfizető megjeleníti az
+üzenetet. A labor nem használ valós hardvert; minden a
+<code>native_sim</code> boardon és a hoston fut.</p>
+<p><strong>Munkakönyvtár:</strong></p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i028/ts-node-mqtt/src</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/iot-labor/i028/paho-sub</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i028</span></code></pre></div>
+<h4 data-number="10.3.4.1"
+id="mosquitto-konfiguráció-a-compose-ban"><span
+class="header-section-number">10.3.4.1</span> 1. Mosquitto-konfiguráció
+a Compose-ban</h4>
+<p>A korábban létrehozott
+<code>~/iot-labor/stack/mosquitto/mosquitto.conf</code> fájlt bővítjük
+ki a labor igényei szerint:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">listener 1883</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">allow_anonymous true</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">log_dest stdout</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">log_type all</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">persistence false</span></span></code></pre></div>
+<p>A <code>~/iot-labor/stack/compose.yaml</code> releváns részlete:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">services</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">lab-broker</span><span class="kw">:</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">image</span><span class="kw">:</span><span class="at"> eclipse-mosquitto:2</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">container_name</span><span class="kw">:</span><span class="at"> terra-broker</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">ports</span><span class="kw">:</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> </span><span class="st">&quot;1883:1883&quot;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">restart</span><span class="kw">:</span><span class="at"> unless-stopped</span></span></code></pre></div>
+<p>Indítsuk el a brokert:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/stack</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> compose up <span class="at">-d</span> lab-broker</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> ps <span class="kw">|</span> <span class="fu">grep</span> terra-broker</span></code></pre></div>
+<p>Várt kimenet: a <code>terra-broker</code> konténer fut, és a 1883-as
+port elérhető a hoston.</p>
+<h4 data-number="10.3.4.2"
+id="zephyr-mqtt-publikáló-a-native_sim-célon"><span
+class="header-section-number">10.3.4.2</span> 2. Zephyr MQTT-publikáló a
+<code>native_sim</code> célon</h4>
+<p>Hozzuk létre a <code>ts-node-mqtt</code> alkalmazást. A
+<code>prj.conf</code>:</p>
+<pre class="kconfig"><code>CONFIG_NETWORKING=y
+CONFIG_NET_IPV4=y
+CONFIG_NET_DHCPV4=n
+CONFIG_NET_CONFIG_SETTINGS=y
+CONFIG_NET_CONFIG_MY_IPV4_ADDR=&quot;127.0.0.1&quot;
+CONFIG_MQTT_LIB=y</code></pre>
+<blockquote>
+<p><strong>Ellenőrzési igény.</strong> A Zephyr <code>native_sim</code>
+hálózati konfigurációja és a <code>CONFIG_MQTT_LIB</code> név pontos
+elérhetősége a használt Zephyr-verziótól függ; a fenti beállítások a
+jelen tananyag feltételezett környezetére vonatkoznak, de a build előtt
+ellenőrizni kell a Zephyr dokumentációjában.</p>
+</blockquote>
+<p>A <code>CMakeLists.txt</code>:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cmake"><code class="sourceCode cmake"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">cmake_minimum_required</span>(<span class="ot">VERSION</span> <span class="dt">3.20.0</span>)</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">find_package</span>(Zephyr <span class="ot">REQUIRED</span> <span class="ot">HINTS</span> <span class="fl">$ENV{ZEPHYR_BASE}</span>)</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">project</span>(ts-node-mqtt)</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="kw">target_sources</span>(<span class="bn">app</span> <span class="ot">PRIVATE</span> src/main.c)</span></code></pre></div>
+<p>A <code>src/main.c</code>:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/kernel.h&gt;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;zephyr/net/mqtt.h&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define SERVER_ADDR </span><span class="st">&quot;127.0.0.1&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define SERVER_PORT </span><span class="dv">1883</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLIENT_ID </span><span class="st">&quot;ts-node-n001&quot;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TOPIC_TELEMETRY </span><span class="st">&quot;terrasense/gh1/n001/telemetry&quot;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TOPIC_STATE </span><span class="st">&quot;terrasense/gh1/n001/status&quot;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint8_t</span> rx_buffer<span class="op">[</span><span class="dv">512</span><span class="op">];</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint8_t</span> tx_buffer<span class="op">[</span><span class="dv">512</span><span class="op">];</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> mqtt_client client<span class="op">;</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="kw">struct</span> sockaddr_storage broker<span class="op">;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> seq<span class="op">;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> broker_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> sockaddr_in <span class="op">*</span>addr <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> sockaddr_in <span class="op">*)&amp;</span>broker<span class="op">;</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">-&gt;</span>sin_family <span class="op">=</span> AF_INET<span class="op">;</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">-&gt;</span>sin_port <span class="op">=</span> htons<span class="op">(</span>SERVER_PORT<span class="op">);</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    inet_pton<span class="op">(</span>AF_INET<span class="op">,</span> SERVER_ADDR<span class="op">,</span> <span class="op">&amp;</span>addr<span class="op">-&gt;</span>sin_addr<span class="op">);</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> mqtt_evt_handler<span class="op">(</span><span class="kw">struct</span> mqtt_client <span class="op">*</span><span class="dt">const</span> c<span class="op">,</span> <span class="dt">const</span> <span class="kw">struct</span> mqtt_evt <span class="op">*</span>evt<span class="op">)</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>evt<span class="op">-&gt;</span>result <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;MQTT event error: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> evt<span class="op">-&gt;</span>result<span class="op">);</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> connect_mqtt<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> rc<span class="op">;</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    mqtt_client_init<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>broker <span class="op">=</span> <span class="op">&amp;</span>broker<span class="op">;</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>evt_cb <span class="op">=</span> mqtt_evt_handler<span class="op">;</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>client_id<span class="op">.</span>utf8 <span class="op">=</span> CLIENT_ID<span class="op">;</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>client_id<span class="op">.</span>size <span class="op">=</span> strlen<span class="op">(</span>CLIENT_ID<span class="op">);</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>protocol_version <span class="op">=</span> MQTT_VERSION_3_1_1<span class="op">;</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>clean_session <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>keepalive <span class="op">=</span> <span class="dv">60</span><span class="op">;</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>rx_buf <span class="op">=</span> rx_buffer<span class="op">;</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>rx_buf_size <span class="op">=</span> <span class="kw">sizeof</span><span class="op">(</span>rx_buffer<span class="op">);</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>tx_buf <span class="op">=</span> tx_buffer<span class="op">;</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>tx_buf_size <span class="op">=</span> <span class="kw">sizeof</span><span class="op">(</span>tx_buffer<span class="op">);</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> mqtt_connect<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rc <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;MQTT connect failed: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> rc<span class="op">);</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;MQTT connected</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rc<span class="op">;</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> publish_telemetry<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> payload<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> len <span class="op">=</span> snprintf<span class="op">(</span>payload<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>payload<span class="op">),</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>                       <span class="st">&quot;{</span><span class="sc">\&quot;</span><span class="st">node_id</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">\&quot;</span><span class="st">n001</span><span class="sc">\&quot;</span><span class="st">,</span><span class="sc">\&quot;</span><span class="st">seq</span><span class="sc">\&quot;</span><span class="st">:</span><span class="sc">%u</span><span class="st">,</span><span class="sc">\&quot;</span><span class="st">ts</span><span class="sc">\&quot;</span><span class="st">:0}&quot;</span><span class="op">,</span> seq<span class="op">);</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mqtt_publish_param param<span class="op">;</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>qos <span class="op">=</span> MQTT_QOS_1_AT_LEAST_ONCE<span class="op">;</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>utf8 <span class="op">=</span> TOPIC_TELEMETRY<span class="op">;</span></span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>size <span class="op">=</span> strlen<span class="op">(</span>TOPIC_TELEMETRY<span class="op">);</span></span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>data <span class="op">=</span> payload<span class="op">;</span></span>
+<span id="cb7-70"><a href="#cb7-70" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>len <span class="op">=</span> len<span class="op">;</span></span>
+<span id="cb7-71"><a href="#cb7-71" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>message_id <span class="op">=</span> mqtt_client_get_next_id<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb7-72"><a href="#cb7-72" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>dup_flag <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-73"><a href="#cb7-73" aria-hidden="true" tabindex="-1"></a>    param<span class="op">.</span>retain_flag <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-74"><a href="#cb7-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-75"><a href="#cb7-75" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> rc <span class="op">=</span> mqtt_publish<span class="op">(&amp;</span>client<span class="op">,</span> <span class="op">&amp;</span>param<span class="op">);</span></span>
+<span id="cb7-76"><a href="#cb7-76" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>rc <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-77"><a href="#cb7-77" aria-hidden="true" tabindex="-1"></a>        printk<span class="op">(</span><span class="st">&quot;Publish failed: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> rc<span class="op">);</span></span>
+<span id="cb7-78"><a href="#cb7-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> rc<span class="op">;</span></span>
+<span id="cb7-79"><a href="#cb7-79" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-80"><a href="#cb7-80" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;Published: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> payload<span class="op">);</span></span>
+<span id="cb7-81"><a href="#cb7-81" aria-hidden="true" tabindex="-1"></a>    seq<span class="op">++;</span></span>
+<span id="cb7-82"><a href="#cb7-82" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-83"><a href="#cb7-83" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-84"><a href="#cb7-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-85"><a href="#cb7-85" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb7-86"><a href="#cb7-86" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-87"><a href="#cb7-87" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> attempt <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-88"><a href="#cb7-88" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">int</span> backoff_base_ms <span class="op">=</span> <span class="dv">1000</span><span class="op">;</span></span>
+<span id="cb7-89"><a href="#cb7-89" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">int</span> backoff_max_ms <span class="op">=</span> <span class="dv">32000</span><span class="op">;</span></span>
+<span id="cb7-90"><a href="#cb7-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-91"><a href="#cb7-91" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;ts-node MQTT publisher starting</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb7-92"><a href="#cb7-92" aria-hidden="true" tabindex="-1"></a>    broker_init<span class="op">();</span></span>
+<span id="cb7-93"><a href="#cb7-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-94"><a href="#cb7-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-95"><a href="#cb7-95" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span>client<span class="op">.</span>connected<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-96"><a href="#cb7-96" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> rc <span class="op">=</span> connect_mqtt<span class="op">();</span></span>
+<span id="cb7-97"><a href="#cb7-97" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>rc <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-98"><a href="#cb7-98" aria-hidden="true" tabindex="-1"></a>                <span class="dt">int</span> backoff <span class="op">=</span> backoff_base_ms <span class="op">*</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> attempt<span class="op">);</span></span>
+<span id="cb7-99"><a href="#cb7-99" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>backoff <span class="op">&gt;</span> backoff_max_ms<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-100"><a href="#cb7-100" aria-hidden="true" tabindex="-1"></a>                    backoff <span class="op">=</span> backoff_max_ms<span class="op">;</span></span>
+<span id="cb7-101"><a href="#cb7-101" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb7-102"><a href="#cb7-102" aria-hidden="true" tabindex="-1"></a>                printk<span class="op">(</span><span class="st">&quot;Reconnect backoff: </span><span class="sc">%d</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> backoff<span class="op">);</span></span>
+<span id="cb7-103"><a href="#cb7-103" aria-hidden="true" tabindex="-1"></a>                k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span>backoff<span class="op">));</span></span>
+<span id="cb7-104"><a href="#cb7-104" aria-hidden="true" tabindex="-1"></a>                attempt<span class="op">++;</span></span>
+<span id="cb7-105"><a href="#cb7-105" aria-hidden="true" tabindex="-1"></a>                <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb7-106"><a href="#cb7-106" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb7-107"><a href="#cb7-107" aria-hidden="true" tabindex="-1"></a>            attempt <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-108"><a href="#cb7-108" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-109"><a href="#cb7-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-110"><a href="#cb7-110" aria-hidden="true" tabindex="-1"></a>        mqtt_input<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb7-111"><a href="#cb7-111" aria-hidden="true" tabindex="-1"></a>        mqtt_live<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb7-112"><a href="#cb7-112" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-113"><a href="#cb7-113" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>client<span class="op">.</span>connected <span class="op">&amp;&amp;</span> <span class="op">(</span>k_uptime_get_32<span class="op">()</span> <span class="op">%</span> <span class="dv">5000</span> <span class="op">==</span> <span class="dv">0</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb7-114"><a href="#cb7-114" aria-hidden="true" tabindex="-1"></a>            publish_telemetry<span class="op">();</span></span>
+<span id="cb7-115"><a href="#cb7-115" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-116"><a href="#cb7-116" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-117"><a href="#cb7-117" aria-hidden="true" tabindex="-1"></a>        k_sleep<span class="op">(</span>K_MSEC<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb7-118"><a href="#cb7-118" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-119"><a href="#cb7-119" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kód magyarázata:</p>
+<ul>
+<li>A <code>broker_init()</code> a <code>127.0.0.1:1883</code> végpontot
+tölti fel a kliensstruktúrába.</li>
+<li>A <code>connect_mqtt()</code> beállítja a client id-t, a
+<code>clean_session</code>-t és a keepalive-ot, majd meghívja az
+<code>mqtt_connect()</code>-et.</li>
+<li>A <code>publish_telemetry()</code> egy minimális JSON payloadot
+készít. A <code>ts</code> mezőt most nullával töltjük, hogy a laborban a
+lánc működését igazoljuk; a tényleges időbélyeg-konvenciót a <a
+href="i034.html">Következő lépések</a> tárgyalja.</li>
+<li>A főciklus figyeli, hogy csatlakozott-e a kliens. Ha nem,
+exponenciális backoff-fal újrapróbálja. Ha csatlakozott, futtatja az
+input/live loopot, és 5 másodpercenként publikál.</li>
+<li>A <code>seq</code> monoton nő, így minden üzenet egyedi sorszámmal
+megy ki.</li>
+</ul>
+<p>Build és futtatás:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i028/ts-node-mqtt</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">west</span> build <span class="at">-b</span> native_sim <span class="at">-p</span> always</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./build/zephyr/zephyr.exe</span></span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code>ts-node MQTT publisher starting
+MQTT connected
+Published: {&quot;node_id&quot;:&quot;n001&quot;,&quot;seq&quot;:0,&quot;ts&quot;:0}
+Published: {&quot;node_id&quot;:&quot;n001&quot;,&quot;seq&quot;:1,&quot;ts&quot;:0}
+...</code></pre>
+<h4 data-number="10.3.4.3" id="paho-c-előfizető-linuxon"><span
+class="header-section-number">10.3.4.3</span> 3. Paho C előfizető
+Linuxon</h4>
+<p>A <code>paho-sub/subscriber.c</code>:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;MQTTClient.h&gt;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ADDRESS </span><span class="st">&quot;tcp://127.0.0.1:1883&quot;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CLIENTID </span><span class="st">&quot;lab-paho-sub&quot;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TOPIC </span><span class="st">&quot;terrasense/+/+/telemetry&quot;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define QOS </span><span class="dv">1</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TIMEOUT_MS </span><span class="dv">1000</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">volatile</span> <span class="dt">int</span> delivered<span class="op">;</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> msgarrvd<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>context<span class="op">,</span> <span class="dt">char</span> <span class="op">*</span>topicName<span class="op">,</span> <span class="dt">int</span> topicLen<span class="op">,</span> MQTTClient_message <span class="op">*</span>message<span class="op">)</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;topic=</span><span class="sc">%s</span><span class="st"> payload=</span><span class="sc">%.*s\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>           topicName<span class="op">,</span> message<span class="op">-&gt;</span>payloadlen<span class="op">,</span> <span class="op">(</span><span class="dt">char</span> <span class="op">*)</span>message<span class="op">-&gt;</span>payload<span class="op">);</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    MQTTClient_freeMessage<span class="op">(&amp;</span>message<span class="op">);</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    MQTTClient_free<span class="op">(</span>topicName<span class="op">);</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>    delivered <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> connlost<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>context<span class="op">,</span> <span class="dt">char</span> <span class="op">*</span>cause<span class="op">)</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;connection lost: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> cause <span class="op">?</span> cause <span class="op">:</span> <span class="st">&quot;unknown&quot;</span><span class="op">);</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    MQTTClient client<span class="op">;</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    MQTTClient_connectOptions conn_opts <span class="op">=</span> MQTTClient_connectOptions_initializer<span class="op">;</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> rc<span class="op">;</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>    MQTTClient_create<span class="op">(&amp;</span>client<span class="op">,</span> ADDRESS<span class="op">,</span> CLIENTID<span class="op">,</span> MQTTCLIENT_PERSISTENCE_NONE<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    conn_opts<span class="op">.</span>keepAliveInterval <span class="op">=</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>    conn_opts<span class="op">.</span>cleansession <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>    MQTTClient_setCallbacks<span class="op">(</span>client<span class="op">,</span> NULL<span class="op">,</span> connlost<span class="op">,</span> msgarrvd<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span>rc <span class="op">=</span> MQTTClient_connect<span class="op">(</span>client<span class="op">,</span> <span class="op">&amp;</span>conn_opts<span class="op">))</span> <span class="op">!=</span> MQTTCLIENT_SUCCESS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;connect failed: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> rc<span class="op">);</span></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span>rc <span class="op">=</span> MQTTClient_subscribe<span class="op">(</span>client<span class="op">,</span> TOPIC<span class="op">,</span> QOS<span class="op">))</span> <span class="op">!=</span> MQTTCLIENT_SUCCESS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;subscribe failed: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> rc<span class="op">);</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;waiting on </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> TOPIC<span class="op">);</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>delivered<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>        MQTTClient_receive<span class="op">(</span>client<span class="op">,</span> TIMEOUT_MS<span class="op">);</span></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>    MQTTClient_disconnect<span class="op">(</span>client<span class="op">,</span> <span class="dv">1000</span><span class="op">);</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a>    MQTTClient_destroy<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A Paho C szinkron kliens a <code>MQTTClient_receive()</code> hívással
+blokkol legfeljebb a megadott timeoutig. Az eseménykezelő
+<code>msgarrvd</code> minden beérkező üzenetre lefut; itt kiírom a
+topicot és a payloadot, majd a <code>delivered</code> flaget beállítom,
+hogy a program egy üzenet után kilépjen.</p>
+<p>Telepítés és build (ha a <code>libpaho-mqtt-dev</code> még nincs
+fent):</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> apt install libpaho-mqtt-dev   <span class="co"># ellenőrizendő a pontos csomagnév</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i028/paho-sub</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-o</span> sub subscriber.c <span class="at">-lpaho-mqtt3c</span></span></code></pre></div>
+<p>Futtatás egy másik terminálban, miközben a Zephyr alkalmazás fut:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i028/paho-sub</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./sub</span></span></code></pre></div>
+<p>Várt kimenet:</p>
+<pre class="text"><code>waiting on terrasense/+/+/telemetry
+topic=terrasense/gh1/n001/telemetry payload={&quot;node_id&quot;:&quot;n001&quot;,&quot;seq&quot;:12,&quot;ts&quot;:0}</code></pre>
+<p><strong>Továbbvitt eredmény.</strong> Ebben a laborban létrejött a
+működő MQTT-lánc: a <code>ts-node</code> a
+<code>terrasense/gh1/n001/telemetry</code> topicra publikál QoS 1-gyel,
+<code>node_id</code> és monoton <code>seq</code> mezőkkel,
+<code>clean_session=1</code> beállítással. A broker a
+<code>stack/compose.yaml</code> szerinti <code>lab-broker</code>
+szolgáltatás, a Paho C előfizető a hivatkozott fájl. Ezt a láncot
+használja a <a href="i036.html">ts-gw szolgáltatás C++-ban:
+protokollfordítás MQTT-re</a> alfejezet, a <a
+href="i057.html">Biztonságos kapcsolat: TLS 1.3, mTLS és DTLS az
+MQTT/CoAP alatt</a> alfejezet, és a <a href="i066.html">Záróprojekt: a
+teljes TerraSense rendszer összeállítása és átvétele</a> alfejezet.</p>
+<h3 data-number="10.3.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">10.3.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>Ellenőrzéshez használhatjuk a parancssori
+<code>mosquitto_sub</code>-ot is:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_sub</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-t</span> <span class="st">&#39;terrasense/+/+/telemetry&#39;</span> <span class="at">-v</span></span></code></pre></div>
+<p>Ennek ugyanazt az üzenetfolyamot kell mutatnia, mint a
+Paho-előfizetőnek. A Zephyr logban a „Published” sorok jelennek meg
+minden egyes küldésnél.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hibatünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A Zephyr alkalmazás nem csatlakozik</td>
+<td>A broker nem fut, vagy a 1883-as port foglalt</td>
+<td><code>docker ps</code> és <code>ss -tlnp</code> ellenőrzése, a
+Mosquitto indítása</td>
+</tr>
+<tr class="even">
+<td>A Zephyr log „MQTT connect failed”</td>
+<td>Hálózati konfiguráció hiányzik vagy helytelen</td>
+<td><code>prj.conf</code> ellenőrzése, <code>CONFIG_NETWORKING=y</code>
+és IP-beállítások</td>
+</tr>
+<tr class="odd">
+<td>A Paho-sub nem kap üzenetet</td>
+<td>A topic wildcard hibás, vagy a subscription után nincs
+<code>MQTTClient_receive()</code> ciklus</td>
+<td>Ellenőrizd a topicot: <code>terrasense/+/+/telemetry</code>, és a
+ciklust</td>
+</tr>
+<tr class="even">
+<td>A kapcsolat megszakad, és nem áll vissza</td>
+<td>A <code>mqtt_connect()</code> visszatérési értékét nem kezeljük</td>
+<td>Az exponenciális backoff kódrész beépítése</td>
+</tr>
+<tr class="odd">
+<td>A broker a Paho-subból kizárja a ts-node-ot</td>
+<td>Az MQTT 3.1.1-ben azonos client id miatt a régebbi kapcsolat
+lezárul</td>
+<td>Egyedi <code>CLIENT_ID</code> használata minden kliensnél</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="10.3.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">10.3.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>Az input/live loop elhagyása.</strong> A Zephyr
+MQTT-kliens nem külön szál, és a keepalive-ot az alkalmazásnak kell
+karbantartania. Ha a <code>mqtt_live()</code> nem fut, a broker a
+keepalive-időtúllépés után lezárja a kapcsolatot.</p></li>
+<li><p><strong>Újracsatlakozás fix késleltetéssel.</strong> Ha minden
+sikertelen próba után ugyanannyit várakozunk, akkor a hálózati hiba
+elhárulásakor a csomópont feleslegesen sokat alszik. Az exponenciális
+backoff a kezdeti gyors újrapróbálkozást és a későbbi energiatakarékos
+ritmust kombinálja.</p></li>
+<li><p><strong>A seq nem monoton növekvő.</strong> A <code>seq</code>
+sorszámmal a későbbi idempotens ingest (<a href="i044.html">Ingest:
+MQTT-ből a backendbe, idempotensen</a>) azonosítja az üzeneteket. Ha a
+számláló újraindulás után nullázódik, a duplikátumok észrevétlenek
+maradnak.</p></li>
+<li><p><strong>A Last Will elhagyása.</strong> A <code>ts-node</code>
+normál leállásakor a <code>status</code> topic retained üzenete nem
+frissül; a rendszer nem tudja, hogy az eszköz offline lett. A Last Will
+beállítása a <a href="i027.html">MQTT QoS, munkamenetek, retain, Last
+Will és MQTT 5</a> alfejezetben leírtak szerint kötelező.</p></li>
+<li><p><strong>Időbélyeg nélküli vagy uptime-ot használó
+payload.</strong> A <code>ts</code> mező most placeholder nulla, de éles
+rendszerben UTC epoch ms kell. Az uptime nem hordoz globális sorrendet,
+ezért a telemetria-sémát a <a href="i034.html">Idő az IoT-ban:
+időbélyeg, időszinkron, sorrend</a> alfejezet szerint kell
+véglegesíteni.</p></li>
+</ol>
+<h3 data-number="10.3.7" id="feladatok"><span
+class="header-section-number">10.3.7</span> Feladatok</h3>
+<h4 data-number="10.3.7.1" id="a-fogalmi-kérdés"><span
+class="header-section-number">10.3.7.1</span> (a) Fogalmi kérdés</h4>
+<p>Miért nem elegendő, ha a Zephyr MQTT-kliensben csak a
+<code>mqtt_connect()</code> és a <code>mqtt_publish()</code> hívásokat
+használjuk? Mi a szerepe az <code>mqtt_input()</code> és az
+<code>mqtt_live()</code> hívásoknak?</p>
+<h4 data-number="10.3.7.2" id="b-számolási-feladat"><span
+class="header-section-number">10.3.7.2</span> (b) Számolási feladat</h4>
+<p>Egy eszköz a laborban használt exponenciális backoffot használja:
+<code>base = 1000 ms</code>, <code>max = 32000 ms</code>. Hány másodperc
+a teljes várakozási idő, ha az első öt újracsatlakozási kísérlet mind
+sikertelen, és a hatodik kísérlet sikerült? (A várakozás mindig a
+sikertelen próba után következik be.)</p>
+<h4 data-number="10.3.7.3" id="c-implementációs-feladat"><span
+class="header-section-number">10.3.7.3</span> (c) Implementációs
+feladat</h4>
+<p>Módosítsd a <code>ts-node-mqtt/src/main.c</code> fájlt úgy, hogy a
+<code>mqtt_connect()</code> előtt beállítod a Last Will üzenetet a
+<code>terrasense/gh1/n001/status</code> topicra, retained flaggel és
+<code>"offline"</code> payloaddal. Tedd hozzá a megfelelő
+MQTT-paramétereket, és ellenőrizd a brokeren.</p>
+<h4 data-number="10.3.7.4"
+id="d-hibakeresésikiterjesztési-feladat"><span
+class="header-section-number">10.3.7.4</span> (d)
+Hibakeresési/kiterjesztési feladat</h4>
+<p>Írj egy új Paho C előfizetőt <code>paho-sub/cmd_sub.c</code> néven,
+amely a <code>terrasense/gh1/n001/cmd</code> topicra iratkozik fel, és
+minden bejövő parancsot kiír a szabványos kimenetre. Ezzel előkészíted a
+<a href="i049.html">Parancsok és konfiguráció lefelé: kézbesítés,
+nyugtázás, időkorlát</a> alfejezetet.</p>
+<h3 data-number="10.3.8" id="megoldások"><span
+class="header-section-number">10.3.8</span> Megoldások</h3>
+<h4 data-number="10.3.8.1" id="a"><span
+class="header-section-number">10.3.8.1</span> (a)</h4>
+<p>Az <code>mqtt_input()</code> olvassa a socketet és feldolgozza a
+CONNACK, SUBACK, PUBACK stb. vezérlőcsomagokat. Enélkül a kliens nem
+tudná meg a kapcsolatfelvétel eredményét, és a bejövő üzeneteket sem
+dolgozná fel. Az <code>mqtt_live()</code> a keepalive-ot küldi és a
+PUBACK-várakozást kezeli. Ha ezek a hívások hiányoznak, a kapcsolat
+lejár, és a kliens nem érzékeli a broker válaszait.</p>
+<h4 data-number="10.3.8.2" id="b"><span
+class="header-section-number">10.3.8.2</span> (b)</h4>
+<p>Az első öt sikertelen próba után a várakozások:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Kísérlet sorszáma</th>
+<th><code>attempt</code></th>
+<th>Várakozás (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>0</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>0</mn></msup><mo>⋅</mo><mn>1000</mn><mo>=</mo><mn>1000</mn></mrow><annotation encoding="application/x-tex">2^0 \cdot 1000 = 1000</annotation></semantics></math></td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>1</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>1</mn></msup><mo>⋅</mo><mn>1000</mn><mo>=</mo><mn>2000</mn></mrow><annotation encoding="application/x-tex">2^1 \cdot 1000 = 2000</annotation></semantics></math></td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>2</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>2</mn></msup><mo>⋅</mo><mn>1000</mn><mo>=</mo><mn>4000</mn></mrow><annotation encoding="application/x-tex">2^2 \cdot 1000 = 4000</annotation></semantics></math></td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>3</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>3</mn></msup><mo>⋅</mo><mn>1000</mn><mo>=</mo><mn>8000</mn></mrow><annotation encoding="application/x-tex">2^3 \cdot 1000 = 8000</annotation></semantics></math></td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>4</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mn>2</mn><mn>4</mn></msup><mo>⋅</mo><mn>1000</mn><mo>=</mo><mn>16000</mn></mrow><annotation encoding="application/x-tex">2^4 \cdot 1000 = 16000</annotation></semantics></math></td>
+</tr>
+</tbody>
+</table>
+<p>Összesen:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1000</mn><mo>+</mo><mn>2000</mn><mo>+</mo><mn>4000</mn><mo>+</mo><mn>8000</mn><mo>+</mo><mn>16000</mn><mo>=</mo><mn>31000</mn><mspace width="0.278em"></mspace><mtext mathvariant="normal">ms</mtext><mo>=</mo><mn>31</mn><mspace width="0.278em"></mspace><mtext mathvariant="normal">s</mtext></mrow><annotation encoding="application/x-tex">1000 + 2000 + 4000 + 8000 + 16000 = 31000 \; \text{ms} = 31 \; \text{s}</annotation></semantics></math>.
+A hatodik kísérlet sikeres, tehát nem várakozunk utána. (Ha a hatodik is
+sikertelen lenne, a <code>max</code> miatt a várakozás 32 s lenne.)</p>
+<h4 data-number="10.3.8.3" id="c"><span
+class="header-section-number">10.3.8.3</span> (c)</h4>
+<p>A <code>connect_mqtt()</code> függvényben a
+<code>mqtt_connect()</code> hívása előtt beállítjuk a Last Will-et:</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>will_topic <span class="op">=</span> TOPIC_STATE<span class="op">;</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>will_payload <span class="op">=</span> <span class="st">&quot;offline&quot;</span><span class="op">;</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> set_last_will<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mqtt_will_param will<span class="op">;</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>utf8 <span class="op">=</span> will_topic<span class="op">;</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>size <span class="op">=</span> strlen<span class="op">(</span>will_topic<span class="op">);</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>data <span class="op">=</span> <span class="op">(</span><span class="dt">void</span> <span class="op">*)</span>will_payload<span class="op">;</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>len <span class="op">=</span> strlen<span class="op">(</span>will_payload<span class="op">);</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>message<span class="op">.</span>qos <span class="op">=</span> MQTT_QOS_1_AT_LEAST_ONCE<span class="op">;</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>    will<span class="op">.</span>message<span class="op">.</span>retain_flag <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>    client<span class="op">.</span>will <span class="op">=</span> <span class="op">&amp;</span>will<span class="op">;</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ezt meghívjuk a <code>connect_mqtt()</code>-on belül, mielőtt a
+<code>mqtt_connect()</code> futna. Ellenőrzés:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_sub</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-t</span> <span class="st">&#39;terrasense/gh1/n001/status&#39;</span> <span class="at">-v</span> <span class="at">-W</span> 5</span></code></pre></div>
+<p>A Zephyr alkalmazás leállításakor (Ctrl+C) a <code>offline</code>
+üzenetnek meg kell jelennie.</p>
+<h4 data-number="10.3.8.4" id="d"><span
+class="header-section-number">10.3.8.4</span> (d)</h4>
+<p>A <code>paho-sub/cmd_sub.c</code> hasonló a
+<code>subscriber.c</code>-hez, de a topic
+<code>terrasense/gh1/n001/cmd</code>, és a callback minden üzenetet
+kiír. Fontos, hogy a <code>delivered</code> flag helyett folyamatosan
+várjunk, például
+<code>while (1) { MQTTClient_receive(client, TIMEOUT_MS); }</code>.
+Build:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ~/iot-labor/i028/paho-sub</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-o</span> cmd_sub cmd_sub.c <span class="at">-lpaho-mqtt3c</span></span></code></pre></div>
+<p>Teszteléshez publikáljunk egy tesztparancsot:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_pub</span> <span class="at">-h</span> 127.0.0.1 <span class="at">-t</span> <span class="st">&#39;terrasense/gh1/n001/cmd&#39;</span> <span class="at">-m</span> <span class="st">&#39;{&quot;cmd&quot;:&quot;open_valve&quot;,&quot;seq&quot;:100}&#39;</span></span></code></pre></div>
+<p>A <code>cmd_sub</code> kiírja a parancsot.</p>
+<h3 data-number="10.3.9" id="rövid-összefoglaló"><span
+class="header-section-number">10.3.9</span> Rövid összefoglaló</h3>
+<p>Ebben az alfejezetben működő MQTT-láncot építettünk a TerraSense
+laborban. A Zephyr <code>native_sim</code> célon futó
+<code>ts-node</code> a <code>~/iot-labor/i028/ts-node-mqtt/</code> alatt
+egy újracsatlakozó MQTT-publikálót valósít meg:
+<code>mqtt_connect()</code> a brokerhez,
+<code>mqtt_input()</code>/<code>mqtt_live()</code> az input/live
+loopban, <code>mqtt_publish()</code> QoS 1-gyel. Az újracsatlakozás
+exponenciális backoffot használ <code>base=1000 ms</code>,
+<code>max=32000 ms</code> paraméterekkel. A broker a
+<code>stack/compose.yaml</code> <code>lab-broker</code>
+szolgáltatásaként fut, a konfiguráció a
+<code>stack/mosquitto/mosquitto.conf</code>-ban hallgat a 1883-as
+porton. A Linux oldali Paho C előfizető a
+<code>~/iot-labor/i028/paho-sub/subscriber.c</code> fájlban figyel a
+<code>terrasense/+/+/telemetry</code> topicra. A továbbvitt eredmény: a
+<code>terrasense/gh1/n001/telemetry</code> topic, a
+<code>node_id</code>/<code>seq</code>/<code>ts</code> mezőkkel ellátott
+JSON payload és a QoS 1 publikálás; ezt építi tovább a gateway (<a
+href="i036.html">A ts-gw szolgáltatás C++-ban: protokollfordítás
+MQTT-re</a>), a biztonság (<a href="i057.html">Biztonságos kapcsolat:
+TLS 1.3, mTLS és DTLS az MQTT/CoAP alatt</a>) és a záróprojekt (<a
+href="i066.html">Záróprojekt: a teljes TerraSense rendszer összeállítása
+és átvétele</a>).</p>
+<h3 data-number="10.3.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.3.10</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li>Zephyr MQTT-kliens API dokumentáció:
+https://docs.zephyrproject.org/latest/connectivity/networking/api/mqtt.html
+– ellenőrizendő a <code>mqtt_connect</code>, <code>mqtt_publish</code>,
+<code>mqtt_input</code>, <code>mqtt_live</code> függvények pontos
+szignatúrája és a <code>CONFIG_MQTT_LIB</code> Kconfig-név az aktuális
+Zephyr-kiadásban.</li>
+<li>Zephyr <code>native_sim</code> networking:
+https://docs.zephyrproject.org/latest/boards/native/native_sim/doc/index.html
+– ellenőrizendő a hálózati interfész viselkedése és a statikus
+IP-konfiguráció pontos nevei.</li>
+<li>Mosquitto dokumentáció: https://mosquitto.org/documentation/ –
+ellenőrizendő a <code>allow_anonymous</code>, <code>log_dest</code> és
+<code>persistence</code> direktívák pontos szintaxisa a Mosquitto 2.x
+verzióban.</li>
+<li>Paho MQTT C kliens API:
+https://eclipse.dev/paho/files/paho.mqtt.c/doc/ – ellenőrizendő a
+szinkron API függvénynevek és a <code>libpaho-mqtt3c</code> könyvtár
+elérhetősége Ubuntu 24.04-en.</li>
+<li>A Zephyr MQTT-kliens 3.1.1-es protokollverziójának támogatása:
+ellenőrizendő a hivatalos Zephyr release notes alapján.</li>
+</ul>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i027.html">← 10.2 MQTT QoS, munkamenetek, retain, Last Will és MQTT 5</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i029.html">10.4 CoAP: REST UDP fölött, Observe és blokkátvitel →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.4 IOPS, queue és Linux I/O statisztikák – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch10">10 Linux blokk-I/O, VFS és tartósság</a></p>
+<div class="links"><a class="prev" rel="prev" href="d048.html">← 10.3 Buffered/direct/async I/O és diagnosztika</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d050.html">10.5 Tartóssági és I/O rétegdiagnosztikai labor →</a></div>
+</nav>
+<h2 data-number="10.4" id="d049"><span
+class="header-section-number">10.4</span> IOPS, queue és Linux I/O
+statisztikák</h2>
+<h3 data-number="10.4.1" id="motiváció"><span
+class="header-section-number">10.4.1</span> Motiváció</h3>
+<p>Egy szenior C++ fejlesztő a saját szolgáltatásán rendszerint pontosan
+tudja, mennyi időt tölt a processz a szinkron hívásokban: tranzakció
+log, RocksDB/LevelDB WAL, StateSnapshot mentés, parquet export, vagy
+éppen egy <code>io_uring</code> batch. Amikor a p99 latency megugrik, a
+Linux oldalon szinte mindig az <code>iostat</code> az első parancs. A
+<code>%util</code>, <code>await</code> és <code>avgqu-sz</code> mezők
+azonban félrevezetők lehetnek, különösen gyors SSD/NVMe, párhuzamos
+eszköz queue-k, writeback és cgroup limit mellett. A d008 sorbanállási
+modellje segít számszerűsíteni a várakozást, a d048 pedig már bevezette
+a gyorsítótár nélküli és szinkron adatutat. Ebben az alfejezetben az a
+cél, hogy az eszköz- és processzcounters adatokból <strong>telítődési
+hipotézist</strong> tudj alkotni, és külön tudd választani a
+throughput-platót a latency-növekedéstől.</p>
+<h3 data-number="10.4.2" id="definíció-és-mérési-modell"><span
+class="header-section-number">10.4.2</span> Definíció és mérési
+modell</h3>
+<p>A Linux block I/O réteg a fájlrendszerből, page cache-ből vagy direct
+I/O-ból érkező kéréseket <em>bio</em> és <em>request</em> formában adja
+át az eszközmeghajtónak. A rétegek közötti határon a kernel monoton
+számlálókat tart nyilván; ezekből számol az <code>iostat</code>, a
+<code>pidstat</code> és a <code>/proc/diskstats</code>.</p>
+<ul>
+<li><strong>IOPS</strong> (I/O operations per second): az adott
+intervallumban befejezett olvasási és írási kérések száma osztva az
+intervallum hosszával. Képletben
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">IOPS</mtext><mo>=</mo><mi>r</mi><mi>/</mi><mi>s</mi><mo>+</mo><mi>w</mi><mi>/</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">\text{IOPS} = r/s + w/s</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mi>/</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">r/s</annotation></semantics></math>
+a befejezett olvasási,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mi>/</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">w/s</annotation></semantics></math>
+a befejezett írási kérés/s.</li>
+<li><strong>Throughput</strong>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>r</mi><mrow><mi>k</mi><mi>B</mi></mrow></msub><mi>/</mi><mi>s</mi><mo>+</mo><msub><mi>w</mi><mrow><mi>k</mi><mi>B</mi></mrow></msub><mi>/</mi><mi>s</mi></mrow><annotation encoding="application/x-tex">r_{kB}/s + w_{kB}/s</annotation></semantics></math>;
+az áthelyezett hasznos adatmennyiség, nem maga a kérésszám. A kapcsolat:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">IOPS</mtext><mo>×</mo><mtext mathvariant="normal">átlagos kérésméret</mtext><mo>=</mo><mtext mathvariant="normal">throughput</mtext></mrow><annotation encoding="application/x-tex">\text{IOPS} \times \text{átlagos kérésméret} = \text{throughput}</annotation></semantics></math>,
+ha a kérések méreteloszlása közel állandó.</li>
+<li><strong>await</strong>: átlagos teljes kéréslatencia, a request
+létrejöttétől a befejezésig. Ez tartalmazza a várakozási időt és a
+<em>service time</em>-ot is. Mértékegysége ms.</li>
+<li><strong>avgqu-sz</strong> (régebbi rendszereken
+<code>aqu-sz</code>): az adott blokkeszközön átlagosan várakozó vagy
+folyamatban lévő kérések száma. A <code>sysstat</code> kiadások között a
+pontos definíció változhat, ezért a helyi <code>iostat(1)</code> manpage
+verzióját ellenőrizni kell.</li>
+<li><strong>%util</strong>: azon idő aránya, amikor az intervallumban
+legalább egy kérés aktív volt az eszközön. Nem egyenlő a ténylegesen
+kihasznált párhuzamos kapacitással.</li>
+</ul>
+<p>A d008 Little-törvénye itt is érvényes stabil, egy adott mérési
+intervallumra:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mi>W</mi></mrow><annotation encoding="application/x-tex">L = \lambda W</annotation></semantics></math>.
+Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>r</mi><mi>/</mi><mi>s</mi><mo>+</mo><mi>w</mi><mi>/</mi><mi>s</mi><mo stretchy="true" form="postfix">)</mo></mrow><mi>/</mi><mn>1</mn><mspace width="0.167em"></mspace><mi mathvariant="normal">s</mi></mrow><annotation encoding="application/x-tex">\lambda = (r/s+w/s)/1\,\mathrm{s}</annotation></semantics></math>,
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mtext mathvariant="normal">await</mtext><mi>/</mi><mn>1000</mn><mspace width="0.167em"></mspace><mi mathvariant="normal">s</mi></mrow><annotation encoding="application/x-tex">W = \text{await}/1000\,\mathrm{s}</annotation></semantics></math>,
+akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+becsült kérésszámnak közel kell lennie az <code>avgqu-sz</code>
+értékhez. A pontatlanságot okozhatja a kernelben történő merge, a
+kérések eltérő mérete, a mérési ablakok nem egyezése, valamint a
+counterek kerekítése.</p>
+<h3 data-number="10.4.3"
+id="iostat-await-avgqu-sz-és-a-párhuzamos-eszközök-korlátai"><span
+class="header-section-number">10.4.3</span> iostat, await, avgqu-sz és a
+párhuzamos eszközök korlátai</h3>
+<p>A tipikus parancs:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-dxh</span> 1 3</span></code></pre></div>
+<p>A <code>-d</code> az eszköznézet, az <code>-x</code> a kiterjesztett
+statisztikák, a <code>-h</code> emberi egységek, a <code>1 3</code>
+pedig másodpercenkénti mintavételt és három mintát jelent. Az első
+jelentés a rendszerindítás óta eltelt átlag, ezért állandósult állapot
+vizsgálatakor a második vagy harmadik mintát kell elemezni. A
+<code>%util</code> régi SATA HDD-k esetében jól jelezte a telítettséget,
+mert azok gyakran egyszerre egy parancsot szolgáltak ki. SSD és NVMe
+esetén azonban a device több belső queue-val és nagyobb
+parancsmélységgel dolgozik, ezért akár <code>%util = 100</code> mellett
+is lehet szabad kapacitás, és <code>%util = 60</code> mellett is
+előfordulhat latenciaromlás, ha például egyetlen belső erőforrás,
+firmware-feladat vagy vezérlő queue telítődik.</p>
+<p>A gyakorlati telítődési hipotézis ezért nem egyetlen mezőn alapul,
+hanem a következő együttes mintán:</p>
+<ul>
+<li>Az IOPS növekedése megáll, miközben a felkínált terhelés nő;</li>
+<li><code>avgqu-sz</code> tartósan nő, vagy már az eszköz/párhuzamos
+képességhez képest magas;</li>
+<li><code>await</code> meredeken emelkedik, a p99 oldalon még
+jobban;</li>
+<li><code>%util</code> magas, de ez modern eszközökön önmagában gyenge
+bizonyíték.</li>
+</ul>
+<p>Az NVMe párhuzamosság vizsgálatához az eszközspecifikus sysfs értéket
+kell megnézni, például:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/nvme0n1/device/queue_count</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/block/sda/device/queue_depth</span></code></pre></div>
+<p>A <code>queue_count</code> az NVMe controllerhez rendelt hardware
+queue-k számát mutatja, a <code>queue_depth</code> pedig egy
+SCSI/SAS/SATA eszköz parancsmélységét. Ezeket a gyártói specifikációval
+és a tényleges eszközmodell adatlapjával együtt kell értelmezni, mert a
+virtualizált labeszközökön a host storage stack további korlátokat
+adhat. Például egy KVM alatti <code>vda</code> lehet gyors a guestben,
+de a fizikai LUN vagy a host QoS szabhat határt.</p>
+<p>A <code>svctm</code> mező a modern <code>sysstat</code> kiadásokban
+elavult és megbízhatatlan, főleg párhuzamos eszközökön, ezért ne
+használjuk service time becslésre. A service time és a queue time tiszta
+szétválasztása kernel szinten nem mindig lehetséges, mert a Linux
+blokklayer az aktív időt aggregálja, nem minden kéréshez külön-külön
+méri az eszköz tényleges kiszolgálási idejét.</p>
+<h3 data-number="10.4.4" id="pidstat--d-és-procdiskstats"><span
+class="header-section-number">10.4.4</span> pidstat -d és
+/proc/diskstats</h3>
+<p>Az eszközszintű statisztika nem mondja meg, melyik processz vagy
+cgroup termeli a terhelést. Erre való a <code>pidstat -d</code>:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-d</span> <span class="at">-h</span> 1 5</span></code></pre></div>
+<p>A fontos mezők: <code>UID</code>, <code>PID</code>,
+<code>kB_rd/s</code>, <code>kB_wr/s</code>, <code>kB_ccwr/s</code>
+(cancelled write), <code>iodelay</code> és <code>Command</code>. Az
+<code>iodelay</code> a blokk I/O-ra várakozással töltött idő ms-ban; ez
+a processz szinkron I/O-hoz közeli költségét mutatja, például
+<code>O_DIRECT</code> olvasás vagy <code>fsync</code> alatt. A
+<code>write()</code> önmagában sokszor rövid, mert a page cache-be
+másol; a tényleges eszközművelet a kernel writeback szálaihoz tartozik,
+ezért a <code>pidstat -d</code> nem ruházza át automatikusan a writeback
+terhelést az író processzre. A <code>fsync</code> viszont igen, mert a
+hívó vár a dirty adatok kiírására.</p>
+<p>A <code>/proc/diskstats</code> a kernel által exportált nyers
+számlálókat tartalmazza, például:</p>
+<pre class="text"><code>major minor name reads_completed reads_merged sectors_read ms_reading writes_completed writes_merged sectors_written ms_writing ios_in_flight ms_doing_io weighted_ms_doing_io discards_completed ...</code></pre>
+<p>A modern eszközök sorai további discard mezőket is tartalmaznak. Az
+<code>iostat</code> ezekből a számlálókból számol delta alapú arányokat.
+Például az <code>ios_in_flight</code> az éppen folyamatban lévő kérések
+pillanatnyi száma, a <code>weighted_ms_doing_io</code> pedig az aktív
+kérések időbeli súlyozott összege; ebből az intervallumra eső átlagos
+queue hossz számolható, ami lényegében az <code>avgqu-sz</code>
+alapja.</p>
+<p>A <code>pidstat -d</code> hátránya, hogy nem mutatja a processz által
+generált bio-k merge arányát, az eszközglobális queue-t, valamint a
+cgroup limitet. Ezért a diagnosztikában az eszköznézetet és a
+processznézetet mindig együtt kell nézni.</p>
+<h3 data-number="10.4.5" id="queue-depth-service-time-és-merge"><span
+class="header-section-number">10.4.5</span> Queue depth, service time és
+merge</h3>
+<p>A Linux block rétegben a bio-ból requestek lesznek, és az I/O
+scheduler, például <code>mq-deadline</code> vagy <code>none</code>,
+összevonhatja az egymáshoz közel eső kéréseket. Ezt <em>merge</em>-nek
+nevezzük. Az <code>iostat</code> <code>rrqm/s</code>,
+<code>wrqm/s</code> és <code>%rrqm</code>, <code>%wrqm</code> mezői
+mutatják a merge-elt kérések arányát. Ha nagy, az általában jó: a
+szekvenciális munkaterhelés kevesebb, nagyobb eszközkérésként kerül a
+device-ra. Ha alacsony, a munkaterhelés véletlenszerű, vagy a rétegek
+felbontják a kéréseket.</p>
+<p>A queue depth több szinten értelmezhető:</p>
+<ul>
+<li>Alkalmazás szintű aszinkron queue: hány <code>io_uring</code>/libaio
+kérés lehet egyszerre beküldve.</li>
+<li>Linux blokklayer queue:
+<code>/sys/block/vda/queue/nr_requests</code>.</li>
+<li>Device hardware queue: NVMe queue count és queue depth, SCSI
+<code>queue_depth</code>.</li>
+</ul>
+<p>A <code>avgqu-sz</code> ezek közül főként a Linux blokklayer/eszkező
+réteg felől látszik. Ha például <code>avgqu-sz = 2</code> és a device
+<code>queue_depth = 32</code>, az még nem jelenti a hardware
+telítettségét. Ha viszont <code>avgqu-sz</code> tartósan a hardware
+queue mélység közelében van, és <code>await</code> nő, érdemes a
+tényleges eszközképességeket és a gyártói specifikációt ellenőrizni.</p>
+<p>A service time-et a következő idealizált összefüggésből becsülhetjük,
+ha a rendszer M/M/1-hez közel áll:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>μ</mi><mo>=</mo><mfrac><mn>1</mn><mrow><mi>W</mi><mo>−</mo><msub><mi>W</mi><mi>q</mi></msub></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\mu = \frac{1}{W - W_q}
+</annotation></semantics></math></p>
+<p>Ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+az <code>await</code>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>W</mi><mi>q</mi></msub><annotation encoding="application/x-tex">W_q</annotation></semantics></math>
+a sorban töltött idő. A kernel counterekből azonban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>W</mi><mi>q</mi></msub><annotation encoding="application/x-tex">W_q</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>W</mi><mi>s</mi></msub><annotation encoding="application/x-tex">W_s</annotation></semantics></math>
+nem mindig választható szét, ezért a gyakorlatban gyakran az
+<code>await</code> változását és az <code>avgqu-sz</code> növekedését
+használjuk, nem a <code>svctm</code> mezőt.</p>
+<h3 data-number="10.4.6" id="writeback-és-dirty-throttling"><span
+class="header-section-number">10.4.6</span> Writeback és dirty
+throttling</h3>
+<p>A <code>write()</code> buffered I/O esetén nem feltétlenül jár
+azonnali eszközírással. A dirty page-eket a kernel <code>bdi</code>
+writeback szálai írják ki, amit a következő paraméterek vezérelnek:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">sysctl</span> vm.dirty_ratio vm.dirty_background_ratio vm.dirty_expire_centisecs vm.dirty_writeback_centisecs</span></code></pre></div>
+<p>Az <code>vm.dirty_ratio</code> a dirty page-ek maximális aránya a
+rendszermemóriában; ha közelít hozzá, a kernel elkezdi <em>dirty
+throttling</em>-gal lassítani az író processzeket. Az
+<code>vm.dirty_background_ratio</code> az a szint, amely felett a kernel
+háttérben elindítja a writebacket. Ha az alkalmazás <code>write()</code>
+latenciája megnő, de az <code>iostat</code> <code>%util</code> alacsony,
+a legvalószínűbb okok egyike a dirty throttling, nem a device
+telítettség. Ilyenkor az alkalmazás szinkron hívása azért lassul, mert a
+kernel visszafogja a dirty page termelőt.</p>
+<p>Az <code>fsync</code> más pályán hat: a hívó processz megvárja, hogy
+az adott fájl dirty page-jei a device-ra kerüljenek. Ilyenkor
+<code>pidstat -d</code> <code>iodelay</code> nő, az <code>iostat</code>
+<code>w_await</code> és <code>avgqu-sz</code> is nő, és a
+<code>%util</code> is magas lehet. A <code>writeback</code> állapotát a
+következővel lehet megfigyelni:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Dirty|Writeback&#39;</span> /proc/meminfo</span></code></pre></div>
+<p>A <code>Dirty</code> a ki nem írt page cache mennyisége, a
+<code>Writeback</code> pedig az éppen kiírás alatt álló mennyiség. A
+dirty throttling diagnosztikájában ez a két mennyiség legalább olyan
+fontos, mint az <code>iostat</code> eszköznézet.</p>
+<h3 data-number="10.4.7" id="io-psi-és-cgroup-io-limit"><span
+class="header-section-number">10.4.7</span> IO PSI és cgroup IO
+limit</h3>
+<p>A pressure stall information (PSI) a CPU, memória és I/O várakozás
+arányát mutatja, nem csak a device aktivitást. A host szintű I/O
+nyomás:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/io</span></code></pre></div>
+<p>Példa sor:</p>
+<pre class="text"><code>some avg10=18.20 avg60=4.10 avg300=1.20 total=1702304</code></pre>
+<p>A <code>some</code> azt mutatja, hogy az idő mekkora részében volt
+legalább egy taszk I/O-ra várva. Ez jobban tükrözi a felhasználói
+érzetet, mint a <code>%util</code>, mert a párhuzamos eszközökön is
+megjelenik a várakozási nyomás.</p>
+<p>A cgroup v2 IO limit viszont erőforrás-korlátot ad egy cgroup
+számára. A device limitet így lehet beállítani:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, user: labuser; sudo szükséges</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%t:%T&#39;</span> /dev/vda        <span class="co"># eszköz major:minor az io.max-hoz</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /sys/fs/cgroup/lab-d049-io</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;252:0 rbps=max wbps=10M riops=max wiops=max&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /sys/fs/cgroup/lab-d049-io/io.max</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$$</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /sys/fs/cgroup/lab-d049-io/cgroup.procs</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/lab-d049-io/io.stat</span></code></pre></div>
+<p>A <code>rbps</code> és <code>wbps</code> byte/s, a <code>riops</code>
+és <code>wiops</code> kérés/s korlátot ad, a <code>max</code>
+engedélyezett korlátot jelent. A cgroup limit miatt az alkalmazás
+<code>write()</code>/<code>fsync</code> latenciája nőhet, miközben az
+eszköz <code>iostat</code> <code>%util</code> alacsony marad, mert a
+device nem telített, csak a cgroup limitje szorít. Ilyenkor az
+<code>iostat</code> eszköznézet nem magyarázza a hibát; a
+<code>/sys/fs/cgroup/lab-d049-io/io.stat</code> és az
+<code>io.pressure</code> adja a megfelelő bizonyítékot. A
+<code>io.stat</code> a cgroupra jutó <code>rbytes</code>,
+<code>wbytes</code>, <code>rios</code>, <code>wios</code> és discard
+értékeket mutatja.</p>
+<h3 data-number="10.4.8"
+id="counterek-és-workload-mérés-korrelációja"><span
+class="header-section-number">10.4.8</span> Counterek és workload-mérés
+korrelációja</h3>
+<p>A diagnosztikai eljárás célja, hogy a réteghatárok szerint gyűjtsünk
+összefüggő adatokat. Egyetlen <code>iostat</code> pillanatfelvétel nem
+elég. Az alábbi lépéssor használható:</p>
+<ol type="1">
+<li>Rögzítsd a munkaterhelést: mennyi a várt IOPS, request size,
+szinkron/aszinkron, direct/buffered, <code>fsync</code> politika.</li>
+<li>Rögzítsd az időablakot: az <code>iostat</code> és
+<code>pidstat</code> második mintájától számolj deltát.</li>
+<li>Gyűjts eszköznézetet: <code>iostat -dxh 1 N</code>, kiemelve
+<code>r/s</code>, <code>w/s</code>, <code>await</code>,
+<code>avgqu-sz</code>, <code>%util</code>.</li>
+<li>Gyűjts processznézetet: <code>pidstat -d 1 N</code>, különösen
+<code>iodelay</code>.</li>
+<li>Gyűjts rendszerszintű nyomást: <code>/proc/pressure/io</code>.</li>
+<li>Nézd meg a writeback állapotot: <code>Dirty</code> és
+<code>Writeback</code> a <code>/proc/meminfo</code>-ban.</li>
+<li>Ha cgroup limit gyanúja merül fel, nézd meg az <code>io.max</code>
+és <code>io.stat</code> tartalmát.</li>
+<li>Ellenőrizd a Little-törvény konzisztenciáját:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>≈</mo><mi>λ</mi><mi>W</mi></mrow><annotation encoding="application/x-tex">L \approx \lambda W</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>λ</mi><annotation encoding="application/x-tex">\lambda</annotation></semantics></math>
+IOPS,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+az <code>await</code> másodpercben.</li>
+</ol>
+<p>A C++ szolgáltatás szempontjából ez a korreláció azt jelenti, hogy
+nem szabad csak a saját <code>std::chrono</code> p99-et nézni. Például
+egy WAL-fájl <code>fdatasync</code> latenciája azért nőhet, mert:</p>
+<ul>
+<li>a device queue telített: <code>avgqu-sz</code> magas,
+<code>%util</code> magas, <code>iodelay</code> magas;</li>
+<li>dirty throttling fékez: <code>Dirty</code> magas, <code>%util</code>
+alacsony, <code>iodelay</code> alacsony;</li>
+<li>cgroup limit szorít: <code>%util</code> alacsony,
+<code>io.stat</code> bytes értéke a limithez közelít;</li>
+<li>a guest mögötti virtualizált storage lassú, amit a vendor/hypervisor
+counterei mutatnak.</li>
+</ul>
+<p>Ezért mindig több forrásból kell egy hipotézist megerősíteni, mielőtt
+a device cseréjére vagy a storage beállítás módosítására gondolnánk.</p>
+<h3 data-number="10.4.9" id="kidolgozott-példa"><span
+class="header-section-number">10.4.9</span> Kidolgozott példa</h3>
+<p>A következő példa a labhoston indított <code>fio</code> szinkron
+írási munkaterhelést mutat. Az <code>fio</code> itt demonstrációs
+workload, a parancsot a labor eszközön saját készüléken/könyvtárban kell
+futtatni. A kimeneti számok <strong>hipotetikus, illusztratív várható
+értékek</strong>, nem tényleges laberedmények.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, account: labuser, sudo csak a cgroup részhez kell</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /var/tmp/lab-d049</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-dxh</span> 1 3 <span class="op">&gt;</span> /var/tmp/lab-d049/iostat.out <span class="kw">&amp;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="va">iostat_pid</span><span class="op">=</span><span class="va">$!</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>lab-d049-write <span class="at">--ioengine</span><span class="op">=</span>sync <span class="at">--rw</span><span class="op">=</span>write <span class="at">--bs</span><span class="op">=</span>64k <span class="dt">\</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>256M <span class="at">--fsync</span><span class="op">=</span>1 <span class="at">--end_fsync</span><span class="op">=</span>1 <span class="dt">\</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">--directory</span><span class="op">=</span>/var/tmp/lab-d049 <span class="at">--time_based</span> <span class="at">--runtime</span><span class="op">=</span>30</span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="bu">wait</span> <span class="st">&quot;</span><span class="va">$iostat_pid</span><span class="st">&quot;</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="ex">pidstat</span> <span class="at">-d</span> <span class="at">-h</span> 1 5</span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/pressure/io</span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Dirty|Writeback&#39;</span> /proc/meminfo</span></code></pre></div>
+<p>Várt, illusztratív <code>iostat</code> részlet a második
+mintából:</p>
+<pre class="text"><code>Device   r/s  rkB/s  w/s    wkB/s  r_await  w_await  avgqu-sz  %util
+vda      0.0  0.0    720.0  46080  0.0      13.0     9.4       96.0</code></pre>
+<p>Várt <code>pidstat -d</code> sor:</p>
+<pre class="text"><code>Average: UID  PID  kB_rd/s  kB_wr/s  kB_ccwr/s  iodelay  Command
+Average: 1000 1234 0.0      46080.0  0.0        12.8     fio</code></pre>
+<p>A Little-törvény ellenőrzése:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>λ</mi><mo>=</mo><mn>720</mn><mo>+</mo><mn>0</mn><mo>=</mo><mn>720</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">k</mi><mi mathvariant="normal">é</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">é</mi><mi mathvariant="normal">s</mi><mi mathvariant="normal">/</mi><mi mathvariant="normal">s</mi></mrow></mrow><annotation encoding="application/x-tex">\lambda = 720 + 0 = 720\,\mathrm{kérés/s}</annotation></semantics></math></li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mn>13.0</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">s</mi></mrow><mo>=</mo><mn>0.013</mn><mspace width="0.167em"></mspace><mi mathvariant="normal">s</mi></mrow><annotation encoding="application/x-tex">W = 13.0\,\mathrm{ms} = 0.013\,\mathrm{s}</annotation></semantics></math></li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mi>λ</mi><mi>W</mi><mo>=</mo><mn>720</mn><mo>×</mo><mn>0.013</mn><mo>=</mo><mn>9.36</mn></mrow><annotation encoding="application/x-tex">L = \lambda W = 720 \times 0.013 = 9.36</annotation></semantics></math></li>
+<li><code>avgqu-sz = 9.4</code>, ami konzisztens.</li>
+</ul>
+<p>Ez a minta eszközszintű telítődésre utal: <code>%util</code> közel
+96%, <code>avgqu-sz</code> jelentősen nő, <code>w_await</code> pedig 13
+ms. A processz szintű <code>iodelay</code> is hasonló, mert a
+<code>--fsync=1</code> miatt a processz minden 64 KiB-os írás után
+megvárja a device megerősítést. Ha a <code>%util</code> 25% lenne, de
+<code>Dirty</code> magas lenne, akkor nem eszköztelítettségre, hanem
+dirty throttlingra kellene gondolni.</p>
+<h3 data-number="10.4.10" id="tipikus-hibák-és-ellenpróbák"><span
+class="header-section-number">10.4.10</span> Tipikus hibák és
+ellenpróbák</h3>
+<h4 data-number="10.4.10.1"
+id="tévhit-util-100-minden-eszközön-teljes-telítettséget-jelent"><span
+class="header-section-number">10.4.10.1</span> Tévhit:
+<code>%util = 100</code> minden eszközön teljes telítettséget
+jelent</h4>
+<p>Ellenpróba: NVMe SSD-n több hardware queue és nagyobb queue depth
+lehet; <code>%util = 100</code> mellett is nőhet az IOPS, ha további
+párhuzamosságot adunk. A <code>avgqu-sz</code> és a gyártói
+<code>queue_count</code>/<code>queue_depth</code> együtt ad jobb
+hipotézist.</p>
+<h4 data-number="10.4.10.2"
+id="tévhit-ha-await-nő-a-device-lassult"><span
+class="header-section-number">10.4.10.2</span> Tévhit: ha
+<code>await</code> nő, a device lassult</h4>
+<p>Ellenpróba: a növekvő <code>await</code> lehet a megnövekedett queue
+hossz következménye is, nem a device service time romlása. A d008 M/M/1
+modellje szerint ugyanaz a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>μ</mi><annotation encoding="application/x-tex">\mu</annotation></semantics></math>
+mellett is nő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>,
+ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>λ</mi><annotation encoding="application/x-tex">\lambda</annotation></semantics></math>
+közelít a telítettséghez. Emellett a dirty throttling a
+<code>write()</code> latencyt növeli anélkül, hogy az eszköz
+<code>await</code> romlana.</p>
+<h4 data-number="10.4.10.3"
+id="tévhit-pidstat--d-minden-io-t-hozzárendel-a-processzhez"><span
+class="header-section-number">10.4.10.3</span> Tévhit:
+<code>pidstat -d</code> minden I/O-t hozzárendel a processzhez</h4>
+<p>Ellenpróba: a buffered <code>write()</code> után a háttérbeli
+writeback terhelést a kernel writeback szálai generálják; az
+<code>iostat</code> eszköznézetben megjelenik, de a
+<code>pidstat -d</code>-ben nem az alkalmazás
+<code>iodelay</code>-jeként. Ha az alkalmazás később
+<code>fsync</code>-et hív, az <code>iodelay</code> hirtelen megjelenik,
+mert a processz megvárja a korábbi dirty page-ek kiírását.</p>
+<h4 data-number="10.4.10.4"
+id="tévhit-a-svctm-mezőből-megbízható-service-time-számolható"><span
+class="header-section-number">10.4.10.4</span> Tévhit: a
+<code>svctm</code> mezőből megbízható service time számolható</h4>
+<p>Ellenpróba: a <code>sysstat</code> dokumentációja szerint ez a mező
+modern, párhuzamos eszközökön megbízhatatlan, ezért elavult. A service
+time becsléséhez a workload és az eszközspecifikus gyártói adatok
+kellenek.</p>
+<h4 data-number="10.4.10.5"
+id="tévhit-a-cgroup-io-limitet-az-iostat-mutatja"><span
+class="header-section-number">10.4.10.5</span> Tévhit: a cgroup IO
+limitet az <code>iostat</code> mutatja</h4>
+<p>Ellenpróba: a cgroup korlát a processz látható latenciáját növeli, de
+az eszköz <code>%util</code> alacsony maradhat. A megfelelő adat a
+cgroup <code>io.stat</code> és <code>io.pressure</code> mappájában
+van.</p>
+<h3 data-number="10.4.11" id="feladatok"><span
+class="header-section-number">10.4.11</span> Feladatok</h3>
+<h4 data-number="10.4.11.1"
+id="feladat-értelmező-feladat-a-little-törvénnyel"><span
+class="header-section-number">10.4.11.1</span> 1. feladat: értelmező
+feladat a Little-törvénnyel</h4>
+<p>Adott két <code>iostat -dxh 1 3</code> minta. Az első nyugalmi
+állapot, a második terhelt állapot. A terhelt minta:</p>
+<pre class="text"><code>Device  r/s   rkB/s  w/s    wkB/s  r_await  w_await  avgqu-sz  %util
+vda     800.0 3200.0 200.0  6400.0 0.8      4.2      0.9       82.0</code></pre>
+<p>Számold ki a Little-törvény alapján várható <code>avgqu-sz</code>
+értéket, és állapítsd meg, konzisztens-e a kiírt <code>avgqu-sz</code>
+értékkel. Fogalmazz meg hipotézist arról, hogy a device telített-e vagy
+sem.</p>
+<h4 data-number="10.4.11.2"
+id="feladat-cgroup-io-limit-beállítása-és-ellenőrzése"><span
+class="header-section-number">10.4.11.2</span> 2. feladat: cgroup IO
+limit beállítása és ellenőrzése</h4>
+<p>Indíts egy <code>fio</code> szinkron írást, majd korlátozd az írási
+sávszélességet egy <code>lab-d049-io</code> cgroupban maximum
+<code>10M</code> wbps értékre. Ellenőrizd az <code>io.stat</code> bytes
+értékét és az <code>iostat %util</code> értékét. Végül töröld a
+laborgyűjtő cgroupot, és ellenőrizd, hogy a processz visszatérjen az
+alapértelmezett, korlátlan írási sebességhez.</p>
+<h4 data-number="10.4.11.3"
+id="feladat-diagnosztikai-és-recovery-forgatókönyv"><span
+class="header-section-number">10.4.11.3</span> 3. feladat: diagnosztikai
+és recovery forgatókönyv</h4>
+<p>A szolgáltatás <code>fdatasync</code> p99 latencyje megnőtt, de az
+<code>iostat %util</code> 25% körül marad, <code>avgqu-sz</code> 0,4,
+<code>w_await</code> 2 ms. A <code>pidstat -d</code>
+<code>iodelay</code> alacsony. A <code>/proc/meminfo</code> szerint
+<code>Dirty</code> értéke a memória 18%-a. Fogalmazz meg hipotézist,
+gyűjts megerősítő adatot, majd hajts végre egy változtatást (például
+mérsékelt <code>vm.dirty_ratio</code> csökkentést vagy a writeback
+korábbi indítását), és ellenőrizd a postconditiont.</p>
+<h3 data-number="10.4.12" id="megoldások"><span
+class="header-section-number">10.4.12</span> Megoldások</h3>
+<h4 data-number="10.4.12.1" id="feladat"><span
+class="header-section-number">10.4.12.1</span> 1. feladat</h4>
+<p>$ \lambda = 800 + 200 = 1000,\mathrm{kérés/s} $. Az átlagos
+<code>await</code> súlyozva a kérésszámokkal:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mo>=</mo><mfrac><mrow><mn>800</mn><mo>×</mo><mn>0.8</mn><mo>+</mo><mn>200</mn><mo>×</mo><mn>4.2</mn></mrow><mn>1000</mn></mfrac><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">s</mi></mrow><mo>=</mo><mn>1.48</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">s</mi></mrow></mrow><annotation encoding="application/x-tex">
+W = \frac{800 \times 0.8 + 200 \times 4.2}{1000}\,\mathrm{ms} = 1.48\,\mathrm{ms}
+</annotation></semantics></math></p>
+<p>Számított sorhossz:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mn>1000</mn><mo>×</mo><mn>0.00148</mn><mo>=</mo><mn>1.48</mn></mrow><annotation encoding="application/x-tex">
+L = 1000 \times 0.00148 = 1.48
+</annotation></semantics></math></p>
+<p>A kiírt <code>avgqu-sz = 0.9</code>, ami alacsonyabb a számítottnál.
+Az eltérés oka lehet, hogy a kérések nagy része read, sok kisebb kérés
+van merge-elve, vagy a <code>avgqu-sz</code> definíciója az adott
+<code>sysstat</code> kiadásban a várakozó kéréseket nem az átlagos aktív
+kérésszámmal egyezően számolja. A <code>%util = 82</code> modern
+eszközön önmagában nem bizonyítja a telítettséget, de a
+<code>w_await</code> és a read/write keverék vizsgálata további mérést
+igényel. Ha az IOPS tovább növelhető a <code>w_await</code> és a p99
+jelentős romlása nélkül, akkor az eszköz nincs teljesen telítve.</p>
+<h4 data-number="10.4.12.2" id="feladat-1"><span
+class="header-section-number">10.4.12.2</span> 2. feladat</h4>
+<p>Várható lépések:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /sys/fs/cgroup/lab-d049-io</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%t:%T&#39;</span> /dev/vda <span class="kw">|</span> <span class="fu">awk</span> <span class="at">-F:</span> <span class="st">&#39;{print &quot;echo &quot;$1&quot;:&quot;$2&quot; rbps=max wbps=10M riops=max wiops=max | sudo tee /sys/fs/cgroup/lab-d049-io/io.max&quot;}&#39;</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="va">$$</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /sys/fs/cgroup/lab-d049-io/cgroup.procs</span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>lab-d049-limit <span class="at">--ioengine</span><span class="op">=</span>sync <span class="at">--rw</span><span class="op">=</span>write <span class="at">--bs</span><span class="op">=</span>64k <span class="dt">\</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>128M <span class="at">--fsync</span><span class="op">=</span>1 <span class="at">--directory</span><span class="op">=</span>/var/tmp/lab-d049-limit</span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/fs/cgroup/lab-d049-io/io.stat</span></code></pre></div>
+<p>Az <code>io.stat</code> <code>wbytes</code> növekedése az
+intervallumban hozzávetőleg <code>10 MiB/s</code>-ra korlátozódik,
+miközben az <code>iostat %util</code> valószínűleg alacsony marad, mert
+a device nem telített. A postcondition: a cgroup limit alatt a
+munkaterhelés nem lépte túl a beállított wbps értéket. Cleanup:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rmdir /sys/fs/cgroup/lab-d049-io</span></code></pre></div>
+<p>A <code>rmdir</code> csak akkor működik, ha a cgroup üres, ezért
+ellenőrizd, hogy a processz visszakerült-e a szülő cgroupba.</p>
+<h4 data-number="10.4.12.3" id="feladat-2"><span
+class="header-section-number">10.4.12.3</span> 3. feladat</h4>
+<p>A hipotézis: az alacsony <code>%util</code> és <code>avgqu-sz</code>
+alapján nem az eszköz a szűk keresztmetszet; a 18% Dirty arány miatt
+dirty throttling növeli a <code>write()</code>/<code>fdatasync</code>
+p99-et. Megerősítő adat:
+<code>grep -E 'Dirty|Writeback' /proc/meminfo</code> és a
+<code>cat /proc/pressure/io</code>. Ha a <code>some</code> nyomás
+alacsony, de a Dirty magas, a throttling valószínűbb.</p>
+<p>Változtatás: csökkentsd a dirty hányadot, például:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl vm.dirty_ratio=10</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sysctl vm.dirty_background_ratio=3</span></code></pre></div>
+<p>Ez a változtatás a rendszeren globális, ezért labkörnyezetben
+hajtható végre, és minden értéket dokumentálni kell. A postcondition: a
+Dirty arány csökken, a <code>fdatasync</code> p99 latency visszatér a
+korábbi tartományba, és az <code>iostat %util</code> továbbra is
+alacsony marad. Ha a latency nem javul, a következő lépés a cgroup
+<code>io.max</code> és a guest mögötti storage vizsgálata.</p>
+<h3 data-number="10.4.13" id="rövid-összefoglaló"><span
+class="header-section-number">10.4.13</span> Rövid összefoglaló</h3>
+<p>Az <code>iostat</code>, a <code>pidstat -d</code>, a
+<code>/proc/diskstats</code>, a writeback state és az IO PSI együtt ad
+használható képet a Linux block I/O rétegéről. A <code>%util</code>
+modern párhuzamos eszközökön nem elégséges telítettségjelző; a
+<code>avgqu-sz</code> és az <code>await</code> együttes változása,
+valamint a Little-törvény konzisztenciája jobb hipotézist ad. A processz
+I/O <code>iodelay</code> mutatja a szinkron várakozást, de a writeback
+és a cgroup limit néha rejtve marad az eszköz <code>%util</code> mögött.
+A diagnózis ezért mindig több réteg counterét korrelálja, és csak egy
+változtatással ellenőriz.</p>
+<p>Továbbhasznált definíciók:</p>
+<ul>
+<li><strong>IOPS</strong>: az intervallumban befejezett olvasási és
+írási kérések száma másodpercenként.</li>
+<li><strong>await</strong>: átlagos teljes blokkeszköz-kéréslatencia
+ms-ban, beleértve a sorban töltött időt.</li>
+<li><strong>avgqu-sz</strong>: átlagos folyamatban lévő vagy várakozó
+kérések száma az eszközön; Little-törvénnyel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>≈</mo><mi>λ</mi><mi>W</mi></mrow><annotation encoding="application/x-tex">L \approx \lambda W</annotation></semantics></math>.</li>
+</ul>
+<h3 data-number="10.4.14" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.4.14</span> Források és ellenőrzési
+hiányok</h3>
+<ul>
+<li><a href="https://docs.kernel.org/">Linux kernel documentation</a> —
+a block réteg statisztikai dokumentációja kiindulópont, nem olvasott
+forrás.</li>
+<li><a href="https://man7.org/linux/man-pages/">Linux man-pages</a> — az
+<code>iostat(1)</code>, <code>pidstat(1)</code>, <code>proc(5)</code> és
+a cgroup v2 dokumentáció kiindulópont.</li>
+<li><a href="https://nvmexpress.org/specifications/">NVM Express
+specifications</a> — az NVMe queue modell és parancsmélység hivatalos
+specifikációja kiindulópont.</li>
+</ul>
+<p>Ellenőrizendő a labhost tényleges <code>sysstat</code> verziójában az
+<code>avgqu-sz</code> pontos definíciója, a <code>-dh</code> kapcsolók
+megléte, a <code>/proc/diskstats</code> discard mezőinek száma, valamint
+a virtualizált <code>vda</code> mögötti storage limitek. A példában
+szereplő <code>fio</code> kimenet és az összes idő- és sávszélességérték
+hipotetikus; tényleges mérés nélkül nem kezelhető bizonyítékként. A
+cgroup <code>io.max</code> elérhetősége a kernel és a systemd
+verziójától, az NVMe <code>queue_count</code> sysfs útvonal az eszköz
+meghajtójától függ.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d048.html">← 10.3 Buffered/direct/async I/O és diagnosztika</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d050.html">10.5 Tartóssági és I/O rétegdiagnosztikai labor →</a></div>
+</nav>
+</body>
+</html>

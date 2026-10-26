@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.2 MQTT QoS, munkamenetek, retain, Last Will és MQTT 5 –
+IoT-rendszerek és szoftverkomponensek – az eszköztől a felhőig,
+programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Kommunikáció: rádiók, hálózatok, protokollok, adatformátumok</a> › <a href="index.html#ich09">10 Üzenetkezelési protokollok</a></p>
+<div class="links"><a class="prev" rel="prev" href="i026.html">← 10.1 MQTT: publish/subscribe, broker, topicok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i028.html">10.3 MQTT a gyakorlatban: Zephyr-kliens és Mosquitto →</a></div>
+</nav>
+<h2 data-number="10.2" id="i027"><span
+class="header-section-number">10.2</span> MQTT QoS, munkamenetek,
+retain, Last Will és MQTT 5</h2>
+<h3 data-number="10.2.1" id="motiváció"><span
+class="header-section-number">10.2.1</span> Motiváció</h3>
+<p>A TerraSense üvegházban a <code>ts-node</code> percenként
+hőmérsékletet, páratartalmat és talajnedvességet küld MQTT-n. Ha a
+hálózat pillanatnyi kimaradása miatt elveszik egy mérés, az nem
+katasztrófa; ha viszont a backend kétszer dolgoz fel egy
+öntözőparancsot, a szelep kétszer nyit, felesleges vízfogyasztást
+okozva. Hasonlóan, ha a felhasználói felület lekérdezi az eszköz
+aktuális állapotát, nem szeretné megvárni a következő telemetriai
+üzenetet: az utolsó jelentett állapotnak azonnal rendelkezésre kell
+állnia. Végül az üzemeltetőnek látnia kell, ha egy csomópont váratlanul
+leállt – ehhez a brokernek a kapcsolat megszakadásakor automatikusan
+jeleznie kell.</p>
+<p>Ezeket a problémákat az MQTT kézbesítési garanciái (Quality of
+Service, QoS), a megőrzött üzenet (retained message) és a Last Will
+Testament (LWT) oldják meg. Az MQTT 5 ezen felül finomabb
+visszajelzéseket, tulajdonságokat és további szolgáltatásokat ad,
+amelyek a robusztus IoT-rendszerekben ma már gyakran
+alapkövetelmények.</p>
+<h3 data-number="10.2.2" id="fogalmak-és-működés"><span
+class="header-section-number">10.2.2</span> Fogalmak és működés</h3>
+<p><strong>Definíció (MQTT QoS).</strong> Az MQTT QoS a kiadványozótól a
+brokerig tartó, illetve a brokertől a feliratkozóig tartó
+üzenetkézbesítés garanciaszintje. A szabvány három szintet definiál:</p>
+<ul>
+<li><strong>QoS 0 – legfeljebb egyszer (at most once):</strong> az
+üzenetet egyszer elküldik, nyugtázás nincs.</li>
+<li><strong>QoS 1 – legalább egyszer (at least once):</strong> az
+üzenetet addig küldik, amíg meg nem érkezik a PUBACK; a hálózati hiba
+miatt az üzenet <strong>duplikálódhat</strong>.</li>
+<li><strong>QoS 2 – pontosan egyszer (exactly once):</strong>
+négylépéses kézfogás (PUBLISH, PUBREC, PUBREL, PUBCOMP) biztosítja, hogy
+a broker logikailag egyszer kézbesíti az üzenetet a feliratkozónak.</li>
+</ul>
+<p>Fontos különbség, hogy a QoS a két szakaszra (publisher→broker,
+broker→subscriber) <strong>külön</strong> értelmezett: a publisher QoS
+2-vel küldhet, de a feliratkozó QoS 0-val kaphatja, ha úgy iratkozik
+fel. A broker az üzenetet a subscriber által kért maximális QoS-szel
+továbbítja.</p>
+<figure>
+<img src="assets/i027-diagram-1.png"
+alt="MQTT QoS 1 és QoS 2 kézfogás - Illusztrálja a QoS 1 (kétlépéses) és QoS 2 (négylépéses) üzenetváltást; a szaggatott nyilak nyugták." />
+<figcaption aria-hidden="true">MQTT QoS 1 és QoS 2 kézfogás -
+Illusztrálja a QoS 1 (kétlépéses) és QoS 2 (négylépéses) üzenetváltást;
+a szaggatott nyilak nyugták.</figcaption>
+</figure>
+<p>A diagramon látható: QoS 1 esetén a PUBACK elvesztése után a
+<code>ts-node</code> a DUP jelzővel újraküldi a PUBLISH-t, ez okozza a
+duplikációt. A QoS 2 négylépéses kézfogása ezt a hálózati szintű
+duplikációt kiküszöböli, de a feldolgozó oldali oldalhatás (pl.
+szelepnyitás) duplikálódását már nem tudja megakadályozni, ahogy később
+látni fogjuk.</p>
+<p><strong>Definíció (munkamenet, clean start).</strong> Az
+MQTT-kapcsolat állapota: a kliens és a broker által tárolt
+feliratkozások, ki nem kézbesített QoS 1/2 üzenetek és a klienshez
+tartozó munkamenet-flag. Az MQTT 3.1.1-ben a
+<code>cleanSession=true</code> azt jelenti, hogy a kapcsolat bontásakor
+a broker mindent eldob; <code>false</code> esetén a munkamenet megmarad,
+és a kliens újracsatlakozáskor folytathatja (offline üzenetek, meglévő
+feliratkozások). Az MQTT 5 a <code>clean start</code> fogalmat
+használja: minden csatlakozáskor eldönthető, hogy új munkamenetet
+kezdünk-e, a <code>session expiry</code> intervallum pedig azt szabja
+meg, hogy a broker a kapcsolat megszakadása után mennyi ideig őrizze meg
+a munkamenetet.</p>
+<p><strong>Definíció (retained message).</strong> A broker az utolsó
+retained flaggel küldött üzenetet a topicra elmenti, és új feliratkozó
+csatlakozásakor azonnal elküldi neki. Ez a mechanizmus az
+állapot-jellegű adatok (pl. aktuális hőmérséklet, eszközstátusz)
+közzétételére való: a feliratkozó nem vár a következő időszakos
+publikálásra, hanem azonnal kap egy „utolsó ismert értéket”. Retained
+üzenet törlése üres payload-jú retained PUBLISH küldésével
+lehetséges.</p>
+<p><strong>Definíció (Last Will Testament, LWT).</strong> A kliens a
+csatlakozáskor megadhat egy will-üzenetet: topic, payload, QoS és retain
+flag. Ha a kliens nem szabályos DISCONNECT-tel bontja a kapcsolatot (pl.
+hálózati hiba, akkumulátor lemerülés, processz-összeomlás), a broker ezt
+az üzenetet közzéteszi a megadott topicra. Így a rendszer többi része
+értesül a váratlan kiesésről.</p>
+<p>Az MQTT 5 legfontosabb újdonságai a TerraSense szempontjából:</p>
+<ul>
+<li><strong>Reason codes:</strong> a PUBACK, PUBREC, SUBACK stb.
+csomagokban részletes okkód (pl. <code>0x10</code> – no matching
+subscribers, <code>0x87</code> – not authorized), amely alapján a kliens
+megkülönböztetheti a sikert a hiba típusától.</li>
+<li><strong>User properties:</strong> tetszőleges kulcs-érték párok az
+üzenet fejlécében, pl. <code>trace-id</code> vagy
+<code>ingest-version</code> átvitele.</li>
+<li><strong>Message expiry:</strong> az üzenetre beállítható élettartam
+(másodperc); ha a broker nem tudja kézbesíteni ennyi időn belül,
+eldobja, és a kliens opcionálisan értesítést kap.</li>
+<li><strong>Shared subscriptions:</strong> több kliens közösen
+iratkozhat fel ugyanarra a topicra <code>$share/csoport/topic</code>
+formában; a broker az üzenetet a csoport egy tagjának továbbítja. Ezzel
+a feldolgozás terhelése megosztható, de az üzenetek sorrendje az egyes
+kliensek között nem garantált.</li>
+<li><strong>Request–response minta:</strong> a
+<code>response topic</code> és <code>correlation data</code>
+tulajdonságokkal a válaszüzenet visszaköthető egy adott kéréshez
+anélkül, hogy a válasz topicját a payloadba kellene ágyazni.</li>
+</ul>
+<h3 data-number="10.2.3" id="döntési-szempontok"><span
+class="header-section-number">10.2.3</span> Döntési szempontok</h3>
+<p>A következő táblázat összefoglalja a QoS-szintek
+kompromisszumait:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szempont</th>
+<th>QoS 0</th>
+<th>QoS 1</th>
+<th>QoS 2</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Kézbesítési garancia</td>
+<td>Legfeljebb egyszer</td>
+<td>Legalább egyszer</td>
+<td>Egyszer</td>
+</tr>
+<tr class="even">
+<td>Nyugtázás</td>
+<td>Nincs</td>
+<td>PUBACK</td>
+<td>PUBREC/PUBREL/PUBCOMP</td>
+</tr>
+<tr class="odd">
+<td>Üzenetduplikáció</td>
+<td>Nincs</td>
+<td>Lehetséges</td>
+<td>Hálózati szinten nincs</td>
+</tr>
+<tr class="even">
+<td>Feldolgozói ismétlés</td>
+<td>Nincs</td>
+<td>Van, ha újra feldolgozzák</td>
+<td>Van, ha a feldolgozó oldalhatása nem idempotens</td>
+</tr>
+<tr class="odd">
+<td>Overhead</td>
+<td>Legalacsonyabb</td>
+<td>Közepes</td>
+<td>Legmagasabb</td>
+</tr>
+<tr class="even">
+<td>Jellemző használat</td>
+<td>Műszerfalra küldött telemetria, ahol néhány elvesztés
+elfogadható</td>
+<td>Parancsok, riasztások, telemetria</td>
+<td>Pénzügyi tranzakciók, olyan esetek, ahol a duplikáció súlyos</td>
+</tr>
+</tbody>
+</table>
+<p>A retain és LWT választásánál az alábbiakat érdemes mérlegelni:</p>
+<ul>
+<li><strong>Retain</strong> akkor indokolt, ha a topic tartalma
+állapotot ír le, és a feliratkozóknak azonnal szükségük van az utolsó
+értékre. Ilyen a TerraSense <code>state</code> és <code>status</code>
+topicja. Telemetriai idősoroknál a retain felesleges: az adott pillanat
+mérési értéke elavulttá válik, és a feldolgozó a későbbi üzenetekkel
+dolgozik.</li>
+<li><strong>LWT</strong> minden olyan eszköznél kötelező, amelynek a
+jelenlétét figyelni kell. A <code>status</code> topicra érkező
+will-üzenetet retained flaggel érdemes küldeni, így a kiesést a később
+csatlakozó feliratkozó is azonnal látja.</li>
+</ul>
+<p>A QoS 2 használata csábító, de a gyakorlatban több buktatót rejt: a
+broker és a kliens állapotgépének bonyolultsága nő, a kézfogás
+késleltetést ad, és ami a legfontosabb: <strong>a teljes rendszerre
+vetítve nem jelent „pontosan egyszeri” feldolgozást</strong>, mert az
+üzenet fogyasztója az adatbázisba írást vagy a szelepnyitást akkor is
+megismételheti, ha az üzenet maga egyszer érkezett. A helyes megoldás az
+at-least-once (QoS 1) és az idempotens feldolgozás kombinációja.</p>
+<h3 data-number="10.2.4" id="kidolgozott-példa"><span
+class="header-section-number">10.2.4</span> Kidolgozott példa</h3>
+<p>Tervezzük meg a TerraSense MQTT-topicjainak QoS, retain és LWT
+beállításait. A könyv korábbi konvenciója szerint a topicok:</p>
+<ul>
+<li><code>terrasense/&lt;site&gt;/&lt;node&gt;/telemetry</code></li>
+<li><code>terrasense/&lt;site&gt;/&lt;node&gt;/state</code></li>
+<li><code>terrasense/&lt;site&gt;/&lt;node&gt;/cmd</code></li>
+<li><code>terrasense/&lt;site&gt;/&lt;node&gt;/cmd/result</code></li>
+<li><code>terrasense/&lt;site&gt;/&lt;node&gt;/status</code></li>
+</ul>
+<p>A döntési táblázat ehhez:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Topic</th>
+<th>QoS</th>
+<th>Retain</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>telemetry</code></td>
+<td>1</td>
+<td>Nem</td>
+<td>Idősor, ahol az elvesztés ritka, de a duplikáció kezelhető; retain
+felesleges</td>
+</tr>
+<tr class="even">
+<td><code>state</code></td>
+<td>1</td>
+<td>Igen</td>
+<td>Aktuális állapot; új feliratkozó azonnal látja</td>
+</tr>
+<tr class="odd">
+<td><code>cmd</code></td>
+<td>1</td>
+<td>Nem</td>
+<td>Parancs; nem szabad retained üzenetként újra kiküldeni korábbi
+feliratkozóknak</td>
+</tr>
+<tr class="even">
+<td><code>cmd/result</code></td>
+<td>1</td>
+<td>Nem</td>
+<td>Válasz a parancsra; nem állapot, hanem esemény</td>
+</tr>
+<tr class="odd">
+<td><code>status</code></td>
+<td>1 (LWT)</td>
+<td>Igen</td>
+<td>Jelenlét; a retained garantálja, hogy új megfigyelő is tudja, mi az
+utolsó állapot</td>
+</tr>
+</tbody>
+</table>
+<p>A telemetria üzenetben már definiált <code>seq</code> monoton növekvő
+sorszám az idempotens feldolgozás alapja. A backend a
+<code>(node_id, seq)</code> párt egy rövid lejáratú cache-ben tárolja;
+ha az adott pár már feldolgozásra került, az ismétlődő üzenetet eldobja.
+Ezt a mintát fogja használni az <a href="i044.html">Ingest: MQTT-ből a
+backendbe, idempotensen</a> alfejezet, valamint a <a
+href="i047.html">Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika</a> és a <a href="i049.html">Parancsok és konfiguráció
+lefelé: kézbesítés, nyugtázás, időkorlát</a> alfejezet.</p>
+<p>Példa a deduplikációhoz a ts-backendben (Java, Spring Boot
+környezetben, de csak a logika):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode java"><code class="sourceCode java"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span> <span class="dt">final</span> <span class="bu">Set</span><span class="op">&lt;</span>DedupKey<span class="op">&gt;</span> processed <span class="op">=</span> <span class="bu">Collections</span><span class="op">.</span><span class="fu">newSetFromMap</span><span class="op">(</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">new</span> <span class="bu">LinkedHashMap</span><span class="op">&lt;</span>DedupKey<span class="op">,</span> <span class="bu">Boolean</span><span class="op">&gt;()</span> <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>        <span class="at">@Override</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">protected</span> <span class="dt">boolean</span> <span class="fu">removeEldestEntry</span><span class="op">(</span><span class="bu">Map</span><span class="op">.</span><span class="fu">Entry</span><span class="op">&lt;</span>DedupKey<span class="op">,</span> <span class="bu">Boolean</span><span class="op">&gt;</span> eldest<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="fu">size</span><span class="op">()</span> <span class="op">&gt;</span> <span class="dv">10_000</span><span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">});</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="dt">void</span> <span class="fu">onTelemetry</span><span class="op">(</span><span class="bu">String</span> nodeId<span class="op">,</span> <span class="dt">long</span> seq<span class="op">,</span> <span class="bu">String</span> payloadJson<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    DedupKey key <span class="op">=</span> <span class="kw">new</span> <span class="fu">DedupKey</span><span class="op">(</span>nodeId<span class="op">,</span> seq<span class="op">);</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>processed<span class="op">.</span><span class="fu">add</span><span class="op">(</span>key<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Duplikátum: QoS 1 újraküldés miatt érkezett, már feldolgoztuk.</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Tényleges feldolgozás: TimescaleDB-be írás, riasztásvizsgálat, stb.</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="fu">processTelemetry</span><span class="op">(</span>payloadJson<span class="op">);</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>node_id</code> és a <code>seq</code> együttesen egyedi kulcs;
+a cache mérete korlátozza a memóriahasználatot, és a legrégebbi
+bejegyzések törlődnek. Mivel a <code>seq</code> a csomópontonként
+monoton növekvő, a csomópont újraindulásakor a <code>node_id</code> és a
+<code>seq</code> kombinációja megismétlődhet, ezért a gyakorlatban a
+<code>ts</code> időbélyeget is érdemes a kulcs részévé tenni, vagy a
+<code>seq</code>-et nem felejtő memóriában tartani.</p>
+<p>A retained üzenet és LWT működését a következőképp demonstrálhatjuk
+Mosquitto-val (a 2.x verzió alapértelmezetten csak localhost-on
+engedélyezi az anonim hozzáférést):</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. terminál: feliratkozás a státuszra és a parancsra</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_sub</span> <span class="at">-h</span> localhost <span class="at">-t</span> <span class="st">&#39;terrasense/gh1/n001/status&#39;</span> <span class="at">-v</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. terminál: csatlakozás LWT-vel és retained státusz publikálása</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">mosquitto_pub</span> <span class="at">-h</span> localhost <span class="dt">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-t</span> <span class="st">&#39;terrasense/gh1/n001/status&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-m</span> <span class="st">&#39;{&quot;online&quot;:true,&quot;ts&quot;:1717000000000}&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-r</span> <span class="dt">\</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--will-topic</span> <span class="st">&#39;terrasense/gh1/n001/status&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--will-payload</span> <span class="st">&#39;{&quot;online&quot;:false,&quot;ts&quot;:1717000000000}&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--will-retain</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co"># A mosquitto_pub kilépése után a broker a will-üzenetet retained flaggel publikálja.</span></span></code></pre></div>
+<p>A kliens hirtelen megszakadásakor a <code>status</code> topicra kerül
+a will-üzenet, és mivel retained, az új feliratkozó is azonnal látja,
+hogy a csomópont offline.</p>
+<h3 data-number="10.2.5" id="ellenőrzés-és-hibakeresés"><span
+class="header-section-number">10.2.5</span> Ellenőrzés és
+hibakeresés</h3>
+<p>A QoS, retain és LWT beállítások helyességét a legegyszerűbben
+<code>mosquitto_sub</code> és <code>mosquitto_pub</code> eszközökkel
+ellenőrizhetjük. A fenti példában a retained státusz azonnal megjelenik
+a feliratkozónál, amint csatlakozik; ezt a <code>mosquitto_sub</code>
+kimenetén azonnal látjuk. A LWT akkor ellenőrizhető, ha a publish
+klienst <code>Ctrl+C</code>-vel megszakítjuk anélkül, hogy DISCONNECT
+csomagot küldött volna.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hibatünet</th>
+<th>Lehetséges ok</th>
+<th>Javítás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A feliratkozó nem kap retained üzenetet</td>
+<td>A feliratkozás a retained publish után történt, de a broker nem
+tárolta (retain flag hiányzik)</td>
+<td>Ellenőrizze a publish <code>-r</code> kapcsolóját és a broker
+<code>retain_available</code> beállítását</td>
+</tr>
+<tr class="even">
+<td>A LWT nem jelenik meg a kapcsolat megszakadásakor</td>
+<td>A kliens szabályos DISCONNECT-et küldött, vagy a will-topic
+hibás</td>
+<td>Tesztelje a folyamat <code>SIGKILL</code> jelzésével, ellenőrizze a
+will paramétereket</td>
+</tr>
+<tr class="odd">
+<td>A QoS 1 üzenet duplikátumként érkezik, de a backend nem dobja
+el</td>
+<td>Hiányzik a deduplikációs kulcs (pl. <code>seq</code>) vagy a cache
+nem tartalmazza a feldolgozott kulcsokat</td>
+<td>Vezessen be <code>node_id</code>+<code>seq</code> (és
+<code>ts</code>) alapú deduplikációt</td>
+</tr>
+<tr class="even">
+<td>Az MQTT 5 kliens nem kap reason code-ot</td>
+<td>A broker vagy a kliens MQTT 3.1.1-re visszaminősít</td>
+<td>Győződjön meg róla, hogy mindkét fél MQTT 5-öt tárgyal, és a CONNECT
+protokollszintje 5</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="10.2.6" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">10.2.6</span> Tipikus hibák és
+félreértések</h3>
+<ol type="1">
+<li><p><strong>QoS 1 használata idempotens feldolgozás nélkül.</strong>
+A QoS 1 pontosan azért okozhat duplikátumot, mert a PUBACK hiánya miatt
+az üzenetet újraküldik. Ha a fogadó oldal ezt nem kezeli, a
+szelepparancs kétszer is végrehajtódik. Az <a
+href="i018.html">Eszközszoftver-architektúra: rétegek és
+állapotgépek</a> alfejezetben tárgyalt <code>valve_set_target</code>
+függvény idempotens, de a parancs rétegnek is deduplikálnia
+kell.</p></li>
+<li><p><strong>A QoS 2-t „pontos kézbesítésnek” hiszik teljes
+rendszerre.</strong> A QoS 2 csak a broker és a kliens közötti
+üzenetszintű duplikációt szünteti meg, nem a fogyasztói oldalhatást. Aki
+azt állítja, hogy a QoS 2 pontosan egyszeri végponttól végpontig, az a
+kézbesítést összekeveri a feldolgozással.</p></li>
+<li><p><strong>A retained üzenetet telemetriára alkalmazzák.</strong> A
+telemetria idősor, ahol az utolsó érték nem releváns egy új feliratkozó
+számára; a retained üzenet ráadásul felesleges tárolást és hálózati
+forgalmat generál.</p></li>
+<li><p><strong>A LWT hiánya a jelenlétfigyelésnél.</strong> Ha az eszköz
+váratlanul leáll, a rendszer nem tudja megkülönböztetni a csendes
+működést a kieséstől. A LWT a legegyszerűbb módja a jelenlét
+kezelésének; enélkül a felhő csak a timeoutra hagyatkozhat, ami lassabb
+és pontatlanabb.</p></li>
+</ol>
+<h3 data-number="10.2.7" id="feladatok"><span
+class="header-section-number">10.2.7</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Fogalmi kérdés.</strong> Magyarázza el, miért nem
+garantálja a QoS 2 a pontosan egyszeri feldolgozást egy parancs
+végrehajtásánál. Milyen QoS-t érdemes választani a TerraSense
+öntözőparancsához, ha a parancs idempotens?</p></li>
+<li><p><strong>Tervezési feladat.</strong> Adott egy vízmérő, amely
+naponta egyszer küld egy aggregátumot és egy riasztást, ha a szivárgás
+észlelhető. Milyen QoS-t és retain beállítást választana az
+aggregátumhoz és a riasztáshoz? Indokolja.</p></li>
+<li><p><strong>Implementációs feladat a TerraSense-ben.</strong>
+Készítsen konfigurációt a <code>ts-node</code> MQTT-klienséhez, amely a
+<code>telemetry</code> topicra QoS 1-retain false, a <code>state</code>
+topicra QoS 1-retain true, a <code>cmd/result</code> topicra QoS
+1-retain false beállítással publikál, és a kapcsolódáskor LWT-t
+regisztrál a <code>status</code> topicra. Írja le a pszeudokódot vagy a
+Zephyr MQTT API hívásokat.</p></li>
+<li><p><strong>Hibakeresési feladat.</strong> A teszt során a
+<code>ts-backend</code> kétszer dolgozza fel ugyanazt a telemetriai
+üzenetet: a <code>seq</code> azonos, de a <code>ts</code> időbélyeg is
+azonos. A deduplikációs cache 10 000 bejegyzést tartalmaz, és az
+üzenetek közötti idő néhány másodperc. Mi lehet a hiba? (Tipp: a
+<code>DedupKey</code> osztály <code>equals</code> metódusát
+vizsgálja.)</p></li>
+</ol>
+<h3 data-number="10.2.8" id="megoldások"><span
+class="header-section-number">10.2.8</span> Megoldások</h3>
+<ol type="1">
+<li><p>A QoS 2 a kommunikációs rétegben kiküszöböli a hálózati
+duplikációt, de a parancsot feldolgozó alkalmazás ettől még kétszer is
+kiválthatja a szelepnyitást, ha például a PUBCOMP elvesztése miatt a
+parancsfeldolgozó újraindul és újraolvassa az üzenetet, vagy ha a
+feldolgozó oldali retry logika megismétli a végrehajtást. A helyes
+választás at-least-once (QoS 1) idempotens parancsvégrehajtással: a
+<code>valve_set_target</code> függvényt ismételten hívva ugyanazt az
+állapotot állítja be, és a parancsfeldolgozó a <code>seq</code> alapján
+eldobja a duplikátumot.</p></li>
+<li><p>Az aggregátumhoz QoS 1-retain false: az adat idősor, ahol a napi
+érték elvesztése ritka, de ha elveszne, másnap újabb jön; a retain
+felesleges. A riasztáshoz QoS 1-retain true: a riasztás állapotjellegű,
+a feliratkozóknak azonnal tudniuk kell a legutóbbi riasztási állapotot,
+akár akkor csatlakoznak, amikor a riasztás már aktív. A retain miatt a
+riasztás törlését is explicit üres retained üzenettel kell
+megoldani.</p></li>
+<li><p>Pszeudokód a Zephyr MQTT klienshez (a konkrét API függvénynevek
+verziófüggőek, ellenőrizze a telepített Zephyr dokumentációt):</p></li>
+</ol>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> mqtt_publish_param telemetry <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>qos <span class="op">=</span> MQTT_QOS_1_AT_LEAST_ONCE<span class="op">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>utf8 <span class="op">=</span> <span class="st">&quot;terrasense/gh1/n001/telemetry&quot;</span><span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>size <span class="op">=</span> <span class="kw">sizeof</span><span class="op">(</span><span class="st">&quot;terrasense/gh1/n001/telemetry&quot;</span><span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>data <span class="op">=</span> buf<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message<span class="op">.</span>payload<span class="op">.</span>len <span class="op">=</span> len<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message_id <span class="op">=</span> mqtt_allocate_msg_id<span class="op">(&amp;</span>client<span class="op">),</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>dup_flag <span class="op">=</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>retain_flag <span class="op">=</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>mqtt_publish<span class="op">(&amp;</span>client<span class="op">,</span> <span class="op">&amp;</span>telemetry<span class="op">);</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> mqtt_publish_param state <span class="op">=</span> telemetry<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>state<span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>utf8 <span class="op">=</span> <span class="st">&quot;terrasense/gh1/n001/state&quot;</span><span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>state<span class="op">.</span>message<span class="op">.</span>topic<span class="op">.</span>topic<span class="op">.</span>size <span class="op">=</span> <span class="kw">sizeof</span><span class="op">(</span><span class="st">&quot;terrasense/gh1/n001/state&quot;</span><span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>state<span class="op">.</span>retain_flag <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>state<span class="op">.</span>message_id <span class="op">=</span> mqtt_allocate_msg_id<span class="op">(&amp;</span>client<span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>mqtt_publish<span class="op">(&amp;</span>client<span class="op">,</span> <span class="op">&amp;</span>state<span class="op">);</span></span></code></pre></div>
+<p>A LWT regisztrálás a CONNECT paraméterben: a <code>will_topic</code>
+a <code>status</code> topic, a will payload
+<code>{"online":false}</code> és a <code>will_retain</code> beállítás 1.
+A will QoS szintén 1.</p>
+<ol start="4" type="1">
+<li>A hiba valószínű oka, hogy a <code>DedupKey</code> osztály
+<code>equals</code> és <code>hashCode</code> metódusa nincs összhangban:
+ha az <code>equals</code> a <code>node_id</code>-et és a
+<code>seq</code>-et hasonlítja, de a <code>hashCode</code> csak a
+<code>node_id</code>-et használja, a <code>Set</code> nem találja meg a
+meglévő bejegyzést, így minden üzenetet újként kezel. Megoldás: mindkét
+mezőt szerepeltesse a <code>hashCode</code>-ban, vagy használjon rekord
+típust (Java 21-ben
+<code>record DedupKey(String nodeId, long seq) {}</code>), amely
+automatikusan helyesen implementálja ezeket.</li>
+</ol>
+<h3 data-number="10.2.9" id="rövid-összefoglaló"><span
+class="header-section-number">10.2.9</span> Rövid összefoglaló</h3>
+<p>Az MQTT QoS 0, 1 és 2 szintjei a publisher-broker-subscriber
+szakaszokra külön-külön adnak kézbesítési garanciát. A QoS 1 legalább
+egyszer kézbesít, ezért a fogadó oldalon idempotens feldolgozás
+szükséges; a QoS 2 a hálózati duplikációt szünteti meg, de a feldolgozói
+ismétlést nem. A retained üzenetek az állapottopicokhoz valók, a Last
+Will a váratlan kiesés jelzésére szolgál. A TerraSense konvenciója:
+<code>telemetry</code> QoS 1, retain false; <code>state</code> QoS 1,
+retain true; <code>cmd</code> és <code>cmd/result</code> QoS 1, retain
+false; <code>status</code> QoS 1, LWT retained true. Az MQTT 5 reason
+code-jai, user properties, message expiry és shared subscriptionjei
+finomabb vezérlést adnak. <strong>Továbbvitt eredmény:</strong> az
+at-least-once és idempotens feldolgozás kombinációját használja az <a
+href="i044.html">Ingest: MQTT-ből a backendbe, idempotensen</a>, az <a
+href="i047.html">Eseményvezérelt feldolgozás: Kafka és a kézbesítési
+szemantika</a> és a <a href="i049.html">Parancsok és konfiguráció
+lefelé: kézbesítés, nyugtázás, időkorlát</a> alfejezet; a retained és
+LWT beállításokat az <a href="i050.html">Eszközárnyék és digitális iker:
+kívánt és jelentett állapot</a> és a <a
+href="i062.html">Megfigyelhetőség végponttól végpontig: metrikák,
+naplók, nyomkövetés</a> alfejezet.</p>
+<h3 data-number="10.2.10" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">10.2.10</span> Források és ellenőrzési
+hiányok</h3>
+<p>A QoS-szintek, munkamenet, retained és Last Will definíciói az MQTT
+3.1.1 (OASIS) és MQTT 5.0 (OASIS) szabványokon alapulnak, amelyek stabil
+részei az alapfogalmaknak. Az MQTT 5 reason code-jainak pontos listája
+és a shared subscription szintaxisa verziófüggő: használat előtt
+ellenőrizze a telepített Mosquitto 2.x verziójának dokumentációját. A
+Zephyr MQTT API pontos függvénynevei és struktúrái a Zephyr aktuális
+verziójától függenek; a példában jelzett pszeudokódot a telepített
+Zephyr dokumentációja alapján kell adaptálni. A Mosquitto
+<code>mosquitto_pub</code> és <code>mosquitto_sub</code> kapcsolói
+(<code>--will-*</code>, <code>-r</code>) a 2.x verzióban elérhetők, de
+az anonim hozzáférés és a hálózati beállítások a helyi konfigurációtól
+függnek.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="i026.html">← 10.1 MQTT: publish/subscribe, broker, topicok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="i028.html">10.3 MQTT a gyakorlatban: Zephyr-kliens és Mosquitto →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>45.2 Cloud LB, DNS, CDN és edge – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch45">45 Cloud hálózat, storage és managed szolgáltatások</a></p>
+<div class="links"><a class="prev" rel="prev" href="d221.html">← 45.1 VPC/VNet, subnet, routing és cloud firewall</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d223.html">45.3 Block/file/object storage és tartósság →</a></div>
+</nav>
+<h2 data-number="45.2" id="d222"><span
+class="header-section-number">45.2</span> Cloud LB, DNS, CDN és
+edge</h2>
+<h3 data-number="45.2.1" id="motiváció-és-definíció"><span
+class="header-section-number">45.2.1</span> Motiváció és definíció</h3>
+<p>A Linux hoszton vagy saját VM-en felépített edge gyakran egypontos
+hibává válik: a DNS, TLS, reverse proxy, cache és health-check rétegek
+egymástól való elkülönítés nélkül élnek egy gépen. A provider által
+üzemeltetett, <em>managed edge</em> ezeket alkotóelemként kezeli: a
+managed load balancer (LB), a managed DNS, a CDN, a tanúsítványkezelés,
+a WAF és a rate policy is különálló, programozható szolgáltatás. A cél
+nem az, hogy a Linux-recepteket egy az egyben átmásoljuk, hanem hogy a
+request/health/TLS adatútvonalat kliens, edge és backend <em>trust
+domain</em>, timeout és failure domain szerint tervezzük meg.</p>
+<p>A fogalmi rétegek itt a d221 cloud VPC, subnet, route és security
+group felé épülnek, a tanúsítvány oldalát pedig a <a
+href="d144.html">d144</a> szerint kezeljük: a fájl megléte nem
+bizonyítja, hogy a kliens az új láncot kapja.</p>
+<ul>
+<li><strong>Managed load balancer:</strong> provider által üzemeltetett,
+horizontálisan skálázott L4 vagy L7 forgalomelosztó, amely a backendeket
+health check alapján választja, és általában TLS terminációt is
+végezhet.</li>
+<li><strong>Managed DNS:</strong> a provider által üzemeltetett
+authoritative DNS, amely az LB-hoz vagy CDN-hez egészségtudatosan tud
+alias rekordot kapcsolni.</li>
+<li><strong>CDN:</strong> provider által üzemeltetett, az internetes
+végpontokhoz közeli cache-réteg, amely az <em>origin</em> elé
+kerül.</li>
+<li><strong>Edge:</strong> a kliens felőli belépési pontok együttese:
+DNS, CDN, LB, TLS, WAF és forgalmi policy.</li>
+</ul>
+<p>A kliens–edge–backend adatútvonal trust és timeout modellje:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hoppont</th>
+<th>Trust</th>
+<th>Tipikus timeout</th>
+<th>Egészségforrás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Kliens → DNS</td>
+<td>DNSSEC/doT/doH, nem általános</td>
+<td>resolver timeout 1–5 s</td>
+<td>NS és record validitás</td>
+</tr>
+<tr class="even">
+<td>Kliens → CDN edge</td>
+<td>TLS cert, CDN policy</td>
+<td>connect 1–3 s, response 10–30 s</td>
+<td>CDN origin-health</td>
+</tr>
+<tr class="odd">
+<td>CDN → LB/origin</td>
+<td>LB cert, origin ACL</td>
+<td>connect 1–3 s, origin response 30–60 s</td>
+<td>LB health check, CDN origin</td>
+</tr>
+<tr class="even">
+<td>LB → backend</td>
+<td>security group/header, TLS re-encryption</td>
+<td>connection idle 60–350 s, response 30–120 s</td>
+<td>target health check</td>
+</tr>
+</tbody>
+</table>
+<p>A CDN és az LB közötti kapcsolatnál a CDN az origin felé csak akkor
+küld kérést, ha a cache nem teljesíti; a health check akkor is fut,
+amikor a kliensforgalom nincs jelen.</p>
+<h3 data-number="45.2.2" id="l4l7-managed-lb-és-backend-target"><span
+class="header-section-number">45.2.2</span> L4/L7 managed LB és backend
+target</h3>
+<p>Az L4 managed LB a TCP/UDP/TLS rétegben dolgozik: kapcsolatonként
+választ backendet, nem néz HTTP mezőket. Ezért alacsonyabb késleltetésű,
+jobban viseli a WebSocketet, az arbitrális protokollokat és a nagyobb
+<em>throughputot</em>; a TLS pass-through esetén a backend végzi a
+terminációt. Az L7 managed LB HTTP/HTTPS alapú routingot ad: host, path,
+header, query vagy cookie szerint választ <em>target group</em>t, képes
+TLS terminációra, <code>X-Forwarded-*</code> header beszúrására,
+cookie-alapú session-affinityre és response szintű health
+vizsgálatra.</p>
+<p>A backend target típusa providerenként eltér: virtuális gép/instance
+ID, privát IP cím, konténer, Lambda/Cloud Run/Functions típusú
+serverless célpont. A cloud LB a backendre úgy tekint, mint <em>target
+group</em> tagjára: a <em>health check</em> definíciója dönti el, hogy
+az egészséges célpont forgalmat kapjon-e. A health check legalább
+protokollt, portot, path-t, intervallumot, timeoutot, <em>healthy
+threshold</em>-ot és <em>unhealthy threshold</em>-ot tartalmaz. A
+<code>HTTP 200</code> önmagában nem elég: például a targetnek egy
+<code>/healthz</code> végponton ellenőriznie kell, hogy a helyi config
+betöltött-e, a dependenciák elérhetők-e, és a queue/backend readiness
+igaz-e.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Tulajdonság</th>
+<th>L4 (pl. NLB)</th>
+<th>L7 (pl. ALB)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Réteg</td>
+<td>TCP/UDP/TLS</td>
+<td>HTTP/HTTPS</td>
+</tr>
+<tr class="even">
+<td>Routing kulcs</td>
+<td>connection</td>
+<td>host/path/header/cookie</td>
+</tr>
+<tr class="odd">
+<td>TLS termináció</td>
+<td>lehetséges pass-through</td>
+<td>tipikus</td>
+</tr>
+<tr class="even">
+<td>Client IP</td>
+<td>megőrizhető</td>
+<td><code>X-Forwarded-For</code></td>
+</tr>
+<tr class="odd">
+<td>WebSocket</td>
+<td>natív</td>
+<td>támogatott</td>
+</tr>
+<tr class="even">
+<td>Health</td>
+<td>TCP/HTTP/HTTPS</td>
+<td>HTTP/HTTPS matcher</td>
+</tr>
+<tr class="odd">
+<td>Timeout visibility</td>
+<td>szerver-oldal</td>
+<td>kevésbé</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="45.2.3"
+id="publicprivate-endpoint-és-source-identity"><span
+class="header-section-number">45.2.3</span> Public/private endpoint és
+source identity</h3>
+<p>A managed LB lehet <em>internet-facing</em> vagy
+<em>internal/private</em>. A public endpoint nem jelenti automatikusan,
+hogy a backend is publikus: a backendek privát subnetben maradhatnak, és
+a security group csak az LB biztonsági csoportjától fogad forgalmat. A
+private endpoint csak a VPC-en belülről, VPC peeringen, VPN-en vagy
+PrivateLink jellegű kapcsolaton át érhető el.</p>
+<p>A source identity nem úgy terjed, mint egy processzben. L7 esetén a
+kliens TCP source IP az LB-nél végződik; a backend a provider által
+beszúrt <code>X-Forwarded-For</code> headerből próbálhatja kiolvasni a
+kliens IP-t, de ezt a headert a backend nem kezelheti vakon megbízható
+azonosítóként, ha bárki közvetlenül elérheti. A megbízható szerződés az,
+hogy a backend security group csak az LB-t engedi be, és az
+<code>X-Forwarded-For</code> bal szélső értékét kizárólag akkor
+használjuk, ha az edge mindig felülírja/ellenőrzi. Nativabb megoldás
+L4-nél a <em>proxy protocol</em> vagy a <code>preserve_client_ip</code>
+beállítás; serverless esetén a provider a valódi forrást az
+event/request kontextusban adja át.</p>
+<h3 data-number="45.2.4" id="managed-dns-and-service-discovery"><span
+class="header-section-number">45.2.4</span> Managed DNS and service
+discovery</h3>
+<p>A managed DNS az LB elérését általában alias típusú rekorddal kezeli,
+nem CNAME-mel. Az alias a provider LB-jára mutat, és
+<em>EvaluateTargetHealth</em> esetén a DNS válasz a target health
+állapotától is függhet. Ez azonban nem jelent azonnali failovert: a
+kliens resolverek és a TTL a DNS régi válaszát továbbra is
+gyorsítótárazhatják. A frissítéshez a TTL-t a tartalmi frissítés előtt
+csökkentjük, majd a váltás után helyreállítjuk; a hosszú TTL használata
+olcsóbb, de lassúbb recoveryt ad.</p>
+<p>A <em>service discovery</em> ezt belső, API-val hívható lajstrommá
+teszi: a futtatókörnyezet a szolgáltatás nevéből kérdez le egészséges
+végpontokat. Ez nem helyettesíti a DNS-t, hanem a scale-out és rolling
+változtatás alatti pillanatnyi target listát pontosabbá teszi. A DNS és
+a service discovery együtt él: a külső név a managed DNS-ből jön, a
+belső hívások a discoveryből.</p>
+<h3 data-number="45.2.5" id="cdn-cache-és-origin-invalidation"><span
+class="header-section-number">45.2.5</span> CDN, cache és origin
+invalidation</h3>
+<p>A CDN a klienshez közeli PoP-okon cache-el. A <em>cache key</em>
+általában az URL, host és normalizált query; ha a query változóként vesz
+részt a válaszban, akkor explicit query-string specifikáció kell. Az
+origin <code>Cache-Control: max-age=...</code> vagy a CDN default TTL
+adja az élettartamot; a <code>s-maxage</code> a shared cache-t
+vezérli.</p>
+<p>A frissítés két útja van. A <em>versioned URL</em> (pl.
+<code>/assets/app-20250101-abcdef.js</code>) bevezetése immutable
+tartalmat eredményez, és az egyszerű HTML/API válasz mutat az új
+erőforrásra. A <em>purge/invalidation</em> ezzel szemben a CDN cache-ből
+töröl adott path-okat; ezt akkor használjuk, ha a tartalom nem
+változtatható URL-tel, például egy <code>/index.html</code> vagy egy API
+válasz. Az invalidation nem garantál azonnali globális hatást, és
+költségesebb, mint a versioned URL. A diagnózisnál az <code>Age</code>,
+<code>X-Cache</code> és <code>Via</code> fejlécek mutatják, hogy a
+válasz a CDN-ből jött-e, és mennyi ideje van a cache-ben.</p>
+<h3 data-number="45.2.6" id="certificate-waf-rate-és-size-policy"><span
+class="header-section-number">45.2.6</span> Certificate, WAF, rate és
+size policy</h3>
+<p>A managed edge a TLS terminációt az LB-nél vagy a CDN-nél végzi. A
+provider tanúsítványkezelője a d144-ben megismert challenge alapú
+igazolást automatizálja: DNS validation esetén a rekord a managed
+DNS-ben keletkezik, a megújítás pedig a service állapotában történik,
+nem egy fájlban. A backend felé a kapcsolat lehet új titkosítású
+re-encryption, vagy csak a VPC-n belüli HTTP; az utóbbi csökkenti a
+tűréshatárokat.</p>
+<p>A WAF a managed edge-el együttműködik: managed rule groups (OWASP
+jellegű), IP reputation, cím-, path- és protokollszabályok, valamint
+rate-based szabályok. A rate limit rosszul méretezve a saját health
+checket vagy a belső monitorozást is blokkolhatja, ezért a policy a
+known source-t explicit allowlistázza. A size policy a request body
+méretét korlátozza az L7 belépésnél; ha a CDN mögött van, a CDN maga
+utasítja el a túl nagy kérést, mielőtt az origin-ig érne.</p>
+<h3 data-number="45.2.7" id="haazcapacity-és-provider-quota"><span
+class="header-section-number">45.2.7</span> HA/AZ/capacity és provider
+quota</h3>
+<p>A managed LB cross-AZ működik: a listener és a target group
+regionális erőforrás, a backendeket több AZ-be helyezzük. Ha a targetek
+csak egy AZ-ben vannak, a másik AZ-ben az LB nem tud egészséges
+célponthoz irányítani. A cross-zone load balancing beállítás határozza
+meg, hogy egy AZ-belépés használhat-e másik AZ-ben lévő targetet; ez nem
+mentesíti a targetek AZ-szintű eloszlását.</p>
+<p>A kapacitást a provider <em>capacity unit</em> szerint skálázza
+(például LCU), amely új kapcsolat, aktív kapcsolat, feldolgozott byte és
+rule evaluation szerint fogy. A kvóták korlátot adnak: listener
+darabszám, target group, target, rule, WAF rule group, DNS rekord és
+in-flight request. A kvótaemelés nem azonnali. A kapacitáshiány
+előrejelzésénél az üzleti csúcsot méréssel igazoljuk, a hipotetikus
+terhelést nem nevezzük valósnak.</p>
+<h3 data-number="45.2.8" id="kidolgozott-példa"><span
+class="header-section-number">45.2.8</span> Kidolgozott példa</h3>
+<p>Az alábbi példa AWS referencia, de a CLI verziója, a konkrét ARN
+formátumok és kvóták generáláskor ellenőrizendők. A cél egy HTTPS L7
+belépés, privát backendekkel, managed DNS alias-szal és CDN-nel.</p>
+<p><strong>Target:</strong> <code>lab-cloud</code> AWS profile, account
+<code>111122223333</code>, region <code>eu-west-1</code>, VPC
+<code>vpc-0labvpc</code>, public subnets <code>subnet-0laba</code>
+(eu-west-1a), <code>subnet-0labb</code> (eu-west-1b), backendek
+<code>i-0labweb1</code>, <code>i-0labweb2</code> a
+<code>lab-sg-web</code> csoportban, <code>/healthz</code> health-check
+path.</p>
+<p><strong>Privileges:</strong> a profile rendelkezzen
+<code>elasticloadbalancing</code>, <code>route53</code>,
+<code>cloudfront</code>, <code>acm</code> jogosultsággal.</p>
+<p><strong>Előfeltétel:</strong> a backendek futnak, a security group a
+8080 portot az ALB <code>lab-sg-alb</code> security groupjából
+engedi.</p>
+<p>Target group létrehozása:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 create-target-group <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-web-tg <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--protocol</span> HTTP <span class="at">--port</span> 8080 <span class="dt">\</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--vpc-id</span> vpc-0labvpc <span class="dt">\</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target-type</span> instance <span class="dt">\</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-protocol</span> HTTP <span class="dt">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-path</span> /healthz <span class="dt">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">--health-check-interval-seconds</span> 10 <span class="dt">\</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">--healthy-threshold-count</span> 2 <span class="dt">\</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">--unhealthy-threshold-count</span> 3 <span class="dt">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1</span></code></pre></div>
+<p>A válaszban a target group ARN
+<code>arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/lab-web-tg/abcdef123456</code>.</p>
+<p>Targetek regisztrálása:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 register-targets <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--target-group-arn</span> arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/lab-web-tg/abcdef123456 <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--targets</span> Id=i-0labweb1 Id=i-0labweb2 <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1</span></code></pre></div>
+<p>LB létrehozása:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 create-load-balancer <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> lab-web-alb <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--subnets</span> subnet-0laba subnet-0labb <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--security-groups</span> sg-0lbalb <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--scheme</span> internet-facing <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--type</span> application <span class="dt">\</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1</span></code></pre></div>
+<p>HTTPS listener, amely a <code>lab-web-tg</code>-re továbbít:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> elbv2 create-listener <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--load-balancer-arn</span> arn:aws:elasticloadbalancing:eu-west-1:111122223333:loadbalancer/app/lab-web-alb/abcdef123456 <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--protocol</span> HTTPS <span class="at">--port</span> 443 <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--certificates</span> CertificateArn=arn:aws:acm:eu-west-1:111122223333:certificate/aaaa-bbbb-cccc-dddd <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">--default-actions</span> Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/lab-web-tg/abcdef123456 <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1</span></code></pre></div>
+<p>DNS alias a private hosted zone-ban, health-aware:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> route53 change-resource-record-sets <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--hosted-zone-id</span> Z0LABHZ123 <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--change-batch</span> <span class="st">&#39;{&quot;Changes&quot;:[{&quot;Action&quot;:&quot;UPSERT&quot;,&quot;ResourceRecordSet&quot;:{&quot;Name&quot;:&quot;web.lab.example.net&quot;,&quot;Type&quot;:&quot;A&quot;,&quot;AliasTarget&quot;:{&quot;HostedZoneId&quot;:&quot;Z2PZJEXAMPLE&quot;,&quot;DNSName&quot;:&quot;lab-web-alb-123456.eu-west-1.elb.amazonaws.com&quot;,&quot;EvaluateTargetHealth&quot;:true}}}]}&#39;</span> <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1</span></code></pre></div>
+<p>CDN distribution config fájlban (<code>lab-cloudfront.json</code>),
+az origin a fenti LB:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;CallerReference&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-2025-01-01&quot;</span><span class="fu">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Aliases&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;Items&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;cdn.lab.example.net&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="dt">&quot;Quantity&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">},</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;DefaultCacheBehavior&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;TargetOriginId&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-web-alb&quot;</span><span class="fu">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;ViewerProtocolPolicy&quot;</span><span class="fu">:</span> <span class="st">&quot;redirect-to-https&quot;</span><span class="fu">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;AllowedMethods&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;Items&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;GET&quot;</span><span class="ot">,</span> <span class="st">&quot;HEAD&quot;</span><span class="ot">]</span><span class="fu">,</span> <span class="dt">&quot;Quantity&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">},</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;ForwardedValues&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;QueryString&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">,</span> <span class="dt">&quot;Cookies&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;Forward&quot;</span><span class="fu">:</span> <span class="st">&quot;none&quot;</span><span class="fu">}},</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;DefaultTTL&quot;</span><span class="fu">:</span> <span class="dv">60</span><span class="fu">,</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;MinTTL&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;MaxTTL&quot;</span><span class="fu">:</span> <span class="dv">300</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Origins&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;Items&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;Id&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-web-alb&quot;</span><span class="fu">,</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;DomainName&quot;</span><span class="fu">:</span> <span class="st">&quot;lab-web-alb-123456.eu-west-1.elb.amazonaws.com&quot;</span><span class="fu">,</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;CustomOriginConfig&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;HTTPPort&quot;</span><span class="fu">:</span> <span class="dv">80</span><span class="fu">,</span> <span class="dt">&quot;HTTPSPort&quot;</span><span class="fu">:</span> <span class="dv">443</span><span class="fu">,</span> <span class="dt">&quot;OriginProtocolPolicy&quot;</span><span class="fu">:</span> <span class="st">&quot;https-only&quot;</span><span class="fu">}</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;Quantity&quot;</span><span class="fu">:</span> <span class="dv">1</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>  <span class="fu">},</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;Enabled&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aws</span> cloudfront create-distribution <span class="dt">\</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--profile</span> lab-cloud <span class="at">--region</span> eu-west-1 <span class="dt">\</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--distribution-config</span> file://lab-cloudfront.json</span></code></pre></div>
+<p><strong>Várt kimenet és ellenőrzés:</strong> a
+<code>describe-target-health</code> mindkét targetet
+<code>healthy</code> állapotban mutatja;
+<code>dig +short web.lab.example.net</code> az ALB publikus IP-it adja;
+<code>curl -sS -o /dev/null -w '%{http_code}\n' https://web.lab.example.net/healthz</code>
+200-at ad; a CDN első kérésénél
+<code>X-Cache: Miss from cloudfront</code>, a másodiknál
+<code>X-Cache: Hit from cloudfront</code>, az <code>Age</code> nő.</p>
+<p><strong>Rollback:</strong> a CloudFront distribution disable után
+törölhető, a Route53 rekord <code>DELETE</code> akcióval törölhető, az
+ALB és a target group a <code>delete-load-balancer</code>,
+<code>delete-target-group</code> CLI parancsokkal, a targetek
+<code>deregister-targets</code> után törölhetők. A parancsok csak a
+<code>lab-</code> prefixed erőforrásokra vonatkozzanak.</p>
+<h3 data-number="45.2.9" id="hibák-és-ellenpróbák"><span
+class="header-section-number">45.2.9</span> Hibák és ellenpróbák</h3>
+<p>Az alábbi tünetekből nem következik azonnal a hiba helye; egy lépést
+változtatunk.</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Hipotézis</th>
+<th>Adatgyűjtés</th>
+<th>Változtatás</th>
+<th>Ellenőrzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Az LB 503-at ad</td>
+<td>minden target unhealthy vagy nincs target</td>
+<td><code>describe-target-health</code>, backend access log</td>
+<td>helyes health path; security group engedély</td>
+<td>a target <code>healthy</code>, a kérés 200</td>
+</tr>
+<tr class="even">
+<td>A DNS még a régi IP-t adja</td>
+<td>hosszú TTL vagy resolver cache</td>
+<td><code>dig +short @resolver</code>, TTL</td>
+<td>TTL csökkentés a váltás előtt, alias
+<code>EvaluateTargetHealth</code></td>
+<td>az új IP megjelenik a frissítés után</td>
+</tr>
+<tr class="odd">
+<td>A CDN régi JS-t ad</td>
+<td>nincs invalidation, hosszú <code>Cache-Control</code></td>
+<td><code>curl -i</code> fejléc <code>Age</code>,
+<code>X-Cache</code></td>
+<td>versioned URL + invalidation</td>
+<td>új asset URL, <code>Age: 0</code></td>
+</tr>
+<tr class="even">
+<td>A backend <code>X-Forwarded-For</code>-ból rossz IP-t lát</td>
+<td>nem megbízható header közvetlen hívásnál</td>
+<td>edge access log, backend header log</td>
+<td>security group csak LB-t enged, edge overwrite</td>
+<td>a header az LB-től jön</td>
+</tr>
+<tr class="odd">
+<td>AZ ki</td>
+<td>targetek egy AZ-ben, cross-zone kikapcsolva</td>
+<td><code>describe-target-health</code>, targetek AZ mapping</td>
+<td>targetek több AZ-be, cross-zone enable</td>
+<td>egy AZ kivonása után is healthy target</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="45.2.10" id="feladatok"><span
+class="header-section-number">45.2.10</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Magyarázó feladat.</strong> Adott egy HTTP/JSON API,
+hosszú életű WebSocket kapcsolattal és nagy, lassú uploadokkal.
+Indokolja meg, hogy L4 NLB-t vagy L7 ALB-t választ, és válaszolja meg,
+hogyan kapja meg a backend a kliens IP-jét, hol legyen a TLS termináció,
+és milyen target type alkalmas, ha a backend konténer. A válaszban ne
+általánosítson; a forgalmi és timeout modellt kövesse.</p></li>
+<li><p><strong>Adminisztrációs/konfigurációs feladat.</strong> Készítsen
+desired state-et egy belső, HTTP L7 managed LB-hez: a health check
+<code>/livez</code>, a backendek privát IP-k, a DNS név
+<code>api.lab.internal</code> private hosted zone-ban. Írja le a
+szükséges CLI lépéseket vagy konfigurációt, adja meg az ellenőrző
+parancsot, és fogalmazza meg a postconditiont. Cloud parancsnál adja meg
+a targetet, régiót, accountot és rollbacket.</p></li>
+<li><p><strong>Diagnosztikai/failure/recovery feladat.</strong> A deploy
+után a böngészők egy régi <code>/assets/app.js</code> fájlt kapnak,
+miközben az originon az új fájl van. A CDN
+<code>X-Cache: Hit from cloudfront</code> és <code>Age: 900</code>
+fejlécet mutat. Vezesse le a diagnózist, adja meg a helyreállítást, és
+magyarázza el, hogyan lehet a jövőben a frissítést immutable URL-lel
+cache-mentessé tenni. Tegyen hozzá egy region/AZ health hibát is: az
+egyik AZ-ben lévő backendek unhealthy-k, és a kliens onnan kap 503-at;
+milyen managed DNS/LB beállításokkal és backend elosztással csökkenthető
+a hatás?</p></li>
+</ol>
+<h3 data-number="45.2.11" id="megoldások"><span
+class="header-section-number">45.2.11</span> Megoldások</h3>
+<ol type="1">
+<li><p><strong>L7 ALB</strong> választandó, mert a WebSocketet az ALB a
+megfelelő listener beállítással támogatja, és a nagy upload méretét L7
+policy szabályozza; az L4 NLB akkor lenne előnyösebb, ha TLS
+pass-through-t vagy natív TCP forgalmat kell vinni. A kliens IP L7
+esetén az <code>X-Forwarded-For</code> headerből jön, de csak akkor
+fogadjuk el, ha a backend security group kizárólag az ALB-től fogad. A
+TLS termináció az ALB-nél van, a backend felé re-encryption vagy VPC-n
+belüli HTTP. Konténer target type esetén IP-alapú target group, mert a
+konténer IP a VPC networkben változhat. Postcondition: a WebSocket
+upgrade és a POST upload a health-check targeten sikeres, a törölt
+security group bejegyzés visszaállítása nélkül.</p></li>
+<li><p><strong>Desired state:</strong> belső ALB a
+<code>subnet-0labpriva</code>, <code>subnet-0labprivb</code> private
+subnetsben, HTTP listener 80 porton, target group
+<code>lab-internal-tg</code> TCP/HTTP 8080 porton, health path
+<code>/livez</code>. A DNS <code>api.lab.internal</code> A alias rekord
+az ALB-re, <code>EvaluateTargetHealth: true</code>. CLI lépések a
+példában bemutatott <code>create-load-balancer --scheme internal</code>,
+<code>create-target-group</code>, <code>create-listener</code>, Route53
+UPSERT. Ellenőrzés: <code>aws elbv2 describe-target-health</code>
+<code>healthy</code>, <code>dig @resolver +short api.lab.internal</code>
+private IP-t ad, és
+<code>curl -sS -o /dev/null -w '%{http_code}\n' http://api.lab.internal/livez</code>
+200. Postcondition: a belső kliens VPC-ből eléri a szolgáltatást, a
+public DNS nem teszi elérhetővé, a rollback a lab- prefixed
+erőforrásokra korlátozódik.</p></li>
+<li><p><strong>Diagnózis:</strong> a CDN meleg cache-ben van, az origin
+frissítés nem került a CDN-be. A <code>X-Cache: Hit</code> és
+<code>Age: 900</code> mutatja, hogy a válasz 15 perce a cache-ből jön.
+Helyreállítás: a <code>/assets/app.js</code> path invalidation a
+CDN-ben, majd rövid TTL az origin <code>Cache-Control</code> szerint. A
+hosszú távú megoldás az immutable content: a build a fájlt
+<code>app-&lt;commit&gt;.js</code> néven publikálja, az HTML/API az új
+URL-re mutat; így a cache nem ad régi fájlt. Az AZ hibánál a managed DNS
+<code>EvaluateTargetHealth</code> és a cross-zone LB ellenőrzi a
+targeteket; a backendeket minden AZ-be kell tenni, és a target group
+health threshold a tényleges quorumot tükrözze. Postcondition:
+invalidation után <code>X-Cache: Miss</code> az első kérés, majd
+újrafetch; a régi AZ kivonása után is a healthy target szolgálja ki a
+legtöbb kérést, a DNS TTL a tervezettnél nem lassít.</p></li>
+</ol>
+<h3 data-number="45.2.12" id="rövid-összefoglaló"><span
+class="header-section-number">45.2.12</span> Rövid összefoglaló</h3>
+<p>A managed edge a request path-ból épül: DNS, CDN, LB, TLS, WAF és
+rate policy. A health check a backendek igazságáért felel, de nem
+szinkron a DNS TTL cache-ével. A source identity nem egyenlő a kliens
+IP-hez való vak hozzáféréssel; az edge és backend trust domain határát
+security group, proxy protocol vagy provider identity adja. A CDN
+cache-frissítés a versioned URL-lel előreláthatóbb, mint a purge. A HA
+nem csak AZ-duplikáció: a targetek eloszlása, a cross-zone beállítás és
+a kvóták együtt határozzák meg a tényleges rendelkezésre állást.</p>
+<ul>
+<li><strong>Target group:</strong> az LB health check által kezelt
+backend gyűjtemény, amely a routing akció célja.</li>
+<li><strong>Managed DNS alias:</strong> provider LB/CDN-re mutató,
+health-aware DNS rekord, amely a CNAME-től eltérően az apex névre is
+alkalmazható.</li>
+<li><strong>Origin invalidation:</strong> a CDN cache-ből adott path
+törlése; nem azonnali globális garancia, ezért immutable URL
+preferált.</li>
+</ul>
+<h3 data-number="45.2.13" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">45.2.13</span> Források és ellenőrzési
+hiányok</h3>
+<p>Elsődleges kiindulópontok, <strong>ezeket ebben a munkamenetben nem
+olvastam, ezért aktuális support/verzió/kvóta állításként nem
+ellenőriztem</strong>:</p>
+<ul>
+<li><a
+href="https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/">AWS
+Elastic Load Balancing User Guide</a></li>
+<li><a
+href="https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/">Amazon
+Route 53 Developer Guide</a></li>
+<li><a
+href="https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/">Amazon
+CloudFront Developer Guide</a></li>
+<li><a href="https://cloud.google.com/load-balancing/docs">GCP Cloud
+Load Balancing</a></li>
+</ul>
+<p><strong>Ellenőrzési hiányok:</strong> a CLI parancsok pontos
+szintaxisa, a target group ARN formátum, a CloudFront distribution JSON
+kötelező mezői, az ACM certificate ARN, a kvóták és a capacity-unit árak
+a generálás időpontjában nem ellenőrzöttek. A példa kimeneti értékei
+illusztratívvá várt kimenetek, nem valós futtatási eredmények.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d221.html">← 45.1 VPC/VNet, subnet, routing és cloud firewall</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d223.html">45.3 Block/file/object storage és tartósság →</a></div>
+</nav>
+</body>
+</html>

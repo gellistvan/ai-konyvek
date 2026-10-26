@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>55.4 Incidensek: DNS/TLS/FD/OOM/disk/network – Linux és DevOps
+rendszerszemléletben szenior C++ fejlesztőknek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#dch55">55 Záróprojekt I: üzemeltetett Linux szolgáltatás VM-eken</a></p>
+<div class="links"><a class="prev" rel="prev" href="d273.html">← 55.3 Telemetria, backup és rutin működtetés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d275.html">55.5 Linux/VM projekt review és C++-fejlesztői bridge →</a></div>
+</nav>
+<h2 data-number="55.4" id="d274"><span
+class="header-section-number">55.4</span> Incidensek:
+DNS/TLS/FD/OOM/disk/network</h2>
+<h3 data-number="55.4.1" id="motiváció"><span
+class="header-section-number">55.4.1</span> Motiváció</h3>
+<p>Egy üzemeltetett Linux szolgáltatásnál a felhasználó által látott
+hiba ritkán közvetlenül a gyökérok. A „nem tölt be az oldal” mögött DNS,
+TLS-lánc, route, reverse proxy, backend, elfogyott FD, OOM, telített
+disk vagy párhuzamosan futó háttérterhelés is állhat. Ebben a
+záróprojekt-incidensgyakorlatban ezért nem egyetlen hibát javítunk,
+hanem kontrollált, névvel azonosított labhibákkal gyakoroljuk a
+hipotézisvezérelt recoveryt. A cél az, hogy a szenior C++ fejlesztő a
+Linux stacket ugyanúgy diagnosztizálja, mint egy natív release artifact
+hibáját: tünet, bizonyíték, egy változtatás, verification.</p>
+<p>A korábbi <a href="d160.html">d160</a> hálózati incidensmódszertan és
+<a href="d110.html">d110</a> teljes Linux bottleneck diagnosztika itt
+egy szolgáltatásszintű gyakorlatban fut össze. Ami ott egy rétegen belül
+tanult, az itt több függőségi és erőforrásrétegen keresztül jelenik
+meg.</p>
+<h3 data-number="55.4.2" id="definíció-és-működés"><span
+class="header-section-number">55.4.2</span> Definíció és működés</h3>
+<p><strong>Incidens (incident):</strong> egy szolgáltatás tervezett
+állapotától (desired state) való, felhasználót érintő eltérés. A lab
+gyakorlatban <strong>fault injection</strong> segítségével szándékosan
+hozunk létre incidenst. A <strong>fixture</strong> itt a hibás állapot
+pontos leírása: melyik gépen, melyik fájlban, melyik parancs hajtotta
+végre, és mi a várt tünet.</p>
+<p>A recovery műveleteket meg kell különböztetni:</p>
+<ul>
+<li><strong>Mitigation:</strong> ideiglenesen csökkenti a user impactot,
+de a gyökérok megmaradhat. Például FD-limit emelése, ha a szolgáltatás
+FD leak-es.</li>
+<li><strong>Rollback:</strong> a release artifactot, konfigurációt vagy
+route-ot visszaállítja egy ismert jó állapotba. Nem garantálja, hogy az
+adatintegritás is helyreállt.</li>
+<li><strong>Restore:</strong> adatot vagy teljes fájlrendszert
+ellenőrzött backupból állít vissza. Csak sikeres, integritásellenőrzött
+restore után tekinthető igazolt recoverynek.</li>
+</ul>
+<p>A diagnosztika alapja a <strong>tünet-réteg hozzárendelés</strong>.
+Egy tünetet nem elég látni, a réteget is azonosítani kell:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tünet</th>
+<th>Valószínű réteg</th>
+<th>Elsődleges bizonyíték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A név rossz IP-t ad vagy timeout</td>
+<td>DNS/NSS/hosts</td>
+<td><code>getent ahosts</code>, <code>dig</code>,
+<code>/etc/hosts</code></td>
+</tr>
+<tr class="even">
+<td>TLS kézfogás hiba, „unable to get local issuer certificate”</td>
+<td>TLS-lánc, trust</td>
+<td><code>openssl s_client</code>, <code>openssl verify</code></td>
+</tr>
+<tr class="odd">
+<td>TCP SYN után timeout, DNS/TLS rendben</td>
+<td>route, firewall, PMTU</td>
+<td><code>ip route get</code>, <code>ss -tn</code>,
+<code>tcpdump</code></td>
+</tr>
+<tr class="even">
+<td><code>accept: Too many open files</code></td>
+<td>FD-limit</td>
+<td><code>/proc/PID/limits</code>, FD-count</td>
+</tr>
+<tr class="odd">
+<td>Process exit <code>9/KILL</code>, OOM-kill log</td>
+<td>memória/cgroup</td>
+<td><code>systemctl status</code>, <code>journalctl -k</code></td>
+</tr>
+<tr class="even">
+<td>Magas latency, magas I/O wait</td>
+<td>blokk-I/O, cgroup throttle</td>
+<td><code>iostat -xz</code>, <code>pidstat -d</code>,
+<code>/proc/pressure/io</code></td>
+</tr>
+<tr class="odd">
+<td><code>No space left on device</code>, töredéknyi szabad blokk</td>
+<td>inode/quota</td>
+<td><code>df -h</code>, <code>df -i</code>, <code>quota</code></td>
+</tr>
+<tr class="even">
+<td>HTTP 502/504</td>
+<td>backend/proxy</td>
+<td>nginx error log, backend systemd state</td>
+</tr>
+<tr class="odd">
+<td>Adat sérült vagy hiányzik</td>
+<td>storage/alkalmazás durabilitása</td>
+<td>checksum, backup restore</td>
+</tr>
+</tbody>
+</table>
+<p>A labban minden módosítás <strong>lab-</strong> prefixszel nevesített
+disklab/disposable erőforráson történik. A hibainjektálás előtt mindig
+baseline-t rögzítünk; a recovery után ugyanazzal a smoke teszttel
+ellenőrzünk.</p>
+<h3 data-number="55.4.3" id="kidolgozott-példa"><span
+class="header-section-number">55.4.3</span> Kidolgozott példa</h3>
+<h4 data-number="55.4.3.1" id="labtopológia-és-baseline"><span
+class="header-section-number">55.4.3.1</span> Labtopológia és
+baseline</h4>
+<p>A gyakorlat a d273-ban felépített stacket használja:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Objektum</th>
+<th>Cím/Interfész</th>
+<th>Szerep</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>lab-lb</code></td>
+<td>192.0.2.10/24, 198.51.100.10/24</td>
+<td>Nginx TLS reverse proxy</td>
+</tr>
+<tr class="even">
+<td><code>lab-app-a</code></td>
+<td>198.51.100.20/24</td>
+<td><code>lab-order-svc</code> systemd service</td>
+</tr>
+<tr class="odd">
+<td><code>lab-app-b</code></td>
+<td>198.51.100.21/24</td>
+<td>ugyanaz a service, második backend</td>
+</tr>
+<tr class="even">
+<td><code>lab-client</code></td>
+<td>192.0.2.50/24</td>
+<td>teszt kliens</td>
+</tr>
+<tr class="odd">
+<td><code>lab-backup</code></td>
+<td>198.51.100.30/24</td>
+<td>restic repository</td>
+</tr>
+</tbody>
+</table>
+<p>A dokumentációs címek az RFC 5737 tartományból valók. Az élő név
+<code>lab-svc.example</code>, amely az <code>A</code> rekorddal a
+<code>lab-lb</code> 192.0.2.10-es címére mutat.</p>
+<p>Baseline ellenőrzés:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client, user: lab-admin, privilege: sudo</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">getent</span> ahosts lab-svc.example</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> https://lab-svc.example/health</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co"># várt kimenet:</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 192.0.2.10 STREAM lab-svc.example</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 200</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb, user: lab-admin, privilege: sudo</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> verify <span class="at">-CAfile</span> /etc/ssl/lab/lab-ca-chain.pem /etc/ssl/lab/lab-leaf.pem</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> route get 198.51.100.20</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co"># várt kimenet:</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/ssl/lab/lab-leaf.pem: OK</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 198.51.100.20 dev eth1 src 198.51.100.10</span></span></code></pre></div>
+<p>Ez a három ellenőrzés egyszerre mutatja a DNS-, TLS- és
+route-függőséget. Ha bármelyik eltér, a hiba már a kapcsolat felépítése
+előtt jelentkezik.</p>
+<h4 data-number="55.4.3.2"
+id="hibafixture-wrong-dns-tls-chain-route"><span
+class="header-section-number">55.4.3.2</span> Hibafixture: wrong DNS,
+TLS chain, route</h4>
+<p><strong>Wrong DNS:</strong> a <code>lab-client</code> DNS-feloldását
+egy hibás <code>/etc/hosts</code> sorral térítjük el a forgalom elől. Ez
+jól szimulálja a rossz DNS-rekordot, de NSS szinten könnyen
+visszafordítható.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client, user: lab-admin, privilege: sudo</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&#39;192.0.2.99 lab-svc.example&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee <span class="at">-a</span> /etc/hosts</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># tünet és bizonyíték</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-v</span> https://lab-svc.example/health <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Trying|Connected|failed&#39;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="fu">getent</span> ahosts lab-svc.example</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: Trying 192.0.2.99..., connection timed out</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># getent: 192.0.2.99 STREAM lab-svc.example</span></span></code></pre></div>
+<p>A hipotézis: a névfeloldás rossz célt ad, nem a proxy vagy a hálózat
+hibás. Ellenőrzésként a <code>getent</code> mutatja a hibás IP-t.
+Rollback:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> sed <span class="at">-i</span> <span class="st">&#39;/192.0.2.99 lab-svc.example/d&#39;</span> /etc/hosts</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="fu">getent</span> ahosts lab-svc.example</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: ismét 192.0.2.10</span></span></code></pre></div>
+<p><strong>TLS chain:</strong> a <code>lab-lb</code> Nginx chain
+fájljában csak a leaf certet hagyjuk meg, a köztes CA kikerül a
+chainből. A kliens ekkor nem tudja felépíteni a láncot.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb, user: lab-admin, privilege: sudo</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp /etc/ssl/lab/lab-fullchain.pem /etc/ssl/lab/lab-fullchain.pem.bak</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp /etc/ssl/lab/lab-leaf.pem /etc/ssl/lab/lab-fullchain.pem</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nginx <span class="at">-t</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl reload nginx</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-v</span> https://lab-svc.example/health <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;SSL certificate problem|openssl&#39;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> s_client <span class="at">-connect</span> lab-svc.example:443 <span class="at">-servername</span> lab-svc.example <span class="at">-showcerts</span> <span class="kw">|</span> <span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;/BEGIN CERTIFICATE/,/END CERTIFICATE/p&#39;</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-c</span> <span class="st">&#39;BEGIN CERTIFICATE&#39;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: 1, tehát csak leaf van a chainben</span></span></code></pre></div>
+<p>A tünet „SSL certificate problem: unable to get local issuer
+certificate”. A <code>curl</code> hibája önmagában félrevezethető lenne:
+lehetne rossz CA store vagy órahiba is. Ezért a <code>lab-lb</code>
+oldalán nézzük meg, mit ad ki a szerver. A
+<code>lab-fullchain.pem</code>-ben csak egy cert van, a
+<code>lab-leaf.pem</code> másolata. Rollback:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp /etc/ssl/lab/lab-fullchain.pem.bak /etc/ssl/lab/lab-fullchain.pem</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nginx <span class="at">-t</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl reload nginx</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> https://lab-svc.example/health</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: 200</span></span></code></pre></div>
+<p><strong>Route fixture:</strong> a kliensen a 198.51.100.0/24
+hálózatra rossz gatewayt állítunk be. A DNS és a proxy sorrendben jó, a
+TCP SYN mégis elveszik.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client, user: lab-admin, privilege: sudo</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ip route replace 198.51.100.0/24 via 192.0.2.99 dev eth0</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># bizonyíték</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> route get 198.51.100.20</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: 198.51.100.20 via 192.0.2.99 dev eth0 ... unreachable</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-c1</span> 192.0.2.10</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="fu">ping</span> <span class="at">-c1</span> 198.51.100.20</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co"># a proxy elérhető, a backend nem; a route-fixture a különbség</span></span></code></pre></div>
+<p>Rollback:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ip route replace 198.51.100.0/24 via 192.0.2.10 dev eth0</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> route get 198.51.100.20</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> https://lab-svc.example/health</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: route via 192.0.2.10, HTTP 200</span></span></code></pre></div>
+<h4 data-number="55.4.3.3"
+id="erőforrás-hibák-fd-leak-oom-throttle-io-bottleneck"><span
+class="header-section-number">55.4.3.3</span> Erőforrás-hibák: FD leak,
+OOM, throttle, IO bottleneck</h4>
+<p>Az erőforrás-incidensek közös jellemzője, hogy a külső tünet későn
+jelentkezik, mert a deployment eleinte működik. A labban a
+<code>lab-order-svc</code> release artifactjait a
+<code>lab-install-release</code> helper telepíti. A helper a natív
+binaryt, a source revisiont, a build-id-t és a systemd unit verzióját
+együtt írja le.</p>
+<p><strong>FD leak:</strong> telepítjük a <code>0.2.0-fdleak</code> jelű
+hibás release-t. Minden health-kérés után egy socket/file descriptor
+nyitva marad.</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-admin, privilege: sudo</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lab-install-release lab-order-svc 0.2.0-fdleak</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="co"># terhelés</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 300<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span> <span class="ex">curl</span> <span class="at">-sS</span> http://127.0.0.1:18080/health <span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="cf">break</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="co"># miután az FD-limit közelébe ért:</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> lab-order-svc<span class="va">)</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> <span class="st">&quot;</span><span class="va">$PID</span><span class="st">&quot;</span> != <span class="st">&quot;0&quot;</span> <span class="kw">||</span> <span class="bu">exit</span> 1</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ls <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/fd&quot;</span> <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> grep <span class="st">&#39;Max open files&#39;</span> <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/limits&quot;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-u</span> lab-order-svc <span class="at">-n</span> 30 <span class="at">--no-pager</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív:</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="co"># fd count: 1019</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="co"># Max open files: 1024</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="co"># accept4: Too many open files</span></span></code></pre></div>
+<p>A hipotézis az FD-limit elérés, a bizonyíték a magas FD-count és a
+<code>Max open files = 1024</code>. A mitigation egy ideiglenes
+<code>LimitNOFILE</code> drop-in, de a gyökérok megmarad:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkdir <span class="at">-p</span> /etc/systemd/system/lab-order-svc.service.d</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/systemd/system/lab-order-svc.service.d/10-fd-mitigation.conf</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="st">[Service]</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="st">LimitNOFILE=4096</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span></code></pre></div>
+<p>A valódi recovery a jó release visszaállítása és a provizórikus
+drop-in eltávolítása:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lab-install-release lab-order-svc 0.1.9-good</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /etc/systemd/system/lab-order-svc.service.d/10-fd-mitigation.conf</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="co"># terheléses postcondition</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 300<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span> <span class="ex">curl</span> <span class="at">-sS</span> http://127.0.0.1:18080/health <span class="op">&gt;</span>/dev/null <span class="kw">||</span> <span class="cf">break</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> lab-order-svc<span class="va">)</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ls <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/fd&quot;</span> <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: FD-count stabil, jóval 1024 alatt; a limit nem emelt</span></span></code></pre></div>
+<p><strong>OOM:</strong> a <code>0.2.1-oom</code> release
+memóriafogyasztása folyamatosan nő. A unitra szigorú memóriakonténert
+teszünk, hogy a hiba a lab virtuális adatlemezen és ne a host memóriáját
+feszítse.</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-admin, privilege: sudo</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/systemd/system/lab-order-svc.service.d/10-oom-fixture.conf</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="st">[Service]</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="st">MemoryHigh=384M</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="st">MemoryMax=512M</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lab-install-release lab-order-svc 0.2.1-oom</span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co"># a release a MemoryHigh/MemoryMax alatt először működik, majd OOM-kill következik</span></span></code></pre></div>
+<p>Az OOM-nál a bizonyítékot a restart előtt kell rögzíteni:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl status lab-order-svc <span class="at">--no-pager</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: code=killed, status=9/KILL</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> journalctl <span class="at">-u</span> lab-order-svc <span class="at">-k</span> <span class="at">--no-pager</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> <span class="at">-E</span> <span class="st">&#39;oom|killed process&#39;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show lab-order-svc <span class="at">-p</span> MemoryCurrent <span class="at">-p</span> MemoryPeak</span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co"># MemoryPeak közel a MemoryMax-hoz; MemoryCurrent után OOM-kill után lényegesen kisebb</span></span></code></pre></div>
+<p>A recovery a jó release visszaállítása, majd a hibás fixture drop-in
+eltávolítása. A <code>MemoryGuard</code> csak akkor marad meg, ha a d273
+baseline kifejezetten előírja; itt a rollbackhez megszüntetjük.</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop lab-order-svc</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> lab-install-release lab-order-svc 0.1.9-good</span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /etc/systemd/system/lab-order-svc.service.d/10-oom-fixture.conf</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> show lab-order-svc <span class="at">-p</span> SubState <span class="at">-p</span> MemoryCurrent</span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: active/running; MemoryCurrent tartósan a baseline alatt</span></span></code></pre></div>
+<p><strong>Throttle/IO bottleneck:</strong> itt nem a service release
+hibás, hanem a rendszerkonfiguráció fogja vissza a szolgáltatást. A
+<code>lab-order-svc</code> service alá egy drop-in mesterségesen
+<code>CPUQuota=10%</code>-ot és <code>IORreadBandwidthMax</code>-ot
+adhat. A méréshez a d273-ban használt Prometheus
+<code>lab_order_request_duration_seconds</code> metrikát vagy a lokális
+<code>lab_bench --quantiles</code> eszközt használjuk.</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-admin, privilege: sudo</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/systemd/system/lab-order-svc.service.d/10-throttle.conf</span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="st">[Service]</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="st">CPUQuota=10%</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="st">IOReadBandwidthMax=/dev/vdb 2M</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="co"># mérés: előtte az IOPS-t és a p50/p95-öt rögzítjük, a throttle alatt ismét</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a><span class="ex">iostat</span> <span class="at">-xz</span> 1 5</span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a><span class="ex">systemd-cgtop</span> <span class="at">--depth</span><span class="op">=</span>1 <span class="at">--iterations</span><span class="op">=</span>5</span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a><span class="co"># lab_bench --url http://127.0.0.1:18080/health --quantiles p50,p95,p99</span></span></code></pre></div>
+<p>A bizonyíték itt a request latency és a blokk-IO várakozás egyidejű
+növekedése. A hibás drop-in eltávolítása a recovery:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm /etc/systemd/system/lab-order-svc.service.d/10-throttle.conf</span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl daemon-reload</span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: a p50/p95 visszatér a baseline közelébe, a CPUQuota és IO limit megszűnik</span></span></code></pre></div>
+<h4 data-number="55.4.3.4" id="diskinodequota-és-service-data"><span
+class="header-section-number">55.4.3.4</span> Disk/inode/quota és
+service data</h4>
+<p>A „write nem sikerül” tünetet könnyű félreértelmezni, ha csak
+<code>df -h</code>-t nézünk. A labban inode kimerülést okozunk a service
+adatkönyvtárában:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-admin, privilege: sudo</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc mkdir <span class="at">-p</span> /srv/lab-order-svc/lab-fill</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 10000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span> <span class="fu">sudo</span> <span class="at">-u</span> lab-svc touch <span class="st">&quot;/srv/lab-order-svc/lab-fill/f</span><span class="va">$i</span><span class="st">&quot;</span><span class="kw">;</span> <span class="cf">done</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="co"># bizonyíték</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-h</span> /srv</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc find /srv/lab-order-svc/lab-fill <span class="at">-type</span> f <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: df -h mutat még szabad blokkot, de df -i 100% használt</span></span></code></pre></div>
+<p>A tünet a service oldalán <code>No space left on device</code> lehet
+akkor is, ha blokk szinten van szabad kapacitás. Ennek oka az inode
+kimerülés. A rollback csak a lab-fixture törlése:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-rf</span> /srv/lab-order-svc/lab-fill</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc touch /srv/lab-order-svc/.write-test</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc rm /srv/lab-order-svc/.write-test</span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: inode-használat a baseline, a service adatkönyvtára írható</span></span></code></pre></div>
+<p>Kvóta esetén a bizonyíték a <code>quota</code> vagy
+<code>xfs_quota report</code> kimenete, és a recovery a per-user limit
+feloldása vagy emelése. A service adatknál mindig rögzítjük a használt
+adatútvonalat: <code>/srv/lab-order-svc</code>, a tulajdonost, a backup
+idősorát és a <code>du -x --max-depth=2</code> kimenetet.</p>
+<h4 data-number="55.4.3.5" id="backend-failure-és-proxy-drain"><span
+class="header-section-number">55.4.3.5</span> Backend failure és proxy
+drain</h4>
+<p>A <code>lab-lb</code> Nginx upstream konfigurációja:</p>
+<pre class="nginx"><code>upstream lab_backend {
+    server 198.51.100.20:18080 max_fails=2 fail_timeout=30s;
+    server 198.51.100.21:18080;
+}</code></pre>
+<p>A backend leállítása előtt nem szeretnénk 5xx-et adni. A
+<strong>proxy drain</strong> azt jelenti, hogy a maintenance alá vont
+backendet először kivonjuk a routing döntésből, majd megvárjuk, amíg az
+aktív kapcsolatok lecsengenek, és csak utána állítjuk le a
+service-t.</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb, user: lab-admin, privilege: sudo</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> <span class="op">&lt;&lt;&#39;EOF&#39;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /etc/nginx/conf.d/lab-upstream.conf</span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a><span class="st">upstream lab_backend {</span></span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a><span class="st">    server 198.51.100.20:18080 max_fails=2 fail_timeout=30s down;</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a><span class="st">    server 198.51.100.21:18080;</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb19-7"><a href="#cb19-7" aria-hidden="true" tabindex="-1"></a><span class="op">EOF</span></span>
+<span id="cb19-8"><a href="#cb19-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nginx <span class="at">-t</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl reload nginx</span>
+<span id="cb19-9"><a href="#cb19-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-10"><a href="#cb19-10" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a</span></span>
+<span id="cb19-11"><a href="#cb19-11" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl stop lab-order-svc</span>
+<span id="cb19-12"><a href="#cb19-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb19-13"><a href="#cb19-13" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client</span></span>
+<span id="cb19-14"><a href="#cb19-14" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> https://lab-svc.example/health</span>
+<span id="cb19-15"><a href="#cb19-15" aria-hidden="true" tabindex="-1"></a><span class="co"># várt/illusztratív: 200, mert a lab-app-b továbbra is kiszolgál</span></span></code></pre></div>
+<p>A recovery a leállított backend vizsgálata/javítása után a
+<code>down</code> kulcsszó eltávolítása és reload:</p>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> cp /etc/nginx/conf.d/lab-upstream.conf /etc/nginx/conf.d/lab-upstream.conf.bak</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="co"># a down sor törlése a lab-app-a server elől</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nginx <span class="at">-t</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl reload nginx</span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl start lab-order-svc</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: mindkét backend újra aktív; curl 200</span></span></code></pre></div>
+<p>Ha mindkét backend kiesne, a tünet 502 lesz. Ezt a log bizonyítja,
+nem elég a curl hibakód. A hiba különválasztásához mindig rögzítjük:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> tail <span class="at">-n</span> 50 /var/log/nginx/error.log</span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a és lab-app-b</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> is-active lab-order-svc</span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ss</span> <span class="at">-lntp</span> <span class="kw">|</span> <span class="fu">grep</span> 18080</span></code></pre></div>
+<h4 data-number="55.4.3.6" id="backup-restore-és-data-integrity"><span
+class="header-section-number">55.4.3.6</span> Backup restore és data
+integrity</h4>
+<p>A backup csak akkor jelent valós recoveryt, ha a restore utáni adat
+checksummal és szolgáltatáshealth-tel igazolt. A gyakorlatban
+<code>restic</code> repository-t használunk a <code>lab-backup</code>
+gépen.</p>
+<p>Injektálás: a service aktuális adatfile-ját felülírjuk hibással.</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-svc</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> corrupt <span class="op">&gt;</span> /srv/lab-order-svc/orders/current.dat</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sha256sum</span> /srv/lab-order-svc/orders/current.dat</span></code></pre></div>
+<p>A restore előtt a repository legfrissebb snapshotját kérjük le, majd
+egy külön target könyvtárba restore-olunk, hogy az élő adatot ne írjuk
+felül bizonyíték előtt:</p>
+<div class="sourceCode" id="cb23"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-app-a, user: lab-svc</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc restic <span class="at">-r</span> /srv/lab-backup/repo <span class="dt">\</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">--password-file</span> /etc/lab-backup/password.txt snapshots <span class="at">--latest</span> 1</span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc mkdir <span class="at">-p</span> /tmp/lab-restore</span>
+<span id="cb23-6"><a href="#cb23-6" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc restic <span class="at">-r</span> /srv/lab-backup/repo <span class="dt">\</span></span>
+<span id="cb23-7"><a href="#cb23-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">--password-file</span> /etc/lab-backup/password.txt restore latest <span class="at">--target</span> /tmp/lab-restore</span>
+<span id="cb23-8"><a href="#cb23-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb23-9"><a href="#cb23-9" aria-hidden="true" tabindex="-1"></a><span class="co"># helyreállított fájl ellenőrzése</span></span>
+<span id="cb23-10"><a href="#cb23-10" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc sha256sum /tmp/lab-restore/srv/lab-order-svc/orders/current.dat</span></code></pre></div>
+<p>A két checksum különbözősége igazolja a sérülést. Ha a restore file
+hasha ismert a backup manifestből, akkor először azt ellenőrizzük, és
+csak utána írjuk vissza:</p>
+<div class="sourceCode" id="cb24"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc cp /tmp/lab-restore/srv/lab-order-svc/orders/current.dat <span class="dt">\</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a>  /srv/lab-order-svc/orders/current.dat</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc sha256sum /srv/lab-order-svc/orders/current.dat</span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb24-5"><a href="#cb24-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> http://127.0.0.1:18080/health</span>
+<span id="cb24-6"><a href="#cb24-6" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: checksum egyezik a restore-tel; health 200</span></span></code></pre></div>
+<p>A <code>restic</code> restore <code>--target</code> paramétere nem az
+élő adatot írja felül, ezért a <code>cp</code> előtt a
+checksum-összehasonlítás bizonyítható. A rollout/backup műveleteknél
+mindig meg kell nevezni, hogy a snapshot/replication nem azonos a
+backup/restore-ral; a konténerekben vagy VM snapshotban is lehetnek
+félig írt adatfájlok.</p>
+<h4 data-number="55.4.3.7" id="timeline-evidence-és-postmortem"><span
+class="header-section-number">55.4.3.7</span> Timeline, evidence és
+postmortem</h4>
+<p>A labban minden incidensről a következő formátumú idővonalat
+készítjük. Az időértékek falikór-időben (wall clock) vannak,
+illusztratívak:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>T+perc</th>
+<th>Esemény</th>
+<th>Megfigyelt állapot</th>
+<th>Bizonyíték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>Baseline</td>
+<td>200 health</td>
+<td><code>curl -w</code>, <code>getent</code>,
+<code>openssl verify</code></td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>Wrong DNS fixture</td>
+<td>client timeout</td>
+<td><code>getent ahosts</code> rossz IP</td>
+</tr>
+<tr class="odd">
+<td>9</td>
+<td>DNS rollback</td>
+<td>névfeloldás jó</td>
+<td><code>getent ahosts</code></td>
+</tr>
+<tr class="even">
+<td>11</td>
+<td>TLS chain fixture</td>
+<td>SSL certificate problem</td>
+<td><code>openssl s_client</code> chain</td>
+</tr>
+<tr class="odd">
+<td>16</td>
+<td>TLS rollback</td>
+<td>200</td>
+<td><code>curl</code></td>
+</tr>
+<tr class="even">
+<td>21</td>
+<td>Route fixture</td>
+<td>timeout, proxy ping jó</td>
+<td><code>ip route get</code></td>
+</tr>
+<tr class="odd">
+<td>26</td>
+<td>Route rollback</td>
+<td>200</td>
+<td><code>curl</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>postmortem</strong> vezető szempontjai:</p>
+<ol type="1">
+<li>Mi volt a felhasználói tünet?</li>
+<li>Mi volt a gyökérok, és milyen bizonyíték támasztotta alá?</li>
+<li>Mi volt a contributing factor, amit nem kell gyökéroknak
+nevezni?</li>
+<li>A mitigation, rollback és restore közül melyik mit oldott meg?</li>
+<li>Melyik mérést kell regressziós smoke tesztként megtartani?</li>
+</ol>
+<p>Például a wrong DNS incidensnél a gyökérok a hibás
+<code>/etc/hosts</code> sor, a contributing factor a reverse proxyhoz
+tartozó névfeloldás cache-elése lehetett. A tanulság nem az, hogy „rossz
+a DNS”, hanem hogy a <code>curl</code> timeoutot DNS-bizonyíték nélkül
+nem szabad route-hibaként kezelni.</p>
+<h3 data-number="55.4.4" id="hibák-és-ellenpróbák"><span
+class="header-section-number">55.4.4</span> Hibák és ellenpróbák</h3>
+<p><strong>A tünetet azonnal a rossz réteghez kötjük.</strong> A
+<code>connection timed out</code> nem feltétlenül route-hiba.
+Ellenpróba: <code>getent ahosts lab-svc.example</code>,
+<code>ip route get 198.51.100.20</code>,
+<code>ss -tn state syn-sent '( dport = :443 )'</code>. Ha a név rossz
+IP-t ad, az a DNS réteg; ha a route célorientáció helyes, de a SYN nem
+hagyja el a gépet, a route/ACL/firewall a következő.</p>
+<p><strong>A TLS chain hibáját kizárólag a kliensnapjából
+diagnosztizáljuk.</strong> A <code>curl</code> hibaüzenete nem mondja
+meg, hogy a szerver chain hiányos vagy a kliens CA store rossz.
+Ellenpróba a <code>lab-lb</code> oldali <code>openssl s_client</code> és
+<code>openssl verify</code>; a két oldal összevetése mutatja az eltérő
+chain-t.</p>
+<p><strong>Az OOM bizonyítékot a restart elrontja.</strong> Ha a
+<code>MemoryPeak</code> és a <code>status=9/KILL</code> nem rögzítettük,
+a friss systemd state csak a restart kísérletet mutatja. A labban előbb
+<code>journalctl -k</code>-t és <code>systemctl show</code>-t rögzítünk,
+utána restart.</p>
+<p><strong>A disk tele van, de <code>df -h</code> szerint nincs
+tele.</strong> Ellenpróba a <code>df -i</code>. A blokk-kapacitás és
+inode-kapacitás külön erőforrás; egy fájlrendszerben az inode-kimerülés
+ugyanolyan írásképtelenséget okoz.</p>
+<p><strong>A proxy drain elmarad.</strong> Ha a backendet leállítjuk,
+mielőtt a proxy routing döntéséből kivontuk volna, aktív kérések esnek
+el. Ellenpróba a <code>ss -tnp</code> és az Nginx access log aktív
+kapcsolatai. A drain sorrend: remove from upstream, reload, active
+connections drain, stop service.</p>
+<p><strong>A restore azonnal felülírja az élő adatot.</strong>
+Ellenpróba: először <code>/tmp/lab-restore</code>-ba restore-olunk, ott
+checksumot számolunk, és csak azután másoljuk vissza. Ha a backup maga
+sérült, a rossz restore nem rontja tovább az élő adatot.</p>
+<p><strong>A rollbacket összekeverjük a restore-ral.</strong> A rossz
+release visszavonása nem hozza vissza a törölt adatfile-t. Az
+adatsérülésnél rollback utáni restore is kell, és a healthcheck az adat
+sértetlenségét igazolja.</p>
+<h3 data-number="55.4.5" id="feladatok"><span
+class="header-section-number">55.4.5</span> Feladatok</h3>
+<h4 data-number="55.4.5.1" id="feladat-tünet-réteg-hozzárendelés"><span
+class="header-section-number">55.4.5.1</span> 1. feladat: tünet-réteg
+hozzárendelés</h4>
+<p>A <code>lab-client</code>-en a
+<code>curl https://lab-svc.example/health</code> hibát ad:
+<code>SSL certificate problem: unable to get local issuer certificate</code>.
+A <code>getent ahosts lab-svc.example</code> visszaadja a
+<code>192.0.2.10</code>-et. Az <code>ip route get 198.51.100.20</code>
+rendben mutatja a <code>via</code>-t. Melyik réteg a legerősebb
+hipotézis? Milyen parancssal döntöd el, hogy a kliens CA store vagy a
+szerver TLS chain hibás? Ne telepíts semmit.</p>
+<h4 data-number="55.4.5.2" id="feladat-dnsroute-fixture-recovery"><span
+class="header-section-number">55.4.5.2</span> 2. feladat: DNS/route
+fixture recovery</h4>
+<p>Készítsd el a labban a wrong DNS és a wrong route fixture-t a fenti
+parancsokkal. Mindkét hibát külön állítsd vissza, és igazold a
+postconditiont. A módosító parancsoknál nevezd meg a targetet, a
+privileget, a rollbacket és a vegyes ellenőrzést. Külön figyelj arra,
+hogy a DNS-hiba és a route-hiba tünete hasonló lehet.</p>
+<h4 data-number="55.4.5.3"
+id="feladat-fd-leakoom-diagnosztika-és-timeline"><span
+class="header-section-number">55.4.5.3</span> 3. feladat: FD leak/OOM
+diagnosztika és timeline</h4>
+<p>Telepítsd a <code>0.2.0-fdleak</code> release-t, terheld a health
+endpointot, majd rögzítsd a tünetet és a FD-countot. Állítsd helyre a jó
+release-t. Ezután telepítsd a <code>0.2.1-oom</code> release-t, figyeld
+a service state-et, majd készíts postmortem-t. A postmortem tartalmazza
+a gyökérokot, a contributing factort, a mitigation/rollback lépéseket és
+a regressziós smoke tesztet.</p>
+<h4 data-number="55.4.5.4"
+id="feladat-diskinode-backup-restore-és-data-integrity"><span
+class="header-section-number">55.4.5.4</span> 4. feladat: disk/inode,
+backup restore és data integrity</h4>
+<p>Töltsd fel inode-okkal a <code>lab-order-svc</code> service
+adatkönyvtárát, diagnosztizáld a <code>No space left on device</code>
+tünetet, majd tisztítsd a lab-fixture-t. Ezután rontsd el a
+<code>current.dat</code> adatfile-t, és bizonyítsd a backupból való
+restore-t: checksum, restart, healthcheck. A megoldásban indokold, miért
+restore-olsz előbb <code>/tmp/lab-restore</code>-ba, és miért nem
+közvetlenül az élő adatkönyvtárba.</p>
+<h3 data-number="55.4.6" id="megoldások"><span
+class="header-section-number">55.4.6</span> Megoldások</h3>
+<h4 data-number="55.4.6.1" id="feladat-megoldás"><span
+class="header-section-number">55.4.6.1</span> 1. feladat megoldás</h4>
+<p>A legvalószínűbb réteg a TLS trust/chain, mert a DNS-feloldás és a
+route is rendben van. A döntő bizonyíték a <code>lab-lb</code>-n
+futtatott:</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-lb, user: lab-admin, privilege: sudo</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> s_client <span class="at">-connect</span> lab-svc.example:443 <span class="at">-servername</span> lab-svc.example <span class="at">-showcerts</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a><span class="ex">openssl</span> verify <span class="at">-CAfile</span> /etc/ssl/lab/lab-ca-chain.pem /etc/ssl/lab/lab-leaf.pem</span></code></pre></div>
+<p>Ha a <code>verify</code> helyesen felépített <code>CAfile</code>
+mellett is hibát ad, a szerver által kiküldött chain hiányos. Ha csak a
+kliens CA store a hiányos, a <code>lab-lb</code> lánc valid.
+Postcondition: a hibaforrás egyértelműen az egyik oldalhoz rendelve, nem
+a DNS illetve a route.</p>
+<h4 data-number="55.4.6.2" id="feladat-megoldás-1"><span
+class="header-section-number">55.4.6.2</span> 2. feladat megoldás</h4>
+<p>A parancsok megegyeznek a kidolgozott példa wrong DNS és route
+fixture szakaszaival. A DNS-visszaállítás után:</p>
+<div class="sourceCode" id="cb26"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="fu">getent</span> ahosts lab-svc.example</span>
+<span id="cb26-3"><a href="#cb26-3" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: 192.0.2.10</span></span></code></pre></div>
+<p>A route-visszaállítás után:</p>
+<div class="sourceCode" id="cb27"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-client</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> route get 198.51.100.20</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: 198.51.100.20 via 192.0.2.10 dev eth0</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> https://lab-svc.example/health</span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: 200</span></span></code></pre></div>
+<p>A DNS-hiba és a route-hiba elkülönítése: a DNS-fixture alatt a
+<code>getent ahosts</code> rossz IP-t ad; route-fixture alatt a
+<code>getent</code> jó, de a <code>ping 192.0.2.10</code> és a
+<code>ping 198.51.100.20</code> közül az utóbbi nem megy. Ez a két
+ellenpróba megakadályozza a tünet összemosását.</p>
+<h4 data-number="55.4.6.3" id="feladat-megoldás-2"><span
+class="header-section-number">55.4.6.3</span> 3. feladat megoldás</h4>
+<p>A release telepítése után a tünet akkor jelenik meg, ha a
+<code>/proc/PID/limits</code> és a FD-count együtt mutatja a
+kimerülést:</p>
+<div class="sourceCode" id="cb28"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="va">PID</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> show <span class="at">-p</span> MainPID <span class="at">--value</span> lab-order-svc<span class="va">)</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> ls <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/fd&quot;</span> <span class="kw">|</span> <span class="fu">wc</span> <span class="at">-l</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> grep <span class="st">&#39;Max open files&#39;</span> <span class="st">&quot;/proc/</span><span class="va">$PID</span><span class="st">/limits&quot;</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="co"># várt: FD-count 1024 környékén, Max open files 1024</span></span></code></pre></div>
+<p>A jó release visszaállítása után FD-count ismét stabil alacsony. Az
+OOM-nál a <code>systemctl status lab-order-svc</code> nem
+<code>Restarting</code>, hanem <code>failed</code> vagy
+<code>activating</code>, és a <code>journalctl -k</code> OOM-kill
+bejegyzést ad. A <code>MemoryPeak</code> a <code>MemoryMax</code>
+közelében van.</p>
+<p>A postmortem:</p>
+<ul>
+<li><strong>Gyökérok:</strong> a <code>0.2.1-oom</code> release
+memóriafogyasztása növekedett; a cgroup <code>MemoryMax=512M</code>
+elérése után OOM-kill.</li>
+<li><strong>Contributing factor:</strong> a health requestek a
+memóriaelfogyás előtt is magas kihasználtságot okoztak, de az OOM-ot a
+release okozta.</li>
+<li><strong>Mitigation:</strong> a service
+<code>systemctl stop</code>-ja, hogy megőrizzük a bizonyítékot; ha
+szükséges, a loadbalancerből kivonás.</li>
+<li><strong>Rollback:</strong> <code>0.1.9-good</code> release
+visszaállítása, a 10-oom-fixture drop-in eltávolítása.</li>
+<li><strong>Regressziós smoke teszt:</strong> 5 perces health-terhelés
+után a <code>MemoryCurrent</code> nem közelíti a limitet, FD-count
+stabil, HTTP 200.</li>
+</ul>
+<h4 data-number="55.4.6.4" id="feladat-megoldás-3"><span
+class="header-section-number">55.4.6.4</span> 4. feladat megoldás</h4>
+<p>Az inode-fixture felszámolása:</p>
+<div class="sourceCode" id="cb29"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> rm <span class="at">-rf</span> /srv/lab-order-svc/lab-fill</span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a><span class="fu">df</span> <span class="at">-i</span> /srv</span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc touch /srv/lab-order-svc/.write-test</span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc rm /srv/lab-order-svc/.write-test</span>
+<span id="cb29-5"><a href="#cb29-5" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: write test sikerült; df -i megegyezik a baseline-nal</span></span></code></pre></div>
+<p>A restore sorrend: előbb snapshot list, külön restore, checksum,
+utána felülírás. Ennek oka, hogy ha a backup snapshot sérült, a
+közvetlen felülírás tovább rontaná az élő adatot. A külön restore-tal
+ellenőrizhető a hasha, és a <code>cp</code> csak akkor hajtódhat végre,
+ha a restore integritása igazolt.</p>
+<div class="sourceCode" id="cb30"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc restic <span class="at">-r</span> /srv/lab-backup/repo <span class="dt">\</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--password-file</span> /etc/lab-backup/password.txt restore latest <span class="at">--target</span> /tmp/lab-restore</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc sha256sum /tmp/lab-restore/srv/lab-order-svc/orders/current.dat</span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc cp /tmp/lab-restore/srv/lab-order-svc/orders/current.dat <span class="dt">\</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>  /srv/lab-order-svc/orders/current.dat</span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> <span class="at">-u</span> lab-svc sha256sum /srv/lab-order-svc/orders/current.dat</span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> systemctl restart lab-order-svc</span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-o</span> /dev/null <span class="at">-w</span> <span class="st">&#39;%{http_code}\n&#39;</span> http://127.0.0.1:18080/health</span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="co"># postcondition: checksum egyezik, health 200, a service a restore után fut</span></span></code></pre></div>
+<h3 data-number="55.4.7" id="rövid-összefoglaló"><span
+class="header-section-number">55.4.7</span> Rövid összefoglaló</h3>
+<p>A kontrollált incidenslab a tünetet előbb rendeli erőforrásvagy
+dependency-réteghez, és csak utána változtat. A DNS, TLS-lánc és route
+mind függőségi hiba; a hibás <code>/etc/hosts</code>, a hiányos CA chain
+és a rossz route ugyanazt a látszólagos timeoutot adhatja, ezért
+mindegyikhez külön bizonyíték kell. Az FD leak, OOM, throttle és IO
+bottleneck erőforráshiba; itt a release, a cgroup limit és a
+<code>/proc</code> adatok választják el a hibatípust. A backend
+failure-nél a proxy drain megelőzi az 5xx-et, a restore pedig csak
+checksumolt backupból, külön targetből írja vissza az élő adatot. A
+timeline és postmortem a megfigyelést, a gyökérokot és a regressziós
+smoke tesztet külön kezeli.</p>
+<ul>
+<li><strong>Fixture:</strong> szándékosan hibás, névvel és
+postconditionnel azonosított labállapot.</li>
+<li><strong>Rollback:</strong> release/konfiguráció visszaállítása
+ismert jó állapotba; nem adatrestore.</li>
+<li><strong>Restore:</strong> adat integritásellenőrzött visszaállítása
+backupból; minimum checksum és szolgáltatáshealth igazolja.</li>
+</ul>
+<h3 data-number="55.4.8" id="források-és-ellenőrzési-hiányok"><span
+class="header-section-number">55.4.8</span> Források és ellenőrzési
+hiányok</h3>
+<p>Nem történt webes forrásolvasás vagy laborfuttatás. A változó verzió-
+és supportállításokat az Ubuntu Server 24.04 LTS, az aktuális systemd,
+Nginx, OpenSSL és restic kiadáshoz képest ellenőrizni kell. Ellenőrzési
+kiindulópontok:</p>
+<ul>
+<li><a href="https://ubuntu.com/server/docs/">Ubuntu Server
+documentation</a></li>
+<li><a
+href="https://www.freedesktop.org/software/systemd/man/systemd.service.html">systemd.service(5)</a></li>
+<li><a
+href="https://nginx.org/en/docs/http/ngx_http_upstream_module.html">Nginx
+upstream module</a></li>
+<li><a
+href="https://docs.openssl.org/master/man1/openssl-verify/">OpenSSL
+verify documentation</a></li>
+<li><a href="https://restic.readthedocs.io/">restic
+documentation</a></li>
+<li><a href="https://sre.google/books/">Google SRE books</a></li>
+</ul>
+<p><strong>Ellenőrzési hiányok:</strong> a fenti labparancsok és
+kimenetek illusztratívak/hipotetikusak, nem ténylegesen futtatott
+eredmények. A <code>lab-install-release</code>, <code>lab_bench</code>,
+a pontos restic repository path és a fájlrendszer/quota parancsok a lab
+aktuális setupjától függenek. A release artifactok verziószámai és
+p50/p95 értékei nem mért adatok.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="d273.html">← 55.3 Telemetria, backup és rutin működtetés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d275.html">55.5 Linux/VM projekt review és C++-fejlesztői bridge →</a></div>
+</nav>
+</body>
+</html>
