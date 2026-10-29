@@ -77,21 +77,33 @@ megállapodunk.</p>
 <strong>leállítását (abort)</strong> okozza (korábban UB volt). Három
 külön eset van: (a) <em>Rust pánik</em> az <code>extern "C"</code>
 Rust-exportban: abort, hacsak a függvény törzsét
-<code>catch_unwind</code>-del nem védjük; (b) <em>külföldi kivétel</em>
-(például C++ <code>throw</code>), amely Rust frame-eken át terjedne:
-szintén abort <code>extern "C"</code>-nél; ha ilyen terjedést
-szándékosan engedünk, az <code>extern "C-unwind"</code> ABI kell mindkét
-oldalon; (c) a <code>panic = "abort"</code> profil: ekkor nincs unwind,
-a <code>catch_unwind</code> nem fog el semmit, a pánik azonnal leállítja
-a folyamatot.</p>
+<code>catch_unwind</code>-del nem védjük; (b) <em>idegen kivétel</em>
+(például C++ <code>throw</code>), amely Rust frame-eken át terjedne: ez
+más eset, mint a Rust pánik. A nem unwind ABI-n
+(<code>extern "C"</code>) Rustba belépő idegen unwind <strong>nem
+definiált viselkedés</strong> lehet; a Rust a pánikra ad
+abort-garanciát, az idegen kivételre nem (a Rustonomicon külön
+tárgyalja). A szabály ezért: C++ kivétel nem hagyhatja el azt a C++
+függvényt, amelyet Rustból (vagy Rust-exportból C++-ból)
+<code>extern "C"</code> határon hívunk; a C++ oldalon
+<code>try { ... } catch (...) { return RKV_ERR; }</code> alakú védelem
+kell. Ha a terjedést szándékosan engedjük, az
+<code>extern "C-unwind"</code> ABI kell mindkét oldalon; (c) a
+<code>panic = "abort"</code> profil: ekkor nincs unwind, a
+<code>catch_unwind</code> nem fog el semmit, a pánik azonnal leállítja a
+folyamatot.</p>
 <p>Az <code>rkv-ffi</code> explicit policyja: a crate
 <code>panic = "unwind"</code> profillal készül (ez a Cargo
 alapértelmezése <code>dev</code> és <code>release</code> profilban is),
-és minden exportált függvény törzse a <code>guarded</code>
-segédfüggvényen megy át, amely a pánikot <code>RKV_PANIC</code>
-státuszkóddá alakítja. A <code>catch_unwind</code> itt a <em>ténylegesen
-pánikolható határ</em> védelme, nem mindent felfogó háló: a szokásos
-hibákat (<code>Result</code>) továbbra is státuszkóddá alakítjuk, a
+és minden státuszkódot adó exportált függvény (<code>rkv_set</code>,
+<code>rkv_get</code>, <code>rkv_delete</code>) törzse a
+<code>guarded</code> segédfüggvényen megy át (a <code>new</code>,
+<code>free</code> és <code>buffer_free</code> életciklus-függvények nem
+adnak státuszt, és nem tartalmaznak pánikolható logikát), amely a
+pánikot <code>RKV_PANIC</code> státuszkóddá alakítja. A
+<code>catch_unwind</code> itt a <em>ténylegesen pánikolható határ</em>
+védelme, nem mindent felfogó háló: a szokásos hibákat
+(<code>Result</code>) továbbra is státuszkóddá alakítjuk, a
 <code>catch_unwind</code> csak a váratlan pánikot kezeli. Ha a projekt
 <code>panic = "abort"</code> profilt választ, a dokumentáció ezt
 vállalja: a pánik leállítja a folyamatot, <code>RKV_PANIC</code> nem
@@ -404,183 +416,195 @@ teljes csere · ellenőrzés: <code>cargo build -p rkv-ffi</code></p>
 class="sourceCode rust"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">//! C ABI az rkv tárolóhoz.</span></span>
 <span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="co">//!</span></span>
 <span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="co">//! Szerződés (a generált `rkv_ffi.h`-ban is szerepel):</span></span>
-<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">//! * Minden függvény `int` státuszkódot ad (`RKV_OK`, `RKV_NOT_FOUND`, `RKV_INVALID_ARG`,</span></span>
-<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `RKV_ERROR`, `RKV_PANIC`).</span></span>
-<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A kulcs NUL-végű, érvényes UTF-8 C string; az érték tetszőleges bájtsorozat (pointer + hossz).</span></span>
-<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A `RkvStore` kezelő több szálról egyszerre is használható (belül zár védi), kivéve a</span></span>
-<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `rkv_store_free`-t: az kizárólagos, egyszeri, és minden más hívás után következhet.</span></span>
-<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A Rust által lefoglalt kimeneti puffert a `rkv_buffer_free(ptr, len)` szabadítja fel, pontosan egyszer.</span></span>
-<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::ffi::</span><span class="op">{</span>CStr<span class="op">,</span> <span class="dt">c_char</span><span class="op">,</span> <span class="dt">c_int</span><span class="op">};</span></span>
-<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::panic::</span><span class="op">{</span>AssertUnwindSafe<span class="op">,</span> catch_unwind<span class="op">};</span></span>
-<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>ptr<span class="op">;</span></span>
-<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>MemStore<span class="op">,</span> SharedStore<span class="op">};</span></span>
-<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_OK<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
-<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_NOT_FOUND<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
-<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_INVALID_ARG<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
-<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_ERROR<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
-<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_PANIC<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
-<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="co">/// Átlátszatlan kezelő: a C oldal csak mutatót lát (`typedef struct RkvStore RkvStore;`).</span></span>
-<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> RkvStore <span class="op">{</span></span>
-<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>    inner<span class="op">:</span> SharedStore<span class="op">,</span></span>
-<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="co">/// Minden exportált függvény törzse ezen megy át: a pánikot státuszkóddá alakítja.</span></span>
-<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="co">/// Ez csak `panic = &quot;unwind&quot;` profilban működik; `panic = &quot;abort&quot;` mellett a pánik</span></span>
-<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a><span class="co">/// leállítja a folyamatot (ezt a könyv nem vállalja el: a csomag profilja `unwind`).</span></span>
-<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> guarded(f<span class="op">:</span> <span class="kw">impl</span> <span class="bu">FnOnce</span>() <span class="op">-&gt;</span> <span class="dt">c_int</span>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
-<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a>    catch_unwind(AssertUnwindSafe(f))<span class="op">.</span>unwrap_or(RKV_PANIC)</span>
-<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a><span class="co">/// Új, memóriabeli tároló. A kezelőt a `rkv_store_free`-vel kell felszabadítani.</span></span>
-<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_new() <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> RkvStore <span class="op">{</span></span>
-<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store <span class="op">=</span> RkvStore <span class="op">{</span> inner<span class="op">:</span> <span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()) <span class="op">};</span></span>
-<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>into_raw(<span class="dt">Box</span><span class="pp">::</span>new(store))</span>
-<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a><span class="co">/// A kezelő felszabadítása.</span></span>
-<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` null, vagy a `rkv_store_new` által adott, még fel nem szabadított kezelő.</span></span>
-<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a><span class="co">/// A hívás kizárólagos: közben más szál nem használhatja a kezelőt, és utána senki sem.</span></span>
-<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_free(store<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> RkvStore) <span class="op">{</span></span>
-<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>store<span class="op">.</span>is_null() <span class="op">{</span></span>
-<span id="cb11-49"><a href="#cb11-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a szerződés szerint a mutató a Box::into_raw eredménye, egyszer szabadítjuk.</span></span>
-<span id="cb11-50"><a href="#cb11-50" aria-hidden="true" tabindex="-1"></a>        drop(<span class="kw">unsafe</span> <span class="op">{</span> <span class="dt">Box</span><span class="pp">::</span>from_raw(store) <span class="op">}</span>)<span class="op">;</span></span>
-<span id="cb11-51"><a href="#cb11-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb11-52"><a href="#cb11-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-53"><a href="#cb11-53" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-54"><a href="#cb11-54" aria-hidden="true" tabindex="-1"></a><span class="co">/// Segéd: a kezelő megosztott referenciája (nincs `&amp;mut`, a zár a SharedStore-ban van).</span></span>
-<span id="cb11-55"><a href="#cb11-55" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-56"><a href="#cb11-56" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-57"><a href="#cb11-57" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` null vagy érvényes, élő kezelő.</span></span>
-<span id="cb11-58"><a href="#cb11-58" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> handle<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="ot">&#39;a</span> RkvStore<span class="op">&gt;</span> <span class="op">{</span></span>
-<span id="cb11-59"><a href="#cb11-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó garantálja az érvényességet és az élettartamot.</span></span>
-<span id="cb11-60"><a href="#cb11-60" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> store<span class="op">.</span>as_ref() <span class="op">}</span></span>
-<span id="cb11-61"><a href="#cb11-61" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-62"><a href="#cb11-62" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-63"><a href="#cb11-63" aria-hidden="true" tabindex="-1"></a><span class="co">/// Segéd: NUL-végű UTF-8 kulcs.</span></span>
-<span id="cb11-64"><a href="#cb11-64" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-65"><a href="#cb11-65" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-66"><a href="#cb11-66" aria-hidden="true" tabindex="-1"></a><span class="co">/// `key` null vagy érvényes, NUL-végű C string, amely a hívás alatt él.</span></span>
-<span id="cb11-67"><a href="#cb11-67" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> key_str<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="ot">&#39;a</span> <span class="dt">str</span><span class="op">&gt;</span> <span class="op">{</span></span>
-<span id="cb11-68"><a href="#cb11-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> key<span class="op">.</span>is_null() <span class="op">{</span></span>
-<span id="cb11-69"><a href="#cb11-69" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="cn">None</span><span class="op">;</span></span>
-<span id="cb11-70"><a href="#cb11-70" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb11-71"><a href="#cb11-71" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó szerződése szerint érvényes, NUL-végű.</span></span>
-<span id="cb11-72"><a href="#cb11-72" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">CStr::</span>from_ptr(key) <span class="op">}.</span>to_str()<span class="op">.</span>ok()</span>
-<span id="cb11-73"><a href="#cb11-73" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-74"><a href="#cb11-74" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-75"><a href="#cb11-75" aria-hidden="true" tabindex="-1"></a><span class="co">/// Érték beállítása. Az érték tetszőleges bájtsorozat; `value` lehet null, ha `value_len == 0`.</span></span>
-<span id="cb11-76"><a href="#cb11-76" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-77"><a href="#cb11-77" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-78"><a href="#cb11-78" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` érvényes kezelő; `key` NUL-végű C string; `value` legalább `value_len` olvasható bájtra mutat.</span></span>
-<span id="cb11-79"><a href="#cb11-79" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-80"><a href="#cb11-80" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_set(</span>
-<span id="cb11-81"><a href="#cb11-81" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span></span>
-<span id="cb11-82"><a href="#cb11-82" aria-hidden="true" tabindex="-1"></a>    key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
-<span id="cb11-83"><a href="#cb11-83" aria-hidden="true" tabindex="-1"></a>    value<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">u8</span><span class="op">,</span></span>
-<span id="cb11-84"><a href="#cb11-84" aria-hidden="true" tabindex="-1"></a>    value_len<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span></span>
-<span id="cb11-85"><a href="#cb11-85" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
-<span id="cb11-86"><a href="#cb11-86" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
-<span id="cb11-87"><a href="#cb11-87" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
-<span id="cb11-88"><a href="#cb11-88" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
-<span id="cb11-89"><a href="#cb11-89" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
-<span id="cb11-90"><a href="#cb11-90" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
-<span id="cb11-91"><a href="#cb11-91" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> bytes <span class="op">=</span> <span class="cf">if</span> value_len <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
-<span id="cb11-92"><a href="#cb11-92" aria-hidden="true" tabindex="-1"></a>            <span class="dt">Vec</span><span class="pp">::</span>new()</span>
-<span id="cb11-93"><a href="#cb11-93" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> value<span class="op">.</span>is_null() <span class="op">{</span></span>
-<span id="cb11-94"><a href="#cb11-94" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
-<span id="cb11-95"><a href="#cb11-95" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
-<span id="cb11-96"><a href="#cb11-96" aria-hidden="true" tabindex="-1"></a>            <span class="co">// SAFETY: value_len olvasható bájt, a szerződés szerint.</span></span>
-<span id="cb11-97"><a href="#cb11-97" aria-hidden="true" tabindex="-1"></a>            <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts(value<span class="op">,</span> value_len) <span class="op">}.</span>to_vec()</span>
-<span id="cb11-98"><a href="#cb11-98" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
-<span id="cb11-99"><a href="#cb11-99" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>set(key<span class="op">.</span>to_owned()<span class="op">,</span> bytes) <span class="op">{</span></span>
-<span id="cb11-100"><a href="#cb11-100" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(()) <span class="op">=&gt;</span> RKV_OK<span class="op">,</span></span>
-<span id="cb11-101"><a href="#cb11-101" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
-<span id="cb11-102"><a href="#cb11-102" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb11-103"><a href="#cb11-103" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
-<span id="cb11-104"><a href="#cb11-104" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-105"><a href="#cb11-105" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-106"><a href="#cb11-106" aria-hidden="true" tabindex="-1"></a><span class="co">/// Érték lekérdezése. Siker (`RKV_OK`) esetén `*out_value` egy Rust által lefoglalt puffer</span></span>
-<span id="cb11-107"><a href="#cb11-107" aria-hidden="true" tabindex="-1"></a><span class="co">/// (`*out_len` bájt; az üres érték hossza 0, a mutató ekkor is nem null), amelyet a</span></span>
-<span id="cb11-108"><a href="#cb11-108" aria-hidden="true" tabindex="-1"></a><span class="co">/// `rkv_buffer_free(*out_value, *out_len)` szabadít fel. Hiányzó kulcsra `RKV_NOT_FOUND`,</span></span>
-<span id="cb11-109"><a href="#cb11-109" aria-hidden="true" tabindex="-1"></a><span class="co">/// a kimenetek `NULL` és `0`.</span></span>
-<span id="cb11-110"><a href="#cb11-110" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-111"><a href="#cb11-111" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-112"><a href="#cb11-112" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` érvényes kezelő; `key` NUL-végű C string; `out_value` és `out_len` írható mutatók.</span></span>
-<span id="cb11-113"><a href="#cb11-113" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-114"><a href="#cb11-114" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_get(</span>
-<span id="cb11-115"><a href="#cb11-115" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span></span>
-<span id="cb11-116"><a href="#cb11-116" aria-hidden="true" tabindex="-1"></a>    key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
-<span id="cb11-117"><a href="#cb11-117" aria-hidden="true" tabindex="-1"></a>    out_value<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span></span>
-<span id="cb11-118"><a href="#cb11-118" aria-hidden="true" tabindex="-1"></a>    out_len<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">usize</span><span class="op">,</span></span>
-<span id="cb11-119"><a href="#cb11-119" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
-<span id="cb11-120"><a href="#cb11-120" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
-<span id="cb11-121"><a href="#cb11-121" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> out_value<span class="op">.</span>is_null() <span class="op">||</span> out_len<span class="op">.</span>is_null() <span class="op">{</span></span>
-<span id="cb11-122"><a href="#cb11-122" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
-<span id="cb11-123"><a href="#cb11-123" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb11-124"><a href="#cb11-124" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a kimeneti mutatók írhatók, a szerződés szerint.</span></span>
-<span id="cb11-125"><a href="#cb11-125" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span></span>
-<span id="cb11-126"><a href="#cb11-126" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>out_value <span class="op">=</span> <span class="pp">ptr::</span>null_mut()<span class="op">;</span></span>
-<span id="cb11-127"><a href="#cb11-127" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>out_len <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
-<span id="cb11-128"><a href="#cb11-128" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb11-129"><a href="#cb11-129" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
-<span id="cb11-130"><a href="#cb11-130" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
-<span id="cb11-131"><a href="#cb11-131" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
-<span id="cb11-132"><a href="#cb11-132" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
-<span id="cb11-133"><a href="#cb11-133" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>get(key) <span class="op">{</span></span>
-<span id="cb11-134"><a href="#cb11-134" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">Some</span>(value)) <span class="op">=&gt;</span> <span class="op">{</span></span>
-<span id="cb11-135"><a href="#cb11-135" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> boxed <span class="op">=</span> value<span class="op">.</span>into_boxed_slice()<span class="op">;</span></span>
-<span id="cb11-136"><a href="#cb11-136" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> len <span class="op">=</span> boxed<span class="op">.</span>len()<span class="op">;</span></span>
-<span id="cb11-137"><a href="#cb11-137" aria-hidden="true" tabindex="-1"></a>                <span class="co">// SAFETY: a kimeneti mutatók írhatók.</span></span>
-<span id="cb11-138"><a href="#cb11-138" aria-hidden="true" tabindex="-1"></a>                <span class="kw">unsafe</span> <span class="op">{</span></span>
-<span id="cb11-139"><a href="#cb11-139" aria-hidden="true" tabindex="-1"></a>                    <span class="op">*</span>out_len <span class="op">=</span> len<span class="op">;</span></span>
-<span id="cb11-140"><a href="#cb11-140" aria-hidden="true" tabindex="-1"></a>                    <span class="op">*</span>out_value <span class="op">=</span> <span class="dt">Box</span><span class="pp">::</span>into_raw(boxed)<span class="op">.</span><span class="pp">cast::</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>()<span class="op">;</span></span>
-<span id="cb11-141"><a href="#cb11-141" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
-<span id="cb11-142"><a href="#cb11-142" aria-hidden="true" tabindex="-1"></a>                RKV_OK</span>
-<span id="cb11-143"><a href="#cb11-143" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
-<span id="cb11-144"><a href="#cb11-144" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">None</span>) <span class="op">=&gt;</span> RKV_NOT_FOUND<span class="op">,</span></span>
-<span id="cb11-145"><a href="#cb11-145" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
-<span id="cb11-146"><a href="#cb11-146" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb11-147"><a href="#cb11-147" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
-<span id="cb11-148"><a href="#cb11-148" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-149"><a href="#cb11-149" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-150"><a href="#cb11-150" aria-hidden="true" tabindex="-1"></a><span class="co">/// Törlés. `RKV_OK`, ha a kulcs létezett és törlődött; `RKV_NOT_FOUND`, ha nem létezett.</span></span>
-<span id="cb11-151"><a href="#cb11-151" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-152"><a href="#cb11-152" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-153"><a href="#cb11-153" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` érvényes kezelő; `key` NUL-végű C string.</span></span>
-<span id="cb11-154"><a href="#cb11-154" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-155"><a href="#cb11-155" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_delete(store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span> key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
-<span id="cb11-156"><a href="#cb11-156" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
-<span id="cb11-157"><a href="#cb11-157" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
-<span id="cb11-158"><a href="#cb11-158" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
-<span id="cb11-159"><a href="#cb11-159" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
-<span id="cb11-160"><a href="#cb11-160" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
-<span id="cb11-161"><a href="#cb11-161" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>delete(key) <span class="op">{</span></span>
-<span id="cb11-162"><a href="#cb11-162" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">true</span>) <span class="op">=&gt;</span> RKV_OK<span class="op">,</span></span>
-<span id="cb11-163"><a href="#cb11-163" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">false</span>) <span class="op">=&gt;</span> RKV_NOT_FOUND<span class="op">,</span></span>
-<span id="cb11-164"><a href="#cb11-164" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
-<span id="cb11-165"><a href="#cb11-165" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb11-166"><a href="#cb11-166" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
-<span id="cb11-167"><a href="#cb11-167" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb11-168"><a href="#cb11-168" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb11-169"><a href="#cb11-169" aria-hidden="true" tabindex="-1"></a><span class="co">/// A `rkv_get` által adott puffer felszabadítása.</span></span>
-<span id="cb11-170"><a href="#cb11-170" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
-<span id="cb11-171"><a href="#cb11-171" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
-<span id="cb11-172"><a href="#cb11-172" aria-hidden="true" tabindex="-1"></a><span class="co">/// `ptr` és `len` pontosan a `rkv_get` által adott `*out_value` és `*out_len`, még fel nem szabadítva;</span></span>
-<span id="cb11-173"><a href="#cb11-173" aria-hidden="true" tabindex="-1"></a><span class="co">/// `ptr == NULL` esetén a hívás nem tesz semmit.</span></span>
-<span id="cb11-174"><a href="#cb11-174" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
-<span id="cb11-175"><a href="#cb11-175" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_buffer_free(ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span> len<span class="op">:</span> <span class="dt">usize</span>) <span class="op">{</span></span>
-<span id="cb11-176"><a href="#cb11-176" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>ptr<span class="op">.</span>is_null() <span class="op">{</span></span>
-<span id="cb11-177"><a href="#cb11-177" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a puffert Box&lt;[u8]&gt;-ból adtuk ki pontosan ekkora hosszal.</span></span>
-<span id="cb11-178"><a href="#cb11-178" aria-hidden="true" tabindex="-1"></a>        drop(<span class="kw">unsafe</span> <span class="op">{</span> <span class="dt">Box</span><span class="pp">::</span>from_raw(<span class="pp">ptr::</span>slice_from_raw_parts_mut(ptr<span class="op">,</span> len)) <span class="op">}</span>)<span class="op">;</span></span>
-<span id="cb11-179"><a href="#cb11-179" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb11-180"><a href="#cb11-180" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A műveleti függvények (`rkv_set`, `rkv_get`, `rkv_delete`) `int` státuszkódot adnak</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">//!   (`RKV_OK`, `RKV_NOT_FOUND`, `RKV_INVALID_ARG`, `RKV_ERROR`, `RKV_PANIC`), és a törzsük a</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `guarded` segéden megy át. Az életciklus-függvények nem adnak státuszt és nem guardedek:</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `rkv_store_new` kezelőt (hibánál nem tér vissza: az allokációs hiba abortot okoz),</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `rkv_store_free` és `rkv_buffer_free` `void`-ot ad; nincs bennük pánikolható logika.</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A kulcs NUL-végű, érvényes UTF-8 C string; az érték tetszőleges bájtsorozat (pointer + hossz).</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A `RkvStore` kezelő több szálról egyszerre is használható (belül zár védi), kivéve a</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co">//!   `rkv_store_free`-t: az kizárólagos, egyszeri, és minden más hívás után következhet.</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="co">//! * A Rust által lefoglalt kimeneti puffert a `rkv_buffer_free(ptr, len)` szabadítja fel, pontosan egyszer.</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::ffi::</span><span class="op">{</span>CStr<span class="op">,</span> <span class="dt">c_char</span><span class="op">,</span> <span class="dt">c_int</span><span class="op">};</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::panic::</span><span class="op">{</span>AssertUnwindSafe<span class="op">,</span> catch_unwind<span class="op">};</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>ptr<span class="op">;</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">rkv_core::</span><span class="op">{</span>MemStore<span class="op">,</span> SharedStore<span class="op">};</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_OK<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_NOT_FOUND<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_INVALID_ARG<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_ERROR<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">const</span> RKV_PANIC<span class="op">:</span> <span class="dt">c_int</span> <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a><span class="co">/// Átlátszatlan kezelő: a C oldal csak mutatót lát (`typedef struct RkvStore RkvStore;`).</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">struct</span> RkvStore <span class="op">{</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a>    inner<span class="op">:</span> SharedStore<span class="op">,</span></span>
+<span id="cb11-28"><a href="#cb11-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-29"><a href="#cb11-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-30"><a href="#cb11-30" aria-hidden="true" tabindex="-1"></a><span class="co">/// Minden exportált függvény törzse ezen megy át: a pánikot státuszkóddá alakítja.</span></span>
+<span id="cb11-31"><a href="#cb11-31" aria-hidden="true" tabindex="-1"></a><span class="co">/// Ez csak `panic = &quot;unwind&quot;` profilban működik; `panic = &quot;abort&quot;` mellett a pánik</span></span>
+<span id="cb11-32"><a href="#cb11-32" aria-hidden="true" tabindex="-1"></a><span class="co">/// leállítja a folyamatot (ezt a könyv nem vállalja el: a csomag profilja `unwind`).</span></span>
+<span id="cb11-33"><a href="#cb11-33" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> guarded(f<span class="op">:</span> <span class="kw">impl</span> <span class="bu">FnOnce</span>() <span class="op">-&gt;</span> <span class="dt">c_int</span>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb11-34"><a href="#cb11-34" aria-hidden="true" tabindex="-1"></a>    catch_unwind(AssertUnwindSafe(f))<span class="op">.</span>unwrap_or(RKV_PANIC)</span>
+<span id="cb11-35"><a href="#cb11-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-36"><a href="#cb11-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-37"><a href="#cb11-37" aria-hidden="true" tabindex="-1"></a><span class="co">/// Új, memóriabeli tároló. A kezelőt a `rkv_store_free`-vel kell felszabadítani.</span></span>
+<span id="cb11-38"><a href="#cb11-38" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-39"><a href="#cb11-39" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_new() <span class="op">-&gt;</span> <span class="op">*</span><span class="kw">mut</span> RkvStore <span class="op">{</span></span>
+<span id="cb11-40"><a href="#cb11-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> store <span class="op">=</span> RkvStore <span class="op">{</span> inner<span class="op">:</span> <span class="pp">SharedStore::</span>new(<span class="pp">MemStore::</span>new()) <span class="op">};</span></span>
+<span id="cb11-41"><a href="#cb11-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>into_raw(<span class="dt">Box</span><span class="pp">::</span>new(store))</span>
+<span id="cb11-42"><a href="#cb11-42" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-43"><a href="#cb11-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-44"><a href="#cb11-44" aria-hidden="true" tabindex="-1"></a><span class="co">/// A kezelő felszabadítása.</span></span>
+<span id="cb11-45"><a href="#cb11-45" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-46"><a href="#cb11-46" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-47"><a href="#cb11-47" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` null, vagy a `rkv_store_new` által adott, még fel nem szabadított kezelő.</span></span>
+<span id="cb11-48"><a href="#cb11-48" aria-hidden="true" tabindex="-1"></a><span class="co">/// A hívás kizárólagos: közben más szál nem használhatja a kezelőt, és utána senki sem.</span></span>
+<span id="cb11-49"><a href="#cb11-49" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-50"><a href="#cb11-50" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_store_free(store<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> RkvStore) <span class="op">{</span></span>
+<span id="cb11-51"><a href="#cb11-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>store<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb11-52"><a href="#cb11-52" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a szerződés szerint a mutató a Box::into_raw eredménye, egyszer szabadítjuk.</span></span>
+<span id="cb11-53"><a href="#cb11-53" aria-hidden="true" tabindex="-1"></a>        drop(<span class="kw">unsafe</span> <span class="op">{</span> <span class="dt">Box</span><span class="pp">::</span>from_raw(store) <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb11-54"><a href="#cb11-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-55"><a href="#cb11-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-56"><a href="#cb11-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-57"><a href="#cb11-57" aria-hidden="true" tabindex="-1"></a><span class="co">/// Segéd: a kezelő megosztott referenciája (nincs `&amp;mut`, a zár a SharedStore-ban van).</span></span>
+<span id="cb11-58"><a href="#cb11-58" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-59"><a href="#cb11-59" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-60"><a href="#cb11-60" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` null vagy érvényes, élő kezelő.</span></span>
+<span id="cb11-61"><a href="#cb11-61" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> handle<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="ot">&#39;a</span> RkvStore<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb11-62"><a href="#cb11-62" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó garantálja az érvényességet és az élettartamot.</span></span>
+<span id="cb11-63"><a href="#cb11-63" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> store<span class="op">.</span>as_ref() <span class="op">}</span></span>
+<span id="cb11-64"><a href="#cb11-64" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-65"><a href="#cb11-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-66"><a href="#cb11-66" aria-hidden="true" tabindex="-1"></a><span class="co">/// Segéd: NUL-végű UTF-8 kulcs.</span></span>
+<span id="cb11-67"><a href="#cb11-67" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-68"><a href="#cb11-68" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-69"><a href="#cb11-69" aria-hidden="true" tabindex="-1"></a><span class="co">/// `key` null vagy érvényes, NUL-végű C string, amely a hívás alatt él.</span></span>
+<span id="cb11-70"><a href="#cb11-70" aria-hidden="true" tabindex="-1"></a><span class="kw">unsafe</span> <span class="kw">fn</span> key_str<span class="op">&lt;</span><span class="ot">&#39;a</span><span class="op">&gt;</span>(key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="ot">&#39;a</span> <span class="dt">str</span><span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb11-71"><a href="#cb11-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> key<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb11-72"><a href="#cb11-72" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="cn">None</span><span class="op">;</span></span>
+<span id="cb11-73"><a href="#cb11-73" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-74"><a href="#cb11-74" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAFETY: a hívó szerződése szerint érvényes, NUL-végű.</span></span>
+<span id="cb11-75"><a href="#cb11-75" aria-hidden="true" tabindex="-1"></a>    <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">CStr::</span>from_ptr(key) <span class="op">}.</span>to_str()<span class="op">.</span>ok()</span>
+<span id="cb11-76"><a href="#cb11-76" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-77"><a href="#cb11-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-78"><a href="#cb11-78" aria-hidden="true" tabindex="-1"></a><span class="co">/// Érték beállítása. Az érték tetszőleges bájtsorozat; `value` lehet null, ha `value_len == 0`.</span></span>
+<span id="cb11-79"><a href="#cb11-79" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-80"><a href="#cb11-80" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-81"><a href="#cb11-81" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` érvényes kezelő; `key` NUL-végű C string; `value` legalább `value_len` olvasható bájtra mutat.</span></span>
+<span id="cb11-82"><a href="#cb11-82" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-83"><a href="#cb11-83" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_set(</span>
+<span id="cb11-84"><a href="#cb11-84" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span></span>
+<span id="cb11-85"><a href="#cb11-85" aria-hidden="true" tabindex="-1"></a>    key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
+<span id="cb11-86"><a href="#cb11-86" aria-hidden="true" tabindex="-1"></a>    value<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">u8</span><span class="op">,</span></span>
+<span id="cb11-87"><a href="#cb11-87" aria-hidden="true" tabindex="-1"></a>    value_len<span class="op">:</span> <span class="dt">usize</span><span class="op">,</span></span>
+<span id="cb11-88"><a href="#cb11-88" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb11-89"><a href="#cb11-89" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb11-90"><a href="#cb11-90" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
+<span id="cb11-91"><a href="#cb11-91" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb11-92"><a href="#cb11-92" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
+<span id="cb11-93"><a href="#cb11-93" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb11-94"><a href="#cb11-94" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> bytes <span class="op">=</span> <span class="cf">if</span> value_len <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb11-95"><a href="#cb11-95" aria-hidden="true" tabindex="-1"></a>            <span class="dt">Vec</span><span class="pp">::</span>new()</span>
+<span id="cb11-96"><a href="#cb11-96" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> value<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb11-97"><a href="#cb11-97" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
+<span id="cb11-98"><a href="#cb11-98" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb11-99"><a href="#cb11-99" aria-hidden="true" tabindex="-1"></a>            <span class="co">// SAFETY: value_len olvasható bájt, a szerződés szerint.</span></span>
+<span id="cb11-100"><a href="#cb11-100" aria-hidden="true" tabindex="-1"></a>            <span class="kw">unsafe</span> <span class="op">{</span> <span class="pp">std::slice::</span>from_raw_parts(value<span class="op">,</span> value_len) <span class="op">}.</span>to_vec()</span>
+<span id="cb11-101"><a href="#cb11-101" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb11-102"><a href="#cb11-102" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>set(key<span class="op">.</span>to_owned()<span class="op">,</span> bytes) <span class="op">{</span></span>
+<span id="cb11-103"><a href="#cb11-103" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(()) <span class="op">=&gt;</span> RKV_OK<span class="op">,</span></span>
+<span id="cb11-104"><a href="#cb11-104" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
+<span id="cb11-105"><a href="#cb11-105" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-106"><a href="#cb11-106" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb11-107"><a href="#cb11-107" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-108"><a href="#cb11-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-109"><a href="#cb11-109" aria-hidden="true" tabindex="-1"></a><span class="co">/// Érték lekérdezése. Siker (`RKV_OK`) esetén `*out_value` egy Rust által lefoglalt puffer</span></span>
+<span id="cb11-110"><a href="#cb11-110" aria-hidden="true" tabindex="-1"></a><span class="co">/// (`*out_len` bájt; az üres érték hossza 0, a mutató ekkor is nem null), amelyet a</span></span>
+<span id="cb11-111"><a href="#cb11-111" aria-hidden="true" tabindex="-1"></a><span class="co">/// `rkv_buffer_free(*out_value, *out_len)` szabadít fel. Hiányzó kulcsra `RKV_NOT_FOUND`,</span></span>
+<span id="cb11-112"><a href="#cb11-112" aria-hidden="true" tabindex="-1"></a><span class="co">/// a kimenetek `NULL` és `0`.</span></span>
+<span id="cb11-113"><a href="#cb11-113" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-114"><a href="#cb11-114" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-115"><a href="#cb11-115" aria-hidden="true" tabindex="-1"></a><span class="co">/// A függvény *normál hibakezelésként* ellenőrzi és `RKV_INVALID_ARG`-ra képezi a `NULL`</span></span>
+<span id="cb11-116"><a href="#cb11-116" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store`, `key`, `out_value` és `out_len` mutatót, valamint a nem UTF-8 kulcsot. Az alábbi</span></span>
+<span id="cb11-117"><a href="#cb11-117" aria-hidden="true" tabindex="-1"></a><span class="co">/// feltételeket viszont **nem tudja ellenőrizni**, ezek a hívó felelőssége:</span></span>
+<span id="cb11-118"><a href="#cb11-118" aria-hidden="true" tabindex="-1"></a><span class="co">/// * `store` nem `NULL` esetén a `rkv_store_new` által adott, még fel nem szabadított kezelő,</span></span>
+<span id="cb11-119"><a href="#cb11-119" aria-hidden="true" tabindex="-1"></a><span class="co">///   és a hívás ideje alatt senki nem hívja a `rkv_store_free`-t (a kezelő egyébként több</span></span>
+<span id="cb11-120"><a href="#cb11-120" aria-hidden="true" tabindex="-1"></a><span class="co">///   szálról használható);</span></span>
+<span id="cb11-121"><a href="#cb11-121" aria-hidden="true" tabindex="-1"></a><span class="co">/// * `key` a NUL-ig olvasható, teljes, élő tartományra mutat, és a hívás alatt nem módosul;</span></span>
+<span id="cb11-122"><a href="#cb11-122" aria-hidden="true" tabindex="-1"></a><span class="co">/// * `out_value` és `out_len` érvényes, igazított, írható `*mut u8`, illetve `usize` tárolóra</span></span>
+<span id="cb11-123"><a href="#cb11-123" aria-hidden="true" tabindex="-1"></a><span class="co">///   mutat, egymással és a `key` tartományával nem fedik át egymást, és a hívás alatt más szál</span></span>
+<span id="cb11-124"><a href="#cb11-124" aria-hidden="true" tabindex="-1"></a><span class="co">///   nem fér hozzájuk.</span></span>
+<span id="cb11-125"><a href="#cb11-125" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-126"><a href="#cb11-126" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_get(</span>
+<span id="cb11-127"><a href="#cb11-127" aria-hidden="true" tabindex="-1"></a>    store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span></span>
+<span id="cb11-128"><a href="#cb11-128" aria-hidden="true" tabindex="-1"></a>    key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span><span class="op">,</span></span>
+<span id="cb11-129"><a href="#cb11-129" aria-hidden="true" tabindex="-1"></a>    out_value<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span></span>
+<span id="cb11-130"><a href="#cb11-130" aria-hidden="true" tabindex="-1"></a>    out_len<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">usize</span><span class="op">,</span></span>
+<span id="cb11-131"><a href="#cb11-131" aria-hidden="true" tabindex="-1"></a>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb11-132"><a href="#cb11-132" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb11-133"><a href="#cb11-133" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> out_value<span class="op">.</span>is_null() <span class="op">||</span> out_len<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb11-134"><a href="#cb11-134" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
+<span id="cb11-135"><a href="#cb11-135" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-136"><a href="#cb11-136" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a kimeneti mutatók írhatók, a szerződés szerint.</span></span>
+<span id="cb11-137"><a href="#cb11-137" aria-hidden="true" tabindex="-1"></a>        <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb11-138"><a href="#cb11-138" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>out_value <span class="op">=</span> <span class="pp">ptr::</span>null_mut()<span class="op">;</span></span>
+<span id="cb11-139"><a href="#cb11-139" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>out_len <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb11-140"><a href="#cb11-140" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-141"><a href="#cb11-141" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
+<span id="cb11-142"><a href="#cb11-142" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb11-143"><a href="#cb11-143" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
+<span id="cb11-144"><a href="#cb11-144" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb11-145"><a href="#cb11-145" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>get(key) <span class="op">{</span></span>
+<span id="cb11-146"><a href="#cb11-146" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">Some</span>(value)) <span class="op">=&gt;</span> <span class="op">{</span></span>
+<span id="cb11-147"><a href="#cb11-147" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> boxed <span class="op">=</span> value<span class="op">.</span>into_boxed_slice()<span class="op">;</span></span>
+<span id="cb11-148"><a href="#cb11-148" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> len <span class="op">=</span> boxed<span class="op">.</span>len()<span class="op">;</span></span>
+<span id="cb11-149"><a href="#cb11-149" aria-hidden="true" tabindex="-1"></a>                <span class="co">// SAFETY: a kimeneti mutatók írhatók.</span></span>
+<span id="cb11-150"><a href="#cb11-150" aria-hidden="true" tabindex="-1"></a>                <span class="kw">unsafe</span> <span class="op">{</span></span>
+<span id="cb11-151"><a href="#cb11-151" aria-hidden="true" tabindex="-1"></a>                    <span class="op">*</span>out_len <span class="op">=</span> len<span class="op">;</span></span>
+<span id="cb11-152"><a href="#cb11-152" aria-hidden="true" tabindex="-1"></a>                    <span class="op">*</span>out_value <span class="op">=</span> <span class="dt">Box</span><span class="pp">::</span>into_raw(boxed)<span class="op">.</span><span class="pp">cast::</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span>()<span class="op">;</span></span>
+<span id="cb11-153"><a href="#cb11-153" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb11-154"><a href="#cb11-154" aria-hidden="true" tabindex="-1"></a>                RKV_OK</span>
+<span id="cb11-155"><a href="#cb11-155" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb11-156"><a href="#cb11-156" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">None</span>) <span class="op">=&gt;</span> RKV_NOT_FOUND<span class="op">,</span></span>
+<span id="cb11-157"><a href="#cb11-157" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
+<span id="cb11-158"><a href="#cb11-158" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-159"><a href="#cb11-159" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb11-160"><a href="#cb11-160" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-161"><a href="#cb11-161" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-162"><a href="#cb11-162" aria-hidden="true" tabindex="-1"></a><span class="co">/// Törlés. `RKV_OK`, ha a kulcs létezett és törlődött; `RKV_NOT_FOUND`, ha nem létezett.</span></span>
+<span id="cb11-163"><a href="#cb11-163" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-164"><a href="#cb11-164" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-165"><a href="#cb11-165" aria-hidden="true" tabindex="-1"></a><span class="co">/// `store` érvényes kezelő; `key` NUL-végű C string.</span></span>
+<span id="cb11-166"><a href="#cb11-166" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-167"><a href="#cb11-167" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_delete(store<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> RkvStore<span class="op">,</span> key<span class="op">:</span> <span class="op">*</span><span class="kw">const</span> <span class="dt">c_char</span>) <span class="op">-&gt;</span> <span class="dt">c_int</span> <span class="op">{</span></span>
+<span id="cb11-168"><a href="#cb11-168" aria-hidden="true" tabindex="-1"></a>    guarded(<span class="op">||</span> <span class="op">{</span></span>
+<span id="cb11-169"><a href="#cb11-169" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: lásd a függvény # Safety szakaszát.</span></span>
+<span id="cb11-170"><a href="#cb11-170" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> (<span class="cn">Some</span>(store)<span class="op">,</span> <span class="cn">Some</span>(key)) <span class="op">=</span> (<span class="kw">unsafe</span> <span class="op">{</span> handle(store) <span class="op">},</span> <span class="kw">unsafe</span> <span class="op">{</span> key_str(key) <span class="op">}</span>) <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb11-171"><a href="#cb11-171" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> RKV_INVALID_ARG<span class="op">;</span></span>
+<span id="cb11-172"><a href="#cb11-172" aria-hidden="true" tabindex="-1"></a>        <span class="op">};</span></span>
+<span id="cb11-173"><a href="#cb11-173" aria-hidden="true" tabindex="-1"></a>        <span class="cf">match</span> store<span class="op">.</span>inner<span class="op">.</span>delete(key) <span class="op">{</span></span>
+<span id="cb11-174"><a href="#cb11-174" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">true</span>) <span class="op">=&gt;</span> RKV_OK<span class="op">,</span></span>
+<span id="cb11-175"><a href="#cb11-175" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span>(<span class="cn">false</span>) <span class="op">=&gt;</span> RKV_NOT_FOUND<span class="op">,</span></span>
+<span id="cb11-176"><a href="#cb11-176" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Err</span>(_) <span class="op">=&gt;</span> RKV_ERROR<span class="op">,</span></span>
+<span id="cb11-177"><a href="#cb11-177" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-178"><a href="#cb11-178" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb11-179"><a href="#cb11-179" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-180"><a href="#cb11-180" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-181"><a href="#cb11-181" aria-hidden="true" tabindex="-1"></a><span class="co">/// A `rkv_get` által adott puffer felszabadítása.</span></span>
+<span id="cb11-182"><a href="#cb11-182" aria-hidden="true" tabindex="-1"></a><span class="co">///</span></span>
+<span id="cb11-183"><a href="#cb11-183" aria-hidden="true" tabindex="-1"></a><span class="co">/// # Safety</span></span>
+<span id="cb11-184"><a href="#cb11-184" aria-hidden="true" tabindex="-1"></a><span class="co">/// `ptr` és `len` pontosan a `rkv_get` által adott `*out_value` és `*out_len`, még fel nem szabadítva;</span></span>
+<span id="cb11-185"><a href="#cb11-185" aria-hidden="true" tabindex="-1"></a><span class="co">/// `ptr == NULL` esetén a hívás nem tesz semmit.</span></span>
+<span id="cb11-186"><a href="#cb11-186" aria-hidden="true" tabindex="-1"></a><span class="at">#[</span><span class="kw">unsafe</span><span class="at">(</span>no_mangle<span class="at">)]</span></span>
+<span id="cb11-187"><a href="#cb11-187" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">unsafe</span> <span class="kw">extern</span> <span class="st">&quot;C&quot;</span> <span class="kw">fn</span> rkv_buffer_free(ptr<span class="op">:</span> <span class="op">*</span><span class="kw">mut</span> <span class="dt">u8</span><span class="op">,</span> len<span class="op">:</span> <span class="dt">usize</span>) <span class="op">{</span></span>
+<span id="cb11-188"><a href="#cb11-188" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>ptr<span class="op">.</span>is_null() <span class="op">{</span></span>
+<span id="cb11-189"><a href="#cb11-189" aria-hidden="true" tabindex="-1"></a>        <span class="co">// SAFETY: a puffert Box&lt;[u8]&gt;-ból adtuk ki pontosan ekkora hosszal.</span></span>
+<span id="cb11-190"><a href="#cb11-190" aria-hidden="true" tabindex="-1"></a>        drop(<span class="kw">unsafe</span> <span class="op">{</span> <span class="dt">Box</span><span class="pp">::</span>from_raw(<span class="pp">ptr::</span>slice_from_raw_parts_mut(ptr<span class="op">,</span> len)) <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb11-191"><a href="#cb11-191" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-192"><a href="#cb11-192" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <p>A hibakezelés négy külön ellenőrizhető ágat ad: a hiányzó kulcs
 <code>RKV_NOT_FOUND</code> (nem hiba), a null mutató vagy nem UTF-8
 kulcs <code>RKV_INVALID_ARG</code>, a tároló hibája
@@ -591,8 +615,17 @@ ezért mutató + hossz a szerződés, nem NUL-végű string.</p>
 <li><strong>Tesztek.</strong> A tesztek a szerződés minden esetét külön
 vizsgálják: üres érték, belső <code>0</code>, nem UTF-8 érték, hiányzó
 kulcs, hibás kulcskódolás, <code>NULL</code> argumentumok, törlés (volt
-/ nem volt), valamint a pánik-védelmet. Mivel a pánik-policy a profiltól
-függ, a tesztet debug és release módban is futtatjuk:</li>
+/ nem volt), valamint a pánik-védelmet. A pánik-policy a <em>termék</em>
+profiljától függ, a tesztcélpontot azonban a Cargo mindig unwindinggel
+fordítja, ezért a <code>cargo test --release</code> önmagában
+<strong>nem</strong> igazolja a termék pánikvédelmét: csak a
+<code>guarded</code> logikáját ellenőrzi. A termék profilját külön,
+közvetlenül ellenőrizzük (az eredmény <code>panic="unwind"</code> kell
+legyen):
+<code>cargo rustc -p rkv-ffi --release --lib -- --print cfg | grep panic</code>;
+ezen felül a C kliens a kész <code>cdylib</code>/<code>staticlib</code>
+ellen futó átvételi tesztje a végső bizonyíték. A tesztet debug és
+release módban is futtatjuk:</li>
 </ol>
 <p><em>Kódblokk</em> — fájl: <code>rkv-ffi/src/lib.rs</code> · művelet:
 beillesztés a fájl végére · ellenőrzés:
@@ -740,22 +773,36 @@ pontosan egyszer szabadítunk (<code>goto done</code>), és a
 <span id="cb17-18"><a href="#cb17-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> len <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
 <span id="cb17-19"><a href="#cb17-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> status <span class="op">=</span> rkv_get<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">,</span> <span class="op">&amp;</span>value<span class="op">,</span> <span class="op">&amp;</span>len<span class="op">);</span></span>
 <span id="cb17-20"><a href="#cb17-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">==</span> RKV_OK<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;VALUE </span><span class="sc">%.*s\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="op">(</span><span class="dt">int</span><span class="op">)</span>len<span class="op">,</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*)</span>value<span class="op">);</span></span>
-<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a>        rkv_buffer_free<span class="op">(</span>value<span class="op">,</span> len<span class="op">);</span> <span class="co">/* pontosan egyszer, a kapott hosszal */</span></span>
-<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>status <span class="op">==</span> RKV_NOT_FOUND<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;NOTFOUND</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
-<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
-<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;GET hiba: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> status<span class="op">);</span></span>
-<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> done<span class="op">;</span></span>
-<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;DEL </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> rkv_delete<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">)</span> <span class="op">==</span> RKV_OK <span class="op">?</span> <span class="st">&quot;OK&quot;</span> <span class="op">:</span> <span class="st">&quot;NOTFOUND&quot;</span><span class="op">);</span></span>
-<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;DEL </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> rkv_delete<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">)</span> <span class="op">==</span> RKV_OK <span class="op">?</span> <span class="st">&quot;OK&quot;</span> <span class="op">:</span> <span class="st">&quot;NOTFOUND&quot;</span><span class="op">);</span></span>
-<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
-<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>done<span class="op">:</span></span>
-<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a>    rkv_store_free<span class="op">(</span>store<span class="op">);</span></span>
-<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rc<span class="op">;</span></span>
-<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<span id="cb17-21"><a href="#cb17-21" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* A puffer tetszőleges bájtokat tartalmazhat: belső 0, nem UTF-8.</span></span>
+<span id="cb17-22"><a href="#cb17-22" aria-hidden="true" tabindex="-1"></a><span class="co">           A printf(&quot;%.*s&quot;) csak NUL-mentes szövegre jó, ezért itt a</span></span>
+<span id="cb17-23"><a href="#cb17-23" aria-hidden="true" tabindex="-1"></a><span class="co">           hosszal írunk: a tartalom és a hossz is megmarad. */</span></span>
+<span id="cb17-24"><a href="#cb17-24" aria-hidden="true" tabindex="-1"></a>        fwrite<span class="op">(</span><span class="st">&quot;VALUE &quot;</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">6</span><span class="op">,</span> stdout<span class="op">);</span></span>
+<span id="cb17-25"><a href="#cb17-25" aria-hidden="true" tabindex="-1"></a>        fwrite<span class="op">(</span>value<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> len<span class="op">,</span> stdout<span class="op">);</span></span>
+<span id="cb17-26"><a href="#cb17-26" aria-hidden="true" tabindex="-1"></a>        fputc<span class="op">(</span><span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">,</span> stdout<span class="op">);</span></span>
+<span id="cb17-27"><a href="#cb17-27" aria-hidden="true" tabindex="-1"></a>        rkv_buffer_free<span class="op">(</span>value<span class="op">,</span> len<span class="op">);</span> <span class="co">/* pontosan egyszer, a kapott hosszal */</span></span>
+<span id="cb17-28"><a href="#cb17-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>status <span class="op">==</span> RKV_NOT_FOUND<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-29"><a href="#cb17-29" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;NOTFOUND</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-30"><a href="#cb17-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb17-31"><a href="#cb17-31" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;GET hiba: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> status<span class="op">);</span></span>
+<span id="cb17-32"><a href="#cb17-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">goto</span> done<span class="op">;</span></span>
+<span id="cb17-33"><a href="#cb17-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-34"><a href="#cb17-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-35"><a href="#cb17-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">2</span><span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span> <span class="co">/* az első törlés OK, a második NOTFOUND */</span></span>
+<span id="cb17-36"><a href="#cb17-36" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> del <span class="op">=</span> rkv_delete<span class="op">(</span>store<span class="op">,</span> <span class="st">&quot;alma&quot;</span><span class="op">);</span></span>
+<span id="cb17-37"><a href="#cb17-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>del <span class="op">==</span> RKV_OK<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-38"><a href="#cb17-38" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;DEL OK</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-39"><a href="#cb17-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>del <span class="op">==</span> RKV_NOT_FOUND<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-40"><a href="#cb17-40" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;DEL NOTFOUND</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb17-41"><a href="#cb17-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span> <span class="co">/* RKV_ERROR, RKV_INVALID_ARG, RKV_PANIC: nem &quot;nem találtam&quot; */</span></span>
+<span id="cb17-42"><a href="#cb17-42" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;DEL hiba: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> del<span class="op">);</span></span>
+<span id="cb17-43"><a href="#cb17-43" aria-hidden="true" tabindex="-1"></a>            <span class="cf">goto</span> done<span class="op">;</span></span>
+<span id="cb17-44"><a href="#cb17-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-45"><a href="#cb17-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-46"><a href="#cb17-46" aria-hidden="true" tabindex="-1"></a>    rc <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb17-47"><a href="#cb17-47" aria-hidden="true" tabindex="-1"></a>done<span class="op">:</span></span>
+<span id="cb17-48"><a href="#cb17-48" aria-hidden="true" tabindex="-1"></a>    rkv_store_free<span class="op">(</span>store<span class="op">);</span></span>
+<span id="cb17-49"><a href="#cb17-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rc<span class="op">;</span></span>
+<span id="cb17-50"><a href="#cb17-50" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <ol start="9" type="1">
 <li><strong>Fordítsuk és linkeljük a C klienst.</strong> A linker a
 parancssorban <em>balról jobbra</em> old fel: a <strong>forrás/object
@@ -782,6 +829,13 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href=
 <pre class="text"><code>VALUE piros
 DEL OK
 DEL NOTFOUND</code></pre>
+<p>Ez a kimenet a szöveges <code>piros</code> értékre vonatkozik. Belső
+<code>0</code>-t vagy <code>0xFF</code>-et tartalmazó értéknél a
+<code>fwrite</code> a nyers bájtokat írja ki; az ellenőrzéshez a hosszt
+és a bájtokat kell összevetni (például <code>xxd</code>-vel), nem a
+szöveges megjelenítést. A <code>printf("%.*s")</code> erre nem alkalmas:
+a belső <code>0</code>-nál megállna, és a hossz sem ellenőrizhető
+belőle.</p>
 <ol start="10" type="1">
 <li><strong>C++ kliens.</strong> A header <code>cpp_compat</code>
 beállítása miatt ugyanaz a fájl C++-ként is fordítható (a deklarációk
@@ -868,17 +922,17 @@ class="header-section-number">19.1.9</span> Feladatok</h3>
 <code>&amp;str</code>-et közvetlenül C függvénynek átadni? Milyen típust
 használunk helyette, és miért? Mi a különbség az ABI-kompatibilitás és
 az értékérvényességi szerződés között?</li>
-<li><strong>C++ kód átírása:</strong> Írjon C++ függvényt, amely
+<li><strong>C++ kód átírása:</strong> Írj C++ függvényt, amely
 <code>std::string</code>-et fogad, és egy C könyvtárnak adja át
 <code>char*</code>-ként, a könyvtár pedig a pufferrel a saját
-<code>free()</code>-jével szabadít. Írja meg a Rust megfelelőjét
-<code>unsafe extern "C"</code> deklarációval, és indokolja, miért nem jó
+<code>free()</code>-jével szabadít. Írd meg a Rust megfelelőjét
+<code>unsafe extern "C"</code> deklarációval, és indokold, miért nem jó
 itt a <code>CString::into_raw</code>.</li>
-<li><strong>Implementációs feladat:</strong> Egészítse ki az
+<li><strong>Implementációs feladat:</strong> Egészítsd ki az
 <code>rkv-ffi</code> crate-et egy <code>rkv_exists(store, key)</code>
 függvénnyel, amely <code>RKV_OK</code>-t ad, ha a kulcs létezik,
-<code>RKV_NOT_FOUND</code>-ot, ha nem. Generálja újra a headert, és
-tesztelje a Rust egységtesztben.</li>
+<code>RKV_NOT_FOUND</code>-ot, ha nem. Generáld újra a headert, és
+teszteld a Rust egységtesztben.</li>
 <li><strong>Tervezési döntés:</strong> Tervezze meg egy
 <code>rkv_list</code> függvény szerződését, amely sok kulcsot ad vissza.
 Milyen kimeneti paraméterek kellenek, ki foglal és ki szabadít, hogyan
