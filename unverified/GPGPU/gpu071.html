@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.2 Sparse mátrixreprezentációk – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch18">19 Sparse és dense lineáris algebra</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu070.html">← 19.1 Dense GEMM</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu072.html">19.3 SpMV és sparse optimalizálás →</a></div>
+</nav>
+<h2 data-number="19.2" id="gpu071"><span
+class="header-section-number">19.2</span> Sparse
+mátrixreprezentációk</h2>
+<p>A ritka mátrixok a tudományos számítás és a gépi tanulás alapvető
+adatszerkezetei. Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>×</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">m \times n</annotation></semantics></math>-es
+mátrix akkor ritka, ha a nullától különböző elemek száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mi>n</mi><mi>z</mi></mrow><annotation encoding="application/x-tex">nnz</annotation></semantics></math>
+lényegesen kisebb, mint a teljes elemek száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>⋅</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">m \cdot n</annotation></semantics></math>.
+A GPU-n futó lineáris algebrai műveletek – például a sparse
+matrix–vector multiply (SpMV) – hatékonysága nagymértékben függ attól,
+hogyan reprezentáljuk a mátrixot. Ebben az alfejezetben a három
+leggyakoribb ritka formátumot, a COO-t, a CSR-t és az ELL-t vezetjük be,
+megmutatjuk az index- és értéktömbök felépítését, elemezzük a
+formátumválasztás szempontjait, majd egy futtatható CUDA-laborban
+CSR-alapú SpMV-t implementálunk és mérünk.</p>
+<h3 data-number="19.2.1"
+id="miért-van-szükség-speciális-reprezentációra"><span
+class="header-section-number">19.2.1</span> 1. Miért van szükség
+speciális reprezentációra?</h3>
+<p>A sűrű mátrix tárolása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="true" form="prefix">(</mo><mi>m</mi><mo>⋅</mo><mi>n</mi><mo stretchy="true" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(m \cdot n)</annotation></semantics></math>
+memóriahelyet foglal. Ha egy mátrix 99%-ban nullákat tartalmaz, a nullák
+tárolása és a velük végzett szorzások pazarolják a memóriát és a
+számítási kapacitást. A ritka formátumok kihasználják, hogy csak a
+nemnulla elemeket és azok pozícióit kell megőrizni. A cél az, hogy a
+memória-hozzáférést minimalizáljuk, miközben a párhuzamos feldolgozást
+hatékonyan támogassuk.</p>
+<p>A GPU szempontjából a ritka reprezentáció minőségét három tényező
+határozza meg:</p>
+<ul>
+<li><strong>Tömörség:</strong> mennyi memóriát foglal a nemnulla elemek
+mellett az indexelési információ.</li>
+<li><strong>Hozzáférhetőség:</strong> mennyire gyorsan lehet egy sor
+vagy oszlop nemnulla elemeit megtalálni.</li>
+<li><strong>Párhuzamosíthatóság:</strong> mennyire egyenletesen osztható
+el a munka a szálak között, és mennyire koaleszkált a
+memória-hozzáférés.</li>
+</ul>
+<p>A következő három formátum eltérő kompromisszumot kínál ezen
+szempontok között.</p>
+<h3 data-number="19.2.2" id="coo-coordinate-formátum"><span
+class="header-section-number">19.2.2</span> 2. COO (Coordinate)
+formátum</h3>
+<p>A COO a legegyszerűbb ritka reprezentáció. Minden nemnulla elemhez
+három értéket tárolunk: a sorindexet, az oszlopindexet és magát az
+értéket. A COO három, egyenként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mi>n</mi><mi>z</mi></mrow><annotation encoding="application/x-tex">nnz</annotation></semantics></math>
+hosszúságú tömböt használ:</p>
+<ul>
+<li><code>row_idx[0..nnz-1]</code> – a nemnulla elem sorindexe,</li>
+<li><code>col_idx[0..nnz-1]</code> – az oszlopindexe,</li>
+<li><code>values[0..nnz-1]</code> – a numerikus érték.</li>
+</ul>
+<p>Például a következő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mo>×</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">4 \times 5</annotation></semantics></math>-ös
+mátrix:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">(</mo><mtable><mtr><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>2</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd></mtr><mtr><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>4</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd></mtr><mtr><mtd columnalign="center" style="text-align: center"><mn>5</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>6</mn></mtd></mtr><mtr><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>7</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd></mtr></mtable><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">
+A = \begin{pmatrix}
+0 &amp; 2 &amp; 0 &amp; 0 &amp; 0 \\
+0 &amp; 0 &amp; 0 &amp; 4 &amp; 0 \\
+5 &amp; 0 &amp; 0 &amp; 0 &amp; 6 \\
+0 &amp; 0 &amp; 7 &amp; 0 &amp; 0
+\end{pmatrix}
+</annotation></semantics></math></p>
+<p>COO-ban így tárolható (a nemnulla elemeket sor- és oszlopindex
+szerint rendezve):</p>
+<table>
+<thead>
+<tr class="header">
+<th>index</th>
+<th>row_idx</th>
+<th>col_idx</th>
+<th>values</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>2</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>1</td>
+<td>3</td>
+<td>4</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>2</td>
+<td>0</td>
+<td>5</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>2</td>
+<td>4</td>
+<td>6</td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td>3</td>
+<td>2</td>
+<td>7</td>
+</tr>
+</tbody>
+</table>
+<p>A COO előnye az egyszerűsége: a mátrix könnyen módosítható, és a
+rendezett COO átalakítható más formátumokba. Hátránya, hogy SpMV-hez
+általában atomi összeadásra van szükség, mert ugyanahhoz a kimeneti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>y</mi><mi>i</mi></msub><annotation encoding="application/x-tex">y_i</annotation></semantics></math>
+elemhez több szál is hozzáadhat. Például a COO-alapú SpMV-kernelben
+minden nemnulla elemhez egy szál tartozik:</p>
+<pre><code>__global__ void spmv_coo_kernel(
+    const int* __restrict__ row_idx,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ values,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int nnz)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &gt;= nnz) return;
+    int row = row_idx[i];
+    int col = col_idx[i];
+    atomicAdd(&amp;y[row], values[i] * x[col]);
+}</code></pre>
+<p>Ez a kernel kihasználja a nagy párhuzamosságot, de az atomi műveletek
+miatt lassabb lehet, ha sok nemnulla elem ugyanabba a sorba esik (atomi
+versengés). COO-t ezért elsősorban mátrixkonstrukcióhoz, konverzióhoz és
+olyan esetekben használunk, ahol a mátrixot ritkán kell SpMV-ben
+használni.</p>
+<h3 data-number="19.2.3" id="csr-compressed-sparse-row-formátum"><span
+class="header-section-number">19.2.3</span> 3. CSR (Compressed Sparse
+Row) formátum</h3>
+<p>A CSR a legelterjedtebb reprezentáció GPU-s SpMV-hez. A COO-val
+ellentétben a CSR tömöríti a sorindexeket, mert a nemnulla elemeket
+soronként rendezve tárolja. Három tömböt használ:</p>
+<ul>
+<li><code>row_ptr[0..num_rows]</code> – az egyes sorok kezdőindexei a
+<code>col_idx</code> és <code>values</code> tömbben; a tömb hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">m+1</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>m</mi><annotation encoding="application/x-tex">m</annotation></semantics></math>
+a sorok száma.</li>
+<li><code>col_idx[0..nnz-1]</code> – az oszlopindexek a soronként
+rendezett nemnulla elemekhez.</li>
+<li><code>values[0..nnz-1]</code> – a hozzájuk tartozó értékek.</li>
+</ul>
+<p>A <code>row_ptr[i]</code> az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>-edik
+sor első nemnulla elemének pozíciója a <code>col_idx</code> és
+<code>values</code> tömbben, <code>row_ptr[i+1]</code> pedig az utolsó
+elem utáni pozíció. A sor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>
+nemnulla elemei tehát a <code>[row_ptr[i], row_ptr[i+1])</code>
+intervallumban találhatók.</p>
+<p>A fenti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><mo>×</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">4 \times 5</annotation></semantics></math>-ös
+mátrix CSR-jében a tömbök:</p>
+<table>
+<thead>
+<tr class="header">
+<th>index</th>
+<th>row_ptr</th>
+<th>col_idx</th>
+<th>values</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>0</td>
+<td>1</td>
+<td>2</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>1</td>
+<td>3</td>
+<td>4</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>2</td>
+<td>0</td>
+<td>5</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>4</td>
+<td>4</td>
+<td>6</td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td>5</td>
+<td>2</td>
+<td>7</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>row_ptr</code> értékei: <code>[0, 1, 2, 4, 5]</code>. A 0.
+sor egy elemet tartalmaz (<code>col_idx[0]=1</code>,
+<code>values[0]=2</code>), az 1. sor egy elemet
+(<code>col_idx[1]=3</code>, <code>values[1]=4</code>), a 2. sor kettőt
+(5 és 6), a 3. sor egyet (7).</p>
+<p>A CSR SpMV-t soronkénti szálakkal célszerű végrehajtani. Minden szál
+egy sort dolgoz fel, bejárja a sor nemnulla elemeit, és a sűrű
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+vektor megfelelő elemeivel szorozva összegzést végez:</p>
+<pre><code>__global__ void spmv_csr_row_kernel(
+    const int* __restrict__ row_ptr,
+    const int* __restrict__ col_idx,
+    const float* __restrict__ values,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int num_rows)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+
+    float sum = 0.0f;
+    int start = row_ptr[row];
+    int end   = row_ptr[row + 1];
+    for (int j = start; j &lt; end; ++j) {
+        sum += values[j] * x[col_idx[j]];
+    }
+    y[row] = sum;
+}</code></pre>
+<p>Ennek a kernelnek az előnye, hogy nincs szükség atomi műveletekre,
+mert minden
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>y</mi><mi>i</mi></msub><annotation encoding="application/x-tex">y_i</annotation></semantics></math>
+kimenetet pontosan egy szál ír. Hátránya, hogy a sorok közötti terhelés
+egyenlőtlen lehet: ha egy sor sok nemnulla elemet tartalmaz, egy szál
+sokáig dolgozik, míg más szálak hamar végeznek. Ez warp-divergenciához
+és alacsony kihasználtsághoz vezethet. A CSR előnye a tömörség: a
+sorindexeket csak
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="true" form="prefix">(</mo><mi>m</mi><mo>+</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(m+1)</annotation></semantics></math>
+egész szám tárolja, ellentétben a COO
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mi>n</mi><mi>z</mi></mrow><annotation encoding="application/x-tex">nnz</annotation></semantics></math>
+sorindexével.</p>
+<h3 data-number="19.2.4" id="ell-ellpack-formátum"><span
+class="header-section-number">19.2.4</span> 4. ELL (ELLPACK)
+formátum</h3>
+<p>Az ELL formátum a soronkénti feldolgozást fix hosszúságú ciklussal
+támogatja. A mátrixot két,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>m</mi><mo>×</mo><msub><mi>k</mi><mo>max</mo></msub></mrow><annotation encoding="application/x-tex">m \times k_{\max}</annotation></semantics></math>
+méretű sűrű tömbben tárolja, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>k</mi><mo>max</mo></msub><annotation encoding="application/x-tex">k_{\max}</annotation></semantics></math>
+a soronkénti nemnulla elemek maximális száma:</p>
+<ul>
+<li><code>values[0..m*k_max-1]</code> – a mátrixelemek értékei
+soronként, paddinggel kiegészítve,</li>
+<li><code>col_ind[0..m*k_max-1]</code> – a hozzájuk tartozó
+oszlopindexek; a padding helyeken általában <code>-1</code> vagy más
+érvénytelen index áll.</li>
+</ul>
+<p>Az ELL az eredeti sűrű mátrixot „balra igazítja”, azaz minden sorban
+a nemnulla elemeket egymás mellé teszi, a sorokat azonos szélességűre
+bővíti, a hiányzó helyeket nullával (vagy érvénytelen indexszel) tölti
+ki. Például a fenti mátrixban a maximális sor-hossz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>k</mi><mo>max</mo></msub><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">k_{\max}=2</annotation></semantics></math>,
+így a táblázat:</p>
+<table>
+<thead>
+<tr class="header">
+<th>sor</th>
+<th>col_ind</th>
+<th>values</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td>1, -1</td>
+<td>2, 0</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td>3, -1</td>
+<td>4, 0</td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td>0, 4</td>
+<td>5, 6</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>2, -1</td>
+<td>7, 0</td>
+</tr>
+</tbody>
+</table>
+<p>Az ELL SpMV-kernel minden sorhoz egy szálat rendel, amely fix
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>k</mi><mo>max</mo></msub><annotation encoding="application/x-tex">k_{\max}</annotation></semantics></math>
+lépésben végigmegy a sor elemein:</p>
+<pre><code>__global__ void spmv_ell_kernel(
+    const int* __restrict__ col_ind,
+    const float* __restrict__ values,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int num_rows,
+    int k_max)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &gt;= num_rows) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k &lt; k_max; ++k) {
+        int col = col_ind[row * k_max + k];
+        if (col != -1) {
+            sum += values[row * k_max + k] * x[col];
+        }
+    }
+    y[row] = sum;
+}</code></pre>
+<p>Az ELL előnye, hogy a belső ciklus hossza minden sorban azonos, ezért
+nincs warp-divergencia a ciklus iterációszámában, és a
+memória-hozzáférés jól tervezhető. A hátránya azonban súlyos: ha a sorok
+hossza nagyon eltér, a padding jelentős memóriapazarlást okoz. Például
+ha egy mátrixban egy sor 100 nemnulla elemet tartalmaz, a többi sor
+pedig csak 1–2-t, akkor a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>k</mi><mo>max</mo></msub><mo>=</mo><mn>100</mn></mrow><annotation encoding="application/x-tex">k_{\max}=100</annotation></semantics></math>
+szélességű tárolás hatalmas felesleges területet foglal. Az ELL ezért
+elsősorban olyan mátrixokhoz alkalmas, ahol a soronkénti nemnulla elemek
+száma közel egyenletes.</p>
+<h3 data-number="19.2.5" id="formátumválasztás-szempontjai"><span
+class="header-section-number">19.2.5</span> 5. Formátumválasztás
+szempontjai</h3>
+<p>Nincs minden helyzetben legjobb ritka reprezentáció; a választást a
+mátrix szerkezete, a művelet típusa és a GPU-architektúra együtt
+határozza meg. A leggyakoribb döntési szempontok:</p>
+<ul>
+<li><strong>Mátrixszerkezet:</strong> ha a sorok hossza egyenletes, az
+ELL hatékony; ha erősen változó, a CSR jobb választás. A COO akkor
+előnyös, ha a mátrixot gyakran módosítani kell vagy egyszeri
+konverzióhoz használjuk.</li>
+<li><strong>Művelet:</strong> SpMV-hez a CSR a leggyakoribb, mert nincs
+atomi szükség, és a memória-hozzáférés jól szabályozható. A COO SpMV
+atomi műveleteket igényel, de könnyen párhuzamosítható. ELL SpMV fix
+ciklussal, atomi nélkül jó, ha a padding alacsony.</li>
+<li><strong>Átalakítás:</strong> a COO egyszerű, rendezhető, és könnyen
+konvertálható CSR-be vagy ELL-be. Sok könyvtár (pl. cuSPARSE, CUSP) a
+COO-t köztes formátumként használja.</li>
+<li><strong>Memória és sávszélesség:</strong> a CSR tömörebb, mint a
+COO, mert a sorindexeket tömöríti. Az ELL paddingje növelheti a
+memóriaforgalmat, de a fix ciklus miatt jobb lehet a gyorsítótár
+kihasználása.</li>
+<li><strong>Párhuzamosság:</strong> a CSR soronkénti szál-hozzárendelése
+egyenetlen terhelést okozhat; a COO nonzero-onkénti szálai jobban
+kiegyenlítenek, de atomiakat igényelnek. A gyakorlatban hibrid
+formátumok is léteznek, mint a HYB (COO + ELL kombináció) vagy a
+SELL-C-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>σ</mi><annotation encoding="application/x-tex">\sigma</annotation></semantics></math>,
+amelyek a fenti hátrányokat próbálják csökkenteni.</li>
+</ul>
+<p>A következő táblázat összefoglalja a három formátum legfontosabb
+jellemzőit:</p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Formátum</th>
+<th>Tömbök</th>
+<th>Előnyök</th>
+<th>Hátrányok</th>
+<th>Tipikus használat</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>COO</td>
+<td>row_idx, col_idx, values</td>
+<td>egyszerű, rugalmas, könnyű módosítás</td>
+<td>atomi szükséges SpMV-hez, nagy indexelési memória</td>
+<td>konstrukció, konverzió, debug</td>
+</tr>
+<tr class="even">
+<td>CSR</td>
+<td>row_ptr, col_idx, values</td>
+<td>tömör, gyors SpMV atomi nélkül</td>
+<td>soronként egyenetlen terhelés, nehéz módosítani</td>
+<td>SpMV, SpMM, iteratív megoldók</td>
+</tr>
+<tr class="odd">
+<td>ELL</td>
+<td>values, col_ind (fix szélesség)</td>
+<td>fix ciklus, jó coalescing lehetőség</td>
+<td>padding memóriapazarlás, sorhossz-egyenetlenségre érzékeny</td>
+<td>közel egyenletes sorhosszú mátrixok</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="19.2.6" id="labor-spmv-csr-ben-cuda-c-szal"><span
+class="header-section-number">19.2.6</span> 6. Labor: SpMV CSR-ben CUDA
+C++-szal</h3>
+<p>A következő labor egy CSR-alapú SpMV teljes CUDA C++ implementációját
+mutatja be. A kód fordítható, de a konkrét mérési értékeket a futtató
+környezetben kell rögzíteni. A labor megfelel a könyv
+labor-szerződésének: a GPU-t, drivert, CUDA-verziót és operációs
+rendszert rögzítjük, a mérés előtt warm-up, majd 10 ismétlés, átlag és
+szórás. A mért és a várt eredményt világosan elválasztjuk.</p>
+<h3 data-number="19.2.7" id="környezet-és-fordítás"><span
+class="header-section-number">19.2.7</span> 6.1. Környezet és
+fordítás</h3>
+<p>A laborban használt környezet (helyőrző, a tényleges futtatásnál
+kitöltendő):</p>
+<ul>
+<li>GPU: NVIDIA RTX 4070, compute capability 8.9 (példa,
+ellenőrizendő)</li>
+<li>Driver: 550.54.14 (ellenőrizendő)</li>
+<li>CUDA Toolkit: 12.5 (ellenőrizendő)</li>
+<li>OS: Ubuntu 22.04, kernel 6.8 (ellenőrizendő)</li>
+<li>Fordító: <code>nvcc</code> C++17 módban</li>
+</ul>
+<p>A kód fordítási parancsa:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_89 <span class="at">-o</span> spmv_csr_lab spmv_csr_lab.cu</span></code></pre></div>
+<p>A futtatási parancs egyszerűen:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./spmv_csr_lab</span></span></code></pre></div>
+<h3 data-number="19.2.8" id="a-cuda-c-forráskód"><span
+class="header-section-number">19.2.8</span> 6.2. A CUDA C++
+forráskód</h3>
+<p>A kód egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1024</mn><mo>×</mo><mn>1024</mn></mrow><annotation encoding="application/x-tex">1024 \times 1024</annotation></semantics></math>-es
+ritka mátrixot állít elő 0,5% kitöltöttséggel, fix maggal a
+reprodukálhatóság érdekében. A referencia CPU SpMV kiszámítja a várt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+vektort, majd a GPU kernel ugyanezt végrehajtja. A kód ellenőrzi a CUDA
+API hibákat, eseményekkel méri a futásidőt, és összehasonlítja a GPU- és
+CPU-eredményt.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), NVCC 12.5, Linux x86_64, izolált labor</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -O3 -arch=sm_89 -o spmv_csr_lab spmv_csr_lab.cu</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Futtatás: ./spmv_csr_lab</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co">// A kód szemléltető; a mérési értékeket a tényleges futtatás után kell rögzíteni.</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co">// A kernel nem tartalmaz végtelen ciklust; timeout terv: 30 s limit.</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;random&gt;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;algorithm&gt;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                     </span><span class="op">\</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">              </span><span class="op">\</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="pp">                </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                     </span><span class="op">\</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                           </span><span class="op">\</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="co">// Egyszerű CPU referencia SpMV CSR-rel.</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> cpu_spmv_csr<span class="op">(</span><span class="at">const</span> <span class="dt">int</span><span class="op">*</span> row_ptr<span class="op">,</span> <span class="at">const</span> <span class="dt">int</span><span class="op">*</span> col_idx<span class="op">,</span> <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> values<span class="op">,</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>                  <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> x<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> y<span class="op">,</span> <span class="dt">int</span> num_rows<span class="op">)</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_rows<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> row_ptr<span class="op">[</span>i<span class="op">];</span> j <span class="op">&lt;</span> row_ptr<span class="op">[</span>i <span class="op">+</span> <span class="dv">1</span><span class="op">];</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>            sum <span class="op">+=</span> values<span class="op">[</span>j<span class="op">]</span> <span class="op">*</span> x<span class="op">[</span>col_idx<span class="op">[</span>j<span class="op">]];</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a><span class="co">// GPU kernel: minden szál egy sort dolgoz fel CSR-rel.</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> spmv_csr_row_kernel<span class="op">(</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span><span class="op">*</span> <span class="ex">__restrict__</span> row_ptr<span class="op">,</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span><span class="op">*</span> <span class="ex">__restrict__</span> col_idx<span class="op">,</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> values<span class="op">,</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> num_rows<span class="op">)</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> row <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>row <span class="op">&gt;=</span> num_rows<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> start <span class="op">=</span> row_ptr<span class="op">[</span>row<span class="op">];</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> end   <span class="op">=</span> row_ptr<span class="op">[</span>row <span class="op">+</span> <span class="dv">1</span><span class="op">];</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> start<span class="op">;</span> j <span class="op">&lt;</span> end<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> values<span class="op">[</span>j<span class="op">]</span> <span class="op">*</span> x<span class="op">[</span>col_idx<span class="op">[</span>j<span class="op">]];</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>    y<span class="op">[</span>row<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mátrix/méret paraméterei</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> num_rows <span class="op">=</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> num_cols <span class="op">=</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> density <span class="op">=</span> <span class="fl">0.005</span><span class="bu">f</span><span class="op">;</span>       <span class="co">// 0,5% kitöltöttség</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">unsigned</span> <span class="dt">int</span> seed <span class="op">=</span> <span class="dv">42</span><span class="op">;</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Véletlen ritka mátrix generálása CSR-ben CPU-n</span></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> row_ptr<span class="op">(</span>num_rows <span class="op">+</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> col_idx<span class="op">;</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> values<span class="op">;</span></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mt19937 gen<span class="op">(</span>seed<span class="op">);</span></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>uniform_real_distribution<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> val_dist<span class="op">(</span><span class="fl">0.1</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>uniform_int_distribution<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> col_dist<span class="op">(</span><span class="dv">0</span><span class="op">,</span> num_cols <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> row <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> row <span class="op">&lt;</span> num_rows<span class="op">;</span> <span class="op">++</span>row<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a>        row_ptr<span class="op">[</span>row<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>col_idx<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> col <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> col <span class="op">&lt;</span> num_cols<span class="op">;</span> <span class="op">++</span>col<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span><span class="bu">std::</span>generate_canonical<span class="op">&lt;</span><span class="dt">float</span><span class="op">,</span> <span class="dv">32</span><span class="op">&gt;(</span>gen<span class="op">)</span> <span class="op">&lt;</span> density<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>                col_idx<span class="op">.</span>push_back<span class="op">(</span>col<span class="op">);</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>                values<span class="op">.</span>push_back<span class="op">(</span>val_dist<span class="op">(</span>gen<span class="op">));</span></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>    row_ptr<span class="op">[</span>num_rows<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>col_idx<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> nnz <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>col_idx<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Sűrű x és y vektorok</span></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> x<span class="op">(</span>num_cols<span class="op">);</span></span>
+<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> y_cpu<span class="op">(</span>num_rows<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> y_gpu<span class="op">(</span>num_rows<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>uniform_real_distribution<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> x_dist<span class="op">(-</span><span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_cols<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> x<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> x_dist<span class="op">(</span>gen<span class="op">);</span></span>
+<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a>    <span class="co">// CPU referencia (várt eredmény)</span></span>
+<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a>    cpu_spmv_csr<span class="op">(</span>row_ptr<span class="op">.</span>data<span class="op">(),</span> col_idx<span class="op">.</span>data<span class="op">(),</span> values<span class="op">.</span>data<span class="op">(),</span></span>
+<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a>                 x<span class="op">.</span>data<span class="op">(),</span> y_cpu<span class="op">.</span>data<span class="op">(),</span> num_rows<span class="op">);</span></span>
+<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device memória allokálása</span></span>
+<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">*</span>d_row_ptr<span class="op">,</span> <span class="op">*</span>d_col_idx<span class="op">;</span></span>
+<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_values<span class="op">,</span> <span class="op">*</span>d_x<span class="op">,</span> <span class="op">*</span>d_y<span class="op">;</span></span>
+<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_row_ptr<span class="op">,</span> <span class="op">(</span>num_rows <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb6-101"><a href="#cb6-101" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_col_idx<span class="op">,</span> nnz <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb6-102"><a href="#cb6-102" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_values<span class="op">,</span> nnz <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb6-103"><a href="#cb6-103" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_x<span class="op">,</span> num_cols <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb6-104"><a href="#cb6-104" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_y<span class="op">,</span> num_rows <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb6-105"><a href="#cb6-105" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-106"><a href="#cb6-106" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host -&gt; device másolás</span></span>
+<span id="cb6-107"><a href="#cb6-107" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_row_ptr<span class="op">,</span> row_ptr<span class="op">.</span>data<span class="op">(),</span> <span class="op">(</span>num_rows <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb6-108"><a href="#cb6-108" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_col_idx<span class="op">,</span> col_idx<span class="op">.</span>data<span class="op">(),</span> nnz <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb6-109"><a href="#cb6-109" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_values<span class="op">,</span> values<span class="op">.</span>data<span class="op">(),</span> nnz <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb6-110"><a href="#cb6-110" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_x<span class="op">,</span> x<span class="op">.</span>data<span class="op">(),</span> num_cols <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb6-111"><a href="#cb6-111" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-112"><a href="#cb6-112" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Launch konfiguráció: grid = ceil(num_rows / 256), block = 256</span></span>
+<span id="cb6-113"><a href="#cb6-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> block_size <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb6-114"><a href="#cb6-114" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> grid_size <span class="op">=</span> <span class="op">(</span>num_rows <span class="op">+</span> block_size <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block_size<span class="op">;</span></span>
+<span id="cb6-115"><a href="#cb6-115" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> shared_bytes <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-116"><a href="#cb6-116" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> stream <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> <span class="co">// default stream</span></span>
+<span id="cb6-117"><a href="#cb6-117" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-118"><a href="#cb6-118" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Események létrehozása méréshez</span></span>
+<span id="cb6-119"><a href="#cb6-119" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start_event<span class="op">,</span> stop_event<span class="op">;</span></span>
+<span id="cb6-120"><a href="#cb6-120" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start_event<span class="op">));</span></span>
+<span id="cb6-121"><a href="#cb6-121" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop_event<span class="op">));</span></span>
+<span id="cb6-122"><a href="#cb6-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-123"><a href="#cb6-123" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up: 5 indítás</span></span>
+<span id="cb6-124"><a href="#cb6-124" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> warmup <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> warmup <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>warmup<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-125"><a href="#cb6-125" aria-hidden="true" tabindex="-1"></a>        spmv_csr_row_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> block_size<span class="op">,</span> shared_bytes<span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span></span>
+<span id="cb6-126"><a href="#cb6-126" aria-hidden="true" tabindex="-1"></a>            d_row_ptr<span class="op">,</span> d_col_idx<span class="op">,</span> d_values<span class="op">,</span> d_x<span class="op">,</span> d_y<span class="op">,</span> num_rows<span class="op">);</span></span>
+<span id="cb6-127"><a href="#cb6-127" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb6-128"><a href="#cb6-128" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-129"><a href="#cb6-129" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-130"><a href="#cb6-130" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-131"><a href="#cb6-131" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés: 10 ismétlés</span></span>
+<span id="cb6-132"><a href="#cb6-132" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> elapsed_times<span class="op">;</span></span>
+<span id="cb6-133"><a href="#cb6-133" aria-hidden="true" tabindex="-1"></a>    elapsed_times<span class="op">.</span>reserve<span class="op">(</span><span class="dv">10</span><span class="op">);</span></span>
+<span id="cb6-134"><a href="#cb6-134" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> iter <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> iter <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>iter<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-135"><a href="#cb6-135" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start_event<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb6-136"><a href="#cb6-136" aria-hidden="true" tabindex="-1"></a>        spmv_csr_row_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> block_size<span class="op">,</span> shared_bytes<span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span></span>
+<span id="cb6-137"><a href="#cb6-137" aria-hidden="true" tabindex="-1"></a>            d_row_ptr<span class="op">,</span> d_col_idx<span class="op">,</span> d_values<span class="op">,</span> d_x<span class="op">,</span> d_y<span class="op">,</span> num_rows<span class="op">);</span></span>
+<span id="cb6-138"><a href="#cb6-138" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb6-139"><a href="#cb6-139" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop_event<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb6-140"><a href="#cb6-140" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop_event<span class="op">));</span></span>
+<span id="cb6-141"><a href="#cb6-141" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-142"><a href="#cb6-142" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start_event<span class="op">,</span> stop_event<span class="op">));</span></span>
+<span id="cb6-143"><a href="#cb6-143" aria-hidden="true" tabindex="-1"></a>        elapsed_times<span class="op">.</span>push_back<span class="op">(</span>ms<span class="op">);</span></span>
+<span id="cb6-144"><a href="#cb6-144" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-145"><a href="#cb6-145" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-146"><a href="#cb6-146" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-147"><a href="#cb6-147" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device -&gt; host másolás az eredményhez</span></span>
+<span id="cb6-148"><a href="#cb6-148" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>y_gpu<span class="op">.</span>data<span class="op">(),</span> d_y<span class="op">,</span> num_rows <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb6-149"><a href="#cb6-149" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-150"><a href="#cb6-150" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Összehasonlítás a várt és mért eredmény között</span></span>
+<span id="cb6-151"><a href="#cb6-151" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> max_abs_diff <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-152"><a href="#cb6-152" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_rows<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-153"><a href="#cb6-153" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> diff <span class="op">=</span> <span class="bu">std::</span>fabs<span class="op">(</span>y_gpu<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> y_cpu<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb6-154"><a href="#cb6-154" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>diff <span class="op">&gt;</span> max_abs_diff<span class="op">)</span> max_abs_diff <span class="op">=</span> diff<span class="op">;</span></span>
+<span id="cb6-155"><a href="#cb6-155" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-156"><a href="#cb6-156" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-157"><a href="#cb6-157" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Statisztika: átlag és szórás</span></span>
+<span id="cb6-158"><a href="#cb6-158" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-159"><a href="#cb6-159" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">float</span> t <span class="op">:</span> elapsed_times<span class="op">)</span> sum <span class="op">+=</span> t<span class="op">;</span></span>
+<span id="cb6-160"><a href="#cb6-160" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> mean <span class="op">=</span> sum <span class="op">/</span> elapsed_times<span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb6-161"><a href="#cb6-161" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> var <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-162"><a href="#cb6-162" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">float</span> t <span class="op">:</span> elapsed_times<span class="op">)</span> var <span class="op">+=</span> <span class="op">(</span>t <span class="op">-</span> mean<span class="op">)</span> <span class="op">*</span> <span class="op">(</span>t <span class="op">-</span> mean<span class="op">);</span></span>
+<span id="cb6-163"><a href="#cb6-163" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> std_dev <span class="op">=</span> <span class="bu">std::</span>sqrt<span class="op">(</span>var <span class="op">/</span> elapsed_times<span class="op">.</span>size<span class="op">());</span></span>
+<span id="cb6-164"><a href="#cb6-164" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-165"><a href="#cb6-165" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;SpMV CSR labor eredmények</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb6-166"><a href="#cb6-166" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Mátrix: </span><span class="sc">%d</span><span class="st"> x </span><span class="sc">%d</span><span class="st">, nnz=</span><span class="sc">%d</span><span class="st">, density=</span><span class="sc">%.4f\n</span><span class="st">&quot;</span><span class="op">,</span> num_rows<span class="op">,</span> num_cols<span class="op">,</span> nnz<span class="op">,</span> density<span class="op">);</span></span>
+<span id="cb6-167"><a href="#cb6-167" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Grid: </span><span class="sc">%d</span><span class="st">, Block: </span><span class="sc">%d</span><span class="st">, Shared bytes: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> grid_size<span class="op">,</span> block_size<span class="op">,</span> shared_bytes<span class="op">);</span></span>
+<span id="cb6-168"><a href="#cb6-168" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Átlag futásidő: </span><span class="sc">%.6f</span><span class="st"> ms, szórás: </span><span class="sc">%.6f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> mean<span class="op">,</span> std_dev<span class="op">);</span></span>
+<span id="cb6-169"><a href="#cb6-169" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Max abszolút eltérés (GPU vs CPU): </span><span class="sc">%.8e\n</span><span class="st">&quot;</span><span class="op">,</span> max_abs_diff<span class="op">);</span></span>
+<span id="cb6-170"><a href="#cb6-170" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Várt eredmény (CPU) y[0..3]: </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb6-171"><a href="#cb6-171" aria-hidden="true" tabindex="-1"></a>           y_cpu<span class="op">[</span><span class="dv">0</span><span class="op">],</span> y_cpu<span class="op">[</span><span class="dv">1</span><span class="op">],</span> y_cpu<span class="op">[</span><span class="dv">2</span><span class="op">],</span> y_cpu<span class="op">[</span><span class="dv">3</span><span class="op">]);</span></span>
+<span id="cb6-172"><a href="#cb6-172" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Mért eredmény (GPU) y[0..3]: </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f</span><span class="st">, </span><span class="sc">%f\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb6-173"><a href="#cb6-173" aria-hidden="true" tabindex="-1"></a>           y_gpu<span class="op">[</span><span class="dv">0</span><span class="op">],</span> y_gpu<span class="op">[</span><span class="dv">1</span><span class="op">],</span> y_gpu<span class="op">[</span><span class="dv">2</span><span class="op">],</span> y_gpu<span class="op">[</span><span class="dv">3</span><span class="op">]);</span></span>
+<span id="cb6-174"><a href="#cb6-174" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-175"><a href="#cb6-175" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Tisztítás</span></span>
+<span id="cb6-176"><a href="#cb6-176" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_row_ptr<span class="op">));</span></span>
+<span id="cb6-177"><a href="#cb6-177" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_col_idx<span class="op">));</span></span>
+<span id="cb6-178"><a href="#cb6-178" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_values<span class="op">));</span></span>
+<span id="cb6-179"><a href="#cb6-179" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_x<span class="op">));</span></span>
+<span id="cb6-180"><a href="#cb6-180" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_y<span class="op">));</span></span>
+<span id="cb6-181"><a href="#cb6-181" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start_event<span class="op">));</span></span>
+<span id="cb6-182"><a href="#cb6-182" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop_event<span class="op">));</span></span>
+<span id="cb6-183"><a href="#cb6-183" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-184"><a href="#cb6-184" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-185"><a href="#cb6-185" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="19.2.9" id="mérési-napló"><span
+class="header-section-number">19.2.9</span> 6.3. Mérési napló</h3>
+<p>A labor futtatása során az alábbi táblázatot kell kitölteni. A
+táblázat a könyv konvencióinak megfelelően elkülöníti a mért és a várt
+értékeket. A mért oszlopba a tényleges futtatás után kerülnek az adatok;
+a várt oszlop a CPU referencia által szolgáltatott értékeket
+mutatja.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Mért (GPU, futtatás után)</th>
+<th>Várt (CPU referencia)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU modell</td>
+<td>— (kitöltendő)</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>Driver</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>CUDA verzió</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>OS</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>Mátrix méret</td>
+<td>—</td>
+<td>1024×1024</td>
+</tr>
+<tr class="odd">
+<td>nnz</td>
+<td>—</td>
+<td>~5243 (0,5% sűrűség)</td>
+</tr>
+<tr class="even">
+<td>Precision</td>
+<td>FP32</td>
+<td>FP32</td>
+</tr>
+<tr class="odd">
+<td>Grid / block</td>
+<td>—</td>
+<td>ceil(1024/256)=4 / 256</td>
+</tr>
+<tr class="even">
+<td>Shared mem / reg.</td>
+<td>—</td>
+<td>0 / alacsony</td>
+</tr>
+<tr class="odd">
+<td>Futásidő átlag</td>
+<td>— (ms)</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>Futásidő szórás</td>
+<td>— (ms)</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>Átbocsátóképesség</td>
+<td>— (GFLOPS)</td>
+<td>2·nnz / t</td>
+</tr>
+<tr class="even">
+<td>Sávszélesség</td>
+<td>— (GB/s)</td>
+<td>(nnz·8 + 1025·4 + 1024·4 + 1024·4) / t</td>
+</tr>
+<tr class="odd">
+<td>Max abszolút eltérés</td>
+<td>—</td>
+<td>0 (vagy kicsi kerekítésből)</td>
+</tr>
+</tbody>
+</table>
+<p>A várt eredmény oszlopban a <code>~5243</code> a 1024×1024×0,005 =
+5242,88 kerekítve; a tényleges <code>nnz</code> a generált mátrixban
+kissé eltérhet. A sávszélesség számításánál a tényleges adatforgalom:
+<code>values</code> (nnz×4), <code>col_idx</code> (nnz×4),
+<code>row_ptr</code> ((rows+1)×4), <code>x</code> vektor (cols×4, de
+többször olvasott), <code>y</code> vektor (rows×4). A pontos értéket a
+mérés után a tényleges <code>nnz</code> és a futásidő alapján kell
+kiszámítani.</p>
+<p>A mérés előtt 5 warm-up és 10 mért ismétlés történt. A szórást a 10
+ismétlésből számítottuk. A kernel nem használ shared memóriát,
+regiszterhasználata minimális; az occupancy-t az Nsight Compute
+jelentése mutatja. A fenti kódban a <code>cudaGetLastError</code> és
+<code>cudaDeviceSynchronize</code> minden API-hívás után megtalálható a
+hibamakrón keresztül, illetve a kernelindítások után közvetlenül.</p>
+<h3 data-number="19.2.10" id="gyakori-hibák-és-helyes-megoldások"><span
+class="header-section-number">19.2.10</span> 7. Gyakori hibák és helyes
+megoldások</h3>
+<p>A ritka mátrixok GPU-s implementációja során az alábbi tipikus
+hibákat érdemes elkerülni:</p>
+<ol type="1">
+<li><p><strong>Helytelen <code>row_ptr</code> méret vagy
+indexelés.</strong> A <code>row_ptr</code> hosszának mindig
+<code>num_rows + 1</code>-nek kell lennie, és
+<code>row_ptr[num_rows]</code> értékének <code>nnz</code>-nek kell
+megfelelnie. A <code>row_ptr</code> elemei monoton növekvőek. Ha nem így
+van, a kernel kiolvashat a tömb határán kívül. <em>Megoldás:</em> mindig
+ellenőrizzük a <code>row_ptr</code> utolsó elemét és a monotonitást,
+például egy CPU-s validációval.</p></li>
+<li><p><strong>COO SpMV atomi műveletek nélkül.</strong> Ha minden
+nemnulla elemhez egy szál tartozik, és a szálak közvetlenül írják
+<code>y[row]</code>-t, versenyhelyzet alakul ki: több szál ugyanazt a
+memóriacímet ír, az eredmény nem determinisztikus. <em>Megoldás:</em>
+használjunk <code>atomicAdd</code>-et, vagy váltsunk CSR-alapú
+soronkénti feldolgozásra.</p></li>
+<li><p><strong>ELL padding figyelmen kívül hagyása.</strong> Ha a
+padding elemeket nem jelöljük érvénytelen indexszel (pl.
+<code>-1</code>), a kernel a <code>x</code> vektor érvénytelen
+pozícióját olvashatja. <em>Megoldás:</em> a padding oszlopindexét mindig
+olyan értékre állítsuk, amelyet a kernel ellenőriz (<code>-1</code>), és
+a kernelben <code>if (col != -1)</code> feltétellel védjük a
+hozzáférést.</p></li>
+<li><p><strong>Nem koaleszkált memória-hozzáférés.</strong> A CSR
+soronkénti feldolgozásnál a szomszédos szálak által olvasott
+<code>col_idx</code> és <code>values</code> elemek nem feltétlenül
+szomszédosak a memóriában, mert a sorok hossza eltérő. Ez csökkenti a
+globális memória sávszélességét. <em>Megoldás:</em> a következő
+alfejezetben (<a href="gpu072.html">SpMV és sparse optimalizálás</a>)
+tárgyalt optimalizálások, például a nonzero-onkénti szál-hozzárendelés
+vagy a sorok átrendezése javíthatja a coalescinget. Itt a CSR
+alapváltozat arra jó, hogy a formátum működését demonstrálja.</p></li>
+<li><p><strong>Túl nagy blockméret vagy helytelen grid.</strong> Ha a
+grid mérete nem fedi le az összes sort, a kernel nem dolgozza fel a
+teljes mátrixot. <em>Megoldás:</em> a grid méretet mindig
+<code>ceil(num_rows / block_size)</code>-ként számítsuk, és a kernelben
+ellenőrizzük a <code>row &gt;= num_rows</code> feltételt.</p></li>
+</ol>
+<h3 data-number="19.2.11" id="önellenőrző-kérdés"><span
+class="header-section-number">19.2.11</span> 8. Önellenőrző kérdés</h3>
+<p>Adott a következő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>3</mn><mo>×</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">3 \times 4</annotation></semantics></math>-es
+ritka mátrix:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>=</mo><mrow><mo stretchy="true" form="prefix">(</mo><mtable><mtr><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>1</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd></mtr><mtr><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>2</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd></mtr><mtr><mtd columnalign="center" style="text-align: center"><mn>3</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>0</mn></mtd><mtd columnalign="center" style="text-align: center"><mn>4</mn></mtd></mtr></mtable><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">
+B = \begin{pmatrix}
+0 &amp; 1 &amp; 0 &amp; 0 \\
+0 &amp; 0 &amp; 2 &amp; 0 \\
+3 &amp; 0 &amp; 0 &amp; 4
+\end{pmatrix}
+</annotation></semantics></math></p>
+<p>Írja fel a mátrix COO, CSR és ELL reprezentációit! A soronkénti
+nemnulla elemek száma: 1, 1, 2; a maximális sorhossz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>k</mi><mo>max</mo></msub><mo>=</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">k_{\max}=2</annotation></semantics></math>.
+Melyik formátumot választaná SpMV-hez, ha a mátrix sorai ennyire
+rövidek, és miért? Indokolja meg a választást a memória- és
+párhuzamossági szempontok alapján!</p>
+<p>(A megoldás során ügyeljen a <code>row_ptr</code> hosszára és az ELL
+padding jelölésére.)</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu070.html">← 19.1 Dense GEMM</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu072.html">19.3 SpMV és sparse optimalizálás →</a></div>
+</nav>
+</body>
+</html>

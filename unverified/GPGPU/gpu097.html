@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.4 Aszinkron tervezési minták – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch24">25 Streams, events, CUDA graphs és aszinkron végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu096.html">← 25.3 CUDA graphs</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu098.html">26.1 Több GPU és peer access →</a></div>
+</nav>
+<h2 data-number="25.4" id="gpu097"><span
+class="header-section-number">25.4</span> Aszinkron tervezési
+minták</h2>
+<p>Az aszinkron tervezési minták akkor válnak meghatározóvá, amikor a
+GPU-t nem egyetlen köteg futtatására használjuk, hanem adatfolyamot,
+szolgáltatást vagy interaktív munkamenetet kiszolgáló erőforrásként.
+Ilyenkor már nem elég egy kernel gyorsasága; a host és az eszköz közötti
+átfedés, a folyamatos ütemezés, a hibakezelés és a leállítás is a
+rendszer része. Az alábbi alfejezet a hosszú futású és interaktív
+GPU-munka tervezési elveit, a callback- és event-alapú
+befejezéskezelést, valamint a leállítási és hibakezelési mintákat
+tekinti át.</p>
+<h3 data-number="25.4.1" id="hosszú-futású-gpu-munka"><span
+class="header-section-number">25.4.1</span> 1. Hosszú futású
+GPU-munka</h3>
+<p>Hosszú futású GPU-munkának nevezzük azt az üzemmódot, amikor a GPU
+nem egyetlen rövid feladatot hajt végre, hanem órákon, napokon vagy
+folyamatosan dolgozik. Gyakori példák:</p>
+<ul>
+<li>videó- vagy jelfolyam feldolgozása,</li>
+<li>tudományos szimuláció adatfolyam-szerű mentése és újraindítása,</li>
+<li>gépi tanulási adatbetöltés és előfeldolgozás,</li>
+<li>valós idejű inferencia-kiszolgáló,</li>
+<li>Monte Carlo-szimulációk hosszú sorozata,</li>
+<li>adatbázis- vagy gráffeldolgozó rendszer GPU-gyorsított
+szakaszai.</li>
+</ul>
+<p>Ezekben az esetekben a teljes bemenet gyakran nem fér a
+GPU-memóriába, vagy éppen a kívánt válaszidő miatt chunkokra, windowokra
+és pipeline-okra van szükség. A cél nem egyetlen kernel minimális
+futásideje, hanem a steady-state átbocsátóképesség, az erőforrások
+újrafelhasználása, a memóriaszivárgás elkerülése és a hibák utáni tiszta
+leállás.</p>
+<h3 data-number="25.4.2" id="chunkolt-feldolgozás-és-pipeline"><span
+class="header-section-number">25.4.2</span> 1.1. Chunkolt feldolgozás és
+pipeline</h3>
+<p>Tegyük fel, hogy egy nagy adatfolyamot kell feldolgozni: minden
+chunkra ugyanaz a művelet fut, de a chunkok között nincs szükség
+globális sorrendre. Ekkor a klasszikus megoldás egy háromfázisú
+aszinkron pipeline:</p>
+<ol type="1">
+<li>host–device másolás (<code>H2D</code>),</li>
+<li>GPU-kernel végrehajtása,</li>
+<li>device–host másolás (<code>D2H</code>),</li>
+<li>host oldali utófeldolgozás, ellenőrzés vagy callback.</li>
+</ol>
+<p>A stream- és event-objektumok segítségével a másolások és a kernelek
+átfedésben futhatnak. Amíg az egyik chunk kernelét számolja a GPU, addig
+a következő chunk feltöltése és az előző chunk visszamásolása is
+folyhat, ha külön streameket használunk.</p>
+<p>A legfontosabb tervezési szabály: <strong>soha ne tegyünk globális
+szinkronizálást minden chunk végére</strong>. A
+<code>cudaDeviceSynchronize()</code> vagy akár egy többször használt
+<code>cudaStreamSynchronize()</code> a chunkok közötti pipeliningot
+összeroppantja, mert a host mindig megvárja az összes korábbi
+GPU-műveletet. Helyette az egyes fázisok közötti függőségeket eventekkel
+kell kifejezni, és csak a szükséges pontokon szinkronizálni.</p>
+<h3 data-number="25.4.3" id="visszanyomás-és-korlátos-ablak"><span
+class="header-section-number">25.4.3</span> 1.2. Visszanyomás és
+korlátos ablak</h3>
+<p>Ha a host gyorsabban termeli a chunkokat, mint ahogy a GPU
+feldolgozza, akkor a ki nem fejezett aszinkron műveletek,
+memóriapufferek és event-objektumok száma korlátlanul nőhet. Ez hosszú
+futású munkánál memórianyomáshoz, scheduling overheadhez és nehezen
+diagnosztizálható késésekhez vezet.</p>
+<p>A megoldás a <strong>korlátos csúszóablak</strong>: egyszerre
+legfeljebb <code>W</code> chunk lehet folyamatban. Amikor a host újabb
+chunkot szeretne indítani, előbb meg kell várnia, hogy a
+<code>W</code>-vel korábbi chunk befejeződött. Ezt meg lehet oldani:</p>
+<ul>
+<li>egy <code>std::atomic&lt;size_t&gt;</code> számlálóval, amelyet
+callback növel,</li>
+<li>eventekre való <code>cudaEventSynchronize()</code> hívással a
+legrégebbi befejezetlen chunkon,</li>
+<li>saját gyűrűpufferrel, amelyben újrahasználjuk a memóriát és az
+eseményeket.</li>
+</ul>
+<p>A gyűrűpuffer különösen hasznos, mert elkerüli a folyamatos
+allokációt. Hosszú futású rendszerben soha ne hozzunk létre minden
+chunkhoz új <code>cudaMallocHost</code>-ot, új streamet vagy új eventet;
+használjunk előre lefoglalt poolt.</p>
+<h3 data-number="25.4.4" id="steady-state-és-első-válaszidő"><span
+class="header-section-number">25.4.4</span> 1.3. Steady-state és első
+válaszidő</h3>
+<p>Hosszú futású munkák mérésekor külön kell választani:</p>
+<ul>
+<li><strong>első chunk latency</strong>: az első eredmény megérkezéséig
+eltelt idő, beleértve a CUDA context inicializálását, az első
+allokációkat és a warm-upot,</li>
+<li><strong>steady-state throughput</strong>: a bemelegedés utáni
+chunk/másodperc vagy GiB/s érték,</li>
+<li><strong>tail latency</strong>: a leállítás előtti utolsó chunkok
+befejezésének késése.</li>
+</ul>
+<p>A gyakorlatban az első néhány másodperc gyakran nem reprezentatív,
+ezért a benchmarkot warm-up után kell mérni. Ugyanakkor interaktív vagy
+szolgáltatásjellegű rendszerekben az első token késleltetése önálló SLA
+lehet.</p>
+<h3 data-number="25.4.5" id="interaktív-gpu-munka"><span
+class="header-section-number">25.4.5</span> 2. Interaktív GPU-munka</h3>
+<p>Interaktív GPU-munkánál a felhasználó vagy egy másik rendszer
+kérésére rövid GPU-feladatokat indítunk, és az eredményre viszonylag
+gyorsan szükség van. Példák:</p>
+<ul>
+<li>interaktív vizualizáció, például szűrő, transzformáció vagy
+megjelenítés,</li>
+<li>kérés-válasz alapú kiértékelés,</li>
+<li>jegyzetfüzetben futtatott tudományos számítás,</li>
+<li>játék vagy valós idejű szimuláció.</li>
+</ul>
+<p>A fő cél itt nem a maximális throughput, hanem a
+<strong>válaszkészség</strong>, a <strong>haladásjelzés</strong> és a
+<strong>megszakíthatóság</strong>. Ugyanazok az aszinkron eszközök
+használhatók, de más prioritással.</p>
+<h3 data-number="25.4.6" id="ne-blokkoljuk-a-host-szálat"><span
+class="header-section-number">25.4.6</span> 2.1. Ne blokkoljuk a host
+szálat</h3>
+<p>Az interaktív alkalmazás akkor lesz jól használható, ha a GPU-kérés
+közben a host képes más feladatot végezni, például frissíteni a
+felhasználói felületet, fogadni új kéréseket vagy előkészíteni a
+következő szakaszt. Ezért a <code>cudaMemcpy</code> helyett
+<code>cudaMemcpyAsync</code>, a szinkron
+<code>cudaDeviceSynchronize</code> helyett stream- vagy event-alapú
+várakozás használata indokolt.</p>
+<p>Példa haladásjelzésre:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">(!</span>done<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_acquire<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>cudaEventQuery<span class="op">(</span>progress_event<span class="op">)</span> <span class="op">==</span> cudaSuccess<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>        report_progress<span class="op">();</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    process_ui_events<span class="op">();</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaEventQuery</code> nem blokkol: ha az esemény még nem
+következett be, <code>cudaErrorNotReady</code> értéket ad, így a hívó
+tovább tud lépni.</p>
+<h3 data-number="25.4.7" id="megszakítás-és-prioritás"><span
+class="header-section-number">25.4.7</span> 2.2. Megszakítás és
+prioritás</h3>
+<p>Interaktív munkában gyakori, hogy a felhasználó megszakít egy
+hosszabb számítást. A GPU-n futó kernel kívülről ritkán állítható le
+közvetlenül; a leállítás kooperatív. A bevett minta:</p>
+<ul>
+<li>a kernel ciklusában rendszeresen ellenőriz egy device-memóriában
+lévő <code>cancel</code> flaget,</li>
+<li>ha a flag igaz, a kernel kiszáll,</li>
+<li>a host egy külön vezérlő streamen <code>cudaMemcpyAsync</code>
+segítségével írja be a flaget.</li>
+</ul>
+<p>Ez a megoldás nagy grid-stride loopoknál jól működik. Rövid, egyetlen
+hullámból álló kerneleknél általában nincs értelme, mert a kernel
+hamarabb befejeződik, mint ahogy a megszakítás eljutna hozzá. Ilyenkor
+inkább a chunkok közötti leállítás a megoldás: egy batch feldolgozását
+chunkokra osztjuk, és minden chunk indítása előtt a host lekérdezi a
+megszakítási kérést.</p>
+<p>CUDA-stream szinten prioritást is be lehet állítani:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> high <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> low <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>cudaDeviceGetStreamPriorityRange<span class="op">(&amp;</span>low<span class="op">,</span> <span class="op">&amp;</span>high<span class="op">);</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaStream_t</span> interactive_stream<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>interactive_stream<span class="op">,</span> cudaStreamNonBlocking<span class="op">,</span> high<span class="op">);</span></span></code></pre></div>
+<p>Így a fontos interaktív kernel megelőzheti a háttérben futó munkát. A
+prioritásos ütemezés pontos viselkedése GPU- és driverfüggő, ezért
+méréssel kell igazolni.</p>
+<h3 data-number="25.4.8"
+id="event-és-callback-a-befejezés-kezelésére"><span
+class="header-section-number">25.4.8</span> 3. Event és callback a
+befejezés kezelésére</h3>
+<p>A CUDA aszinkron modelljében az <strong>event</strong> az
+eszközműveletek közötti függőség és a befejezés megfigyelésének alapvető
+eszköze. Az <strong>callback</strong> pedig lehetővé teszi, hogy a host
+egy stream adott pontján automatikusan értesüljön, anélkül hogy blokkoló
+szinkronizálást hívnánk.</p>
+<h3 data-number="25.4.9" id="event-mint-függőségi-pont"><span
+class="header-section-number">25.4.9</span> 3.1. Event mint függőségi
+pont</h3>
+<p>Egy eventet egy streamhez rögzítünk:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>cudaEventRecord<span class="op">(</span>copy_done<span class="op">,</span> copy_stream<span class="op">);</span></span></code></pre></div>
+<p>Ez azt jelenti, hogy az event akkor válik befejezetté, amikor a
+<code>copy_stream</code> összes, az event rögzítése előtti művelete
+lezárult. Egy másik stream így várhat rá:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>cudaStreamWaitEvent<span class="op">(</span>compute_stream<span class="op">,</span> copy_done<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(...,</span> compute_stream<span class="op">);</span> <span class="co">// vagy kernel</span></span></code></pre></div>
+<p>Ez a mechanizmus az alapja a H2D → kernel → D2H pipeline-nak. Az
+eventek között elapsed time is mérhető:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">);</span></span></code></pre></div>
+<p>Időmérésre azonban külön eventpárt használjunk, és a mérést ne
+keverjük a funkcionális függőségi eventekkel.</p>
+<h3 data-number="25.4.10" id="callback-host-oldali-értesítésre"><span
+class="header-section-number">25.4.10</span> 3.2. Callback host oldali
+értesítésre</h3>
+<p>A <code>cudaStreamAddCallback</code> segítségével a streamhez egy
+host-oldali függvényt adhatunk. A callback akkor fut le, amikor a
+streamben az összes korábbi eszközművelet befejeződött:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> CUDART_CB my_callback<span class="op">(</span><span class="dt">void</span><span class="op">*</span> user_data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span><span class="op">*</span> data <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;*&gt;(</span>user_data<span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    data<span class="op">-&gt;</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_release<span class="op">);</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A callback a stream sorrendjében hajtódik végre, de host-kód, nem
+GPU-kód. A gyakorlatban a callback legyen rövid, ne blokkoljon, és ne
+hívjon benne szinkronizáló CUDA-műveleteket, mert az a stream további
+műveleteinek ütemezését is feltarthatja.</p>
+<p>Gyakori kombináció:</p>
+<ol type="1">
+<li>A kernel után
+<code>cudaEventRecord(compute_done, compute_stream)</code>.</li>
+<li>A másoló stream <code>cudaStreamWaitEvent</code>-tel megvárja.</li>
+<li>A D2H másolás után <code>cudaStreamAddCallback</code> értesíti a
+hostot, hogy az eredmény a host memóriában van.</li>
+<li>A callback növeli a befejezett chunkok számlálóját, vagy jelzi egy
+<code>std::condition_variable</code>-nek az új eredményt.</li>
+</ol>
+<p>Így a host nem kénytelen folyamatosan pollozni, az értesítés
+automatikus.</p>
+<h3 data-number="25.4.11" id="tervezési-hiba-callback-túlterhelés"><span
+class="header-section-number">25.4.11</span> 3.3. Tervezési hiba:
+callback túlterhelés</h3>
+<p>Hibás minta:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> CUDART_CB bad_callback<span class="op">(</span><span class="dt">void</span><span class="op">*</span> data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    cudaStreamSynchronize<span class="op">(</span><span class="kw">nullptr</span><span class="op">);</span>  <span class="co">// rossz: blokkoló hívás callbackből</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    heavy_cpu_work<span class="op">();</span>                <span class="co">// rossz: hosszú munka a stream ütemezőjében</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az ilyen callback egy hosszú pipeline-ban visszafogja a következő
+chunkok ütemezését. Helyes megoldás: a callback csak jelölje, hogy egy
+munka elkészült, a tényleges feldolgozást pedig egy másik host szál
+végezze.</p>
+<h3 data-number="25.4.12" id="hibakezelés-aszinkron-környezetben"><span
+class="header-section-number">25.4.12</span> 4. Hibakezelés aszinkron
+környezetben</h3>
+<p>Az aszinkron CUDA-hívásoknál a hiba nem mindig ott jelentkezik, ahol
+keletkezett. A <code>cudaMemcpyAsync</code>, a kernelindítás vagy a
+<code>cudaEventRecord</code> azonnal visszatérhet, a tényleges hiba
+később, egy szinkronizáló híváskor jelenik meg.</p>
+<h3 data-number="25.4.13" id="késleltetett-hibák"><span
+class="header-section-number">25.4.13</span> 4.1. Késleltetett
+hibák</h3>
+<p>A kernelindítás után a <code>cudaGetLastError()</code> csak a launch
+szintű hibákat mutatja, például érvénytelen grid- vagy blockméretet,
+hiányzó eszközt vagy rossz streamet. Az aszinkron végrehajtás közben
+keletkező memóriahibák, illegal instruction vagy eszközhibák gyakran
+csak a következő pontokon figyelhetők meg:</p>
+<ul>
+<li><code>cudaStreamSynchronize(stream)</code>,</li>
+<li><code>cudaEventSynchronize(event)</code>,</li>
+<li><code>cudaEventQuery(event)</code>,</li>
+<li><code>cudaDeviceSynchronize()</code>,</li>
+<li>a következő CUDA-hívás, amely a context állapotát ellenőrzi.</li>
+</ul>
+<p>Emiatt a megbízható CUDA-kód minden aszinkron folyamat végén
+szinkronizál, és a szinkronizálás után is ellenőrzi a hibát.</p>
+<h3 data-number="25.4.14"
+id="hibaellenőrző-makró-aszinkron-műveletekhez"><span
+class="header-section-number">25.4.14</span> 4.2. Hibaellenőrző makró
+aszinkron műveletekhez</h3>
+<p>A könyvben használt hibamakró aszinkron pipeline-hoz is
+használható:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CK_CUDA</span><span class="op">(</span>expr<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>expr<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));\</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>abort<span class="op">();</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                           </span><span class="op">\</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span></code></pre></div>
+<p>A makrót a launch előtti és a szinkronizáló hívásokra is használjuk.
+A <code>cudaStreamSynchronize</code> visszatérési értékét például mindig
+ellenőrizni kell:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>CK_CUDA<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>compute_stream<span class="op">));</span></span></code></pre></div>
+<h3 data-number="25.4.15"
+id="leállítás-és-erőforrás-felszabadítás"><span
+class="header-section-number">25.4.15</span> 4.3. Leállítás és
+erőforrás-felszabadítás</h3>
+<p>A leállítás sorrendje aszinkron rendszerben:</p>
+<ol type="1">
+<li>Jelezzük a termelő szálnak, hogy ne indítson újabb chunkot.</li>
+<li>Megvárjuk a folyamatban lévő chunkok befejezését.</li>
+<li>Szinkronizáljuk az összes streamet és eventet.</li>
+<li>Felszabadítjuk a device- és host-memóriákat.</li>
+<li>Töröljük az eventeket és streameket.</li>
+</ol>
+<p>Tipikus hiba, ha a host memóriát felszabadítja, miközben egy stream
+még mindig használja:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibás: a stream még nem fejeződött be</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(</span>dst<span class="op">,</span> src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>cudaFreeHost<span class="op">(</span>src<span class="op">);</span> <span class="co">// rossz, lehet hogy a másolás még folyamatban van</span></span></code></pre></div>
+<p>Helyes sorrend:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>cudaMemcpyAsync<span class="op">(</span>dst<span class="op">,</span> src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>CK_CUDA<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>cudaFreeHost<span class="op">(</span>src<span class="op">);</span></span></code></pre></div>
+<p>Ha a kernel esetleg beragadt, akkor a folyamat leállítása előtt
+watchdog- vagy timeout-mechanizmust kell alkalmazni. Többfelhasználós
+környezetben ne hívjunk meggondolatlanul
+<code>cudaDeviceReset</code>-et, mert az az eszközön lévő más
+folyamatokat is érintheti. Izolált laborban használhatunk külső
+timeoutot, például konténeres futásidő-korlátot vagy
+<code>timeout</code> parancsot.</p>
+<h3 data-number="25.4.16" id="labor-aszinkron-pipeline-tervezése"><span
+class="header-section-number">25.4.16</span> 5. Labor: aszinkron
+pipeline tervezése</h3>
+<p>A labor célja egy olyan pipeline elkészítése, amely egy nagy
+adathalmazt chunkokra oszt, és a másolást, a GPU-számítást, valamint a
+visszamásolást event-alapú függőségekkel átfedésben végzi. A feladat a
+hosszú futású feldolgozás egy kis, ellenőrizhető modellje.</p>
+<h3 data-number="25.4.17" id="kiinduló-környezet"><span
+class="header-section-number">25.4.17</span> 5.1. Kiinduló
+környezet</h3>
+<p>Az alábbi környezetet rögzítsük minden méréshez:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>NVIDIA A100 40 GB PCIe, ECC be, MIG ki</td>
+</tr>
+<tr class="even">
+<td>Driver</td>
+<td>550.54.14</td>
+</tr>
+<tr class="odd">
+<td>CUDA toolkit</td>
+<td>12.4</td>
+</tr>
+<tr class="even">
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04</td>
+</tr>
+<tr class="odd">
+<td>Precision</td>
+<td>FP32</td>
+</tr>
+<tr class="even">
+<td>Fordító</td>
+<td>nvcc, C++17</td>
+</tr>
+</tbody>
+</table>
+<p>A konkrét értékeket mindenki a saját környezetéhez igazítja; a
+naplóban nem helyettesíthetők az itt szereplő példaértékek valós
+mérésként.</p>
+<h3 data-number="25.4.18" id="kernelszámítás"><span
+class="header-section-number">25.4.18</span> 5.2. Kernelszámítás</h3>
+<p>Az egyszerű feladat egy vektor skálázása:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> scale_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> in<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> out<span class="op">,</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>                             <span class="dt">float</span> alpha<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> stride <span class="op">=</span> gridDim<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> idx<span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i <span class="op">+=</span> stride<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> alpha <span class="op">*</span> in<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel memória-korlátos, ezért alkalmas a másolási átfedés
+megfigyelésére.</p>
+<h3 data-number="25.4.19" id="aszinkron-pipeline-cuda-c-ban"><span
+class="header-section-number">25.4.19</span> 5.3. Aszinkron pipeline
+CUDA C++-ban</h3>
+<p>A kód minden chunkhoz külön eventet használ, hogy elkerülje az
+event-újrahasznosításból adódó sorrendi bizonytalanságot. A callback a
+befejezett D2H-másolást jelzi.</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++17</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CK_CUDA</span><span class="op">(</span>expr<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>expr<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));\</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>abort<span class="op">();</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                           </span><span class="op">\</span></span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Chunk <span class="op">{</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_in <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_in <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> n <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> CallbackData <span class="op">{</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;*</span> finished<span class="op">;</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> chunk_id<span class="op">;</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> CUDART_CB on_d2h_done<span class="op">(</span><span class="dt">void</span><span class="op">*</span> user_data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span><span class="op">*</span> data <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span>CallbackData<span class="op">*&gt;(</span>user_data<span class="op">);</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>    data<span class="op">-&gt;</span>finished<span class="op">-&gt;</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_release<span class="op">);</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">delete</span> data<span class="op">;</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> run_async_pipeline<span class="op">(</span><span class="dt">size_t</span> chunk_count<span class="op">,</span> <span class="dt">size_t</span> n_per_chunk<span class="op">,</span> <span class="dt">float</span> alpha<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> n_per_chunk <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> copy_stream<span class="op">,</span> compute_stream<span class="op">,</span> out_stream<span class="op">;</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>copy_stream<span class="op">));</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>compute_stream<span class="op">));</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>out_stream<span class="op">));</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">cudaEvent_t</span><span class="op">&gt;</span> copy_done<span class="op">(</span>chunk_count<span class="op">);</span></span>
+<span id="cb13-45"><a href="#cb13-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">cudaEvent_t</span><span class="op">&gt;</span> compute_done<span class="op">(</span>chunk_count<span class="op">);</span></span>
+<span id="cb13-46"><a href="#cb13-46" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">cudaEvent_t</span><span class="op">&gt;</span> out_done<span class="op">(</span>chunk_count<span class="op">);</span></span>
+<span id="cb13-47"><a href="#cb13-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-48"><a href="#cb13-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> chunk_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-49"><a href="#cb13-49" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>copy_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-50"><a href="#cb13-50" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>compute_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-51"><a href="#cb13-51" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>out_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-52"><a href="#cb13-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-53"><a href="#cb13-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-54"><a href="#cb13-54" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>Chunk<span class="op">&gt;</span> chunks<span class="op">(</span>chunk_count<span class="op">);</span></span>
+<span id="cb13-55"><a href="#cb13-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> chunk_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-56"><a href="#cb13-56" aria-hidden="true" tabindex="-1"></a>        Chunk<span class="op">&amp;</span> c <span class="op">=</span> chunks<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb13-57"><a href="#cb13-57" aria-hidden="true" tabindex="-1"></a>        c<span class="op">.</span>n <span class="op">=</span> n_per_chunk<span class="op">;</span></span>
+<span id="cb13-58"><a href="#cb13-58" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>c<span class="op">.</span>h_in<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb13-59"><a href="#cb13-59" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>c<span class="op">.</span>h_out<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb13-60"><a href="#cb13-60" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>c<span class="op">.</span>d_in<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb13-61"><a href="#cb13-61" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>c<span class="op">.</span>d_out<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb13-62"><a href="#cb13-62" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> n_per_chunk<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> c<span class="op">.</span>h_in<span class="op">[</span>j<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>j<span class="op">)</span> <span class="op">*</span> <span class="fl">0.001</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb13-63"><a href="#cb13-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-64"><a href="#cb13-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-65"><a href="#cb13-65" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;</span> finished<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb13-66"><a href="#cb13-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-67"><a href="#cb13-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> chunk_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-68"><a href="#cb13-68" aria-hidden="true" tabindex="-1"></a>        Chunk<span class="op">&amp;</span> c <span class="op">=</span> chunks<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb13-69"><a href="#cb13-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-70"><a href="#cb13-70" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>c<span class="op">.</span>d_in<span class="op">,</span> c<span class="op">.</span>h_in<span class="op">,</span> bytes<span class="op">,</span></span>
+<span id="cb13-71"><a href="#cb13-71" aria-hidden="true" tabindex="-1"></a>                                cudaMemcpyHostToDevice<span class="op">,</span> copy_stream<span class="op">));</span></span>
+<span id="cb13-72"><a href="#cb13-72" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>copy_done<span class="op">[</span>i<span class="op">],</span> copy_stream<span class="op">));</span></span>
+<span id="cb13-73"><a href="#cb13-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-74"><a href="#cb13-74" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaStreamWaitEvent<span class="op">(</span>compute_stream<span class="op">,</span> copy_done<span class="op">[</span>i<span class="op">],</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb13-75"><a href="#cb13-75" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> block <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb13-76"><a href="#cb13-76" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> grid <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;((</span>n_per_chunk <span class="op">+</span> block <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block<span class="op">);</span></span>
+<span id="cb13-77"><a href="#cb13-77" aria-hidden="true" tabindex="-1"></a>        scale_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> compute_stream<span class="op">&gt;&gt;&gt;(</span></span>
+<span id="cb13-78"><a href="#cb13-78" aria-hidden="true" tabindex="-1"></a>            c<span class="op">.</span>d_in<span class="op">,</span> c<span class="op">.</span>d_out<span class="op">,</span> alpha<span class="op">,</span> c<span class="op">.</span>n<span class="op">);</span></span>
+<span id="cb13-79"><a href="#cb13-79" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb13-80"><a href="#cb13-80" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>compute_done<span class="op">[</span>i<span class="op">],</span> compute_stream<span class="op">));</span></span>
+<span id="cb13-81"><a href="#cb13-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-82"><a href="#cb13-82" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaStreamWaitEvent<span class="op">(</span>out_stream<span class="op">,</span> compute_done<span class="op">[</span>i<span class="op">],</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb13-83"><a href="#cb13-83" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>c<span class="op">.</span>h_out<span class="op">,</span> c<span class="op">.</span>d_out<span class="op">,</span> bytes<span class="op">,</span></span>
+<span id="cb13-84"><a href="#cb13-84" aria-hidden="true" tabindex="-1"></a>                                cudaMemcpyDeviceToHost<span class="op">,</span> out_stream<span class="op">));</span></span>
+<span id="cb13-85"><a href="#cb13-85" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaStreamAddCallback<span class="op">(</span></span>
+<span id="cb13-86"><a href="#cb13-86" aria-hidden="true" tabindex="-1"></a>            out_stream<span class="op">,</span> on_d2h_done<span class="op">,</span></span>
+<span id="cb13-87"><a href="#cb13-87" aria-hidden="true" tabindex="-1"></a>            <span class="kw">new</span> CallbackData<span class="op">{&amp;</span>finished<span class="op">,</span> i<span class="op">},</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb13-88"><a href="#cb13-88" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>out_done<span class="op">[</span>i<span class="op">],</span> out_stream<span class="op">));</span></span>
+<span id="cb13-89"><a href="#cb13-89" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-90"><a href="#cb13-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-91"><a href="#cb13-91" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> chunk_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-92"><a href="#cb13-92" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>out_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-93"><a href="#cb13-93" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-94"><a href="#cb13-94" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-95"><a href="#cb13-95" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>copy_stream<span class="op">));</span></span>
+<span id="cb13-96"><a href="#cb13-96" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>compute_stream<span class="op">));</span></span>
+<span id="cb13-97"><a href="#cb13-97" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>out_stream<span class="op">));</span></span>
+<span id="cb13-98"><a href="#cb13-98" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-99"><a href="#cb13-99" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;pipeline done, callbacks: </span><span class="sc">%zu</span><span class="st">/</span><span class="sc">%zu\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb13-100"><a href="#cb13-100" aria-hidden="true" tabindex="-1"></a>                finished<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_acquire<span class="op">),</span> chunk_count<span class="op">);</span></span>
+<span id="cb13-101"><a href="#cb13-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-102"><a href="#cb13-102" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>Chunk<span class="op">&amp;</span> c <span class="op">:</span> chunks<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-103"><a href="#cb13-103" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaFreeHost<span class="op">(</span>c<span class="op">.</span>h_in<span class="op">));</span></span>
+<span id="cb13-104"><a href="#cb13-104" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaFreeHost<span class="op">(</span>c<span class="op">.</span>h_out<span class="op">));</span></span>
+<span id="cb13-105"><a href="#cb13-105" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>c<span class="op">.</span>d_in<span class="op">));</span></span>
+<span id="cb13-106"><a href="#cb13-106" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>c<span class="op">.</span>d_out<span class="op">));</span></span>
+<span id="cb13-107"><a href="#cb13-107" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-108"><a href="#cb13-108" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> chunk_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-109"><a href="#cb13-109" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>copy_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-110"><a href="#cb13-110" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>compute_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-111"><a href="#cb13-111" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>out_done<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb13-112"><a href="#cb13-112" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-113"><a href="#cb13-113" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>copy_stream<span class="op">));</span></span>
+<span id="cb13-114"><a href="#cb13-114" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>compute_stream<span class="op">));</span></span>
+<span id="cb13-115"><a href="#cb13-115" aria-hidden="true" tabindex="-1"></a>    CK_CUDA<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>out_stream<span class="op">));</span></span>
+<span id="cb13-116"><a href="#cb13-116" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb13-117"><a href="#cb13-117" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-118"><a href="#cb13-118" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb13-119"><a href="#cb13-119" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> chunk_count <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb13-120"><a href="#cb13-120" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> n_per_chunk <span class="op">=</span> <span class="dv">1</span><span class="bu">u</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span> <span class="co">// 1 Mi float, 4 MiB per chunk</span></span>
+<span id="cb13-121"><a href="#cb13-121" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> alpha <span class="op">=</span> <span class="fl">1.5</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb13-122"><a href="#cb13-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-123"><a href="#cb13-123" aria-hidden="true" tabindex="-1"></a>    <span class="co">// warm-up egyszer</span></span>
+<span id="cb13-124"><a href="#cb13-124" aria-hidden="true" tabindex="-1"></a>    run_async_pipeline<span class="op">(</span><span class="dv">8</span><span class="op">,</span> n_per_chunk<span class="op">,</span> alpha<span class="op">);</span></span>
+<span id="cb13-125"><a href="#cb13-125" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-126"><a href="#cb13-126" aria-hidden="true" tabindex="-1"></a>    <span class="co">// mérés: 10 ismétlés</span></span>
+<span id="cb13-127"><a href="#cb13-127" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> rep <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> rep <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>rep<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-128"><a href="#cb13-128" aria-hidden="true" tabindex="-1"></a>        <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb13-129"><a href="#cb13-129" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb13-130"><a href="#cb13-130" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb13-131"><a href="#cb13-131" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb13-132"><a href="#cb13-132" aria-hidden="true" tabindex="-1"></a>        run_async_pipeline<span class="op">(</span>chunk_count<span class="op">,</span> n_per_chunk<span class="op">,</span> alpha<span class="op">);</span></span>
+<span id="cb13-133"><a href="#cb13-133" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb13-134"><a href="#cb13-134" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb13-135"><a href="#cb13-135" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb13-136"><a href="#cb13-136" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb13-137"><a href="#cb13-137" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;rep </span><span class="sc">%d</span><span class="st">: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> rep<span class="op">,</span> ms<span class="op">);</span></span>
+<span id="cb13-138"><a href="#cb13-138" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb13-139"><a href="#cb13-139" aria-hidden="true" tabindex="-1"></a>        CK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb13-140"><a href="#cb13-140" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-141"><a href="#cb13-141" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb13-142"><a href="#cb13-142" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kódban minden kernelindítás után <code>cudaGetLastError</code>,
+minden szinkronizálás után <code>CK_CUDA</code> fut. A callback csak
+atomi számlálót növel, ezért rövid marad.</p>
+<h3 data-number="25.4.20" id="fordítás-és-futtatás"><span
+class="header-section-number">25.4.20</span> 5.4. Fordítás és
+futtatás</h3>
+<p>Fordítás:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> async_pipeline async_pipeline.cu</span></code></pre></div>
+<p>Futtatás izolált laborban:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 120 ./async_pipeline</span></code></pre></div>
+<p>Ha a kód hosszabb ideig futna, a <code>timeout</code> és a konténer
+erőforráskorlátja megakadályozza a beragadt kernelt.</p>
+<h3 data-number="25.4.21" id="mérési-napló"><span
+class="header-section-number">25.4.21</span> 5.5. Mérési napló</h3>
+<p>A mérési naplóban a <strong>várt</strong> és a <strong>mért</strong>
+értékeket külön kell vezetni. Az alábbi táblázat kitöltendő; az itt
+feltüntetett számok nem tekinthetők hiteles mérésnek.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mérőszám</th>
+<th>Várt</th>
+<th>Mért</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Teljes adatmennyiség</td>
+<td>256 × 4 MiB = 1 GiB</td>
+<td><code>&lt;rögzítendő&gt;</code></td>
+</tr>
+<tr class="even">
+<td>Kernelszámítási idő, eszközmemória alapján</td>
+<td>≈ 2 GiB / ~1,5 TB/s ≈ 1,4 ms</td>
+<td><code>&lt;Nsight Compute vagy event&gt;</code></td>
+</tr>
+<tr class="odd">
+<td>H2D másolási idő, PCIe alapján</td>
+<td>≈ 1 GiB / ~12–25 GiB/s</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr class="even">
+<td>D2H másolási idő</td>
+<td>≈ 1 GiB / ~12–25 GiB/s</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr class="odd">
+<td>Ideális átfedéses átfutás</td>
+<td>max(H2D, D2H, kernel) + overhead</td>
+<td><code>&lt;mérési napló&gt;</code></td>
+</tr>
+<tr class="even">
+<td>10 futtatás mediánja</td>
+<td><code>&lt;várt formula&gt;</code></td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr class="odd">
+<td>Első chunk callback késleltetés</td>
+<td>kis, stream ütemezés + kernel</td>
+<td><code>&lt;mérendő&gt;</code></td>
+</tr>
+<tr class="even">
+<td>Nsight Systems átfedési arány</td>
+<td>cél &gt; 90%</td>
+<td><code>&lt;Nsight riport&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>A várt értékeknél mindig írjuk le, mely sávszélességből vagy
+eszközteljesítményből származnak, és hogy milyen feltételezésekkel
+élünk. Például ha a PCIe irányonkénti sávszélessége 12 GiB/s, akkor a
+H2D várhatóan 1 GiB / 12 GiB/s ≈ 0,083 s, a D2H hasonló. Ha a PCIe
+duplex, a teljes átfutás közel lehet a nagyobbik irány idejéhez; ha nem
+teljesen átfedhető, akkor az összeghez.</p>
+<h3 data-number="25.4.22" id="értékelési-szempontok"><span
+class="header-section-number">25.4.22</span> 5.6. Értékelési
+szempontok</h3>
+<p>A labor akkor sikeres, ha:</p>
+<ul>
+<li>a callbackek száma megegyezik a chunkok számával,</li>
+<li>a mért teljes átfutás a várt aszinkron képlet közelében van,</li>
+<li>az Nsight Systems profilban a H2D, kernel és D2H fázisok átfedése
+látható,</li>
+<li>nincs felszabadítási hiba vagy memóriaszivárgás,</li>
+<li>a leállítás után minden CUDA API-hibaellenőrzés tiszta.</li>
+</ul>
+<h3 data-number="25.4.23" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">25.4.23</span> 6. Tipikus hibák és helyes
+megoldások</h3>
+<p>Az aszinkron tervezési mintákban visszatérő hibák:</p>
+<ol type="1">
+<li><p><strong>Default stream használata nem non-blocking
+módban.</strong> A default stream szinkronizációs szemantikája miatt az
+implicit szinkronizáció tönkreteheti az átfedést. Használjunk explicit
+streameket, és ha szükséges, <code>cudaStreamNonBlocking</code>
+flaget.</p></li>
+<li><p><strong>Esemény újrahasznosítása chunkok között.</strong> Ha
+ugyanazt az eventet rögzítjük több chunkhoz, az függőségi
+bizonytalanságot okozhat. Használjunk event poolt vagy chunkonkénti
+eventet.</p></li>
+<li><p><strong>callbackből szinkronizálás vagy hosszú munka.</strong> A
+callback blokkolja az adott stream további ütemezését. Csak rövid
+értesítést tegyünk bele.</p></li>
+<li><p><strong>Memória felszabadítása szinkronizálás nélkül.</strong> A
+stream még használhatja a buffert. Előbb
+<code>cudaStreamSynchronize</code> vagy
+<code>cudaEventSynchronize</code>, majd
+<code>cudaFreeHost</code>.</p></li>
+<li><p><strong>A hibaellenőrzés elhagyása a szinkronizálás
+után.</strong> A launch utáni <code>cudaGetLastError</code> nem mutatja
+az aszinkron hibát. A szinkronizáló hívás visszatérési értékét is
+ellenőrizni kell.</p></li>
+<li><p><strong>Korlátlan chunk-ablak.</strong> Hosszú futású
+pipeline-ban a host elébe megy a GPU-nak, ami memórianyomást és
+event-túlcsordulást okozhat. Vezessünk be legfeljebb <code>W</code>
+folyamatban lévő chunkot.</p></li>
+<li><p><strong>Interaktív leállítás tervezése nélkül.</strong> Ha egy
+hosszú kernel nem ellenőriz leállítási flaget, a felhasználó nem tudja
+megszakítani. Tervezzük meg a cooperativ cancel mechanizmust már a
+kernel API-jában.</p></li>
+</ol>
+<h3 data-number="25.4.24" id="opencl--és-jax-vonatkozások"><span
+class="header-section-number">25.4.24</span> 7. OpenCL- és
+JAX-vonatkozások</h3>
+<p>Az aszinkron tervezési alapelvek nem csak CUDA-ra érvényesek.</p>
+<ul>
+<li><strong>OpenCL:</strong> az out-of-order command queue, a
+<code>cl_event</code> és a <code>clSetEventCallback</code> hasonló
+szerepet töltenek be. A work-group és a command-queue közötti függőségek
+explicit eventekkel adhatók meg. A callback ott is host-oldali
+befejezésértesítést ad.</li>
+<li><strong>JAX:</strong> az API hívásai gyakran aszinkron dispatch-ek;
+a <code>block_until_ready()</code> explicit szinkronizálás, a hiánya
+pedig lehetővé teszi az XLA által szervezett pipeline-t. A JAX-keretben
+a callback- és eseménykezelés gyakran rejtve marad, de a sharding és az
+eszköz-összehangolás mögött ugyanazok a függőségi gráfok dolgoznak.</li>
+</ul>
+<h3 data-number="25.4.25" id="önellenőrző-kérdések"><span
+class="header-section-number">25.4.25</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért nem elég a <code>cudaGetLastError()</code> közvetlenül a
+kernelindítás után egy hosszú aszinkron pipeline hibáinak
+kimutatására?</li>
+<li>Hogyan terveznéd meg egy olyan GPU-feladat leállítását, amely
+egyetlen nagy grid-stride kernelben dolgozik fel egy nagy
+adathalmazt?</li>
+<li>Milyen veszélye van annak, ha hosszú futású pipeline-ban minden
+chunkhoz új pinned memóriát allokálunk?</li>
+<li>Mi a különbség az event <code>cudaEventQuery</code>, a
+<code>cudaEventSynchronize</code> és a
+<code>cudaStreamSynchronize</code> szerepe között egy interaktív
+alkalmazásban?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu096.html">← 25.3 CUDA graphs</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu098.html">26.1 Több GPU és peer access →</a></div>
+</nav>
+</body>
+</html>

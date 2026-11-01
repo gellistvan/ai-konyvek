@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>23.2 CUTLASS – GPGPU – általános célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch22">23 CUTLASS, tensor cores és mixed precision</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu086.html">← 23.1 Tensor Core architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu088.html">23.3 Mixed precision →</a></div>
+</nav>
+<h2 data-number="23.2" id="gpu087"><span
+class="header-section-number">23.2</span> CUTLASS</h2>
+<p>A CUTLASS (CUDA Templates for Linear Algebra Subroutines and Solvers)
+az NVIDIA nyílt forráskódú, kizárólag C++ sablonokra épülő könyvtára,
+amely hatékony GPU-implementációkat ad a lineáris algebrai
+primitívekhez, elsősorban a GEMM-hez. A CUTLASS nem egy fekete doboz: a
+fejlesztő fordítási időben dönt a tile méretekről, a
+memória-elrendezésről, a pipeline mélységéről és az epilogue
+műveletéről. Ez a fejezet a CUTLASS GEMM hierarchiáját mutatja be, és
+egy izolált laboron keresztül demonstrálja a használatát.</p>
+<h3 data-number="23.2.1"
+id="a-cutlass-sablonkönyvtár-és-a-gemm-hierarchia"><span
+class="header-section-number">23.2.1</span> A CUTLASS sablonkönyvtár és
+a GEMM hierarchia</h3>
+<p>A CUTLASS alapgondolata az, hogy a GEMM-et rétegesen bontja fel, és
+minden réteget külön sablonparaméterként kezel. A hierarchia alulról
+felfelé a következő:</p>
+<ul>
+<li><strong>Thread szint:</strong> a legelemibb szint, amely a
+memória-hozzáférésekért és az epilogue műveleteiért felel. Itt történik
+a vektorizált betöltés, a kimeneti elemek megformázása, valamint a
+skálázás és az aktiváció.</li>
+<li><strong>Warp szint:</strong> a warpok a Tensor Core
+<code>mma.sync</code> utasításokat hajtják végre, és a hozzájuk tartozó
+fragmenteket kezelik. A CUTLASS itt definiálja a warp tile méreteit,
+amelyek meghatározzák, hogy egy warp hány adatelemen dolgozik
+egyszerre.</li>
+<li><strong>Threadblock szint:</strong> egy SM-re kerülő szálblokk,
+amely a threadblock tile-t birtokolja. A threadblock felelős a shared
+memory-ba való betöltésért, a warpok közötti munkamegosztásért és a K
+dimenzió mentén történő iterációért.</li>
+<li><strong>Kernel szint:</strong> a GPU kernel függvénye, amely a
+gridet és a threadblockok közötti swizzle-t vezérli.</li>
+<li><strong>Device szint:</strong> a teljes GEMM művelet, amely a kernel
+launch konfigurációját, a workspace memóriát és a streamet foglalja
+össze.</li>
+</ul>
+<p>A hierarchia lelkét a <strong>tile</strong> fogalma adja. A CUTLASS a
+teljes mátrixszorzást kisebb, jól meghatározott méretű blokkokra osztja.
+Például egy FP16 Tensor Core GEMM esetében tipikus konfiguráció:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Gemm <span class="op">=</span> cutlass<span class="op">::</span>gemm<span class="op">::</span>device<span class="op">::</span>Gemm<span class="op">&lt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">,</span>   <span class="co">// A</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">,</span>   <span class="co">// B</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">,</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">,</span>             <span class="co">// C</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">,</span>                                         <span class="co">// akkumulátor</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>arch<span class="op">::</span>OpClassTensorOp<span class="op">,</span>                <span class="co">// Tensor Core</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>arch<span class="op">::</span>Sm80<span class="op">,</span>                           <span class="co">// compute capability</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">128</span><span class="op">,</span> <span class="dv">128</span><span class="op">,</span> <span class="dv">32</span><span class="op">&gt;,</span>        <span class="co">// threadblock tile</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">64</span><span class="op">,</span> <span class="dv">64</span><span class="op">,</span> <span class="dv">32</span><span class="op">&gt;,</span>          <span class="co">// warp tile</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">16</span><span class="op">,</span> <span class="dv">8</span><span class="op">,</span> <span class="dv">8</span><span class="op">&gt;,</span>            <span class="co">// instruction shape</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>epilogue<span class="op">::</span>thread<span class="op">::</span>LinearCombination<span class="op">&lt;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span><span class="op">,</span> <span class="dv">128</span> <span class="op">/</span> cutlass<span class="op">::</span>sizeof_bits<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;::</span>value<span class="op">,</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span><span class="op">,</span> <span class="dt">float</span><span class="op">&gt;,</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>threadblock<span class="op">::</span>GemmIdentityThreadblockSwizzle<span class="op">&lt;&gt;,</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="dv">3</span>                                                <span class="co">// pipeline stages</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="op">&gt;;</span></span></code></pre></div>
+<p>Ebben a konfigurációban a threadblock tile 128×128×32: minden
+szálblokk egy 128 sorból, 128 oszlopból és 32 K-mélységből álló
+mátrixszeletet dolgoz fel. A warp tile 64×64×32: a threadblock 4 warpja
+(2×2) ilyen altile-eket kap. Az instruction shape 16×8×8 az FP16 Tensor
+Core <code>mma.sync</code> utasítás geometriája. A pipeline stages
+értéke 3, ami azt jelenti, hogy a CUTLASS a K dimenzió mentén három
+K-tile-t tölt be előre a shared memory-ba, átfedve a memória-hozzáférést
+és a számítást.</p>
+<h3 data-number="23.2.2" id="tile-warp-és-threadblock"><span
+class="header-section-number">23.2.2</span> Tile, warp és
+threadblock</h3>
+<p>A CUTLASS GEMM végrehajtása a következő lépésekből áll. A grid a M és
+N dimenziók mentén osztja fel a kimeneti mátrixot. Minden threadblock
+egy (CTileM × CTileN) kimeneti régiót kap. A K dimenzió mentén a
+threadblock szekvenciálisan halad: minden iterációban betölt egy (CTileM
+× CTileK) méretű A-szeletet és egy (CTileK × CTileN) méretű B-szeletet a
+global memóriából a shared memory-ba. Ezt követően a warpok a shared
+memory-ból olvasnak, és a Tensor Core <code>mma</code> utasításokkal
+kiszámítják a részösszeget, amelyet a regiszterekben akkumulálnak.
+Amikor a teljes K dimenziót bejárták, az epilogue kiírja az eredményt a
+global memóriába.</p>
+<p>A threadblock tile méretének megválasztása kulcsfontosságú. A nagyobb
+tile jobb adat-újrafelhasználást tesz lehetővé, mert a shared memory-ból
+többször olvassák be ugyanazt az elemet, csökkentve a global memória
+forgalmát. Ugyanakkor a nagyobb tile több shared memory-t fogyaszt, és
+kevesebb szálblokk fér el egy SM-en, ami rontja az occupancy-t. A
+CUTLASS a shared memory igényt a tile méretekből és a pipeline
+stage-ekből számítja ki. Ha a konfiguráció nem fér el az SM shared
+memory limitjében, a fordító hibát ad.</p>
+<p>A warp tile határozza meg, hogy a threadblockon belül hogyan oszlanak
+meg a feladatok. A fenti példában a 128×128-as threadblock tile-t 2×2-es
+warp rácsra osztjuk, így minden warp egy 64×64-es altile-t kap. A warp
+az <code>MmaTensorOp</code> operátorral dolgozik, amely a Tensor Core
+<code>mma.sync</code> utasítást használja. Az instruction shape 16×8×8
+azt jelenti, hogy egyetlen <code>mma.sync</code> hívás 16×8×8 elemet
+számol ki. A warp a saját altile-jét több ilyen <code>mma</code>
+utasításra bontja.</p>
+<p>A CUTLASS 3.x-ben a <code>cute</code> (CUDA Templates for Efficient)
+absztrakció tovább egyszerűsíti a hierarchiát. A <code>cute::gemm</code>
+ugyanazt a hardvert célozza, de magasabb szintű, funkcionálisabb
+felületet ad. A klasszikus CUTLASS 2.x API azonban továbbra is elérhető,
+és jól szemlélteti a hierarchikus tiling fogalmát. A laborban ezért a
+klasszikus API-t használjuk.</p>
+<h3 data-number="23.2.3" id="epilogue"><span
+class="header-section-number">23.2.3</span> Epilogue</h3>
+<p>Az epilogue a CUTLASS azon rétege, amely a Tensor Core kimeneti
+fragmentjeit feldolgozza és a global memóriába írja. Az epilogue
+elkülönítése azért fontos, mert a GEMM magja nem változik, ha például
+bias-t, ReLU-t vagy skálázást akarunk hozzáadni. A CUTLASS az
+epilogue-ot funktorként valósítja meg, így a felhasználó saját
+epilogue-ot írhat anélkül, hogy a kernel többi részét módosítaná.</p>
+<p>A leggyakoribb epilogue a
+<code>cutlass::epilogue::thread::LinearCombination</code>, amely a<br />
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mi>α</mi><mo>⋅</mo><mi>A</mi><mo>⋅</mo><mi>B</mi><mo>+</mo><mi>β</mi><mo>⋅</mo><mi>C</mi></mrow><annotation encoding="application/x-tex">
+C = \alpha \cdot A \cdot B + \beta \cdot C
+</annotation></semantics></math> műveletet végzi. A fenti
+sablonparaméterben a <code>LinearCombination</code> az
+<code>ElementC</code> típusú kimeneti elemeket kezeli, és az FP32
+akkumulátor értékeket a kívánt kimeneti típusra konvertálja. Az epilogue
+a thread szinten fut, és a fragmenteket a kimeneti layout szerint
+írja.</p>
+<p>Egyéni epilogue készítéséhez a CUTLASS a
+<code>cutlass::epilogue::thread::LinearCombination</code>-t lehet alapul
+venni, vagy a <code>cutlass::epilogue::thread::Epilogue</code> sablont
+közvetlenül testreszabni. Például egy ReLU epilogue a következőképpen
+nézhet ki:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ReluEpilogue <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">template</span> <span class="op">&lt;</span><span class="kw">typename</span> FragmentC<span class="op">,</span> <span class="kw">typename</span> FragmentD<span class="op">&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="kw">operator</span><span class="op">()(</span>FragmentC <span class="op">&amp;</span>acc<span class="op">,</span> FragmentD <span class="op">&amp;</span>out<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>        <span class="pp">#pragma unroll</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> acc<span class="op">.</span>size<span class="op">();</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>            out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>acc<span class="op">[</span>i<span class="op">]</span> <span class="op">&gt;</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">)</span> <span class="op">?</span> acc<span class="op">[</span>i<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Ezt a funktort a CUTLASS epilogue pipeline-jába illesztve a GEMM
+kimenetén közvetlenül ReLU aktivációt alkalmazhatunk. A CUTLASS 2.x-ben
+a <code>cutlass::epilogue::threadblock::Epilogue</code> és a
+<code>cutlass::epilogue::thread::Epilogue</code> sablonok együttese
+biztosítja ezt a rugalmasságot.</p>
+<h3 data-number="23.2.4" id="streamk"><span
+class="header-section-number">23.2.4</span> Streamk</h3>
+<p>A hagyományos data-parallel GEMM a gridet az M és N dimenziók mentén
+osztja fel, és minden threadblock a teljes K dimenziót bejárja. Ez a
+megközelítés akkor optimális, ha a threadblockok száma jól illeszkedik
+az SM-ek számához, és a K dimenzió elegendően nagy ahhoz, hogy a
+pipeline feltöltődjön. Ha azonban a K dimenzió rövid, vagy a
+threadblockok száma nem tölti ki a GPU-t, a terhelés egyenetlen lesz,
+mert néhány SM hamarabb végez, mint a többi.</p>
+<p>A <strong>stream-K</strong> a CUTLASS 3.x egyik fontos újdonsága.
+Ahelyett, hogy minden threadblock a teljes K dimenziót dolgozná fel, a
+stream-K a K dimenzió mentén is partícionál. Minden threadblock egy
+(M-tile, N-tile, K-szelet) darabot kap, és a részösszegeket atomikusan
+adja össze a global memóriában. Ez a módszer jobb terheléselosztást
+eredményez, mert a threadblockok kisebb K-tartományokat dolgoznak fel,
+és a GPU hullámossága kiegyenlítettebbé válik.</p>
+<p>A stream-K különösen akkor előnyös, ha a teljes K dimenzió nem
+osztható egyenletesen a pipeline stage-ekre, vagy ha a mátrix mérete nem
+ideálisan illeszkedik a threadblock rácsra. A CUTLASS 3.x a
+<code>cutlass::gemm::kernel::GemmUniversal</code> sablonban a
+<code>KernelSchedule::StreamK</code> opcióval választható. A laborban a
+hagyományos data-parallel konfigurációt használjuk, mert a CUTLASS 2.x
+API-ban a stream-K nem érhető el, és a hierarchia fogalmai a klasszikus
+konfiguráción keresztül jobban szemléltethetők.</p>
+<h3 data-number="23.2.5" id="gyakori-hibák-és-megoldások"><span
+class="header-section-number">23.2.5</span> Gyakori hibák és
+megoldások</h3>
+<p>A CUTLASS használata során a következő tipikus hibákra érdemes
+figyelni:</p>
+<ol type="1">
+<li><p><strong>A shared memory limit figyelmen kívül hagyása.</strong> A
+túl nagy tile vagy túl sok pipeline stage miatt a szükséges shared
+memory meghaladja az SM kapacitását. Fordítási hiba keletkezik, amelyet
+a <code>-Xptxas -v</code> kapcsolóval ellenőrizhetünk. Megoldás:
+csökkentsük a tile méretet vagy a stage-ek számát.</p></li>
+<li><p><strong>A mutatók 16 byte-os igazításának elhagyása.</strong> A
+CUTLASS vectorizált betöltést használ, amely feltételezi, hogy a global
+memória pointerek 16 byte-ra igazítottak. Ha ez nem teljesül, a kernel
+lelassul, vagy hibás eredményt ad. Megoldás: <code>cudaMalloc</code>
+helyett <code>cudaMallocManaged</code>-et vagy
+<code>cudaMalloc</code>-ot használjunk megfelelő igazítással, illetve a
+CUTLASS <code>device_memory::allocation</code> osztályát.</p></li>
+<li><p><strong>Az epilogue típusainak eltévesztése.</strong> Ha a
+kimeneti mátrix típusa FP16, de az epilogue FP32-re van beállítva, a
+<code>LinearCombination</code> nem konvertál megfelelően, és a numerikus
+tartomány túlcsordulhat. Megoldás: mindig ellenőrizzük az
+<code>ElementC</code> és az epilogue <code>ElementOutput</code>
+típusainak egyezését.</p></li>
+<li><p><strong>A stream-K atomikus hozzáadásainak nem determinisztikus
+sorrendje.</strong> A stream-K modellben a részösszegeket atomikusan
+adják össze, ami a lebegőpontos kerekítés miatt nem garantál bit-azonos
+eredményt. Ha determinizmus szükséges, használjunk hagyományos
+data-parallel konfigurációt, vagy rögzítsük a végrehajtási
+sorrendet.</p></li>
+<li><p><strong>A pipeline stage-ek helytelen beállítása.</strong> Túl
+kevés stage nem fedi át a memória-hozzáférést és a számítást, túl sok
+stage pedig feleslegesen foglalja a shared memory-t. A legtöbb Tensor
+Core konfigurációnál a 3–5 stage optimális.</p></li>
+</ol>
+<h3 data-number="23.2.6" id="labor-cutlass-gemm-példa"><span
+class="header-section-number">23.2.6</span> Labor: CUTLASS GEMM
+példa</h3>
+<p>Ez a labor egy FP16 Tensor Core GEMM-et futtat a CUTLASS
+segítségével, és ellenőrzi az eredményt egy CPU referencia ellen. A cél
+a hierarchikus tiling, az epilogue és a mérési módszertan gyakorlati
+bemutatása.</p>
+<h3 data-number="23.2.7" id="labor-környezet"><span
+class="header-section-number">23.2.7</span> Labor környezet</h3>
+<p>A mérés izolált laborban, az alábbi konfigurációban készült:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>NVIDIA A100 80 GB PCIe, compute capability 8.0</td>
+</tr>
+<tr class="even">
+<td>CUDA</td>
+<td>12.4</td>
+</tr>
+<tr class="odd">
+<td>Driver</td>
+<td>550.54.15</td>
+</tr>
+<tr class="even">
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04</td>
+</tr>
+<tr class="odd">
+<td>CUTLASS</td>
+<td>3.5 (a példa a 2.x API-t használja)</td>
+</tr>
+<tr class="even">
+<td>Fordító</td>
+<td>nvcc 12.4, C++17</td>
+</tr>
+</tbody>
+</table>
+<p>A mátrix méret:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>=</mo><mi>N</mi><mo>=</mo><mi>K</mi><mo>=</mo><mn>16384</mn></mrow><annotation encoding="application/x-tex">M = N = K = 16384</annotation></semantics></math>.
+Az A és B mátrixok FP16 típusúak, a C kimenet FP32. Az elemek 0.5-re
+vannak állítva, így a várt matematikai eredmény minden elemre:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>16384</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>=</mo><mn>4096</mn><mo>,</mo><mn>0</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+16384 \cdot 0{,}5 \cdot 0{,}5 = 4096{,}0.
+</annotation></semantics></math> A CUTLASS konfiguráció a fent
+bemutatott FP16 Tensor Core GEMM, 128×128×32 threadblock tile, 64×64×32
+warp tile, 16×8×8 instruction shape, 3 pipeline stage.</p>
+<h3 data-number="23.2.8" id="cuda-c-kód"><span
+class="header-section-number">23.2.8</span> CUDA C++ kód</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cutlass/cutlass.h&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cutlass/gemm/device/gemm.h&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cutlass/util/host_tensor.h&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cutlass/util/device_memory.h&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;: &quot;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="pp">                  </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUTLASS_CHECK</span><span class="op">(</span>status<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span>cutlass<span class="op">::</span>Status<span class="pp"> </span><span class="va">status_</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>status<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span><span class="va">status_</span><span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cutlass<span class="op">::</span>Status<span class="op">::</span>kSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUTLASS error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> ElementA <span class="op">=</span> cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> ElementB <span class="op">=</span> cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> ElementC <span class="op">=</span> <span class="dt">float</span><span class="op">;</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> ElementAccumulator <span class="op">=</span> <span class="dt">float</span><span class="op">;</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> LayoutA <span class="op">=</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">;</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> LayoutB <span class="op">=</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">;</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> LayoutC <span class="op">=</span> cutlass<span class="op">::</span>layout<span class="op">::</span>RowMajor<span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Gemm <span class="op">=</span> cutlass<span class="op">::</span>gemm<span class="op">::</span>device<span class="op">::</span>Gemm<span class="op">&lt;</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    ElementA<span class="op">,</span> LayoutA<span class="op">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    ElementB<span class="op">,</span> LayoutB<span class="op">,</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    ElementC<span class="op">,</span> LayoutC<span class="op">,</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    ElementAccumulator<span class="op">,</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>arch<span class="op">::</span>OpClassTensorOp<span class="op">,</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>arch<span class="op">::</span>Sm80<span class="op">,</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">128</span><span class="op">,</span> <span class="dv">128</span><span class="op">,</span> <span class="dv">32</span><span class="op">&gt;,</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">64</span><span class="op">,</span> <span class="dv">64</span><span class="op">,</span> <span class="dv">32</span><span class="op">&gt;,</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmShape<span class="op">&lt;</span><span class="dv">16</span><span class="op">,</span> <span class="dv">8</span><span class="op">,</span> <span class="dv">8</span><span class="op">&gt;,</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>epilogue<span class="op">::</span>thread<span class="op">::</span>LinearCombination<span class="op">&lt;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        ElementC<span class="op">,</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>        <span class="dv">128</span> <span class="op">/</span> cutlass<span class="op">::</span>sizeof_bits<span class="op">&lt;</span>ElementC<span class="op">&gt;::</span>value<span class="op">,</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        ElementAccumulator<span class="op">,</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>        ElementAccumulator<span class="op">&gt;,</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>threadblock<span class="op">::</span>GemmIdentityThreadblockSwizzle<span class="op">&lt;&gt;,</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="dv">3</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a><span class="op">&gt;;</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> M <span class="op">=</span> <span class="dv">16384</span><span class="op">,</span> N <span class="op">=</span> <span class="dv">16384</span><span class="op">,</span> K <span class="op">=</span> <span class="dv">16384</span><span class="op">;</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host mátrixok</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>HostTensor<span class="op">&lt;</span>ElementA<span class="op">,</span> LayoutA<span class="op">&gt;</span> A<span class="op">({</span>M<span class="op">,</span> K<span class="op">});</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>HostTensor<span class="op">&lt;</span>ElementB<span class="op">,</span> LayoutB<span class="op">&gt;</span> B<span class="op">({</span>K<span class="op">,</span> N<span class="op">});</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>HostTensor<span class="op">&lt;</span>ElementC<span class="op">,</span> LayoutC<span class="op">&gt;</span> C<span class="op">({</span>M<span class="op">,</span> N<span class="op">});</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> M <span class="op">*</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> A<span class="op">.</span>host_data<span class="op">()[</span>i<span class="op">]</span> <span class="op">=</span> cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">(</span><span class="fl">0.5</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K <span class="op">*</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> B<span class="op">.</span>host_data<span class="op">()[</span>i<span class="op">]</span> <span class="op">=</span> cutlass<span class="op">::</span><span class="dt">half_t</span><span class="op">(</span><span class="fl">0.5</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> M <span class="op">*</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> C<span class="op">.</span>host_data<span class="op">()[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device allokáció</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>device_memory<span class="op">::</span>allocation<span class="op">&lt;</span><span class="dt">uint8_t</span><span class="op">&gt;</span> d_A<span class="op">(</span>A<span class="op">.</span>bytes<span class="op">());</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>device_memory<span class="op">::</span>allocation<span class="op">&lt;</span><span class="dt">uint8_t</span><span class="op">&gt;</span> d_B<span class="op">(</span>B<span class="op">.</span>bytes<span class="op">());</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>device_memory<span class="op">::</span>allocation<span class="op">&lt;</span><span class="dt">uint8_t</span><span class="op">&gt;</span> d_C<span class="op">(</span>C<span class="op">.</span>bytes<span class="op">());</span></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_A<span class="op">.</span>get<span class="op">(),</span> A<span class="op">.</span>host_data<span class="op">(),</span> A<span class="op">.</span>bytes<span class="op">(),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_B<span class="op">.</span>get<span class="op">(),</span> B<span class="op">.</span>host_data<span class="op">(),</span> B<span class="op">.</span>bytes<span class="op">(),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_C<span class="op">.</span>get<span class="op">(),</span> C<span class="op">.</span>host_data<span class="op">(),</span> C<span class="op">.</span>bytes<span class="op">(),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>    <span class="co">// CUTLASS argumentumok</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmCoord problem_size<span class="op">(</span>M<span class="op">,</span> N<span class="op">,</span> K<span class="op">);</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>    ElementAccumulator alpha <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>    ElementAccumulator beta <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>    cutlass<span class="op">::</span>gemm<span class="op">::</span>GemmArguments args<span class="op">(</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>        problem_size<span class="op">,</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>ElementA<span class="op">*&gt;(</span>d_A<span class="op">.</span>get<span class="op">()),</span> K<span class="op">,</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>ElementB<span class="op">*&gt;(</span>d_B<span class="op">.</span>get<span class="op">()),</span> N<span class="op">,</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>ElementC<span class="op">*&gt;(</span>d_C<span class="op">.</span>get<span class="op">()),</span> N<span class="op">,</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>        <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>ElementC<span class="op">*&gt;(</span>d_C<span class="op">.</span>get<span class="op">()),</span> N<span class="op">,</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span>alpha<span class="op">,</span> <span class="op">&amp;</span>beta<span class="op">);</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>    Gemm gemm<span class="op">;</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>    CUTLASS_CHECK<span class="op">(</span>gemm<span class="op">(</span>args<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">));</span>   <span class="co">// warm-up</span></span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> num_runs <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> total_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> best_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_runs<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>        <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a>        cudaEventCreate<span class="op">(&amp;</span>start<span class="op">);</span></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a>        cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">);</span></span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>        cudaEventRecord<span class="op">(</span>start<span class="op">);</span></span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>        CUTLASS_CHECK<span class="op">(</span>gemm<span class="op">(</span>args<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">));</span></span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>        cudaEventRecord<span class="op">(</span>stop<span class="op">);</span></span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a>        cudaEventSynchronize<span class="op">(</span>stop<span class="op">);</span></span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> elapsed_ms<span class="op">;</span></span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>        cudaEventElapsedTime<span class="op">(&amp;</span>elapsed_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">);</span></span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>        total_ms <span class="op">+=</span> elapsed_ms<span class="op">;</span></span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>i <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> best_ms <span class="op">=</span> elapsed_ms<span class="op">;</span></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>        <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>elapsed_ms <span class="op">&lt;</span> best_ms<span class="op">)</span> best_ms <span class="op">=</span> elapsed_ms<span class="op">;</span></span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>        cudaEventDestroy<span class="op">(</span>start<span class="op">);</span></span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a>        cudaEventDestroy<span class="op">(</span>stop<span class="op">);</span></span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> avg_ms <span class="op">=</span> total_ms <span class="op">/</span> num_runs<span class="op">;</span></span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmény visszamásolása</span></span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>C<span class="op">.</span>host_data<span class="op">(),</span> d_C<span class="op">.</span>get<span class="op">(),</span> C<span class="op">.</span>bytes<span class="op">(),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés CPU referencia ellen</span></span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> max_error <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> M <span class="op">*</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> expected <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>K<span class="op">)</span> <span class="op">*</span> <span class="fl">0.5</span><span class="bu">f</span> <span class="op">*</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">;</span>  <span class="co">// 4096.0</span></span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a>        max_error <span class="op">=</span> <span class="bu">std::</span>max<span class="op">(</span>max_error<span class="op">,</span> <span class="bu">std::</span>abs<span class="op">(</span>C<span class="op">.</span>host_data<span class="op">()[</span>i<span class="op">]</span> <span class="op">-</span> expected<span class="op">));</span></span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> flops <span class="op">=</span> <span class="fl">2.0</span> <span class="op">*</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>M<span class="op">)</span> <span class="op">*</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>N<span class="op">)</span> <span class="op">*</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>K<span class="op">);</span></span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> tflops <span class="op">=</span> flops <span class="op">/</span> <span class="op">(</span>avg_ms <span class="op">*</span> <span class="fl">1e-3</span><span class="op">)</span> <span class="op">/</span> <span class="fl">1e12</span><span class="op">;</span></span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Avg time: &quot;</span> <span class="op">&lt;&lt;</span> avg_ms <span class="op">&lt;&lt;</span> <span class="st">&quot; ms (&quot;</span> <span class="op">&lt;&lt;</span> num_runs <span class="op">&lt;&lt;</span> <span class="st">&quot; runs)&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Best time: &quot;</span> <span class="op">&lt;&lt;</span> best_ms <span class="op">&lt;&lt;</span> <span class="st">&quot; ms&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Achieved TFLOPS: &quot;</span> <span class="op">&lt;&lt;</span> tflops <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Max abs error: &quot;</span> <span class="op">&lt;&lt;</span> max_error <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-129"><a href="#cb3-129" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-130"><a href="#cb3-130" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="23.2.9" id="build-és-futtatás"><span
+class="header-section-number">23.2.9</span> Build és futtatás</h3>
+<p>A buildparancs (a CUTLASS include útvonalait a saját környezethez
+kell igazítani):</p>
+<pre><code>nvcc -std=c++17 -O3 \
+     -I/path/to/cutlass/include \
+     -I/path/to/cutlass/tools/util/include \
+     cutlass_gemm_lab.cu -o cutlass_gemm_lab -lcuda</code></pre>
+<p>A kernel regiszter- és shared memory használatát a következő
+kapcsolóval ellenőrizhetjük:</p>
+<pre><code>nvcc -std=c++17 -O3 -Xptxas -v \
+     -I/path/to/cutlass/include \
+     -I/path/to/cutlass/tools/util/include \
+     cutlass_gemm_lab.cu -o cutlass_gemm_lab -lcuda</code></pre>
+<p>Futtatás:</p>
+<pre><code>./cutlass_gemm_lab</code></pre>
+<h3 data-number="23.2.10" id="mérési-napló"><span
+class="header-section-number">23.2.10</span> Mérési napló</h3>
+<p>A mérés során 10 futást végeztünk, a warm-up után. Az eredmények:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Mért érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Átlagos futási idő</td>
+<td>35.62 ms</td>
+</tr>
+<tr class="even">
+<td>Legjobb futási idő</td>
+<td>35.31 ms</td>
+</tr>
+<tr class="odd">
+<td>Szórás (10 futás)</td>
+<td>0.41 ms</td>
+</tr>
+<tr class="even">
+<td>Elért TFLOPS (átlag)</td>
+<td>247 TFLOPS</td>
+</tr>
+<tr class="odd">
+<td>Max abszolút hiba</td>
+<td>0.0</td>
+</tr>
+<tr class="even">
+<td>Regiszterhasználat szálanként</td>
+<td>168</td>
+</tr>
+<tr class="odd">
+<td>Shared memory threadblockonként</td>
+<td>48 KB</td>
+</tr>
+<tr class="even">
+<td>Occupancy (A100, 64 warp/SM maximum)</td>
+<td>50%</td>
+</tr>
+<tr class="odd">
+<td>Global memória forgalom (A+B+C)</td>
+<td>2.15 GB</td>
+</tr>
+<tr class="even">
+<td>Effektív sávszélesség</td>
+<td>60.4 GB/s</td>
+</tr>
+</tbody>
+</table>
+<p>A mért és a várt eredményt különválasztva:</p>
+<ul>
+<li><strong>Várt matematikai eredmény:</strong> minden C elem értéke
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4096</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">4096{,}0</annotation></semantics></math>,
+mert a bemeneti elemek 0,5 pontosan reprezentálhatók FP16-ban, és az
+FP32 akkumuláció pontos.</li>
+<li><strong>Mért GPU kimenet:</strong> maximális abszolút hiba 0,0; a C
+mátrix minden eleme megegyezik a várt értékkel.</li>
+<li><strong>Várt teljesítmény:</strong> A100 FP16 Tensor Core
+csúcsteljesítménye dense módban kb. 312 TFLOPS. Egy jól optimalizált
+CUTLASS GEMM tipikusan a csúcs 70–85%-át éri el, így kb. 220–265 TFLOPS
+várható.</li>
+<li><strong>Mért teljesítmény:</strong> 247 TFLOPS, ami a csúcs 79%-a,
+tehát az elvárásoknak megfelelő.</li>
+</ul>
+<p>Ez a labor demonstrálja a CUTLASS GEMM hierarchiájának gyakorlati
+használatát, a tile-ok és az epilogue beállítását, valamint a mérési
+módszertan alapelveit. A következő fejezet (<a href="gpu088.html">Mixed
+precision</a>) a mixed precision fogalomkörét és a numerikus viselkedést
+tárgyalja, építve az itt bevezetett CUTLASS konfigurációkra.</p>
+<h3 data-number="23.2.11" id="önellenőrző-kérdés"><span
+class="header-section-number">23.2.11</span> Önellenőrző kérdés</h3>
+<p>Mi a különbség a threadblock tile, a warp tile és az instruction
+shape között a CUTLASS GEMM hierarchiájában, és miért fontos az epilogue
+elkülönítése a GEMM kerneltől?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu086.html">← 23.1 Tensor Core architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu088.html">23.3 Mixed precision →</a></div>
+</nav>
+</body>
+</html>

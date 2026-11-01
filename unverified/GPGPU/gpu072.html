@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.3 SpMV és sparse optimalizálás – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch18">19 Sparse és dense lineáris algebra</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu071.html">← 19.2 Sparse mátrixreprezentációk</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu073.html">19.4 Könyvtári és saját megoldás →</a></div>
+</nav>
+<h2 data-number="19.3" id="gpu072"><span
+class="header-section-number">19.3</span> SpMV és sparse
+optimalizálás</h2>
+<p>A sparse mátrix-vektor szorzás (SpMV) a ritka lineáris algebra
+sarokköve: iteratív megoldók, PageRank, spektrális klaszterezés,
+végeselem-módszerek és számos tudományos kód minden iterációja legalább
+egy SpMV-t végez. A dense GEMM-mel ellentétben az SpMV memória-kötött,
+szabálytalan hozzáférési mintájú, és a teljesítménye erősen függ a
+mátrix nemnulla szerkezetétől. Ebben az alfejezetben a CSR-reprezentáció
+feletti alapvető kernelektől a terheléskiegyensúlyozatlanság kezelésén
+át a cuSPARSE könyvtári megoldásig jutunk el, és egy teljes mérési
+labort építünk fel.</p>
+<h3 data-number="19.3.1"
+id="az-spmv-definíciója-és-költségmodellje"><span
+class="header-section-number">19.3.1</span> Az SpMV definíciója és
+költségmodellje</h3>
+<p>Az SpMV az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>=</mo><mi>A</mi><mi>x</mi></mrow><annotation encoding="application/x-tex">y = A x</annotation></semantics></math>
+műveletet számítja, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>A</mi><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>n</mi><mo>×</mo><mi>n</mi></mrow></msup></mrow><annotation encoding="application/x-tex">A \in \mathbb{R}^{n \times n}</annotation></semantics></math>
+ritka,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><mo>,</mo><mi>y</mi><mo>∈</mo><msup><mi>ℝ</mi><mi>n</mi></msup></mrow><annotation encoding="application/x-tex">x,y \in \mathbb{R}^n</annotation></semantics></math>.
+A ritkaságot a nemnulla elemek számával,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow><annotation encoding="application/x-tex">\mathrm{nnz}</annotation></semantics></math>-vel
+jellemezzük. A művelet aritmetikai költsége
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow></mrow><annotation encoding="application/x-tex">2\, \mathrm{nnz}</annotation></semantics></math>
+lebegőpontos művelet (FLOP), de a tényleges futásidőt a memóriaforgalom
+dominálja: minden nemnulla elemhez be kell olvasni az értékét és az
+oszlopindexét, minden sorhoz a sorhatárokat, valamint az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+vektorból a megfelelő elemeket, és ki kell írni az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+vektort. A memóriaforgalom tipikusan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>8</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow><mo>+</mo><mn>4</mn><mspace width="0.167em"></mspace><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow><mo>+</mo><mn>4</mn><mrow><mo stretchy="true" form="prefix">(</mo><mi>n</mi><mo>+</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>+</mo><mn>8</mn><mi>n</mi><mo>+</mo><mn>8</mn><mi>n</mi></mrow><annotation encoding="application/x-tex">8\,\mathrm{nnz} + 4\,\mathrm{nnz} + 4(n+1) + 8n + 8n</annotation></semantics></math>
+bájt double precízió esetén, ami általában egy nagyságrenddel nagyobb,
+mint a hasznos aritmetika – ezért az SpMV a
+memória-sávszélesség-korlátos tartományban van.</p>
+<p>A <a href="gpu071.html">Sparse mátrixreprezentációk</a> alfejezetben
+bevezetett CSR-formátum a legelterjedtebb reprezentáció. Itt a
+<code>row_ptr</code> tömb hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">n+1</annotation></semantics></math>,
+a <code>col_idx</code> és <code>values</code> tömbök hossza
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow><annotation encoding="application/x-tex">\mathrm{nnz}</annotation></semantics></math>.
+A soronkénti feldolgozás természetes párhuzamosságot ad, de a sorhosszak
+szóródása – a ritka mátrixok jellegzetessége – egyenetlen
+munkamennyiséget okoz a szálak között.</p>
+<h3 data-number="19.3.2" id="a-naiv-scalar-kernel"><span
+class="header-section-number">19.3.2</span> A naiv scalar kernel</h3>
+<p>A legegyszerűbb CUDA-megvalósítás minden sorhoz egy szálat rendel. A
+kernel a globális indexszámítást követően a <code>row_ptr</code>
+határokon belül iterál, és felhalmozza a részletösszeget:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+__global__ void spmv_csr_scalar(const int* row_ptr,
+                                 const int* col_idx,
+                                 const double* values,
+                                 const double* x,
+                                 double* y,
+                                 int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &lt; n) {
+        double sum = 0.0;
+        int start = row_ptr[row];
+        int end   = row_ptr[row + 1];
+        for (int j = start; j &lt; end; ++j) {
+            sum += values[j] * x[col_idx[j]];
+        }
+        y[row] = sum;
+    }
+}</code></pre>
+<p>A launch konfiguráció:
+<code>dim3 block(256); dim3 grid((n + block.x - 1) / block.x);</code>, a
+kernel indítása pedig
+<code>spmv_csr_scalar&lt;&lt;&lt;grid, block&gt;&gt;&gt;(...)</code>.
+Minden szál pontosan egy sort dolgoz fel, így nincs versenyhelyzet az
+<code>y</code> írásakor. A memória-hozzáférés a <code>col_idx[j]</code>
+indirekción keresztül történik, ami az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+vektor véletlenszerű, nem koaleszkált olvasását eredményezi. A
+<code>values[j]</code> és <code>col_idx[j]</code> tömbök viszont soron
+belül folytonosak, tehát a globális memória-hozzáférés ezekre a tömbökre
+koaleszkált, amennyiben a szomszédos szálak hasonló ütemben haladnak –
+ez azonban ritkán teljesül.</p>
+<p>A kernel fő problémája a
+<strong>terheléskiegyensúlyozatlanság</strong> (load imbalance). Ha a
+sorhosszak eloszlása széles – például egy skálafüggetlen gráf mátrixában
+néhány sor több ezer nemnulla elemet tartalmaz, míg a legtöbb sor csak
+néhányat –, akkor a hosszú sorokat feldolgozó szálak sokáig dolgoznak,
+míg a rövid sorokhoz rendelt szálak befejezik a munkájukat és
+várakoznak. A GPU ütemezője a warpokat csak akkor vonja ki, ha a warp
+mind a 32 szála befejezte a kernelét, ezért a leghosszabb sor hossza
+határozza meg a teljes warp futásidejét. A divergencia mellett a
+kihasználatlan szálak csökkentik az effektív sávszélességet.</p>
+<p>A scalar kernel előnye az egyszerűsége és az alacsony
+regiszterigénye, ami magas occupancy-t tesz lehetővé. Rövid, egyenletes
+sorhosszúságú mátrixokon – például sávos mátrixokon, ahol minden sorban
+5–7 nemnulla elem van – a kernel elfogadhatóan teljesít, mert a warp
+minden szála közel azonos munkát végez, és a koaleszkált hozzáférés
+megmarad.</p>
+<h3 data-number="19.3.3" id="a-warp-per-row-kernel"><span
+class="header-section-number">19.3.3</span> A warp-per-row kernel</h3>
+<p>A hosszú sorok hatékony feldolgozásához egy sort több szálra kell
+bontani. A warp-per-row stratégia minden sorhoz egy 32 szálból álló
+warp-ot rendel, a sor nemnulla elemeit pedig a warp szálai ciklikusan
+osztják el. A részletösszegeket ezután egy warp-szintű redukcióval
+kombináljuk:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+__global__ void spmv_csr_warp(const int* row_ptr,
+                               const int* col_idx,
+                               const double* values,
+                               const double* x,
+                               double* y,
+                               int n)
+{
+    int warps_per_block = blockDim.x / warpSize;   // warpSize == 32
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+    if (row &gt;= n) return;
+
+    int lane = threadIdx.x % warpSize;
+    int start = row_ptr[row];
+    int end   = row_ptr[row + 1];
+
+    double sum = 0.0;
+    for (int j = start + lane; j &lt; end; j += warpSize) {
+        sum += values[j] * x[col_idx[j]];
+    }
+
+    // Warp-szintű redukció shuffle-lel
+    for (int offset = warpSize / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+
+    if (lane == 0) {
+        y[row] = sum;
+    }
+}</code></pre>
+<p>A launch konfiguráció:
+<code>dim3 block(256); int rows_per_block = block.x / warpSize; dim3 grid((n + rows_per_block - 1) / rows_per_block);</code>.
+A kernelben a <code>__shfl_down_sync</code> a warp szálai közötti
+adatcserét valósítja meg regisztereken keresztül, ami elkerüli a shared
+memory használatát és a barrier szinkronizációt. A redukció után csak a
+0. lane írja az <code>y[row]</code> értéket, így nincs
+versenyhelyzet.</p>
+<p>A warp-per-row kernel lényegesen jobb a hosszú sorokra, mert a
+nemnulla elemek feldolgozását 32 szál párhuzamosítja, és a
+<code>values</code>/<code>col_idx</code> tömbök olvasása szintén
+koaleszkált marad. A shuffle-redukció logaritmikus költsége
+elhanyagolható a soron belüli iterációhoz képest. A kernel hátránya,
+hogy rövid sorok esetén a warp nagy része tétlen: ha egy sorban csak 3
+nemnulla elem van, a 32 szálból 29 nem végez hasznos munkát a ciklusban,
+és a redukció is pazarló. Ezért a warp-per-row kernel a hosszú sorok
+dominálta mátrixoknál előnyös, míg a scalar kernel a rövid soroknál.</p>
+<h3 data-number="19.3.4" id="load-imbalance-és-irregularitás"><span
+class="header-section-number">19.3.4</span> Load imbalance és
+irregularitás</h3>
+<p>A ritka mátrixok sorhossz-eloszlása gyakran erősen ferde. A valós
+alkalmazásokban – például szociális hálózatok, webgráfok, vagy adaptív
+végeselem-hálók – előfordul, hogy a sorok 90%-a kevesebb mint 10
+nemnulla elemet tartalmaz, míg a maradék 10% több száz vagy több ezer
+elemet. A naiv scalar kernel ilyenkor a leghosszabb sor hosszával
+arányos időt tölt, miközben a legtöbb szál már régen végzett. A
+warp-per-row kernel ezt részben orvosolja, de a rövid soroknál a warp
+pazarlása miatt a teljesítmény még mindig messze van a
+memória-sávszélesség-korláttól.</p>
+<p>A terheléskiegyensúlyozatlanság mérésére a
+<strong>sorhossz-szóródás</strong> (coefficient of variation)
+használható:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>σ</mi><mi>/</mi><mi>μ</mi></mrow><annotation encoding="application/x-tex">\sigma / \mu</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>μ</mi><annotation encoding="application/x-tex">\mu</annotation></semantics></math>
+az átlagos sorhossz,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>σ</mi><annotation encoding="application/x-tex">\sigma</annotation></semantics></math>
+pedig a szórása. Ha ez az érték nagy, akkor a soronkénti párhuzamosítás
+rosszul teljesít. A megoldás az, hogy a hosszú sorokat több szálra
+bontjuk, a rövid sorokat pedig több soronként egy szálra csoportosítjuk.
+Ezt a <strong>hibrid</strong> megközelítést a következőképpen
+valósíthatjuk meg:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+// Hibrid kernel: rövid sorokhoz scalar, hosszú sorokhoz warp-per-row.
+// A row_ptr alapján előre besoroljuk a sorokat.
+__global__ void spmv_csr_hybrid(const int* row_ptr,
+                                 const int* col_idx,
+                                 const double* values,
+                                 const double* x,
+                                 double* y,
+                                 int n,
+                                 int threshold)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+
+    // Minden szál egy vagy több rövid sort dolgoz fel scalar módban,
+    // a hosszú sorokat pedig a warpok közösen.
+    for (int row = tid; row &lt; n; row += total_threads) {
+        int start = row_ptr[row];
+        int end   = row_ptr[row + 1];
+        int nnz_row = end - start;
+        if (nnz_row &lt;= threshold) {
+            double sum = 0.0;
+            for (int j = start; j &lt; end; ++j) {
+                sum += values[j] * x[col_idx[j]];
+            }
+            y[row] = sum;
+        }
+    }
+    // A hosszú sorokhoz külön kernel vagy szakasz tartozik;
+    // itt a teljesség kedvéért a warp-per-row logikát alkalmazzuk.
+    // A gyakorlatban ezt külön kernelbe érdemes szervezni.
+    __syncthreads(); // blokk-szintű szinkronizáció a közös munkához
+    int warps_per_block = blockDim.x / warpSize;
+    int warp_id = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+    int lane = threadIdx.x % warpSize;
+    // A hosszú sorok listáját egy előfeldolgozott tömbből kapjuk,
+    // vagy egyszerűen újraindítjuk a gridet a hosszú sorokra.
+}</code></pre>
+<p>A fenti vázlatban a hibrid kernel két fázisra bomlik, de a tényleges
+implementációban a hosszú sorokat érdemes külön kernelben vagy a
+<code>__syncthreads()</code> utáni szakaszban kezelni, ahol a warpok a
+hosszú sorok listáját kapják. A döntési küszöb (<code>threshold</code>)
+tipikusan 16–32 nemnulla elem, mivel efölött a warp-per-row előnye
+meghaladja a pazarlást.</p>
+<p>A <strong>SELL-C-σ</strong> formátum egy másik megoldás: a mátrixot
+sorblokkokra osztja, és minden blokkban a sorokat a blokk maximális
+sorhosszára egészíti ki üres helyekkel, majd a blokk sorait
+oszlopfolytonosan tárolja. Ez a formátum a koaleszkált hozzáférést és a
+terheléskiegyensúlyozást egyszerre javítja, de a feltöltés miatt extra
+memóriát igényel. A gyakorlatban a SELL-C-σ a rövid sorok dominálta
+mátrixokon igen hatékony, míg a CSR a hosszú sorokra jobb.</p>
+<h3 data-number="19.3.5" id="a-cusparse-könyvtár-spmv-api-ja"><span
+class="header-section-number">19.3.5</span> A cuSPARSE könyvtár SpMV
+API-ja</h3>
+<p>A CUDA ökoszisztéma a ritka mátrixműveletekhez a cuSPARSE könyvtárat
+biztosítja. A cuSPARSE a CUDA 11-től kezdve egy <strong>generikus
+API</strong>-t kínál, amely a mátrix- és vektorleírók segítségével
+egységes felületet ad a különböző formátumokhoz. Az SpMV-hez a
+<code>cusparseSpMV</code> függvény tartozik, amely puffert igényel az
+előfeldolgozási adatokhoz. Az API használata:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – cuSPARSE generikus API (CUDA 11+)
+#include &lt;cusparse.h&gt;
+
+void cusparse_spmv_example(int n, int nnz,
+                           int* d_row_ptr, int* d_col_idx, double* d_values,
+                           double* d_x, double* d_y)
+{
+    cusparseHandle_t handle;
+    cusparseCreate(&amp;handle);
+
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+
+    // Mátrixleíró: CSR formátum, 32 bites indexek, 0 bázisú indexelés, double
+    cusparseCreateCsr(&amp;matA, n, n, nnz,
+                      d_row_ptr, d_col_idx, d_values,
+                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+
+    // Vektorleírók
+    cusparseCreateDnVec(&amp;vecX, n, d_x, CUDA_R_64F);
+    cusparseCreateDnVec(&amp;vecY, n, d_y, CUDA_R_64F);
+
+    double alpha = 1.0, beta = 0.0;
+    size_t bufferSize = 0;
+    void* d_buffer = nullptr;
+
+    // Pufferméret lekérdezése
+    cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &amp;alpha, matA, vecX, &amp;beta, vecY,
+                            CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT,
+                            &amp;bufferSize);
+    CHECK_CUDA(cudaMalloc(&amp;d_buffer, bufferSize));
+
+    // SpMV végrehajtása: y = alpha * A * x + beta * y
+    cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                 &amp;alpha, matA, vecX, &amp;beta, vecY,
+                 CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT,
+                 d_buffer);
+
+    // Takarítás
+    cusparseDestroySpMat(matA);
+    cusparseDestroyDnVec(vecX);
+    cusparseDestroyDnVec(vecY);
+    cusparseDestroy(handle);
+    cudaFree(d_buffer);
+}</code></pre>
+<p>A <code>cusparseSpMV_bufferSize</code> hívás nélkülözhetetlen: a
+cuSPARSE a megadott algoritmushoz szükséges ideiglenes puffert itt
+méretezi, és a <code>cusparseSpMV</code> ennek a puffernek a tartalmát
+használja. A <code>CUSPARSE_SPMV_ALG_DEFAULT</code> az alapértelmezett
+algoritmus, de létezik <code>CUSPARSE_SPMV_ALG_MERGE_PATH</code> is,
+amely nagyobb párhuzamosságot biztosít a hosszú sorokra. A mátrixleírót
+a formátumnak megfelelően kell létrehozni; CSR-hez a
+<code>cusparseCreateCsr</code>, COO-hoz a
+<code>cusparseCreateCoo</code>, BSR-hez a <code>cusparseCreateBsr</code>
+szolgál. A vektorleírók a sűrű vektorokat reprezentálják.</p>
+<p>A cuSPARSE belsőleg több optimalizálást alkalmaz, beleértve a
+soronkénti feldolgozás adaptív kiválasztását, a memória-hozzáférési
+minták javítását és a hosszú sorok párhuzamosítását. A gyakorlatban a
+cuSPARSE SpMV-ja általában jelentősen gyorsabb, mint a naiv kernel, de a
+teljesítménye erősen függ a mátrix szerkezetétől és a választott
+formátumtól. A <code>cusparseSpMV</code> a
+<code>CUSPARSE_MV_ALG_DEFAULT</code> mellett lehetővé teszi az elemzési
+fázis különválasztását is (<code>cusparseSpMV_analysis</code>), ami
+ismételt SpMV-knél hasznos.</p>
+<p><strong>Fontos verziómegjegyzés:</strong> A cuSPARSE API a CUDA 10.x
+előtt más szignatúrával rendelkezett (<code>cusparseDcsrmv</code>). A
+fenti példa a CUDA 11+ generikus API-t használja, amely a jelenlegi
+(CUDA 12.x) verziókban az ajánlott. A pontos függvényszignatúrák és
+konstansok a cuSPARSE dokumentációban ellenőrizendők, mivel azok
+verzióról verzióra változhatnak.</p>
+<h3 data-number="19.3.6" id="labor-spmv-teljesítménymérése"><span
+class="header-section-number">19.3.6</span> Labor: SpMV
+teljesítménymérése</h3>
+<p>A labor célja a naiv scalar kernel, a warp-per-row kernel és a
+cuSPARSE SpMV teljesítményének összehasonlítása különböző ritka
+mátrixokon. A méréshez rögzíteni kell a GPU konfigurációját, a
+CUDA-verziót, a drivert és az operációs rendszert.</p>
+<h3 data-number="19.3.7" id="környezet-és-eszközök"><span
+class="header-section-number">19.3.7</span> 1. Környezet és
+eszközök</h3>
+<p><strong>Rögzített környezet (példa, a hallgató a sajátját tölti
+ki):</strong> - GPU: NVIDIA A100 40 GB (helyőrző; a labor során a
+tényleges eszközt kell beírni) - Driver: 550.54.14 - CUDA toolkit: 12.4
+- OS: Ubuntu 22.04 LTS - Fordító: nvcc 12.4, g++ 11.4 -
+Teljesítmény-beállítások: power limit alapértelmezett, ECC bekapcsolva,
+MIG kikapcsolva</p>
+<h3 data-number="19.3.8" id="forráskód"><span
+class="header-section-number">19.3.8</span> 2. Forráskód</h3>
+<p>A laborprogram a következőket tartalmazza: - Véletlen sparse mátrix
+generálása adott sorhossz-eloszlással - CPU referencia SpMV az
+ellenőrzéshez - A fenti három kernel (scalar, warp, cuSPARSE) - Mérési
+keretrendszer warm-up-pal és ismételt futtatásokkal</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) – labor: spmv_benchmark.cu
+// Build: nvcc -std=c++17 -O3 -arch=sm_80 -lcusparse -o spmv_benchmark spmv_benchmark.cu
+// Run:   ./spmv_benchmark
+
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cusparse.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;chrono&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+#include &lt;random&gt;
+
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+#define CHECK_CUSPARSE(call) do { \
+    cusparseStatus_t st = call; \
+    if (st != CUSPARSE_STATUS_SUCCESS) { \
+        fprintf(stderr, &quot;cuSPARSE error at %s:%d: %d\n&quot;, __FILE__, __LINE__, (int)st); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+// --- Kernelek a korábbi definíciókból ---
+__global__ void spmv_csr_scalar(const int* row_ptr, const int* col_idx,
+                                 const double* values, const double* x,
+                                 double* y, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &lt; n) {
+        double sum = 0.0;
+        int start = row_ptr[row];
+        int end   = row_ptr[row + 1];
+        for (int j = start; j &lt; end; ++j) {
+            sum += values[j] * x[col_idx[j]];
+        }
+        y[row] = sum;
+    }
+}
+
+__global__ void spmv_csr_warp(const int* row_ptr, const int* col_idx,
+                               const double* values, const double* x,
+                               double* y, int n)
+{
+    int warps_per_block = blockDim.x / warpSize;
+    int row = blockIdx.x * warps_per_block + (threadIdx.x / warpSize);
+    if (row &gt;= n) return;
+    int lane = threadIdx.x % warpSize;
+    int start = row_ptr[row];
+    int end   = row_ptr[row + 1];
+    double sum = 0.0;
+    for (int j = start + lane; j &lt; end; j += warpSize) {
+        sum += values[j] * x[col_idx[j]];
+    }
+    for (int offset = warpSize / 2; offset &gt; 0; offset &gt;&gt;= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) y[row] = sum;
+}
+
+// --- CPU referencia ---
+void spmv_cpu(const int* row_ptr, const int* col_idx, const double* values,
+              const double* x, double* y, int n)
+{
+    for (int i = 0; i &lt; n; ++i) {
+        double sum = 0.0;
+        for (int j = row_ptr[i]; j &lt; row_ptr[i + 1]; ++j) {
+            sum += values[j] * x[col_idx[j]];
+        }
+        y[i] = sum;
+    }
+}
+
+// --- Mátrixgenerátor: minden sorban véletlen számú nemnulla elem,
+//     log-normális eloszlású sorhosszakkal a terheléskiegyensúlyozatlanság modellezésére ---
+void generate_sparse_matrix(int n, int target_nnz_per_row, double imbalance,
+                            std::vector&lt;int&gt;&amp; row_ptr, std::vector&lt;int&gt;&amp; col_idx,
+                            std::vector&lt;double&gt;&amp; values, int&amp; nnz)
+{
+    row_ptr.resize(n + 1);
+    std::mt19937 rng(42);
+    std::lognormal_distribution&lt;double&gt; dist(0.0, imbalance);
+    row_ptr[0] = 0;
+    for (int i = 0; i &lt; n; ++i) {
+        int len = std::max(1, (int)std::round(dist(rng) * target_nnz_per_row));
+        row_ptr[i + 1] = row_ptr[i] + len;
+    }
+    nnz = row_ptr[n];
+    col_idx.resize(nnz);
+    values.resize(nnz);
+    std::uniform_int_distribution&lt;int&gt; col_dist(0, n - 1);
+    std::uniform_real_distribution&lt;double&gt; val_dist(-1.0, 1.0);
+    for (int i = 0; i &lt; n; ++i) {
+        for (int j = row_ptr[i]; j &lt; row_ptr[i + 1]; ++j) {
+            col_idx[j] = col_dist(rng);
+            values[j] = val_dist(rng);
+        }
+    }
+}
+
+// --- Mérési segédfüggvény ---
+double measure_time(void (*launch)(const int*, const int*, const double*,
+                                   const double*, double*, int, int, int),
+                    const int* d_row_ptr, const int* d_col_idx,
+                    const double* d_values, const double* d_x, double* d_y,
+                    int n, int nnz, int block_size, int grid_size,
+                    int warmup, int iters)
+{
+    // Warm-up
+    for (int i = 0; i &lt; warmup; ++i) {
+        launch(d_row_ptr, d_col_idx, d_values, d_x, d_y, n, nnz, block_size, grid_size);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    cudaEvent_t start, stop;
+    cudaEventCreate(&amp;start);
+    cudaEventCreate(&amp;stop);
+    cudaEventRecord(start);
+    for (int i = 0; i &lt; iters; ++i) {
+        launch(d_row_ptr, d_col_idx, d_values, d_x, d_y, n, nnz, block_size, grid_size);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&amp;ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return ms / iters;
+}
+
+// Launch wrapper-ök a kernelekhez
+void launch_scalar(const int* d_row_ptr, const int* d_col_idx,
+                   const double* d_values, const double* d_x, double* d_y,
+                   int n, int nnz, int block_size, int grid_size)
+{
+    spmv_csr_scalar&lt;&lt;&lt;grid_size, block_size&gt;&gt;&gt;(d_row_ptr, d_col_idx, d_values, d_x, d_y, n);
+}
+
+void launch_warp(const int* d_row_ptr, const int* d_col_idx,
+                 const double* d_values, const double* d_x, double* d_y,
+                 int n, int nnz, int block_size, int grid_size)
+{
+    spmv_csr_warp&lt;&lt;&lt;grid_size, block_size&gt;&gt;&gt;(d_row_ptr, d_col_idx, d_values, d_x, d_y, n);
+}
+
+// cuSPARSE launch wrapper
+void launch_cusparse(const int* d_row_ptr, const int* d_col_idx,
+                     const double* d_values, const double* d_x, double* d_y,
+                     int n, int nnz, int block_size, int grid_size,
+                     cusparseHandle_t handle)
+{
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    CHECK_CUSPARSE(cusparseCreateCsr(&amp;matA, n, n, nnz,
+                                     const_cast&lt;int*&gt;(d_row_ptr),
+                                     const_cast&lt;int*&gt;(d_col_idx),
+                                     const_cast&lt;double*&gt;(d_values),
+                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    CHECK_CUSPARSE(cusparseCreateDnVec(&amp;vecX, n, const_cast&lt;double*&gt;(d_x), CUDA_R_64F));
+    CHECK_CUSPARSE(cusparseCreateDnVec(&amp;vecY, n, d_y, CUDA_R_64F));
+
+    double alpha = 1.0, beta = 0.0;
+    size_t bufferSize = 0;
+    void* d_buffer = nullptr;
+    CHECK_CUSPARSE(cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT,
+                                           &amp;bufferSize));
+    CHECK_CUDA(cudaMalloc(&amp;d_buffer, bufferSize));
+    CHECK_CUSPARSE(cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, d_buffer));
+    CHECK_CUDA(cudaFree(d_buffer));
+    CHECK_CUSPARSE(cusparseDestroySpMat(matA));
+    CHECK_CUSPARSE(cusparseDestroyDnVec(vecX));
+    CHECK_CUSPARSE(cusparseDestroyDnVec(vecY));
+}
+
+int main()
+{
+    // Paraméterek
+    const int n = 1&#39;000&#39;000;
+    const int target_nnz_per_row = 10;
+    const double imbalance = 1.5;  // log-normális szórás
+    const int block_size = 256;
+    const int warmup = 5;
+    const int iters = 20;
+
+    // Mátrix generálása CPU-n
+    std::vector&lt;int&gt; h_row_ptr, h_col_idx;
+    std::vector&lt;double&gt; h_values;
+    int nnz;
+    generate_sparse_matrix(n, target_nnz_per_row, imbalance, h_row_ptr, h_col_idx, h_values, nnz);
+    printf(&quot;n = %d, nnz = %d, avg row length = %.1f\n&quot;, n, nnz, (double)nnz / n);
+
+    // CPU referencia
+    std::vector&lt;double&gt; h_x(n), h_y_ref(n), h_y_test(n);
+    std::mt19937 rng(123);
+    std::uniform_real_distribution&lt;double&gt; dist(-1.0, 1.0);
+    for (auto&amp; v : h_x) v = dist(rng);
+    spmv_cpu(h_row_ptr.data(), h_col_idx.data(), h_values.data(), h_x.data(), h_y_ref.data(), n);
+
+    // GPU allokáció és feltöltés
+    int *d_row_ptr, *d_col_idx;
+    double *d_values, *d_x, *d_y;
+    CHECK_CUDA(cudaMalloc(&amp;d_row_ptr, (n + 1) * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&amp;d_col_idx, nnz * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&amp;d_values, nnz * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&amp;d_x, n * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&amp;d_y, n * sizeof(double)));
+    CHECK_CUDA(cudaMemcpy(d_row_ptr, h_row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_col_idx, h_col_idx.data(), nnz * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_values, h_values.data(), nnz * sizeof(double), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_x, h_x.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+
+    // Mérések
+    int grid_scalar = (n + block_size - 1) / block_size;
+    double t_scalar = measure_time(launch_scalar, d_row_ptr, d_col_idx, d_values, d_x, d_y,
+                                   n, nnz, block_size, grid_scalar, warmup, iters);
+
+    int warps_per_block = block_size / 32;
+    int grid_warp = (n + warps_per_block - 1) / warps_per_block;
+    double t_warp = measure_time(launch_warp, d_row_ptr, d_col_idx, d_values, d_x, d_y,
+                                 n, nnz, block_size, grid_warp, warmup, iters);
+
+    // cuSPARSE mérés
+    cusparseHandle_t handle;
+    CHECK_CUSPARSE(cusparseCreate(&amp;handle));
+    cudaEvent_t start, stop;
+    cudaEventCreate(&amp;start);
+    cudaEventCreate(&amp;stop);
+    for (int i = 0; i &lt; warmup; ++i) {
+        launch_cusparse(d_row_ptr, d_col_idx, d_values, d_x, d_y, n, nnz, block_size, 0, handle);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+    cudaEventRecord(start);
+    for (int i = 0; i &lt; iters; ++i) {
+        launch_cusparse(d_row_ptr, d_col_idx, d_values, d_x, d_y, n, nnz, block_size, 0, handle);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_cusparse = 0.0f;
+    cudaEventElapsedTime(&amp;ms_cusparse, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    double t_cusparse = ms_cusparse / iters;
+    CHECK_CUSPARSE(cusparseDestroy(handle));
+
+    // Ellenőrzés: a cuSPARSE eredményt használjuk (utolsó futtatásból)
+    CHECK_CUDA(cudaMemcpy(h_y_test.data(), d_y, n * sizeof(double), cudaMemcpyDeviceToHost));
+    double max_abs_err = 0.0;
+    for (int i = 0; i &lt; n; ++i) {
+        double err = std::abs(h_y_test[i] - h_y_ref[i]);
+        if (err &gt; max_abs_err) max_abs_err = err;
+    }
+    printf(&quot;Max abs error vs CPU: %.3e\n&quot;, max_abs_err);
+
+    // Sávszélesség számítása
+    size_t mem_bytes = nnz * (sizeof(double) + sizeof(int)) + (n + 1) * sizeof(int) + 2 * n * sizeof(double);
+    double bw_scalar = mem_bytes / (t_scalar * 1e-3) / 1e9;
+    double bw_warp   = mem_bytes / (t_warp * 1e-3) / 1e9;
+    double bw_cusparse = mem_bytes / (t_cusparse * 1e-3) / 1e9;
+
+    printf(&quot;\n=== Mérési eredmények ===\n&quot;);
+    printf(&quot;Kernel        Idő (ms)   Sávszélesség (GB/s)\n&quot;);
+    printf(&quot;scalar        %8.4f   %8.2f\n&quot;, t_scalar, bw_scalar);
+    printf(&quot;warp          %8.4f   %8.2f\n&quot;, t_warp, bw_warp);
+    printf(&quot;cusparse      %8.4f   %8.2f\n&quot;, t_cusparse, bw_cusparse);
+
+    // Takarítás
+    CHECK_CUDA(cudaFree(d_row_ptr));
+    CHECK_CUDA(cudaFree(d_col_idx));
+    CHECK_CUDA(cudaFree(d_values));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_y));
+    return 0;
+}</code></pre>
+<p><strong>Megjegyzés a kódhoz:</strong> A <code>launch_cusparse</code>
+a leírókat minden hívásnál létrehozza és megsemmisíti, ami a mérés során
+overheadet visz be. A tényleges teljesítményméréshez a leírókat és a
+puffert érdemes a mérési cikluson kívül létrehozni, és csak a
+<code>cusparseSpMV</code> hívást ismételni. A laborban a hallgatónak ezt
+az optimalizálást el kell végeznie, és a mérési naplóban jeleznie kell.
+A fenti kód a didaktikai egyszerűség kedvéért mutatja a teljes
+életciklust, de a mérési eredmények így konzervatívabbak (a cuSPARSE
+valós teljesítménye jobb lehet).</p>
+<h3 data-number="19.3.9" id="build-és-futtatás"><span
+class="header-section-number">19.3.9</span> 3. Build és futtatás</h3>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-lcusparse</span> <span class="at">-o</span> spmv_benchmark spmv_benchmark.cu</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./spmv_benchmark</span></span></code></pre></div>
+<p>Az <code>-arch=sm_80</code> az A100 (Ampere) esetén megfelelő; más
+GPU-nál a compute capability-t módosítani kell (pl. <code>sm_86</code>
+RTX 3090, <code>sm_89</code> RTX 4090).</p>
+<h3 data-number="19.3.10" id="mérési-napló"><span
+class="header-section-number">19.3.10</span> 4. Mérési napló</h3>
+<p>A labor során a következő táblázatot kell kitölteni. A <strong>várt
+eredmény</strong> oszlopban a tendencia szerepel – ezt a mérés előtt
+kell megadni, a <strong>mért</strong> oszlopot pedig a futtatás
+után.</p>
+<table>
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 4%" />
+<col style="width: 6%" />
+<col style="width: 14%" />
+<col style="width: 7%" />
+<col style="width: 15%" />
+<col style="width: 14%" />
+<col style="width: 24%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mátrix típus</th>
+<th>n</th>
+<th>nnz</th>
+<th>átl. sorhossz</th>
+<th>Kernel</th>
+<th>Várt tendencia</th>
+<th>Mért idő (ms)</th>
+<th>Mért sávszélesség (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Log-normális sorhossz (imbalance=1.5)</td>
+<td>1 000 000</td>
+<td>~10 000 000</td>
+<td>~10</td>
+<td>scalar</td>
+<td>lassú (nagy imbalance)</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+<tr class="even">
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>warp</td>
+<td>közepes (jobb hosszú sorokra)</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+<tr class="odd">
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>cuSPARSE</td>
+<td>gyors (könyvtári optimalizálás)</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+<tr class="even">
+<td>Egyenletes (sávos, 5 nemnulla/sor)</td>
+<td>1 000 000</td>
+<td>~5 000 000</td>
+<td>5</td>
+<td>scalar</td>
+<td>elfogadható (kiegyensúlyozott)</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+<tr class="odd">
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>warp</td>
+<td>pazarló (rövid sorok)</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+<tr class="even">
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>cuSPARSE</td>
+<td>gyors</td>
+<td><em>laborban mérendő</em></td>
+<td><em>laborban mérendő</em></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fontos:</strong> A fenti táblázatban a „várt tendencia”
+előrejelzés, amelyet a mérés előtt kell megfogalmazni. A „mért” oszlopok
+a tényleges futtatás eredményei, amelyeket a labor során kell rögzíteni.
+A laborjelentésnek tartalmaznia kell a teljes környezetet (GPU modell,
+driver, CUDA verzió, órajel, power limit, ECC állapot) és a mérés
+statisztikáját (átlag, szórás, ismétlésszám). A mérési naplóban a
+tényleges és a várt eredményeket egyértelműen el kell különíteni, és ha
+eltérés van, azt elemezni kell.</p>
+<p>A sávszélesség számításánál a tényleges adatforgalmat kell használni:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">b</mi><mi mathvariant="normal">y</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">e</mi><mi mathvariant="normal">s</mi></mrow><mo>=</mo><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">z</mi></mrow><mo>⋅</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>8</mn><mo>+</mo><mn>4</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>+</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>n</mi><mo>+</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mn>4</mn><mo>+</mo><mn>2</mn><mi>n</mi><mo>⋅</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">\mathrm{bytes} = \mathrm{nnz} \cdot (8 + 4) + (n+1) \cdot 4 + 2 n \cdot 8</annotation></semantics></math>
+double precízió esetén. A névleges GPU sávszélesség (pl. A100: 1555 GB/s
+HBM2e) csak felső korlát; a tényleges SpMV ennek általában 10–30%-át éri
+el a ritka hozzáférés miatt.</p>
+<h3 data-number="19.3.11" id="gyakori-hibák-és-megelőzésük"><span
+class="header-section-number">19.3.11</span> Gyakori hibák és
+megelőzésük</h3>
+<ol type="1">
+<li><p><strong>Out-of-bounds indexelés a CSR tömbökben.</strong> Ha a
+<code>row_ptr[n]</code> nem egyezik a <code>values</code> hosszával,
+vagy a <code>col_idx</code> elemei kívül esnek a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="true" form="prefix">[</mo><mn>0</mn><mo>,</mo><mi>n</mi><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">]</mo></mrow><annotation encoding="application/x-tex">[0, n-1]</annotation></semantics></math>
+tartományon, a kernel nem definiált viselkedést okoz. Megelőzés: a
+mátrixgenerátor után ellenőrizni kell a tömbök konzisztenciáját, és a
+kernelben a <code>col_idx[j]</code> értékét a beolvasás előtt validálni
+(debug módban).</p></li>
+<li><p><strong>Versenyhelyzet az <code>y</code> írásakor.</strong> Ha a
+grid konfiguráció nem fedi le pontosan a sorokat, vagy a hibrid
+kernelben több szál ugyanazt a sort kezeli, az <code>y[row]</code> írása
+versenyhelyzethez vezet. A scalar és warp kernelekben a sor-szál
+hozzárendelés egyértelmű, de a hibrid megoldásoknál atomi művelet vagy
+gondos indexelés szükséges. Megelőzés: a kernelben minden sort pontosan
+egyszer dolgozzunk fel, és ezt a hozzárendelést a launch konfigurációval
+biztosítsuk.</p></li>
+<li><p><strong>A warp-redukció utáni szinkronizáció elhagyása.</strong>
+A <code>__shfl_down_sync</code> után a warp szálai közötti láthatóság
+nem garantált a <code>__syncwarp()</code> vagy a shuffle szinkronizációs
+maszkja nélkül. A fenti kódban a shuffle hívás magában foglalja a
+szinkronizációt a megadott maszkkal, de ha más warp-szintű műveleteket
+használunk, explicit <code>__syncwarp()</code> kell. Megelőzés: mindig
+használjuk a <code>_sync</code> utótagú intrinsics-eket.</p></li>
+<li><p><strong>A cuSPARSE puffer elhagyása vagy helytelen
+méretezése.</strong> A <code>cusparseSpMV</code> a
+<code>bufferSize</code> által meghatározott puffert igényli; ha a puffer
+túl kicsi, a hívás hibát ad vagy nem definiált viselkedést okoz.
+Megelőzés: mindig hívjuk meg a <code>cusparseSpMV_bufferSize</code>-t,
+és ellenőrizzük a visszatérési értékeket.</p></li>
+<li><p><strong>A mérési idő nem tartalmazza a teljes
+adatmozgatást.</strong> Ha a mérés csak a kernel futásidejét rögzíti, de
+a mátrix feltöltését nem, akkor a valós alkalmazás teljesítménye
+rosszabb lesz. Megelőzés: a mérés során a teljes adatutat mérjük, vagy
+legalább külön jelöljük a kernel- és a transzferidőt.</p></li>
+<li><p><strong>A numerikus pontosság elhanyagolása.</strong> Az SpMV-nál
+a felhalmozás sorrendje befolyásolja a kerekítési hibát, különösen ha a
+mátrix értékei nagy dinamikatartományúak. A warp-per-row kernel
+redukciós sorrendje eltér a CPU-tól, ami kis eltéréseket okozhat.
+Megelőzés: a hibahatárt a feladat numerikus igényeihez kell igazítani,
+és a mérési naplóban rögzíteni kell a használt precíziót
+(FP64/FP32).</p></li>
+</ol>
+<h3 data-number="19.3.12" id="összefoglalás"><span
+class="header-section-number">19.3.12</span> Összefoglalás</h3>
+<p>Az SpMV a GPU-számítás egyik legnehezebb memória-kötött feladata. A
+naiv scalar kernel egyszerű, de a terheléskiegyensúlyozatlanság miatt a
+valós mátrixokon gyakran nagyon lassú. A warp-per-row kernel a hosszú
+sorokat párhuzamosítja, de a rövid soroknál pazarló. A hatékony megoldás
+a sorhossz-eloszláshoz igazodó hibrid stratégia vagy a SELL-C-σ
+formátum. A cuSPARSE generikus API-ja kényelmes és erősen optimalizált
+SpMV-t kínál, de a teljesítmény még így is a mátrix szerkezetétől függ.
+A labor során a hallgató a három megközelítést méri össze, és a mért
+eredményeket a várt tendenciákkal veti össze.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért nem elegendő a soronként
+egy szálat indító scalar kernel a nagy sorhossz-szóródású mátrixokhoz?
+Hogyan oldja meg a warp-per-row kernel a problémát, és mi a hátránya
+rövid sorok esetén?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu071.html">← 19.2 Sparse mátrixreprezentációk</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu073.html">19.4 Könyvtári és saját megoldás →</a></div>
+</nav>
+</body>
+</html>

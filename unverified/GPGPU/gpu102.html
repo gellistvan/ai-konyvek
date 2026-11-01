@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>27.1 TPU-architektúra – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch26">27 TPU architektúra és XLA</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu101.html">← 26.4 Unified memory és MIG</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu103.html">27.2 XLA és a gráffordítás →</a></div>
+</nav>
+<h2 data-number="27.1" id="gpu102"><span
+class="header-section-number">27.1</span> TPU-architektúra</h2>
+<figure>
+<img src="assets/gpu102-diagram-1.png"
+alt="TPU v1 magjának fő egységei - A szisztolikus MXU mátrixszorzást végez, a VPU vektoros műveleteket, az aktivációs egység nemlinearitást; a HBM és a vezérlő szolgálja ki őket." />
+<figcaption aria-hidden="true">TPU v1 magjának fő egységei - A
+szisztolikus MXU mátrixszorzást végez, a VPU vektoros műveleteket, az
+aktivációs egység nemlinearitást; a HBM és a vezérlő szolgálja ki
+őket.</figcaption>
+</figure>
+<h3 data-number="27.1.1"
+id="a-tpu-mint-mátrixgép-miért-nem-elég-a-simt"><span
+class="header-section-number">27.1.1</span> A TPU mint „mátrixgép”:
+miért nem elég a SIMT?</h3>
+<p>A GPU-k általános célú számítási modellje a SIMT (Single Instruction,
+Multiple Thread), amelyet a korábbi fejezetekben részletesen
+megismertünk. A GPU tervezésénél az elsődleges cél az volt, hogy a
+grafikai pipeline-okban felmerülő, párhuzamos de egyenként független
+feladatokat (például pixel shader futtatása millió pixelen) minél
+nagyobb átbocsátóképességgel hajtsa végre. A GPU-ból GPGPU-vá fejlődve
+is megmaradt ez az örökség: a hardver nagy számú, viszonylag egyszerű
+vezérlésű magot (CUDA core) és egy mély, de elsősorban szoftveresen
+menedzselt memóriahierarchiát használ. A programozó a szálak és blokkok
+koordinálásával éri el a teljesítményt.</p>
+<p>A Google 2017-ben publikálta a TPU (Tensor Processing Unit) első
+generációjának architekturális leírását. A TPU tervezési kérdése nem az
+volt, hogy „hogyan gyorsítsunk fel mindenféle párhuzamos feladatot?”,
+hanem az, hogy „hogyan gyorsítsuk fel a neurális hálózatok
+következtetését (inference) a lehető legjobb teljesítmény/watt
+mutatóval?”. A neurális hálózatok számítási igényének túlnyomó részét a
+mátrixszorzás teszi ki:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐂</mi><mo>=</mo><mi>𝐀</mi><mi>𝐁</mi><mo>,</mo><mspace width="1.0em"></mspace><msub><mi>C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub><mo>=</mo><munder><mo>∑</mo><mi>j</mi></munder><msub><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><msub><mi>B</mi><mrow><mi>j</mi><mi>k</mi></mrow></msub><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathbf{C} = \mathbf{A} \mathbf{B}, \quad C_{ik} = \sum_j A_{ij} B_{jk}.
+</annotation></semantics></math></p>
+<p>A mátrixszorzás egy rendkívül szabályos adatfolyam-minta. Ez a
+szabályosság lehetővé teszi egy olyan célhardver építését, amely sokkal
+kevesebb vezérlési logikát és adatmozgatást igényel, mint egy GPU,
+miközben a számítási sűrűséget (FLOPs/terület, FLOPs/watt) drasztikusan
+megnöveli. Ez a célhardver a <strong>szisztolikus tömb</strong>.</p>
+<h3 data-number="27.1.2"
+id="a-szisztolikus-tömb-a-mátrixszorzás-hardveres-alakja"><span
+class="header-section-number">27.1.2</span> A szisztolikus tömb: a
+mátrixszorzás hardveres alakja</h3>
+<p>A szisztolikus tömb (systolic array) neve a szívritmus analógiájából
+származik: az adatok a tömbön keresztül lüktetve, ritmikusan áramlanak.
+Képzeljünk el egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>
+méretű rácsot, amelynek minden cellájában egy
+<strong>multiply–accumulate (MAC)</strong> egység található. Minden MAC
+egység képes egy ciklus alatt elvégezni a következő műveletet:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>←</mo><mi>p</mi><mo>+</mo><mi>a</mi><mo>⋅</mo><mi>b</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">
+p \leftarrow p + a \cdot b.
+</annotation></semantics></math></p>
+<p>A TPU első generációjában ez a rács
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>256</mn><mo>×</mo><mn>256</mn></mrow><annotation encoding="application/x-tex">256 \times 256</annotation></semantics></math>
+méretű, tehát 65 536 darab MAC egységet tartalmaz. Ez az egység a
+<strong>MXU (Matrix Multiply Unit)</strong>.</p>
+<p>A működés kulcsa az adatok mozgatásának mikéntje. A hagyományos
+processzorokban (CPU, GPU) egy MAC művelethez az utasításnak explicit
+módon be kell töltenie az adatokat a regiszterekbe. A szisztolikus
+tömbben az adatok nem „címzésre” mozognak, hanem szomszédos elemek
+között áramlanak.</p>
+<p>Tekintsük a <strong>súly-állandós (weight-stationary)</strong>
+szisztolikus tömböt. Ez a TPU MXU működésének szíve.</p>
+<ol type="1">
+<li><p><strong>Súlyok betöltése:</strong> A mátrixszorzás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝐂</mi><mo>=</mo><mi>𝐀</mi><mi>𝐁</mi></mrow><annotation encoding="application/x-tex">\mathbf{C} = \mathbf{A} \mathbf{B}</annotation></semantics></math>
+alakjában legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐁</mi><annotation encoding="application/x-tex">\mathbf{B}</annotation></semantics></math>
+a súlymátrix,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐀</mi><annotation encoding="application/x-tex">\mathbf{A}</annotation></semantics></math>
+az aktiváció (bemeneti adat) mátrix. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐁</mi><annotation encoding="application/x-tex">\mathbf{B}</annotation></semantics></math>
+mátrix elemeit előre betöltjük a MAC egységekbe. Minden MAC egység a
+súlymátrix egy-egy elemét tárolja a saját regiszterében. Például a rács
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="true" form="prefix">(</mo><mi>i</mi><mo>,</mo><mi>k</mi><mo stretchy="true" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(i, k)</annotation></semantics></math>
+pozíciójában lévő MAC egység a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>B</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub><annotation encoding="application/x-tex">B_{ik}</annotation></semantics></math>
+súlyt tárolja.</p></li>
+<li><p><strong>Aktivációk áramlása:</strong> Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐀</mi><annotation encoding="application/x-tex">\mathbf{A}</annotation></semantics></math>
+mátrix elemeit a tömb bal szélén tápláljuk be. Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><annotation encoding="application/x-tex">A_{ij}</annotation></semantics></math>
+elem belép az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>.
+sor bal szélső MAC egységébe. A MAC egység elvégzi a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mo>←</mo><mi>p</mi><mo>+</mo><msub><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><mo>⋅</mo><msub><mi>B</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub></mrow><annotation encoding="application/x-tex">p \leftarrow p + A_{ij} \cdot B_{ik}</annotation></semantics></math>
+műveletet (ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+az oszlop indexe), majd az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><annotation encoding="application/x-tex">A_{ij}</annotation></semantics></math>
+értéket <strong>továbbítja a tőle jobbra lévő</strong> MAC egységnek.
+Így az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix elemei balról jobbra hullámoznak keresztül a tömbön.</p></li>
+<li><p><strong>Részösszegek áramlása:</strong> A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐂</mi><annotation encoding="application/x-tex">\mathbf{C}</annotation></semantics></math>
+mátrix elemeinek részösszegei a tömb tetején indulnak. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub><annotation encoding="application/x-tex">C_{ik}</annotation></semantics></math>
+részösszege belép az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>.
+sor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>.
+oszlopában lévő MAC egységbe, hozzáadódik a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>A</mi><mrow><mi>i</mi><mi>j</mi></mrow></msub><mo>⋅</mo><msub><mi>B</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub></mrow><annotation encoding="application/x-tex">A_{ij} \cdot B_{ik}</annotation></semantics></math>
+szorzathoz, majd az eredmény <strong>lefelé</strong> továbbítódik a
+következő sorban lévő MAC egységnek. Mire a részösszeg a tömb aljára ér,
+az összes szükséges
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>j</mi><annotation encoding="application/x-tex">j</annotation></semantics></math>
+indexre elvégezte az összegzést, és a végső
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mi>i</mi><mi>k</mi></mrow></msub><annotation encoding="application/x-tex">C_{ik}</annotation></semantics></math>
+érték hagyja el a tömböt.</p></li>
+</ol>
+<p>Ebben a sémában <strong>nincs memóriaolvasás a számítás
+közben</strong>. A súlyok a MAC egységekben állnak, az aktivációk és
+részösszegek pedig folyamatosan mozognak a szomszédos elemek között. Ez
+drasztikusan csökkenti az energiafogyasztást, mert az adatmozgatás a
+chipen belüli, rövid, szabályos vezetékeken történik, nem pedig
+energiazabáló, címzett memória-hozzáférésekkel.</p>
+<p><strong>Gyakorlati megjegyzés a terminológiához:</strong> A
+szakirodalomban a TPU MXU-ját gyakran nevezik „szisztolikus tömbnek”,
+bár a pontos adatfolyam-megvalósítás a „systolic array” egy változata. A
+fent leírt súly-állandós, aktiváció-balról-jobbra,
+részösszeg-fentről-lefelé áramlás az a modell, amelyet a TPU v1 leírása
+megad. Az újabb TPU-generációk (v2 és későbbi) a modellt tovább
+finomították, de az alapelv változatlan.</p>
+<h3 data-number="27.1.3"
+id="a-tpu-v1-magjának-felépítése-mxu-vpu-és-aktivációs-egység"><span
+class="header-section-number">27.1.3</span> A TPU v1 magjának
+felépítése: MXU, VPU és aktivációs egység</h3>
+<p>A MXU önmagában nem elegendő egy teljes neurális hálózati réteg
+lefuttatásához. A TPU v1 magja három fő számítási egységből áll:</p>
+<ol type="1">
+<li><p><strong>MXU (Matrix Multiply Unit):</strong> A már ismertetett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>256</mn><mo>×</mo><mn>256</mn></mrow><annotation encoding="application/x-tex">256 \times 256</annotation></semantics></math>
+MAC-rács. Ez a számítási mag felel a mátrixszorzásért. A TPU v1-ben a
+MXU 8 bites egész (INT8) szorzásokat végez, és 32 bites egész számokat
+halmoz fel. Ez a pontosság az inference-hez elegendő, és a
+terület/energia-hatékonyságot maximalizálja. Egy ciklus alatt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>256</mn><mo>×</mo><mn>256</mn><mo>×</mo><mn>2</mn><mo>=</mo><mn>131</mn><mspace width="0.167em"></mspace><mn>072</mn></mrow><annotation encoding="application/x-tex">256 \times 256 \times 2 = 131\,072</annotation></semantics></math>
+műveletet (szorzást és összeadást) képes elvégezni. 700 MHz-es órajel
+mellett ez a névleges csúcs körülbelül
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>92</mn><annotation encoding="application/x-tex">92</annotation></semantics></math>
+TOPS (tera-operations per second,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mn>12</mn></msup><annotation encoding="application/x-tex">10^{12}</annotation></semantics></math>
+művelet másodpercenként).</p></li>
+<li><p><strong>VPU (Vector Processing Unit):</strong> A mátrixszorzás
+eredményét ritkán használjuk közvetlenül. A neurális hálózatok rétegei
+aktivációs függvényeket (pl. ReLU, sigmoid, tanh), bias hozzáadást,
+normalizálást és egyéb elemenkénti műveleteket igényelnek. Ezek a
+műveletek nem illenek a szisztolikus tömb adatfolyam-modelljébe, mert
+vektor-jellegűek, nem mátrix-jellegűek. A VPU ezeket a
+vektor-műveleteket hajtja végre: elemenkénti összeadás, szorzás,
+maximum-képzés, aktivációs függvények közelítése. A VPU architektúrája
+hasonló a GPU-k SIMD egységeihez: széles regiszterfájlokkal és vektoros
+aritmetikai egységekkel rendelkezik.</p></li>
+<li><p><strong>Aktivációs egység (Activation Unit):</strong> A VPU-val
+szorosan együttműködő, célhardveres egység az aktivációs függvények
+kiszámítására. A ReLU, sigmoid és tanh függvényeket lookup táblákkal és
+interpolációval, vagy kis fokszámú polinomokkal közelíti. Ez sokkal
+gyorsabb és energiahatékonyabb, mint ha a VPU általános célú
+utasításaival számolnánk őket.</p></li>
+</ol>
+<h3 data-number="27.1.4"
+id="hbm-a-vezérlő-és-a-memória-alrendszer"><span
+class="header-section-number">27.1.4</span> HBM, a vezérlő és a
+memória-alrendszer</h3>
+<p>A TPU v1 a MXU maximális kihasználtságához hatalmas adatmennyiséget
+kell, hogy folyamatosan biztosítson. A TPU v1 28 MiB on-chip memóriát
+használ, amelyet <strong>Unified Buffer</strong>-nek neveznek. Ez a
+puffer tárolja az aktivációkat, a súlyokat és a részösszegeket. A modern
+GPU-kkal ellentétben a TPU v1 <strong>nem rendelkezik</strong> L1/L2
+cache-sel. A cache hierarchia helyett a szoftver (a XLA fordító) felelős
+az adatok explicit ütemezéséért a Unified Buffer és a MXU között.</p>
+<p>A külső memória a TPU v1-ben <strong>DDR3 SDRAM</strong>, amely 30
+GB/s sávszélességet biztosít. Ez látszólag alacsony a GPU-khoz képest
+(egy modern GPU HBM3-mal több TB/s sávszélességet ér el), de a TPU v1
+tervezési célja az inference volt, ahol a batch méret általában 1, és a
+modell paraméterei (súlyok) viszonylag kis méretűek. A 28 MiB Unified
+Buffer elegendő egy közepes méretű modell súlyainak tárolására, így a
+DDR3-ból való ismételt olvasás ritkán szükséges.</p>
+<p>A következő generációk (TPU v2, v3, v4) a következtetésből a tanítás
+(training) felé terjeszkedtek, és ennek megfelelően HBM (High Bandwidth
+Memory) technológiára váltottak. A HBM a DRAM chipeket egy szilícium
+interposerre szereli, ami rendkívül széles buszt és nagy sávszélességet
+tesz lehetővé (több száz GB/s vagy akár TB/s). A TPU v4 már HBM2e-t
+használ, és a sávszélesség nagyságrendileg megegyezik a hasonló korú
+GPU-kkal.</p>
+<p><strong>Fontos különbség a GPU-hoz képest:</strong> A GPU
+memória-alrendszere általános célú, a programozó által kontrollált
+cache-ekkel és egy koherens memóriamodellel. A TPU memória-alrendszere
+szorosan a MXU-hoz és a XLA fordítóhoz van hangolva. A szoftver a
+memória-hozzáféréseket sokkal determinisztikusabban ütemezi, mivel a
+műveletek sorrendje a gráffordítás során ismert. Ez lehetővé teszi a
+gyorsítótárazás és az adatfolyam pontosabb optimalizálását.</p>
+<h3 data-number="27.1.5"
+id="az-interconnect-a-tpu-k-összekapcsolása"><span
+class="header-section-number">27.1.5</span> Az interconnect: a TPU-k
+összekapcsolása</h3>
+<p>Az egyetlen TPU chip teljesítménye korlátozott. A modern
+munkaterhelések (nagy nyelvi modellek, transzformerek) több chip
+együttműködését igénylik. A TPU-k közötti összeköttetést az <strong>ICI
+(Inter-Chip Interconnect)</strong> biztosítja.</p>
+<ul>
+<li><strong>TPU v2/v3:</strong> A chipeket 2D toroid topológiában kötik
+össze. Minden TPU chip négy szomszédjához kapcsolódik nagy
+sávszélességű, alacsony késleltetésű linkkel. Ez a topológia természetes
+módon támogatja a modellpárhuzamos (model parallel) és adatpárhuzamos
+(data parallel) tanítási mintákat, mert a szomszédos chipek közötti
+kommunikáció gyors és prediktálható.</li>
+<li><strong>TPU v4:</strong> A topológia 3D toroiddá bővült, és az ICI
+sávszélessége jelentősen megnőtt. A TPU v4 egy „pod” több ezer chipet
+tartalmazhat, amelyek nagy sebességű optikai kapcsolatokon keresztül
+kommunikálnak.</li>
+</ul>
+<p>A GPU-k világában a hasonló szerepet az NVLink és az NVSwitch tölti
+be, de a topológia és a kommunikációs primitívek (NCCL) szintje más. A
+TPU-knél a kommunikációt is a XLA és a JAX keretrendszer vezérli, ami a
+programozó számára magasabb szintű absztrakciót kínál (pl.
+<code>pmap</code>, <code>xmap</code>, <code>pjit</code> sharding).</p>
+<h3 data-number="27.1.6"
+id="a-tpu-programozási-modellje-xla-és-a-gráf"><span
+class="header-section-number">27.1.6</span> A TPU programozási modellje:
+XLA és a gráf</h3>
+<p>A GPU-kat C++-ban (CUDA) vagy OpenCL-ben programozzuk, és a kernel
+egy alacsony szintű, az adott hardverre szabott eljárás. A TPU-k
+programozása ezzel éles ellentétben áll: a TPU-t <strong>nem</strong>
+közvetlenül, hanem <strong>XLA (Accelerated Linear Algebra)</strong>
+nevű, gráf-alapú, szimbolikus programozási modellen keresztül
+programozzuk.</p>
+<ol type="1">
+<li><p><strong>Gráfkonstrukció:</strong> A felhasználó (például JAX vagy
+TensorFlow segítségével) egy magas szintű programot ír. Ez a program nem
+hajtódik végre azonnal, hanem egy <strong>számítási gráfot</strong>
+épít. A gráf csomópontjai műveletek (pl. <code>dot</code>,
+<code>add</code>, <code>relu</code>), élei pedig a közöttük áramló
+tenzorok.</p></li>
+<li><p><strong>Gráfoptimalizálás:</strong> Az XLA fordító ezt a gráfot
+veszi bemenetként, és agresszív optimalizálásokat hajt végre. Ide
+tartozik a holt kód eltávolítása, az algebrai egyszerűsítések, a
+konstansok beégetése, és a legfontosabb: a <strong>művelet-fúzió
+(operation fusion)</strong>. A fúzió során az XLA több elemi műveletet
+egyetlen, nagyobb, összetett kernelben egyesít. Például a
+<code>bias_add</code> + <code>relu</code> + <code>matmul</code>
+műveleteket egyetlen TPU kernelben hajthatja végre, csökkentve a köztes
+eredmények memóriába írásának és onnan való visszaolvasásának
+költségét.</p></li>
+<li><p><strong>Kódgenerálás és ütemezés:</strong> Az optimalizált gráf
+alapján az XLA platform-specifikus kódot generál. TPU esetén ez a kód
+közvetlenül a MXU, VPU és a memória-alrendszer utasításait vezérli. A
+GPU-tól eltérően a TPU kernel nem „hagyományos” C++ kód, hanem egy
+hardverközeli, de a XLA által generált leírás.</p></li>
+</ol>
+<p><strong>A JAX szerepe:</strong> A JAX egy Python-könyvtár, amely a
+NumPy API-t ötvözi az automatikus differenciálással és az XLA háttérrel.
+A JAX Pythonban írt kódja Python- és NumPy-függvényekből áll, de amikor
+egy függvényt <code>jax.jit</code>-tel lefordítunk, a JAX a Python
+végrehajtást megállítja, a függvény műveleteit egy XLA gráfba foglalja,
+majd az XLA lefordítja azt a célhardverre. Ez azt jelenti, hogy a TPU-n
+futó JAX program valójában XLA gráfként létezik, és a hardver soha nem
+lát Python kódot.</p>
+<p><strong>Összehasonlítás a CUDA programozási modellel:</strong></p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Jellemző</th>
+<th style="text-align: left;">CUDA / GPU</th>
+<th style="text-align: left;">XLA / TPU</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><strong>Programozási
+paradigma</strong></td>
+<td style="text-align: left;">Imperatív, thread-alapú</td>
+<td style="text-align: left;">Szimbolikus, gráf-alapú</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>Hardver irányítása</strong></td>
+<td style="text-align: left;">Közvetlen kernel indítás,
+memóriakezelés</td>
+<td style="text-align: left;">Absztrakt, XLA által ütemezett</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><strong>Fő optimalizálási
+eszköz</strong></td>
+<td style="text-align: left;">Manuális tiling, shared memory, warp
+intrinsics</td>
+<td style="text-align: left;">XLA gráfoptimalizálás, művelet-fúzió</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>Memóriamodell</strong></td>
+<td style="text-align: left;">Explicit, programozó által vezérelt
+(global, shared, register)</td>
+<td style="text-align: left;">Implicit, az XLA és a hardware kezeli</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><strong>Fő hardveregység</strong></td>
+<td style="text-align: left;">SM-ek, sok CUDA core</td>
+<td style="text-align: left;">MXU (szisztolikus tömb), VPU</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>Tipikus pontosság</strong></td>
+<td style="text-align: left;">FP32, FP16, TF32, BF16, INT8</td>
+<td style="text-align: left;">BF16, FP16, INT8, FP8 (generációtól
+függően)</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="27.1.7" id="labor-tpu-vs.-gpu-összehasonlítás"><span
+class="header-section-number">27.1.7</span> Labor: TPU vs. GPU
+összehasonlítás</h3>
+<p>Ez a labor nem egy teljes TPU hozzáférést igénylő instrukció, hanem a
+<strong>módszertan</strong> bemutatása és egy GPU-n futtatható alapvonal
+(baseline) felállítása. A TPU hozzáférést igénylő részeket JAX/XLA
+kóddal és a XLA gráf elemzésével demonstráljuk, de tényleges TPU futás
+nélkül. <strong>Az alábbi kód nem végrehajtott utasítás, hanem a mérések
+elvégzésének vázlata.</strong></p>
+<p><strong>Cél:</strong> Megmérni egy mátrixszorzás (<code>GEMM</code>)
+teljesítményét GPU-n, és egy TPU-n várható teljesítményt becsülni a
+névleges hardveradatok alapján. A mérés rögzíti a környezetet.</p>
+<p><strong>Előfeltétel:</strong> CUDA toolkit és Python környezet
+JAX-szel.</p>
+<p><strong>Lépések:</strong></p>
+<ol type="1">
+<li><p><strong>GPU mérés CUDA/C++-ban:</strong> Lefordítjuk és futtatjuk
+az alábbi CUDA C++ programot, amely egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4096</mn><mo>×</mo><mn>4096</mn></mrow><annotation encoding="application/x-tex">4096 \times 4096</annotation></semantics></math>-os
+GEMM-et hajt végre cuBLAS segítségével. A mérés előtt warm-up, majd 10
+ismétlés. Rögzítjük az átlagos futásidőt, a sávszélességet és a
+FLOPs-ot.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), NVIDIA CUDA 12.4</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// GPU: NVIDIA A100 40GB, driver 550.54.14, compute capability 8.0</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// OS: Ubuntu 22.04 LTS</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">// A kód hibakezeléssel és méréssel ellátva.</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cublas_v2.h&gt;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: </span><span class="sc">%s</span><span class="st">, </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">),</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUBLAS</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cublasStatus_t</span><span class="pp"> </span>status<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>status<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>CUBLAS_STATUS_SUCCESS<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;cuBLAS hiba: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span>status<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> M <span class="op">=</span> <span class="dv">4096</span><span class="op">,</span> N <span class="op">=</span> <span class="dv">4096</span><span class="op">,</span> K <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> alpha <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> beta <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> flops <span class="op">=</span> <span class="fl">2.0</span> <span class="op">*</span> <span class="dt">double</span><span class="op">(</span>M<span class="op">)</span> <span class="op">*</span> <span class="dt">double</span><span class="op">(</span>N<span class="op">)</span> <span class="op">*</span> <span class="dt">double</span><span class="op">(</span>K<span class="op">);</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes_moved <span class="op">=</span> <span class="dt">size_t</span><span class="op">(</span>M<span class="op">)</span> <span class="op">*</span> K <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)</span> <span class="op">+</span> <span class="dt">size_t</span><span class="op">(</span>K<span class="op">)</span> <span class="op">*</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)</span> <span class="op">+</span> <span class="dt">size_t</span><span class="op">(</span>M<span class="op">)</span> <span class="op">*</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host memória allokálása</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> h_A<span class="op">(</span>M <span class="op">*</span> K<span class="op">),</span> h_B<span class="op">(</span>K <span class="op">*</span> N<span class="op">),</span> h_C<span class="op">(</span>M <span class="op">*</span> N<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> M <span class="op">*</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> h_A<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>rand<span class="op">())</span> <span class="op">/</span> RAND_MAX<span class="op">;</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K <span class="op">*</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> h_B<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>rand<span class="op">())</span> <span class="op">/</span> RAND_MAX<span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device mutatók</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_A<span class="op">,</span> <span class="op">*</span>d_B<span class="op">,</span> <span class="op">*</span>d_C<span class="op">;</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_A<span class="op">,</span> M <span class="op">*</span> K <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_B<span class="op">,</span> K <span class="op">*</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_C<span class="op">,</span> M <span class="op">*</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_A<span class="op">,</span> h_A<span class="op">.</span>data<span class="op">(),</span> M <span class="op">*</span> K <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_B<span class="op">,</span> h_B<span class="op">.</span>data<span class="op">(),</span> K <span class="op">*</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cublasHandle_t</span> handle<span class="op">;</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    CHECK_CUBLAS<span class="op">(</span>cublasCreate<span class="op">(&amp;</span>handle<span class="op">));</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up: 3 iteráció</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>        CHECK_CUBLAS<span class="op">(</span>cublasSgemm<span class="op">(</span>handle<span class="op">,</span> CUBLAS_OP_N<span class="op">,</span> CUBLAS_OP_N<span class="op">,</span> N<span class="op">,</span> M<span class="op">,</span> K<span class="op">,</span> <span class="op">&amp;</span>alpha<span class="op">,</span> d_B<span class="op">,</span> N<span class="op">,</span> d_A<span class="op">,</span> K<span class="op">,</span> <span class="op">&amp;</span>beta<span class="op">,</span> d_C<span class="op">,</span> N<span class="op">));</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés: 10 iteráció</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> start <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>        CHECK_CUBLAS<span class="op">(</span>cublasSgemm<span class="op">(</span>handle<span class="op">,</span> CUBLAS_OP_N<span class="op">,</span> CUBLAS_OP_N<span class="op">,</span> N<span class="op">,</span> M<span class="op">,</span> K<span class="op">,</span> <span class="op">&amp;</span>alpha<span class="op">,</span> d_B<span class="op">,</span> N<span class="op">,</span> d_A<span class="op">,</span> K<span class="op">,</span> <span class="op">&amp;</span>beta<span class="op">,</span> d_C<span class="op">,</span> N<span class="op">));</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> end <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> elapsed_ms <span class="op">=</span> <span class="bu">std::</span>chrono::duration<span class="op">&lt;</span><span class="dt">double</span><span class="op">,</span> <span class="bu">std::</span>milli<span class="op">&gt;(</span>end <span class="op">-</span> start<span class="op">).</span>count<span class="op">()</span> <span class="op">/</span> <span class="fl">10.0</span><span class="op">;</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> elapsed_s <span class="op">=</span> elapsed_ms <span class="op">/</span> <span class="fl">1000.0</span><span class="op">;</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> tflops <span class="op">=</span> <span class="op">(</span>flops <span class="op">/</span> elapsed_s<span class="op">)</span> <span class="op">/</span> <span class="fl">1e12</span><span class="op">;</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> bandwidth_gb_s <span class="op">=</span> <span class="op">(</span>bytes_moved <span class="op">/</span> elapsed_s<span class="op">)</span> <span class="op">/</span> <span class="fl">1e9</span><span class="op">;</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;GPU cuBLAS SGEMM, M=N=K=</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> M<span class="op">);</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Átlagos futásidő: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> elapsed_ms<span class="op">);</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Teljesítmény: </span><span class="sc">%.2f</span><span class="st"> TFLOP/s (cuBLAS SGEMM)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> tflops<span class="op">);</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Sávszélesség (elméleti, ideális adatmozgásra): </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> bandwidth_gb_s<span class="op">);</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_A<span class="op">));</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_B<span class="op">));</span></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_C<span class="op">));</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>    CHECK_CUBLAS<span class="op">(</span>cublasDestroy<span class="op">(</span>handle<span class="op">));</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Fordítás:</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-lcublas</span> gemm_benchmark.cu <span class="at">-o</span> gemm_benchmark</span></code></pre></div>
+<p><strong>Futtatás:</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./gemm_benchmark</span></span></code></pre></div>
+<p><strong>Várt eredmény (ellenőrzési igény, mivel nem futtattuk ezt a
+konkrét kódot):</strong> Egy NVIDIA A100-on, FP32 SGEMM esetén a cuBLAS
+könyvtár teljesítménye jellemzően 19–20 TFLOP/s körül mozog a 19.5
+TFLOP/s névleges FP32 csúcs mellett. A tényleges érték függ a rendszer
+állapotától és a cuBLAS verziójától. A mérési naplóba rögzíteni kell a
+pontos értéket.</p></li>
+<li><p><strong>TPU becslés JAX/XLA segítségével:</strong> A TPU
+teljesítményét a névleges hardveradatokból becsüljük. A TPU v4 egyetlen
+chipje FP32 mátrixszorzáshoz nem az ideális választás (BF16 mellett éri
+el a csúcsát). BF16 mellett a TPU v4 MXU teljesítménye hivatalosan nem
+publikált, de a gyakorlatban a hasonló tervezésű egységek alapján a BF16
+csúcs körülbelül 275 TFLOP/s chipenként. Egy 4096x4096-os GEMM esetén a
+szükséges FLOP-ok:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><msup><mn>4096</mn><mn>3</mn></msup><mo>=</mo><mn>1.374</mn><mo>⋅</mo><msup><mn>10</mn><mn>11</mn></msup></mrow><annotation encoding="application/x-tex">2 \cdot 4096^3 = 1.374 \cdot 10^{11}</annotation></semantics></math>
+FLOP. Ha a TPU a csúcs 70%-át éri el, a futásidő:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mfrac><mrow><mn>1.374</mn><mo>⋅</mo><msup><mn>10</mn><mn>11</mn></msup></mrow><mrow><mn>275</mn><mo>⋅</mo><msup><mn>10</mn><mn>12</mn></msup><mo>⋅</mo><mn>0.7</mn></mrow></mfrac><mo>≈</mo><mn>0.71</mn><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> ms</mtext></mrow></mrow><annotation encoding="application/x-tex">t = \frac{1.374 \cdot 10^{11}}{275 \cdot 10^{12} \cdot 0.7} \approx 0.71 \text{ ms}</annotation></semantics></math></p>
+<p><strong>Fontos:</strong> Ez a becslés <strong>nem mért
+eredmény</strong>, hanem modell-alapú kalkuláció. A tényleges TPU
+futásidőhöz hozzáférés szükséges.</p>
+<p>A JAX kód, amely a TPU-ra fordítható lenne (itt csak a gráf
+létrehozását mutatjuk be, futtatás nélkül):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Python 3.10, JAX 0.4.26, jaxlib 0.4.26 (CPU-only build, TPU nincs csatlakoztatva)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A kód célja a XLA gráf felépítésének bemutatása, nem tényleges TPU futtatás.</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co"># A matmul lefordítva XLA gráffá. TPU háttérrel a &#39;jax.devices()&#39; listában</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"># megjelenne a TPU device. Itt CPU-t használunk a példa kedvéért.</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> gemm(a, b):</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.dot(a, b)</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Véletlen mátrixok</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> jax.random.PRNGKey(<span class="dv">0</span>)</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>a <span class="op">=</span> jax.random.normal(key, (<span class="dv">4096</span>, <span class="dv">4096</span>), dtype<span class="op">=</span>jnp.bfloat16)</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>b <span class="op">=</span> jax.random.normal(key, (<span class="dv">4096</span>, <span class="dv">4096</span>), dtype<span class="op">=</span>jnp.bfloat16)</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co"># A gráf ellenőrzése</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>lowered <span class="op">=</span> gemm.lower(a, b)</span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&quot;Az XLA HLO modul (részlet):&quot;</span>)</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(lowered.compiler_ir(dialect<span class="op">=</span><span class="st">&#39;hlo&#39;</span>).as_hlo_text()[:<span class="dv">500</span>])</span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co"># A &#39;as_hlo_text()&#39; metódus a JAX verziófüggő, ellenőrizni kell a dokumentációt.</span></span></code></pre></div>
+<p>A kimenet egy HLO (High Level Optimizer) gráfot mutat, amelyben a
+<code>dot</code> művelet a TPU MXU-ra lesz leképezve.</p></li>
+</ol>
+<h3 data-number="27.1.8"
+id="a-tanultak-összefoglalása-és-tipikus-hibák"><span
+class="header-section-number">27.1.8</span> A tanultak összefoglalása és
+tipikus hibák</h3>
+<p>A TPU architektúra megértése azt jelenti, hogy felismerjük a
+mátrixszorzás dominanciáját a modern gépi tanulásban, és azt, hogy a
+szisztolikus tömb hogyan szolgálja ki ezt a dominanciát minimális
+energiafogyasztás mellett. A GPU-k általános célú párhuzamos gépek,
+amelyekre a programozó saját maga írja a memóriakezelést és a
+szinkronizációt. A TPU ezzel szemben egy speciális célú, de rendkívül
+hatékony adatfolyam-gép, amelynek programozása magasabb szintű,
+gráf-alapú nyelveken (XLA) keresztül történik.</p>
+<p><strong>Tipikus hibák, amiket el kell kerülni:</strong></p>
+<ol type="1">
+<li><p><strong>A TPU-t „mágikus doboznak” tekinteni:</strong> A TPU nem
+gyorsít fel minden kódot. Ha a feladat nem dominánsan mátrixszorzás (pl.
+rendezés, gráfgráf bejárás, string feldolgozás), a TPU teljesítménye
+drasztikusan visszaesik a GPU-hoz képest, mert a VPU és a vezérlőegység
+gyenge, általános célú magok.</p></li>
+<li><p><strong>A memória- és számítási modell figyelmen kívül
+hagyása:</strong> A TPU-n nincs helye a GPU-k shared memory tilinghez
+hasonló, alacsony szintű optimalizálásnak. A teljesítményt a XLA gráf
+optimalizálása és az adatok elrendezésének (sharding) magas szintű
+megválasztása határozza meg. A CUDA-ban megszokott
+<code>__shared__</code> memóriás trükkök itt nem alkalmazhatók.</p></li>
+<li><p><strong>A pontosság figyelmen kívül hagyása:</strong> A TPU v1
+kizárólag INT8 inference-t támogatott. A későbbi generációk támogatják a
+BF16, FP16 és INT8 formátumokat, de az FP64 támogatás gyakran hiányos
+vagy lassú. Ha egy tudományos számítás FP64 pontosságot igényel, a TPU
+általában nem megfelelő választás, és a GPU továbbra is
+előnyös.</p></li>
+<li><p><strong>A hordozhatóság túlértékelése:</strong> A TPU-ra írt
+JAX/XLA kód hordozható CPU-ra és GPU-ra is (az XLA háttér miatt). Ez
+igaz, de teljesítmény szempontjából korántsem mindegy. A GPU-ra
+optimalizált XLA kód nem feltétlenül lesz optimális TPU-n, és fordítva.
+A sharding stratégiák, a memóriaátrendezések és a kernelválasztás
+platformfüggő.</p></li>
+</ol>
+<p><strong>Önellenőrző kérdés:</strong> Magyarázza el, mi történik a
+súly-állandós szisztolikus tömb első órajel-ciklusában, ha az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐀</mi><annotation encoding="application/x-tex">\mathbf{A}</annotation></semantics></math>
+mátrix első oszlopa belép a tömbbe, és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝐁</mi><annotation encoding="application/x-tex">\mathbf{B}</annotation></semantics></math>
+mátrix már betöltésre került a MAC egységekbe. Miért lesz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+ciklus múlva a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mrow><mn>1</mn><mi>k</mi></mrow></msub><annotation encoding="application/x-tex">C_{1k}</annotation></semantics></math>
+érték kész?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu101.html">← 26.4 Unified memory és MIG</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu103.html">27.2 XLA és a gráffordítás →</a></div>
+</nav>
+</body>
+</html>

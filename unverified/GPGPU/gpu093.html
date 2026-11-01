@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>24.4 Memória és pontosság – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch23">24 Deep learning kernelek: GEMM, conv és attention</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu092.html">← 24.3 Attention kernelek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu094.html">25.1 Streamek és események →</a></div>
+</nav>
+<h2 data-number="24.4" id="gpu093"><span
+class="header-section-number">24.4</span> Memória és pontosság</h2>
+<p>A deep learning kernelek memóriaprofilja nem pusztán a rétegek
+bemeneti és kimeneti tenzorainak méretéből adódik. A futási idő jelentős
+részét a közbenső aktivációk, a csomagolt mátrixműveletek
+munkaterületei, a gyorsítókönyvtárak által lefoglalt ideiglenes pufferek
+és a vegyes pontosságú reprezentációk közötti konverziók határozzák meg.
+Ebben az alfejezetben azt vizsgáljuk, hogyan épül fel a GEMM, a
+konvolúció és az attention kernel memórialábnyoma, miért kritikus az
+aktivációk és a workspace kezelése, és hogyan függ össze a numerikus
+stabilitás a memóriatervezéssel. A cél az, hogy a fejlesztő képes legyen
+előre megbecsülni a szükséges globális és shared memória méretét,
+felismerje a tipikus allokációs hibákat, és tudatosan válasszon FP32,
+FP16, BF16 vagy TF32 reprezentációt a pontossági követelmények
+függvényében.</p>
+<h3 data-number="24.4.1"
+id="a-deep-learning-kernel-memóriaprofilja"><span
+class="header-section-number">24.4.1</span> A deep learning kernel
+memóriaprofilja</h3>
+<p>A deep learning számítások alapvetően tenzorműveletek. A
+memóriaprofil leírásához három szempontot kell elkülöníteni:</p>
+<ol type="1">
+<li><strong>A bemeneti és kimeneti tenzorok</strong> a forward pass
+során mind globális memóriában helyezkednek el. Például egy lineáris
+réteg <code>X</code> bemenete <code>[batch, input_dim]</code>,
+<code>W</code> súlya <code>[input_dim, output_dim]</code>,
+<code>Y</code> kimenete <code>[batch, output_dim]</code>. A bemeneti és
+kimeneti aktivációk mérete lineárisan növekszik a batch mérettel.</li>
+<li><strong>A közbenső aktivációk</strong> – például a normalizálás
+előtti értékek, a konvolúciós réteg kimenetei, a figyelmi mátrix – a
+backward passhoz szükségesek, ezért a forward során vagy eltároljuk
+őket, vagy később újraszámoljuk. Ez a memóriaprofil egyik legnagyobb
+tétele.</li>
+<li><strong>A műveleti kernel által használt munkaterületek</strong> –
+például a cuDNN konvolúciós algoritmusai által igényelt átmeneti
+pufferek, a GEMM törzsmagjai által lefoglalt shared memory tile-ok,
+valamint a gyors Fourier-transzformációk ideiglenes adatai. Ezek
+tipikusan a réteg geometriájától és a választott algoritmustól
+függenek.</li>
+</ol>
+<h3 data-number="24.4.2" id="gemm-memóriaigénye"><span
+class="header-section-number">24.4.2</span> GEMM memóriaigénye</h3>
+<p>Egy <code>C = A × B</code> sűrű mátrixszorzás esetén a memóriaprofilt
+a mátrixok dimenziói határozzák meg. Legyen <code>A</code> mérete
+<code>M×K</code>, <code>B</code> mérete <code>K×N</code>, <code>C</code>
+mérete <code>M×N</code>. FP32 pontosságban minden elem 4 bájt. A
+globális memória forgalom
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mi>M</mi><mo>⋅</mo><mi>K</mi><mo>+</mo><mn>2</mn><mo>⋅</mo><mi>K</mi><mo>⋅</mo><mi>N</mi><mo>+</mo><mi>M</mi><mo>⋅</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">2 \cdot M \cdot K + 2 \cdot K \cdot N + M \cdot N</annotation></semantics></math>
+elem beolvasás/írás, amihez a kernel számítási intenzitása
+hozzávetőleg</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mrow><mn>2</mn><mi>M</mi><mi>N</mi><mi>K</mi></mrow><mrow><mn>2</mn><mi>M</mi><mi>K</mi><mo>+</mo><mn>2</mn><mi>K</mi><mi>N</mi><mo>+</mo><mi>M</mi><mi>N</mi></mrow></mfrac><mspace width="1.0em"></mspace><mtext mathvariant="normal">FLOP/byte</mtext></mrow><annotation encoding="application/x-tex">
+\frac{2 M N K}{2 M K + 2 K N + M N} \quad \text{FLOP/byte}
+</annotation></semantics></math></p>
+<p>lesz, ha minden bemeneti elemet pontosan egyszer olvasunk. A
+gyakorlatban a naiv kernel ennél lényegesen több globális
+memóriaforgalmat generál, mert a belső <code>K</code> dimenzió mentén a
+mátrixelemeket többször is be kell tölteni. A shared memory tiling ezt a
+forgalmat csökkenti: az <code>A</code> és <code>B</code> mátrix egy-egy
+tile-ját egyszer töltjük be, majd a regiszterekben lévő részösszegeket
+frissítjük. A memórialábnyom szempontjából a shared memory igénye a
+választott tile méretétől függ. Például egy <code>16×16</code>-os tile
+<code>A</code> és <code>B</code> mátrixból FP32 pontosságban
+<code>2 · 16 · 16 · 4 = 2048</code> bájtot foglal el. A valós GPU-k
+ennél nagyobb shared memory-val rendelkeznek (például 48–164 KiB
+SM-enként), így a kernel tervezésekor a tile méretét az occupancy és a
+shared memory korlát együttesen határozza meg.</p>
+<h3 data-number="24.4.3" id="konvolúció-memóriaigénye"><span
+class="header-section-number">24.4.3</span> Konvolúció
+memóriaigénye</h3>
+<p>A konvolúciós rétegek esetében a memóriaprofilt az aktiváció tenzor,
+a szűrők és a kimeneti tenzor uralja. Egy <code>N×C×H×W</code> bemenet,
+<code>K×C×R×S</code> szűrő és <code>N×K×P×Q</code> kimenet esetén az
+aktivációk mérete</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>⋅</mo><mi>C</mi><mo>⋅</mo><mi>H</mi><mo>⋅</mo><mi>W</mi><mo>⋅</mo><mtext mathvariant="normal">elem méret</mtext></mrow><annotation encoding="application/x-tex">
+N \cdot C \cdot H \cdot W \cdot \text{elem méret}
+</annotation></semantics></math></p>
+<p>A szűrők mérete általában kisebb, de a mély hálózatokban a kimeneti
+csatornák száma gyakran eléri a százas vagy ezres nagyságrendet, ami a
+kimeneti tenzort nagyobbá teheti, mint a bemenetet. A memóriatervezésnél
+figyelembe kell venni, hogy a forward pass során a bemeneti aktivációt a
+teljes konvolúció befejezéséig meg kell őrizni, mert a kimenet minden
+pontja a bemenet egy receptív mezőjétől függ. A gyakorlatban az im2col
+vagy implicit GEMM algoritmusok a konvolúciót mátrixszorzássá alakítják.
+Az im2col módszer egy duplikált bemeneti mátrixot hoz létre, amelynek
+mérete <code>P·Q·N × C·R·S</code>, és ez a mátrix gyakran a bemeneti
+aktiváció többszöröse lehet. Az implicit GEMM ezt a duplikációt
+elkerüli, de a szűrők és az aktivációk indexelése bonyolultabb. A cuDNN
+a választott algoritmus függvényében ideiglenes munkaterületet
+igényelhet. Például a
+<code>CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM</code> jellemzően kisebb
+workspace-t használ, mint az előre kiszámított
+<code>IMPLICIT_PRECOMP_GEMM</code>, de a pontos méret a réteg
+paramétereitől és a GPU architektúrájától függ. A cuDNN dokumentációja
+szerint a workspace mérete egyes konfigurációkban több száz megabájt is
+lehet, ezért a következtetési rendszerben a memória előre történő
+felmérése elengedhetetlen.</p>
+<h3 data-number="24.4.4" id="attention-memóriaigénye"><span
+class="header-section-number">24.4.4</span> Attention memóriaigénye</h3>
+<p>A transformer-alapú modellek figyelmi rétegeiben a memóriaprofilt a
+<code>Q</code>, <code>K</code>, <code>V</code> vetületek és a figyelmi
+mátrix <code>S = Q·Kᵀ</code> uralja. Legyen a batch mérete
+<code>B</code>, a fejlécek száma <code>H</code>, a szekvencia hossz
+<code>L</code>, a fejenkénti dimenzió <code>d</code>. Ekkor
+<code>Q</code>, <code>K</code>, <code>V</code> mindegyike
+<code>B·H·L·d</code> elem. A figyelmi mátrix <code>S</code> mérete
+<code>B·H·L·L</code> – ez a szekvencia hosszával négyzetesen nő. A
+softmax után a <code>P = softmax(S)</code> mátrix tárolása további
+<code>B·H·L·L</code> elemet igényel, végül a kimenet
+<code>O = P·V</code> mérete <code>B·H·L·d</code>. Ha <code>L</code> nagy
+(például 4096), a figyelmi mátrix önmagában hatalmas lehet: FP32
+pontosságban <code>4096×4096×4 bytes = 64 MiB</code> fejenként. 16 fej
+esetén már 1 GiB felett járunk. Ezért a modern attention kernelek – mint
+például a flash attention – elkerülik a teljes <code>S</code> mátrix
+globális memóriába írását, és a softmaxot online számolják ki, miközben
+a <code>Q</code> és <code>K</code> szorzatokat blokkonként töltik be. A
+memóriaprofilt ilyenkor a <code>Q</code>, <code>K</code>, <code>V</code>
+blokkok, a statisztikai futóértékek és a kimeneti akkumulátorok teszik
+ki, nem pedig a teljes <code>L×L</code> mátrix. A tervezésnél tehát nem
+elegendő a névleges tenzorméretek alapján becsülni; figyelembe kell
+venni az algoritmus által ténylegesen allokált átmeneti adatokat is.</p>
+<h3 data-number="24.4.5" id="activation-és-workspace"><span
+class="header-section-number">24.4.5</span> Activation és workspace</h3>
+<p>A forward pass során keletkező aktivációk életciklusa szorosan
+összefügg a memórialábnyommal. Egy naiv tréning implementáció minden
+réteg kimenetét eltárolja a backward passhoz. Ez a módszer egyszerű, de
+a memória felhasználása a hálózat mélységével lineárisan nő. Például egy
+ResNet-50 hálózatban a teljes aktivációtárolás elérheti a 200–300 MiB-ot
+batch=32 esetén. A memória csökkentésére két elterjedt technika
+létezik:</p>
+<ul>
+<li><strong>Gradient checkpointing:</strong> csak bizonyos rétegek
+aktivációit tároljuk, a többit a backward során újraszámoljuk. Ez a
+memóriát a rétegmélység négyzetgyökével arányosra csökkentheti, miközben
+a számítási költség körülbelül 20–30%-kal nő. A módszer különösen hosszú
+szekvenciák és mély hálózatok esetén hatékony.</li>
+<li><strong>In-place műveletek:</strong> ha a kimeneti tenzor megegyezik
+a bemeneti tenzor címével (például ReLU aktiváció), a memóriaigény
+csökkenthető. Az in-place használat azonban óvatosságot igényel, mert a
+backward passhoz szükség lehet a bemeneti értékekre is. A
+keretrendszerek csak olyan műveleteknél engedik az in-place
+végrehajtást, ahol a bemeneti adat utána már nem szükséges.</li>
+</ul>
+<p>A workspace a GPU gyorsítókönyvtárak által használt átmeneti
+munkaterület. A cuDNN, cuBLAS és cuFFT függvények gyakran igényelnek egy
+<code>workspace</code> mutatót és méretet. A workspace foglalása
+történhet:</p>
+<pre class="cuda"><code>void* d_workspace = nullptr;
+size_t workspace_bytes = 0;
+cudnnConvolutionForward(context, alpha, x_desc, x, w_desc, w,
+                        conv_desc, algorithm, nullptr, 0,
+                        beta, y_desc, y);
+cudnnGetConvolutionForwardWorkspaceSize(context, x_desc, w_desc,
+                                        conv_desc, y_desc, algorithm,
+                                        &amp;workspace_bytes);
+cudaMalloc(&amp;d_workspace, workspace_bytes);</code></pre>
+<p>A méret a választott algoritmustól és a hardver jellemzőitől függ. A
+gyakorlatban a könyvtárak gyakran több algortimust is támogatnak; a
+legkisebb workspace-t igénylő verzió nem mindig a leggyorsabb. A
+memóriatervezés során a fejlesztőnek kompromisszumot kell kötnie a
+sebesség és a memóriafogyasztás között. A nagy batch méreteknél a
+memória gyakran szűk keresztmetszet, ezért a workspace-t előre, a
+legnagyobb réteghez kell méretezni, majd újrahasznosítani.</p>
+<p>A memória poolok alkalmazása hatékony megoldás: egyetlen nagy
+<code>cudaMalloc</code> hívással lefoglalunk egy blokkot, amelyből a
+rétegek igény szerint kapnak szeleteket. Ezzel elkerülhető a gyakori
+<code>cudaMalloc</code>/<code>cudaFree</code>, amelyek nemcsak lassúak,
+hanem fragmentálják is a memóriát. A pool méretét a legnagyobb aktív
+memóriafelhasználás határozza meg. A tervezési lépések:</p>
+<ol type="1">
+<li>Minden rétegre számítsuk ki a szükséges bemeneti, kimeneti, gradiens
+és workspace memóriát.</li>
+<li>Vegyük a rétegek maximális együttes igényét (a forward és backward
+egyidejű aktivitása).</li>
+<li>Adjunk hozzá biztonsági tartalékot (pl. 10–20%) a fragmentáció és az
+ideiglenes pufferek számára.</li>
+<li>Egyetlen <code>cudaMalloc</code> hívással foglaljuk le a poolt, és a
+rétegek között pointereket osszunk ki.</li>
+</ol>
+<p>A workspace és az aktivációk különválasztása segít a memória
+újrafelhasználásában: egy réteg kimeneti aktivációja csak addig él, amíg
+a következő réteg bemenetévé válik; utána a memória felszabadítható. A
+keretrendszerek ezt automatikusan kezelik, de a saját CUDA kódban a
+fejlesztőnek explicit módon kell döntenie.</p>
+<h3 data-number="24.4.6" id="numerikus-stabilitás"><span
+class="header-section-number">24.4.6</span> Numerikus stabilitás</h3>
+<p>A deep learning kernelek numerikus stabilitását a lebegőpontos
+reprezentáció és a műveletek sorrendje együttesen határozza meg. A GPU-k
+hardveresen támogatják a következő formátumokat:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 23%" />
+<col style="width: 21%" />
+<col style="width: 15%" />
+<col style="width: 26%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Formátum</th>
+<th>Mantissza bitek</th>
+<th>Exponens bitek</th>
+<th>Tartomány</th>
+<th>Relatív pontosság</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FP32</td>
+<td>23</td>
+<td>8</td>
+<td>1.18e−38 – 3.40e38</td>
+<td>~6–7 decimális jegy</td>
+</tr>
+<tr class="even">
+<td>TF32</td>
+<td>10</td>
+<td>8</td>
+<td>1.18e−38 – 3.40e38</td>
+<td>~3 decimális jegy</td>
+</tr>
+<tr class="odd">
+<td>FP16</td>
+<td>10</td>
+<td>5</td>
+<td>5.96e−8 – 6.55e4</td>
+<td>~3 decimális jegy</td>
+</tr>
+<tr class="even">
+<td>BF16</td>
+<td>7</td>
+<td>8</td>
+<td>1.18e−38 – 3.40e38</td>
+<td>~2 decimális jegy</td>
+</tr>
+<tr class="odd">
+<td>FP8 (E4M3)</td>
+<td>3</td>
+<td>4</td>
+<td>1.17e−38 – 3.40e38</td>
+<td>~1 decimális jegy</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban szereplő értékek a hardveres specifikációk szerintiek;
+a pontos tartományt és a kerekítési viselkedést a gyártó dokumentációja
+rögzíti (a verziók ellenőrizendők). A mixed precision tanítás során a
+szokásos minta az, hogy a bemeneti aktivációk és a súlyok FP16 vagy BF16
+pontosságúak, de a szorzások és az akkumuláció FP32-ben történik. Ennek
+az az oka, hogy az FP16 mantissza mindössze 10 bit, így a hosszú
+<code>K</code> dimenziójú összegeknél a kerekítési hibák gyorsan
+felhalmozódnak, és a részösszegek kiléphetnek az FP16 tartományából is.
+Az FP32 akkumulátor ezt elkerüli. A memória szempontjából ez azt
+jelenti, hogy a bemeneti mátrixok elemei fél mérettel tárolhatók, de az
+akkumulátorok és a kimeneti mátrix FP32-ben maradnak. Ez a lábnyom
+csökkentésének egyik leghatékonyabb módja.</p>
+<p>A numerikus stabilitás másik kritikus pontja a <strong>loss
+scaling</strong> a mixed precision tréningben. A backward pass
+gradiensértékei gyakran kicsik – tipikusan 1e−4 és 1e−8 között. FP16-ban
+a legkisebb normális érték körülbelül 6e−5, ezért a kis gradiensek
+alulcsordulnak, és nullává válnak. A megoldás az, hogy a loss értékét a
+backward előtt egy <code>scale</code> faktorral (például 1024)
+megszorozzuk, így a gradiensek ugyanilyen arányban nagyobbak lesznek, és
+FP16-ban is reprezentálhatók maradnak. A súlyfrissítés előtt a
+gradienseket vissza kell osztani a skálázó faktorral. A modern GPU-kon a
+skálázás automatikusan is megvalósítható a Tensor Core-ok által
+támogatott mixed precision műveletekkel, de a fejlesztőnek továbbra is
+ellenőriznie kell, hogy a választott skála nem okoz-e túlcsordulást a
+nagy gradienseknél.</p>
+<p>A <strong>softmax stabilitás</strong> egy egyszerű, de gyakori példa.
+A naiv
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>exp</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mi>/</mi><msub><mo>∑</mo><mi>j</mi></msub><mo>exp</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>j</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\exp(x_i) / \sum_j \exp(x_j)</annotation></semantics></math>
+számítás FP16-ban vagy akár FP32-ben is túlcsordulhat, ha az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mi>i</mi></msub><annotation encoding="application/x-tex">x_i</annotation></semantics></math>
+értékek nagyok (például 50 felett). A stabil verzió levonja a maximális
+értéket:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">softmax</mtext><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mfrac><mrow><mo>exp</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>i</mi></msub><mo>−</mo><munder><mo>max</mo><mi>k</mi></munder><msub><mi>x</mi><mi>k</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><mrow><munder><mo>∑</mo><mi>j</mi></munder><mo>exp</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>j</mi></msub><mo>−</mo><munder><mo>max</mo><mi>k</mi></munder><msub><mi>x</mi><mi>k</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\text{softmax}(x_i) = \frac{\exp(x_i - \max_k x_k)}{\sum_j \exp(x_j - \max_k x_k)}
+</annotation></semantics></math></p>
+<p>Ez a művelet a memóriaprofilt alig befolyásolja, de a numerikus
+stabilitást drámaian javítja. Az attention kernelekben a flash attention
+algoritmus éppen ezt a trükköt használja, miközben a teljes
+<code>S</code> mátrixot nem tárolja el. A futó maximális érték és a futó
+összeg nyilvántartása lehetővé teszi, hogy a softmaxot blokkonként
+számoljuk ki, anélkül, hogy a teljes sort egyszerre látnánk.</p>
+<p>A numerikus hiba méréséhez a fejlesztőnek mindig rögzítenie kell a
+referenciát és a hibakorlátot. Egy mixed precision GEMM esetén a relatív
+hiba tipikusan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>3</mn></mrow></msup><annotation encoding="application/x-tex">10^{-3}</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>4</mn></mrow></msup><annotation encoding="application/x-tex">10^{-4}</annotation></semantics></math>
+között mozog, míg FP32 esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><annotation encoding="application/x-tex">10^{-6}</annotation></semantics></math>
+alatt van. A hibát a kimeneti mátrix elemeinél számíthatjuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">rel. hiba</mtext><mo>=</mo><mfrac><mrow><mo stretchy="false" form="postfix">∥</mo><msub><mi>C</mi><mtext mathvariant="normal">FP16</mtext></msub><mo>−</mo><msub><mi>C</mi><mtext mathvariant="normal">FP32</mtext></msub><msub><mo stretchy="false" form="postfix">∥</mo><mi>F</mi></msub></mrow><mrow><mo stretchy="false" form="postfix">∥</mo><msub><mi>C</mi><mtext mathvariant="normal">FP32</mtext></msub><msub><mo stretchy="false" form="postfix">∥</mo><mi>F</mi></msub></mrow></mfrac></mrow><annotation encoding="application/x-tex">
+\text{rel. hiba} = \frac{\|C_{\text{FP16}} - C_{\text{FP32}}\|_F}{\|C_{\text{FP32}}\|_F}
+</annotation></semantics></math></p>
+<p>A mérésnél a bemeneti értékeket véletlenszerűen, például
+<code>[-0.5, 0.5]</code> tartományból választjuk, hogy az FP16 ábrázolás
+tartományán belül maradjunk. Ha a bemeneti értékek tartománya nagyobb
+(például <code>[-10, 10]</code>), a hiba növekszik, mert az FP16
+mantissza kevesebb jelentős bitet képes megőrizni.</p>
+<h3 data-number="24.4.7"
+id="labor-mixed-precision-és-memóriaoptimalizálás"><span
+class="header-section-number">24.4.7</span> Labor: mixed precision és
+memóriaoptimalizálás</h3>
+<p>Ez a labor egy kis, ellenőrizhető példán mutatja be a mixed precision
+számítást és a shared memory tiling hatását. A feladat egy egyszerű GEMM
+kernel FP16 bemenettel, FP32 akkumulátorral, majd a mérési eredmények
+összehasonlítása a tiszta FP32 referencia implementációval. A kód CUDA
+C++ nyelvű, és izolált labor környezetben futtatható. A konfigurációt és
+a verziókat a labor elején rögzíteni kell; az itt megadott értékek
+helyőrzők, a tényleges környezetben ellenőrizendők.</p>
+<h3 data-number="24.4.8" id="környezet-és-verziók-ellenőrizendő"><span
+class="header-section-number">24.4.8</span> Környezet és verziók
+(ellenőrizendő)</h3>
+<ul>
+<li>GPU: NVIDIA RTX A4000, 16 GB (helyőrző, ellenőrizendő)</li>
+<li>Compute capability: 8.6 (helyőrző)</li>
+<li>Driver: 535.104.05 (helyőrző)</li>
+<li>CUDA: 12.4 (helyőrző)</li>
+<li>Operációs rendszer: Ubuntu 22.04 (helyőrző)</li>
+<li>Fordító: nvcc 12.4 (helyőrző)</li>
+<li>Mérési módszer: 10 warm-up, 100 iteráció, átlag és szórás</li>
+</ul>
+<h3 data-number="24.4.9" id="a-kernel-kódja"><span
+class="header-section-number">24.4.9</span> A kernel kódja</h3>
+<p>A kód egy shared memory tilinget használó FP16 GEMM kernel. Az
+<code>A</code> és <code>B</code> mátrix FP16, a kimeneti <code>C</code>
+mátrix FP32. A tile mérete 16×16; a <code>K</code> dimenzió mentén 16-os
+lépésekben haladunk. A shared memory tömbök 16×17 méretűek, a padding a
+bank conflict elkerülésére szolgál.</p>
+<pre class="cuda"><code>// gemm_fp16_shared.cu
+// CUDA C++ (C++17), nvcc
+#include &lt;cuda_fp16.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;chrono&gt;
+
+#define CHECK_CUDA(call)                                                \
+  do {                                                                  \
+    cudaError_t err = call;                                             \
+    if (err != cudaSuccess) {                                           \
+      fprintf(stderr, &quot;CUDA error: %s:%d, %s\n&quot;, __FILE__, __LINE__,    \
+              cudaGetErrorString(err));                                 \
+      exit(EXIT_FAILURE);                                                \
+    }                                                                   \
+  } while (0)
+
+__global__ void gemm_shared_fp16(
+    const __half* __restrict__ A,
+    const __half* __restrict__ B,
+    float* __restrict__ C,
+    int M, int N, int K)
+{
+    __shared__ __half As[16][17]; // 16x16 + padding a bank conflict elkerülésére
+    __shared__ __half Bs[17][16];
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 &lt; K; k0 += 16) {
+        // A tile betöltése
+        if (row &lt; M &amp;&amp; (k0 + threadIdx.x) &lt; K) {
+            As[threadIdx.y][threadIdx.x] = A[row * K + (k0 + threadIdx.x)];
+        } else {
+            As[threadIdx.y][threadIdx.x] = __float2half(0.0f);
+        }
+
+        // B tile betöltése (transzponált indexeléssel a coalescing érdekében)
+        if (col &lt; N &amp;&amp; (k0 + threadIdx.y) &lt; K) {
+            Bs[threadIdx.y][threadIdx.x] = B[(k0 + threadIdx.y) * N + col];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = __float2half(0.0f);
+        }
+
+        __syncthreads();
+
+        // Szorzás és akkumuláció FP32-ben
+        #pragma unroll
+        for (int k = 0; k &lt; 16; ++k) {
+            float a = __half2float(As[threadIdx.y][k]);
+            float b = __half2float(Bs[k][threadIdx.x]);
+            acc += a * b;
+        }
+
+        __syncthreads();
+    }
+
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        C[row * N + col] = acc;
+    }
+}
+
+// Host oldali referencia FP32 CPU-n
+void reference_gemm_fp32(const float* A, const float* B, float* C,
+                         int M, int N, int K) {
+    for (int i = 0; i &lt; M; ++i)
+        for (int j = 0; j &lt; N; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k &lt; K; ++k)
+                sum += A[i * K + k] * B[k * N + j];
+            C[i * N + j] = sum;
+        }
+}
+
+int main(int argc, char** argv) {
+    int M = 1024, N = 1024, K = 1024; // paraméterek, paraméterezhetővé tehető
+    if (argc &gt; 1) M = atoi(argv[1]);
+    if (argc &gt; 2) N = atoi(argv[2]);
+    if (argc &gt; 3) K = atoi(argv[3]);
+
+    size_t size_A = (size_t)M * K * sizeof(__half);
+    size_t size_B = (size_t)K * N * sizeof(__half);
+    size_t size_C = (size_t)M * N * sizeof(float);
+
+    // Host és device foglalás
+    __half *h_A = (__half*)malloc(size_A);
+    __half *h_B = (__half*)malloc(size_B);
+    float *h_C_fp16 = (float*)malloc(size_C);
+    float *h_C_ref = (float*)malloc(size_C);
+
+    // Véletlenszerű inicializálás [-0.5, 0.5]
+    for (int i = 0; i &lt; M * K; ++i)
+        h_A[i] = __float2half(((float)rand() / RAND_MAX) - 0.5f);
+    for (int i = 0; i &lt; K * N; ++i)
+        h_B[i] = __float2half(((float)rand() / RAND_MAX) - 0.5f);
+
+    __half *d_A, *d_B;
+    float *d_C;
+    CHECK_CUDA(cudaMalloc(&amp;d_A, size_A));
+    CHECK_CUDA(cudaMalloc(&amp;d_B, size_B));
+    CHECK_CUDA(cudaMalloc(&amp;d_C, size_C));
+
+    CHECK_CUDA(cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice));
+
+    // Kernel indítási konfiguráció
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    size_t shared_mem_bytes = (17 * 16 + 17 * 16) * sizeof(__half); // 2 tile + padding
+
+    // Warm-up
+    for (int i = 0; i &lt; 10; ++i)
+        gemm_shared_fp16&lt;&lt;&lt;grid, block, shared_mem_bytes&gt;&gt;&gt;(d_A, d_B, d_C, M, N, K);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Mérés
+    auto start = std::chrono::high_resolution_clock::now();
+    const int iterations = 100;
+    for (int i = 0; i &lt; iterations; ++i)
+        gemm_shared_fp16&lt;&lt;&lt;grid, block, shared_mem_bytes&gt;&gt;&gt;(d_A, d_B, d_C, M, N, K);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    auto stop = std::chrono::high_resolution_clock::now();
+    double avg_ms = std::chrono::duration&lt;double, std::milli&gt;(stop - start).count() / iterations;
+
+    // Eredmény másolása
+    CHECK_CUDA(cudaMemcpy(h_C_fp16, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    // CPU referencia FP32
+    // A bemeneti FP16 értékeket FP32-be konvertáljuk
+    float* h_A_f32 = (float*)malloc(M * K * sizeof(float));
+    float* h_B_f32 = (float*)malloc(K * N * sizeof(float));
+    for (int i = 0; i &lt; M * K; ++i) h_A_f32[i] = __half2float(h_A[i]);
+    for (int i = 0; i &lt; K * N; ++i) h_B_f32[i] = __half2float(h_B[i]);
+    reference_gemm_fp32(h_A_f32, h_B_f32, h_C_ref, M, N, K);
+
+    // Hiba számítása
+    double frob_num = 0.0, frob_den = 0.0;
+    for (int i = 0; i &lt; M * N; ++i) {
+        double diff = h_C_fp16[i] - h_C_ref[i];
+        frob_num += diff * diff;
+        frob_den += h_C_ref[i] * h_C_ref[i];
+    }
+    double rel_error = sqrt(frob_num) / sqrt(frob_den);
+
+    // Sávszélesség becslés: A + B beolvasás, C írás
+    double bytes_moved = (double)M * K * sizeof(__half) +
+                         (double)K * N * sizeof(__half) +
+                         (double)M * N * sizeof(float);
+    double bandwidth_gbps = bytes_moved / (avg_ms * 1e-3) / 1e9;
+
+    printf(&quot;M=%d N=%d K=%d\n&quot;, M, N, K);
+    printf(&quot;Average time: %.3f ms (std dev not measured here)\n&quot;, avg_ms);
+    printf(&quot;Effective bandwidth: %.2f GB/s\n&quot;, bandwidth_gbps);
+    printf(&quot;Relative error vs FP32 CPU: %.3e\n&quot;, rel_error);
+
+    free(h_A); free(h_B); free(h_C_fp16); free(h_C_ref);
+    free(h_A_f32); free(h_B_f32);
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    return 0;
+}</code></pre>
+<h3 data-number="24.4.10" id="build-és-futtatás"><span
+class="header-section-number">24.4.10</span> Build és futtatás</h3>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Fordítás</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-o</span> gemm_fp16_shared gemm_fp16_shared.cu</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás egy adott mérettel</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./gemm_fp16_shared</span> 1024 1024 1024</span></code></pre></div>
+<p>A futtatás előtt a környezetben ellenőrizni kell, hogy a GPU nem
+foglalt, és az erőforrás-korlátok be vannak állítva. A kód izolált
+konténerben vagy dedikált GPU-n fut, hogy a mérési eredményeket ne
+zavarja más terhelés.</p>
+<h3 data-number="24.4.11" id="mérési-napló-és-eredmények"><span
+class="header-section-number">24.4.11</span> Mérési napló és
+eredmények</h3>
+<p>A labor során a következő adatokat rögzítjük: futásidő, effektív
+sávszélesség, relatív hiba az FP32 referencia ellen. A táblázatban a
+<strong>várt</strong> oszlop a hardver specifikációiból és a korábbi
+fejezetekben ismertetett modell alapján becsült értékeket tartalmazza, a
+<strong>mért</strong> oszlop pedig a tényleges futtatás eredményeit. Az
+itt bemutatott mért értékek illusztrációk, nem ellenőrzött mérések; a
+hallgató feladata a saját környezetében történő kitöltés.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 15%" />
+<col style="width: 16%" />
+<col style="width: 12%" />
+<col style="width: 15%" />
+<col style="width: 16%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Konfiguráció</th>
+<th>Mért futásidő (ms)</th>
+<th>Mért sávszél. (GB/s)</th>
+<th>Mért rel. hiba</th>
+<th>Várt futásidő (ms)</th>
+<th>Várt sávszél. (GB/s)</th>
+<th>Várt rel. hiba</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FP32 referencia (cuBLAS)</td>
+<td>(mérendő)</td>
+<td>(mérendő)</td>
+<td>0 (referencia)</td>
+<td>~10 ms</td>
+<td>~200 GB/s</td>
+<td>0</td>
+</tr>
+<tr class="even">
+<td>FP16 shared tiling (ez a kernel)</td>
+<td>(mérendő)</td>
+<td>(mérendő)</td>
+<td>(mérendő)</td>
+<td>~5 ms</td>
+<td>~400 GB/s</td>
+<td>&lt; 1e-3</td>
+</tr>
+<tr class="odd">
+<td>FP16 shared tiling + padding</td>
+<td>(mérendő)</td>
+<td>(mérendő)</td>
+<td>(mérendő)</td>
+<td>~5 ms</td>
+<td>~450 GB/s</td>
+<td>&lt; 1e-3</td>
+</tr>
+</tbody>
+</table>
+<p>A várt futásidő az RTX A4000 hivatalos specifikációi alapján: FP32
+teljesítmény körülbelül 19.2 TFLOPS, FP16 pedig ennek kétszerese. A
+memória sávszélesség 448 GB/s. A kernel hatékonysága a memória
+sávszélesség korlátja miatt nem éri el a számítási csúcsot; a várt
+effektív sávszélesség 400–450 GB/s közé esik. A relatív hiba várhatóan
+1e−3 nagyságrendű, mert az FP16 mantissza 10 bit, és a feltöltött
+értékek tartománya kicsi.</p>
+<p>A labor során a mért adatokat a futtatás után kell beírni. A szórást
+100 iterációból számítjuk; a kernelben a
+<code>cudaDeviceSynchronize</code> után a <code>std::chrono</code>
+segítségével mérünk. A szórást külön oszlopban rögzíthetjük.</p>
+<h3 data-number="24.4.12" id="a-labor-értelmezése"><span
+class="header-section-number">24.4.12</span> A labor értelmezése</h3>
+<p>A mixed precision kernel memóriaprofilja javul a tiszta FP32
+verzióhoz képest, mert a bemeneti mátrixok fele akkora helyet foglalnak.
+Ez lehetővé teszi, hogy nagyobb batch méreteket futtassunk ugyanazon a
+GPU-n, vagy hogy a shared memory tile ugyanakkora elemszám mellett
+kisebb legyen, ami növeli az occupancy-t. A numerikus hiba növekedése
+azonban elfogadhatatlan lehet olyan alkalmazásoknál, ahol a kimeneti
+értékeket további érzékeny műveletek (például normalizálás,
+exponenciális) használják. A fejlesztőnek mindig mérnie kell a hibát a
+célfeladat kontextusában.</p>
+<p>A memóriaoptimalizálás második lépése a shared memory padding. A
+16×17-es tömbök elkerülik a bank conflictet, mert az ugyanabban a szóban
+lévő szomszédos szálak nem azonos bankhoz férnek hozzá. A kódban a
+<code>Bs</code> tömböt 17×16-osnak választottuk, ami szintén paddinget
+biztosít. A padding nélküli verzióhoz képest a bank conflict miatt a
+shared memory hozzáférések száma nő, ami a kernel futását lassítja. A
+laborban ezt külön mérhetjük: a padding nélküli változat futásideje
+jellemzően 10–20%-kal hosszabb.</p>
+<h3 data-number="24.4.13" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">24.4.13</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A memória és pontosság témakörében a következő hibák fordulnak elő
+leggyakrabban:</p>
+<ol type="1">
+<li><strong>Nincs loss scaling FP16 tréning esetén.</strong> A
+gradiensek alulcsordulnak, a modell tanulása leáll. A helyes megoldás:
+dinamikus vagy statikus loss scaling, FP32 master weights
+fenntartása.</li>
+<li><strong>A workspace méretét nem kérdezik le, vagy nem ellenőrzik a
+visszatérési kódot.</strong> A cuDNN/cuBLAS hívás hibát jelez, vagy a
+kernel számítási hibát okoz. A workspace méretét mindig a megfelelő
+<code>GetWorkspaceSize</code> függvénnyel kell lekérdezni.</li>
+<li><strong>FP16 aktivációk tárolása a backwardhoz.</strong> A kis
+aktivációk FP16-ban kerekítési hibákat okozhatnak, és a gradiens
+számítása pontatlan lesz. A helyes megoldás: az aktivációkat FP16-ban
+tárolni csak akkor, ha a modell tolerálja a hibát; általában FP32-ben
+érdemes tárolni, vagy legalább a checkpointoknál FP32-re
+konvertálni.</li>
+<li><strong>A memória pool túl kicsi vagy túl nagy.</strong> A túl kicsi
+pool <code>cudaMalloc</code>-hoz vezet, ami lassú; a túl nagy pool
+pazarolja a GPU memóriát. A megoldás: profilozással mérni a tényleges
+csúcsfogyasztást, és ennek alapján méretezni.</li>
+<li><strong>A softmax naiv implementációja nagy bemeneti
+értékeknél.</strong> Az <code>exp</code> túlcsordul, a kimenet NaN. A
+megoldás: a maximális érték levonása minden sorban, vagy online
+softmax.</li>
+<li><strong>A kernelben nincs szinkronizáció a shared memory tile
+feltöltése után.</strong> A szálak olvashatnak érvénytelen adatot. A
+<code>__syncthreads()</code> használata kötelező a tile-ok között.</li>
+</ol>
+<p>Ezek a hibák mind a memória és a pontosság szoros kapcsolatára
+vezethetők vissza: a memória optimalizálása (pl. FP16 használat)
+pontossági áldozatot követel, a numerikus stabilitás fenntartása pedig
+több memóriát (pl. FP32 akkumulátor, loss scaling) igényel. A mérnöki
+döntés mindig a feladat toleranciájától függ.</p>
+<h3 data-number="24.4.14" id="önellenőrző-kérdés"><span
+class="header-section-number">24.4.14</span> Önellenőrző kérdés</h3>
+<p>Adott egy transformer figyelmi réteg <code>L=2048</code>,
+<code>B=4</code>, <code>H=16</code>, <code>d=64</code> paraméterekkel.
+Számítsa ki a teljes figyelmi mátrix <code>S = Q·Kᵀ</code> méretét FP32
+és FP16 pontosságban, és becsülje meg a globális memória igényt. Miért
+előnyös az online softmax alkalmazása a memória és a numerikus
+stabilitás szempontjából? A válaszban térjen ki a workspace igényére és
+a loss scaling szükségességére is.</p>
+<p>A fejezet következő egysége a streamek, események és az aszinkron
+végrehajtás világába vezet, ahol azt vizsgáljuk, hogyan lehet a
+számítást és az adatmozgatást átfedni, és miként építhetők fel a CUDA
+grátok a GPU-erőforrások hatékony kihasználására. Az itt bevezetett
+memória- és pontosságtervezési fogalmak – a workspace, a mixed precision
+reprezentációk és a numerikus stabilitás – közvetlenül kapcsolódnak
+ahhoz, ahogyan az aszinkron műveletek ütemezése és a multi-stream
+végrehajtás befolyásolja a GPU memória foglalását és a kernelindítások
+sorrendjét.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu092.html">← 24.3 Attention kernelek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu094.html">25.1 Streamek és események →</a></div>
+</nav>
+</body>
+</html>

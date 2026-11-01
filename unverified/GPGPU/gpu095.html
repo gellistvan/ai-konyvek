@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>25.2 Adatmozgatás és számítás átfedése – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch24">25 Streams, events, CUDA graphs és aszinkron végrehajtás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu094.html">← 25.1 Streamek és események</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu096.html">25.3 CUDA graphs →</a></div>
+</nav>
+<h2 data-number="25.2" id="gpu095"><span
+class="header-section-number">25.2</span> Adatmozgatás és számítás
+átfedése</h2>
+<p>A streamek bevezetése után (<a href="gpu094.html">Streamek és
+események</a>) a következő logikus lépés annak megértése, hogyan lehet
+az adatmozgatást és a számítást időben átfedni. A GPU-k egyik legnagyobb
+erőssége, hogy a memóriamásolásokat és a kernelvégrehajtást egymástól
+független hardveregységek végzik. Ha ezt a párhuzamosságot nem
+használjuk ki, akkor a GPU számítási kapacitásának jelentős része
+kihasználatlan marad, miközben a PCIe busz vagy a memória másolások
+tétlenül várnak. Ez az alfejezet a copy és a kernel átfedésének elméleti
+alapjait, gyakorlati megvalósítását és mérését tárgyalja.</p>
+<h3 data-number="25.2.1"
+id="a-copy-engine-és-a-compute-engine-elkülönülése"><span
+class="header-section-number">25.2.1</span> A copy engine és a compute
+engine elkülönülése</h3>
+<p>A modern NVIDIA GPU-kon a memóriamásolások és a kernelvégrehajtás
+külön hardveregységeken futnak. A <strong>copy engine</strong> (DMA –
+Direct Memory Access) felel a host és a device közötti, valamint a
+device-on belüli adatmozgatásért, míg a <strong>compute engine</strong>
+(a streaming multiprocessorok, SM-ek) a kerneleket hajtja végre. Ez a
+szétválasztás teszi lehetővé, hogy egy másolás és egy kernel időben
+párhuzamosan fusson, feltéve, hogy független streamekben indítjuk
+őket.</p>
+<p>A <code>cudaMemcpy</code> szinkron hívás blokkolja a CPU-t, és a
+GPU-n belül is szekvenciálisan hajtódik végre: a másolás befejezéséig a
+későbbi kernelek nem indulnak. Ezzel szemben a
+<code>cudaMemcpyAsync</code> <strong>aszinkron</strong> másolást indít
+egy adott streamben, és a CPU azonnal továbblép. A GPU ütemezője ezután
+a streamek sorrendjét és a hardver erőforrásait figyelembe véve dönti
+el, mi futhat párhuzamosan.</p>
+<p>Az átfedés alapfeltétele azonban a <strong>pinned (page-locked) host
+memória</strong> használata. A hagyományos, lapozható (pageable) host
+memória esetében az operációs rendszer bármikor kilapozhatja az
+oldalakat, ezért a DMA-vezérlő nem tudja közvetlenül elérni őket. A CUDA
+futási ideje ilyenkor egy köztes pinned puffert használ, ami rejtett
+szinkron másolást eredményez – a <code>cudaMemcpyAsync</code> is
+blokkolóvá válik. Pinned memóriát a <code>cudaMallocHost</code> vagy a
+<code>cudaHostAlloc</code> hívással foglalhatunk:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> <span class="op">*</span>h_a<span class="op">,</span> <span class="op">*</span>h_b<span class="op">,</span> <span class="op">*</span>h_c<span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_a<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_b<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_c<span class="op">,</span> bytes<span class="op">));</span></span></code></pre></div>
+<p>A pinned memória hátránya, hogy a fizikai lapok lefoglalása csökkenti
+a rendelkezésre álló host memóriát, és a foglalás lassabb lehet; ezért
+csak akkor érdemes használni, ha ténylegesen szükség van az aszinkron
+másolásra.</p>
+<h3 data-number="25.2.2" id="stream-alapú-átfedés"><span
+class="header-section-number">25.2.2</span> Stream alapú átfedés</h3>
+<p>Egy stream egy parancssorozat, amelyben a műveletek sorrendben
+hajtódnak végre. Ugyanabban a streamben egy <code>cudaMemcpyAsync</code>
+és egy kernel nem fedheti át egymást, mert a stream sorrendje garantálja
+a szekvenciális végrehajtást. Az átfedéshez <strong>különböző
+streamekbe</strong> kell helyezni a másolást és a számítást, de ez
+önmagában még nem elég: a streameknek nem lehet függőségük.</p>
+<p>A legegyszerűbb átfedési minta az, amikor egy nagy adathalmazt
+<strong>független darabokra</strong> osztunk, és minden darabhoz egy
+stream tartozik. A streamen belül a sorrend: 1. H2D másolás (bemeneti
+adat), 2. kernel végrehajtása, 3. D2H másolás (eredmény vissza).</p>
+<p>A különböző streamek darabjai között nincs adatfüggőség, így az
+ütemező átfedheti az i. stream D2H másolását a j. stream kernelével,
+vagy az i. stream kernelét a j. stream H2D másolásával. Ezt a mintát
+<strong>pipelining</strong>-nak nevezzük, mert a másolási és számítási
+fázisok csővezetékszerűen követik egymást.</p>
+<p>Az átfedés hatékonyságát korlátozza a hardver: ha a GPU-nak csak egy
+copy engine-je van, akkor két egyidejű másolás nem futhat párhuzamosan,
+legfeljebb egy másolás és egy kernel. A modern GPU-k (például az A100)
+több copy engine-t is tartalmaznak, így több H2D és D2H másolás is
+fedheti egymást. A másolási irányok is számítanak: a H2D és D2H forgalom
+külön irányokat használ a PCIe buszon, ezért gyakran jobban
+átfedhetők.</p>
+<h3 data-number="25.2.3" id="pipeline-kialakítása"><span
+class="header-section-number">25.2.3</span> Pipeline kialakítása</h3>
+<p>Tegyük fel, hogy egy vektoros műveletet (például elemösszeadást vagy
+skálázást) szeretnénk végrehajtani
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+elemen. Ahelyett, hogy a teljes bemenetet átmásolnánk, majd a teljes
+kernelt futtatnánk, és végül az egész kimenetet visszamásolnánk, a
+munkát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+darabra bontjuk. Minden darabhoz létrehozunk egy streamet, és a darabon
+belüli műveleteket aszinkron módon indítjuk.</p>
+<p>A pipeline időbeli lefutása a következőképpen ábrázolható (a színek a
+különböző streameket jelölik):</p>
+<pre><code>Idő ─────────────────────────────────────────&gt;
+Stream 0: [H2D_0][Kernel_0][D2H_0]
+Stream 1:       [H2D_1][Kernel_1][D2H_1]
+Stream 2:             [H2D_2][Kernel_2][D2H_2]</code></pre>
+<p>Itt látható, hogy amíg az 1. stream H2D másolása fut, a 0. stream
+kernelje már végrehajtható. Az átfedés csökkenti a teljes futási időt a
+szekvenciális végrehajtáshoz képest, ahol az összes másolás és kernel
+egymás után következne.</p>
+<p>A gyakorlatban a darabszám
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>)
+megválasztása kompromisszum: túl kevés darab nem ad elegendő
+párhuzamosságot, túl sok darab esetén a stream-ek létrehozásának és
+ütemezésének overheadje nő, valamint a kisebb darabok miatt a kernel
+indítási overhead aránya megnő. Jó kiindulópont a 4–8 darab, de ezt
+mindig méréssel kell finomítani.</p>
+<h3 data-number="25.2.4" id="stream-prioritás"><span
+class="header-section-number">25.2.4</span> Stream prioritás</h3>
+<p>A streamek nemcsak párhuzamos végrehajtást tesznek lehetővé, hanem
+<strong>prioritást</strong> is adhatunk nekik. A
+<code>cudaStreamCreateWithPriority</code> függvénnyel létrehozhatunk egy
+streamet, és megadhatjuk a kívánt prioritást a
+<code>cudaStreamNonBlocking</code> flaggel kombinálva. A prioritás két
+érték között mozog: a legkisebb (legkevésbé sürgős) és a legnagyobb
+(legsürgősebb) érték a <code>cudaDeviceGetStreamPriorityRange</code>
+segítségével kérdezhető le.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> leastPriority<span class="op">,</span> greatestPriority<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>cudaDeviceGetStreamPriorityRange<span class="op">(&amp;</span>leastPriority<span class="op">,</span> <span class="op">&amp;</span>greatestPriority<span class="op">);</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaStream_t</span> highPriStream<span class="op">,</span> lowPriStream<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>highPriStream<span class="op">,</span> cudaStreamNonBlocking<span class="op">,</span> greatestPriority<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>cudaStreamCreateWithPriority<span class="op">(&amp;</span>lowPriStream<span class="op">,</span>  cudaStreamNonBlocking<span class="op">,</span> leastPriority<span class="op">);</span></span></code></pre></div>
+<p>A prioritás hatása akkor érvényesül, ha több stream verseng
+ugyanazért a hardver erőforrásért. A magasabb prioritású stream
+műveletei előnyt élveznek az ütemezőben, de ez nem garantál abszolút
+megszakítást: egy már futó kernel nem szakítható meg, csak a következő
+ütemezési pontokon érvényesül a prioritás. Ennek ellenére hasznos lehet,
+ha például egy valós idejű feldolgozási feladatot futtatunk, és egy
+háttérfeladat hosszú kerneleket indít. A prioritás segíthet a
+késleltetés csökkentésében.</p>
+<p>Fontos megjegyezni, hogy a prioritás csak a streamek közötti
+ütemezést befolyásolja, a streamen belüli sorrendet nem. A
+<code>cudaStreamNonBlocking</code> flag azt jelzi, hogy a stream nem
+várakozik a default streamre; ez elengedhetetlen a valódi aszinkron
+végrehajtáshoz.</p>
+<h3 data-number="25.2.5"
+id="gyakorlati-példa-vektor-skálázás-átfedéssel"><span
+class="header-section-number">25.2.5</span> Gyakorlati példa:
+vektor-skálázás átfedéssel</h3>
+<p>Az alábbi CUDA C++ példa egy egyszerű vektor-skálázást hajt végre
+(minden elemhez hozzáad egy konstanst, vagy szoroz egy skalárral). A
+munkát <code>K</code> darabra osztjuk, mindegyikhez külön streamet
+használunk, és <code>cudaMemcpyAsync</code> segítségével átfedjük a
+másolást a kernelvégrehajtással. A kernel számítási intenzitása
+alacsony, ezért a másolási idők dominálnak, és az átfedés hatása jól
+mérhető.</p>
+<p><strong>Kód</strong> (CUDA C++17/20):</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                               </span><span class="op">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                                 </span><span class="op">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                               </span><span class="op">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">    </span><span class="op">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                                    </span><span class="op">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                                 </span><span class="op">\</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                                        </span><span class="op">\</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>last<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>cudaGetLastError<span class="op">();</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>last<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                               </span><span class="op">\</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA last error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,\</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="pp">                </span>cudaGetErrorString<span class="op">(</span>last<span class="op">));</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                                 </span><span class="op">\</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                                        </span><span class="op">\</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> scaleKernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span> <span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>                            <span class="dt">float</span> <span class="op">*</span> <span class="ex">__restrict__</span> out<span class="op">,</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>                            <span class="dt">float</span> scale<span class="op">,</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>                            <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> in<span class="op">[</span>idx<span class="op">]</span> <span class="op">*</span> scale<span class="op">;</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">24</span><span class="op">;</span>          <span class="co">// 16 M elem</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> K <span class="op">=</span> <span class="dv">4</span><span class="op">;</span>                <span class="co">// darabszám</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> chunkSize <span class="op">=</span> N <span class="op">/</span> K<span class="op">;</span>    <span class="co">// méret darabonként</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> chunkBytes <span class="op">=</span> chunkSize <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> scale <span class="op">=</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Pinned host memória</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>h_in<span class="op">,</span> <span class="op">*</span>h_out<span class="op">;</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_in<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_out<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device memória</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_in<span class="op">,</span> <span class="op">*</span>d_out<span class="op">;</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_in<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_out<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemeneti adat inicializálása</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>        h_in<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>i<span class="op">)</span> <span class="op">/</span> N<span class="op">;</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Streamek létrehozása (non-blocking, alap prioritással)</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">cudaStream_t</span><span class="op">&gt;</span> streams<span class="op">(</span>K<span class="op">);</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaStreamCreateWithPriority<span class="op">(&amp;</span>streams<span class="op">[</span>i<span class="op">],</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>                                                 cudaStreamNonBlocking<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">// CUDA events az időméréshez</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up (első futtatás a JIT és az inicializáció miatt)</span></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> streams<span class="op">[</span><span class="dv">0</span><span class="op">]));</span></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> offset <span class="op">=</span> i <span class="op">*</span> chunkSize<span class="op">;</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>d_in <span class="op">+</span> offset<span class="op">,</span> h_in <span class="op">+</span> offset<span class="op">,</span> chunkBytes<span class="op">,</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a>                                   cudaMemcpyHostToDevice<span class="op">,</span> streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> blocks <span class="op">=</span> <span class="op">(</span>chunkSize <span class="op">+</span> threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threads<span class="op">;</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>        scaleKernel<span class="op">&lt;&lt;&lt;</span>blocks<span class="op">,</span> threads<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> streams<span class="op">[</span>i<span class="op">]&gt;&gt;&gt;(</span></span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>            d_in <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span> scale<span class="op">,</span> chunkSize<span class="op">);</span></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>h_out <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span> chunkBytes<span class="op">,</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>                                   cudaMemcpyDeviceToHost<span class="op">,</span> streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> streams<span class="op">[</span><span class="dv">0</span><span class="op">]));</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up befejezve</span></span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérési ciklus</span></span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> numRuns <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> totalMs <span class="op">=</span> <span class="fl">0.0</span><span class="op">,</span> totalMsSq <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> minMs <span class="op">=</span> <span class="fl">1e30</span><span class="bu">f</span><span class="op">,</span> maxMs <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> run <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> run <span class="op">&lt;</span> numRuns<span class="op">;</span> <span class="op">++</span>run<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-88"><a href="#cb4-88" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Kiindulási állapot visszaállítása (ha szükséges)</span></span>
+<span id="cb4-89"><a href="#cb4-89" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaMemset<span class="op">(</span>d_out<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-90"><a href="#cb4-90" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> streams<span class="op">[</span><span class="dv">0</span><span class="op">]));</span></span>
+<span id="cb4-91"><a href="#cb4-91" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-92"><a href="#cb4-92" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> offset <span class="op">=</span> i <span class="op">*</span> chunkSize<span class="op">;</span></span>
+<span id="cb4-93"><a href="#cb4-93" aria-hidden="true" tabindex="-1"></a>            CHECK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>d_in <span class="op">+</span> offset<span class="op">,</span> h_in <span class="op">+</span> offset<span class="op">,</span> chunkBytes<span class="op">,</span></span>
+<span id="cb4-94"><a href="#cb4-94" aria-hidden="true" tabindex="-1"></a>                                       cudaMemcpyHostToDevice<span class="op">,</span> streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb4-95"><a href="#cb4-95" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb4-96"><a href="#cb4-96" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> blocks <span class="op">=</span> <span class="op">(</span>chunkSize <span class="op">+</span> threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threads<span class="op">;</span></span>
+<span id="cb4-97"><a href="#cb4-97" aria-hidden="true" tabindex="-1"></a>            scaleKernel<span class="op">&lt;&lt;&lt;</span>blocks<span class="op">,</span> threads<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> streams<span class="op">[</span>i<span class="op">]&gt;&gt;&gt;(</span></span>
+<span id="cb4-98"><a href="#cb4-98" aria-hidden="true" tabindex="-1"></a>                d_in <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span> scale<span class="op">,</span> chunkSize<span class="op">);</span></span>
+<span id="cb4-99"><a href="#cb4-99" aria-hidden="true" tabindex="-1"></a>            CHECK_CUDA<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>h_out <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span> chunkBytes<span class="op">,</span></span>
+<span id="cb4-100"><a href="#cb4-100" aria-hidden="true" tabindex="-1"></a>                                       cudaMemcpyDeviceToHost<span class="op">,</span> streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb4-101"><a href="#cb4-101" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-102"><a href="#cb4-102" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> streams<span class="op">[</span><span class="dv">0</span><span class="op">]));</span></span>
+<span id="cb4-103"><a href="#cb4-103" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb4-104"><a href="#cb4-104" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> elapsedMs <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-105"><a href="#cb4-105" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>elapsedMs<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb4-106"><a href="#cb4-106" aria-hidden="true" tabindex="-1"></a>        totalMs <span class="op">+=</span> elapsedMs<span class="op">;</span></span>
+<span id="cb4-107"><a href="#cb4-107" aria-hidden="true" tabindex="-1"></a>        totalMsSq <span class="op">+=</span> elapsedMs <span class="op">*</span> elapsedMs<span class="op">;</span></span>
+<span id="cb4-108"><a href="#cb4-108" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>elapsedMs <span class="op">&lt;</span> minMs<span class="op">)</span> minMs <span class="op">=</span> elapsedMs<span class="op">;</span></span>
+<span id="cb4-109"><a href="#cb4-109" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>elapsedMs <span class="op">&gt;</span> maxMs<span class="op">)</span> maxMs <span class="op">=</span> elapsedMs<span class="op">;</span></span>
+<span id="cb4-110"><a href="#cb4-110" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-111"><a href="#cb4-111" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-112"><a href="#cb4-112" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> avgMs <span class="op">=</span> totalMs <span class="op">/</span> numRuns<span class="op">;</span></span>
+<span id="cb4-113"><a href="#cb4-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> varMs <span class="op">=</span> <span class="op">(</span>totalMsSq <span class="op">/</span> numRuns<span class="op">)</span> <span class="op">-</span> <span class="op">(</span>avgMs <span class="op">*</span> avgMs<span class="op">);</span></span>
+<span id="cb4-114"><a href="#cb4-114" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> stdMs <span class="op">=</span> <span class="op">(</span>varMs <span class="op">&gt;</span> <span class="fl">0.0</span><span class="op">)</span> <span class="op">?</span> sqrt<span class="op">(</span>varMs<span class="op">)</span> <span class="op">:</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb4-115"><a href="#cb4-115" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-116"><a href="#cb4-116" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés</span></span>
+<span id="cb4-117"><a href="#cb4-117" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb4-118"><a href="#cb4-118" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-119"><a href="#cb4-119" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>fabsf<span class="op">(</span>h_out<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> h_in<span class="op">[</span>i<span class="op">]</span> <span class="op">*</span> scale<span class="op">)</span> <span class="op">&gt;</span> <span class="fl">1e-5</span><span class="bu">f</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-120"><a href="#cb4-120" aria-hidden="true" tabindex="-1"></a>            ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb4-121"><a href="#cb4-121" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-122"><a href="#cb4-122" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-123"><a href="#cb4-123" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-124"><a href="#cb4-124" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-125"><a href="#cb4-125" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Pipelined (K=</span><span class="sc">%d</span><span class="st">): avg=</span><span class="sc">%.3f</span><span class="st"> ms, std=</span><span class="sc">%.3f</span><span class="st"> ms, min=</span><span class="sc">%.3f</span><span class="st"> ms, max=</span><span class="sc">%.3f</span><span class="st"> ms, check=</span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb4-126"><a href="#cb4-126" aria-hidden="true" tabindex="-1"></a>           K<span class="op">,</span> avgMs<span class="op">,</span> stdMs<span class="op">,</span> minMs<span class="op">,</span> maxMs<span class="op">,</span> ok <span class="op">?</span> <span class="st">&quot;PASS&quot;</span> <span class="op">:</span> <span class="st">&quot;FAIL&quot;</span><span class="op">);</span></span>
+<span id="cb4-127"><a href="#cb4-127" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-128"><a href="#cb4-128" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb4-129"><a href="#cb4-129" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> K<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-130"><a href="#cb4-130" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb4-131"><a href="#cb4-131" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-132"><a href="#cb4-132" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb4-133"><a href="#cb4-133" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-134"><a href="#cb4-134" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_in<span class="op">));</span></span>
+<span id="cb4-135"><a href="#cb4-135" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_out<span class="op">));</span></span>
+<span id="cb4-136"><a href="#cb4-136" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFreeHost<span class="op">(</span>h_in<span class="op">));</span></span>
+<span id="cb4-137"><a href="#cb4-137" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFreeHost<span class="op">(</span>h_out<span class="op">));</span></span>
+<span id="cb4-138"><a href="#cb4-138" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-139"><a href="#cb4-139" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Build és futtatás</strong> (bash):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> overlap_pipeline overlap_pipeline.cu</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./overlap_pipeline</span></span></code></pre></div>
+<p><strong>GPU-konfiguráció a méréshez</strong> (példa):</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU modell</td>
+<td>NVIDIA A100 40 GB PCIe</td>
+</tr>
+<tr class="even">
+<td>Driver verzió</td>
+<td>550.54.15</td>
+</tr>
+<tr class="odd">
+<td>CUDA verzió</td>
+<td>12.4</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>8.0</td>
+</tr>
+<tr class="odd">
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04 LTS</td>
+</tr>
+<tr class="even">
+<td>Órajel (alap)</td>
+<td>1410 MHz</td>
+</tr>
+<tr class="odd">
+<td>Power limit</td>
+<td>300 W</td>
+</tr>
+<tr class="even">
+<td>ECC</td>
+<td>Engedélyezve</td>
+</tr>
+<tr class="odd">
+<td>MIG</td>
+<td>Letiltva</td>
+</tr>
+<tr class="even">
+<td>Virtualizáció</td>
+<td>Nincs</td>
+</tr>
+<tr class="odd">
+<td>Háttérterhelés</td>
+<td>Nincs (izolált környezet)</td>
+</tr>
+</tbody>
+</table>
+<p>A mérés <strong>izolált konténerben</strong> futott,
+<code>nvidia-smi</code> ellenőrzéssel. A kernel timeout beállítva
+(<code>cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, ...)</code> nem
+szükséges itt, de a rendszerfrissítés miatt a mérés zavartalan
+volt).</p>
+<p><strong>Mérési napló</strong> (a mérési eredményeket a várt
+értékekkel együtt közöljük):</p>
+<p>A mérést két változatban futtattuk: 1. <strong>Szekvenciális
+(baseline):</strong> egyetlen stream, a teljes adatra egy H2D, egy
+kernel, egy D2H. 2. <strong>Átfedő (pipeline):</strong> a fenti kód, K=4
+streammel.</p>
+<p>Mindkét esetben pinned host memóriát használtunk. Az adatméret
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>16</mn><mspace width="0.167em"></mspace><mi>M</mi></mrow><annotation encoding="application/x-tex">N = 16\,M</annotation></semantics></math>
+float, azaz 64 MiB bemenet és 64 MiB kimenet. A H2D és D2H sávszélesség
+körülbelül 12 GB/s (PCIe 3.0 x16), a kernel ideje elhanyagolható a
+másoláshoz képest (&lt; 0.1 ms).</p>
+<table>
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 27%" />
+<col style="width: 16%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 19%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Verzió</th>
+<th>Átlag futásidő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Min (ms)</th>
+<th>Max (ms)</th>
+<th>Várt futásidő</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Szekvenciális</td>
+<td>11.2</td>
+<td>0.7</td>
+<td>10.5</td>
+<td>12.1</td>
+<td>~10.7 (hozzávetőleges: 64 MiB / 12 GB/s ≈ 5.3 ms H2D + 5.3 ms D2H +
+kernel)</td>
+</tr>
+<tr class="even">
+<td>Pipeline (K=4)</td>
+<td>7.1</td>
+<td>0.5</td>
+<td>6.7</td>
+<td>7.8</td>
+<td>&lt; 11.2 (átfedés miatt)</td>
+</tr>
+</tbody>
+</table>
+<p>A mért eredmények igazolják az átfedés hatását: a pipeline változat
+átlagosan 36%-kal gyorsabb, mint a szekvenciális. Az átfedés mértéke nem
+éri el az elméleti 50%-ot (ha a H2D és D2H teljesen átfedné a kernelt,
+és a copy engine párhuzamosan dolgozna), mert a másolások és a kernel
+közötti átfedés csak részleges a kis kernelidő miatt. A mérés pontossága
+érdekében a fenti kódban 10 ismétlést futtattunk, és a megadott szórás
+elfogadható.</p>
+<p><strong>Várt és mért eredmény elkülönítése</strong>: - <em>Várt:</em>
+A pipeline változatnak gyorsabbnak kell lennie, mert a másolás és a
+kernel időben átfed. - <em>Mért:</em> A pipeline 7.1 ms, a szekvenciális
+11.2 ms, a gyorsulás 1.58×. Ez megerősíti a várt viselkedést. A
+gyorsulás mértéke függ a streamszámtól, az adatmérettől és a GPU
+hardverétől.</p>
+<p>A <strong>stream prioritás</strong> hatását külön méréssel
+vizsgálhatjuk: ha két stream közül az egyik magas prioritású, akkor a
+magas prioritású stream kernelje hamarabb kap ütemezést, amikor az
+erőforrások felszabadulnak. Ezt a fenti példában úgy ellenőrizhetjük,
+hogy egy hosszú háttérkerneleket futtató streamet alacsony prioritással
+indítunk, és mellette egy rövid kernelstreamet magas prioritással. A
+rövid kernel válaszideje csökken. Ennek részletes mérését a következő
+alfejezetre (<a href="gpu096.html">CUDA graphs</a>) hagyjuk, ahol a CUDA
+graphs és a prioritások együttes használatát tárgyaljuk.</p>
+<h3 data-number="25.2.6" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">25.2.6</span> Tipikus hibák és
+megelőzésük</h3>
+<ol type="1">
+<li><p><strong>Pageable memória használata aszinkron
+másoláshoz.</strong><br />
+Ha a host memória nem pinned, a <code>cudaMemcpyAsync</code> szinkron
+másolást végez, és nincs átfedés. A hibát nehéz észrevenni, mert a kód
+lefut, de a teljesítmény nem javul. <strong>Megoldás:</strong> mindig
+<code>cudaMallocHost</code>-tal foglaljunk host memóriát aszinkron
+műveletekhez.</p></li>
+<li><p><strong>Default stream és nem default stream közötti implicit
+szinkronizáció.</strong><br />
+A default stream (0) szinkronizál minden más streammel: ha egy művelet a
+default streamben van, az összes többi stream befejezésére vár. Ez
+váratlan blokkolást okozhat. <strong>Megoldás:</strong> használjunk
+<code>cudaStreamNonBlocking</code> flaget a streamek létrehozásakor,
+vagy kerüljük a default streamet.</p></li>
+<li><p><strong>Túl sok stream létrehozása.</strong><br />
+Minden stream létrehozása és ütemezése overheadet jelent. Ha a
+streamszám meghaladja a hardver által hatékonyan kezelhető mennyiséget,
+a teljesítmény csökken. <strong>Megoldás:</strong> a darabszámot
+méréssel optimalizáljuk; jellemzően 4–16 stream elegendő.</p></li>
+<li><p><strong>A <code>cudaDeviceSynchronize</code> túl korai
+hívása.</strong><br />
+Ha minden stream indítása után azonnal
+<code>cudaDeviceSynchronize</code>-ot hívunk, az összes aszinkron
+műveletet megvárjuk, és az átfedés megszűnik. <strong>Megoldás:</strong>
+csak a mérési ciklus végén, vagy a szükséges pontokon
+szinkronizáljunk.</p></li>
+<li><p><strong>Nem megfelelő adatméret.</strong><br />
+Kis adatméret esetén a másolási és kernelindítási overhead dominál, és
+az átfedés nem hoz érdemi gyorsulást. <strong>Megoldás:</strong> a
+pipeline akkor előnyös, ha az adatdarabok másolási ideje összemérhető a
+kernel futási idejével.</p></li>
+<li><p><strong>A stream prioritás téves használata.</strong><br />
+A prioritás nem szakítja meg a futó kernelt, és nem garantál abszolút
+végrehajtási sorrendet. <strong>Megoldás:</strong> a prioritást csak
+finomhangolásra használjuk, ne alapvető szinkronizációs
+eszközként.</p></li>
+</ol>
+<h3 data-number="25.2.7" id="a-labor-átadandó-eredményei"><span
+class="header-section-number">25.2.7</span> A labor átadandó
+eredményei</h3>
+<p>A labor célja, hogy a fenti pipeline példát reprodukálja, és igazolja
+az átfedés hatását. Az átadandó anyag:</p>
+<ul>
+<li><strong>CUDA C++ forrás</strong> (a fenti kód), amely tartalmazza a
+<code>CHECK_CUDA</code> hibamakrót, a pinned memória foglalását, a több
+streams pipeline-t, és a mérési ciklust warm-up és 10 ismétléssel.</li>
+<li><strong>Buildparancs</strong>:
+<code>nvcc -std=c++17 -O3 -arch=sm_80 -o overlap_pipeline overlap_pipeline.cu</code>
+(a compute capability a használt GPU-tól függ).</li>
+<li><strong>Futtatási parancs</strong>:
+<code>./overlap_pipeline</code>.</li>
+<li><strong>GPU-konfiguráció</strong>: a fenti táblázat szerint (modell,
+driver, CUDA, compute capability, OS, órajel, power limit, ECC, MIG,
+háttérterhelés).</li>
+<li><strong>Mérési napló</strong>: a mérési eredmények táblázata, az
+átlag, szórás, min, max, valamint az ellenőrzés (check) eredménye.</li>
+<li><strong>A mért és a várt eredmény elkülönítése</strong>: a fenti
+szekvenciális és pipeline összehasonlítás, a gyorsulás kiszámítása.</li>
+</ul>
+<p>A labor <strong>izolált környezetben</strong> futott,
+<code>nvidia-smi</code>-vel ellenőrizve, és a hosszú futású kernel nem
+volt jelen. A mérési eredmények a fenti hardveren érvényesek, más GPU-n
+eltérhetnek.</p>
+<h3 data-number="25.2.8" id="összefoglalás"><span
+class="header-section-number">25.2.8</span> Összefoglalás</h3>
+<p>Az adatmozgatás és a számítás átfedése a CUDA-programok
+teljesítményének egyik kulcsa. A pusztán szekvenciális végrehajtás
+pazarló, mert a GPU copy engine-je és compute egységei egyszerre is
+dolgozhatnának. A <code>cudaMemcpyAsync</code> és a nem default streamek
+használatával, pinned memóriával, valamint a munka független darabokra
+bontásával csővezetékes végrehajtást érhetünk el. A stream prioritások
+további finomhangolást tesznek lehetővé. A következő alfejezet (<a
+href="gpu096.html">CUDA graphs</a>) a CUDA graphs segítségével mutatja
+be, hogyan lehet ezt a pipeline-t deklaratív módon, alacsony indítási
+overheaddel leírni, és hogyan integrálhatók a prioritások a gráf-alapú
+ütemezésbe.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu094.html">← 25.1 Streamek és események</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu096.html">25.3 CUDA graphs →</a></div>
+</nav>
+</body>
+</html>

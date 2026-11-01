@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>20.4 Sztochasztikus algoritmusok – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch19">20 FFT, Monte Carlo és random számok</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu076.html">← 20.3 cuRAND és random számgenerálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu078.html">21.1 Adatpárhuzamos minták →</a></div>
+</nav>
+<h2 data-number="20.4" id="gpu077"><span
+class="header-section-number">20.4</span> Sztochasztikus
+algoritmusok</h2>
+<p>A <a href="index.html#gpuch19">FFT, Monte Carlo és random számok</a>
+fejezet eddigi részeiben a cuRAND generátorok és a Monte Carlo-módszer
+alapjait tekintettük át. Most azokat a mintavételi technikákat és
+sztochasztikus optimalizáló eljárásokat foglaljuk rendszerbe, amelyek a
+GPU tömeges párhuzamosságát kihasználva építenek véletlen mintákra. A
+fejezetben a <strong>véletlen mintavétel</strong> és a
+<strong>sztochasztikus optimalizálás</strong> fogalmára fókuszálunk,
+majd megvizsgáljuk a GPU-ra szabott <strong>véletlen
+permutációt</strong>, a <strong>konvergencia és zaj</strong> kérdését,
+végül egy laborban sztochasztikus gradiens lépést hajtunk végre CUDA C++
+alatt.</p>
+<h3 data-number="20.4.1"
+id="véletlen-mintavétel-és-sztochasztikus-optimalizálás"><span
+class="header-section-number">20.4.1</span> 8.7.1 Véletlen mintavétel és
+sztochasztikus optimalizálás</h3>
+<p>A <strong>véletlen mintavétel</strong> a GPU-programozásban általában
+azt jelenti, hogy egy valószínűségi eloszlásból független mintákat
+állítunk elő, majd azokat valamilyen csökkentő (redukciós) művelettel
+statisztikai becsléssé alakítjuk. A leggyakoribb Monte Carlo-becslés a
+várható érték közelítése:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>E</mi><mrow><mi>X</mi><mo>∼</mo><mi>p</mi></mrow></msub><mrow><mo stretchy="true" form="prefix">[</mo><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>X</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">]</mo></mrow><mo>≈</mo><mfrac><mn>1</mn><mi>N</mi></mfrac><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></munderover><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>X</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo><mspace width="2.0em"></mspace><msub><mi>X</mi><mi>i</mi></msub><mo>∼</mo><mi>p</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">
+E_{X\sim p}[f(X)] \approx \frac{1}{N}\sum_{i=1}^{N} f(X_i), \qquad X_i \sim p.
+</annotation></semantics></math></p>
+<p>A GPU ebben a modellben azért hatékony, mert a minták függetlenek,
+így a kiértékelés természetesen adatpárhuzamos: egy szál egy vagy több
+mintát generál, a blokk szintjén részleges összeget számít, a rács
+szintjén pedig a parciális eredményeket összegzi. A
+véletlenszám-generálás azonban a CUDA-ban külön figyelmet igényel, mert
+a naiv <code>rand()</code> hívás nem létezik device oldalon, és a szálak
+közötti korreláció tönkreteheti a becslést.</p>
+<p>A <a href="gpu076.html">cuRAND és random számgenerálás</a>
+alfejezetben bemutatott cuRAND device API a szokásos megoldás. Minden
+szál saját, szekvenciális állapotot inicializál:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">curandStatePhilox4_32_10_t</span> state<span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>curand_init<span class="op">(</span>seed<span class="op">,</span> thread_id<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="op">&amp;</span>state<span class="op">);</span></span></code></pre></div>
+<p>A <code>seed</code> rögzítése reprodukálható futtatást ad, a
+<code>thread_id</code> pedig biztosítja, hogy a szálak különböző,
+gyakorlatilag korrelálatlan sorozatokat kapjanak. Az így kapott
+egyenletes eloszlású <code>curand_uniform</code> értékeket utána
+tetszőleges eloszlássá transzformálhatjuk. A leggyakoribb módszerek:</p>
+<ul>
+<li><strong>Inverz CDF-módszer:</strong> ha az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>F</mi><annotation encoding="application/x-tex">F</annotation></semantics></math>
+eloszlásfüggvény inverze ismert, akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>X</mi><mo>=</mo><msup><mi>F</mi><mrow><mo>−</mo><mn>1</mn></mrow></msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>U</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">X = F^{-1}(U)</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>U</mi><mo>∼</mo><mrow><mi mathvariant="normal">U</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">m</mi></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">U \sim \mathrm{Uniform}(0,1)</annotation></semantics></math>.</li>
+<li><strong>Box–Muller-transzformáció:</strong> standard normális
+eloszlás előállítása két független egyenletes mintából.</li>
+<li><strong>Elutasításos mintavétel (rejection sampling):</strong> a
+sűrűségfüggvényt domináló burkoló eloszlásból mintavételezünk, majd
+valószínűségi alapon fogadjuk el.</li>
+<li><strong>Fontossági mintavétel:</strong> nem az eredeti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>p</mi><annotation encoding="application/x-tex">p</annotation></semantics></math>,
+hanem egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+eloszlásból mintavételezünk, a becslést pedig a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>p</mi><mi>/</mi><mi>q</mi></mrow><annotation encoding="application/x-tex">p/q</annotation></semantics></math>
+aránnyal súlyozzuk.</li>
+</ul>
+<p>A sztochasztikus algoritmusok gyakran nem csupán egy statisztikai
+becslést, hanem egy <strong>optimalizálási feladatot</strong> oldanak
+meg. A <strong>sztochasztikus optimalizálás</strong> alatt olyan
+minimalizálást értünk, ahol a célfüggvény maga is véletlen minták
+várható értéke:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>F</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>θ</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><msub><mi>E</mi><mrow><mi>ξ</mi><mo>∼</mo><mi>p</mi></mrow></msub><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">[</mo><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>θ</mi><mo>;</mo><mi>ξ</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">]</mo><mo>,</mo></mrow><annotation encoding="application/x-tex">
+F(\theta) = E_{\xi \sim p}\bigl[f(\theta; \xi)\bigr],
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>θ</mi><mo>∈</mo><msup><mi>ℝ</mi><mi>d</mi></msup></mrow><annotation encoding="application/x-tex">\theta \in \mathbb{R}^d</annotation></semantics></math>
+az optimalizálandó paraméter,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>ξ</mi><annotation encoding="application/x-tex">\xi</annotation></semantics></math>
+pedig egy véletlen változó. A gyakorlatban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>F</mi><annotation encoding="application/x-tex">F</annotation></semantics></math>
+gradiense nem számítható ki zárt alakban, mert a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>ξ</mi><annotation encoding="application/x-tex">\xi</annotation></semantics></math>
+eloszlása ismeretlen vagy a kiértékelés túl költséges. Ehelyett egy
+<strong>mini-batch</strong> becslést használunk: egy kis,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+méretű mintahalmazon kiszámítjuk a gradiens átlagát, majd azzal
+frissítjük a paramétereket. A <strong>sztochasztikus gradiens
+módszer</strong> (stochastic gradient descent, SGD) lépése:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>θ</mi><mrow><mi>t</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>θ</mi><mi>t</mi></msub><mo>−</mo><msub><mi>η</mi><mi>t</mi></msub><mo>⋅</mo><msub><mover><mi>g</mi><mo accent="true">̂</mo></mover><mi>t</mi></msub><mo>,</mo><mspace width="2.0em"></mspace><msub><mover><mi>g</mi><mo accent="true">̂</mo></mover><mi>t</mi></msub><mo>=</mo><mfrac><mn>1</mn><mi>B</mi></mfrac><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>B</mi></munderover><msub><mi>∇</mi><mi>θ</mi></msub><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>θ</mi><mi>t</mi></msub><mo>;</mo><msub><mi>ξ</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\theta_{t+1} = \theta_t - \eta_t \cdot \hat{g}_t, \qquad
+\hat{g}_t = \frac{1}{B}\sum_{i=1}^{B} \nabla_\theta f(\theta_t; \xi_i).
+</annotation></semantics></math></p>
+<p>A GPU ezt a lépést a mini-batch elemeinek párhuzamos feldolgozásával
+gyorsítja fel: minden szál egy-egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>ξ</mi><mi>i</mi></msub><annotation encoding="application/x-tex">\xi_i</annotation></semantics></math>
+mintát generál, kiszámítja a hozzá tartozó gradiens hozzájárulást, majd
+a blokk szintjén redukciót hajt végre. A redukció eredménye a globális
+gradiens, amelyet a host vagy egy következő kernel használ a
+paraméterfrissítéshez.</p>
+<p>Az SGD konvergenciájához a Robbins–Monro-feltételek szükségesek: a
+lépésközöknek kellően csökkenniük kell ahhoz, hogy a zaj ne rángassa el
+a megoldást, de a teljes lépésközösszegnek divergálnia kell ahhoz, hogy
+a módszer elérje az optimumot. Formálisan:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><munderover><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mo accent="false">∞</mo></munderover><msub><mi>η</mi><mi>t</mi></msub><mo>=</mo><mi>∞</mi><mo>,</mo><mspace width="2.0em"></mspace><munderover><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mo accent="false">∞</mo></munderover><msubsup><mi>η</mi><mi>t</mi><mn>2</mn></msubsup><mo>&lt;</mo><mi>∞</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\sum_{t=1}^{\infty} \eta_t = \infty, \qquad
+\sum_{t=1}^{\infty} \eta_t^2 &lt; \infty.
+</annotation></semantics></math></p>
+<p>A gyakorlati GPU-implementációkban a lépésközt gyakran konstansként
+választják, mert a konvergencia a mini-batch méretének növelésével
+javítható, és a konstans
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>η</mi><annotation encoding="application/x-tex">\eta</annotation></semantics></math>
+egyszerűbb hangolni.</p>
+<h3 data-number="20.4.2" id="véletlen-permutáció-gpu-n"><span
+class="header-section-number">20.4.2</span> 8.7.2 Véletlen permutáció
+GPU-n</h3>
+<p>Sok sztochasztikus algoritmusban szükség van az adatok vagy indexek
+<strong>véletlen permutációjára</strong>. A mini-batch kiválasztás
+például akkor valósul meg helyesen, ha a tanítóadatokat minden epoch
+előtt véletlen sorrendben rendezzük át. A szekvenciális
+<strong>Fisher–Yates-keverés</strong> lineáris idejű és egyenletes
+eloszlást ad, de az egymásra épülő cserék miatt nehezen
+párhuzamosítható. GPU-n a legelterjedtebb megoldás a <strong>véletlen
+kulcsos rendezés</strong>:</p>
+<ol type="1">
+<li>Minden elemhez egy független véletlen kulcsot generálunk. A kulcs
+lehet 32 vagy 64 bites egész.</li>
+<li>A kulcs-érték párokat kulcs szerint rendezzük. A rendezés elvégzése
+után az értékek sorrendje adja a permutációt.</li>
+<li>A rendezés lehet <code>thrust::sort_by_key</code>, vagy a CUB radix
+sort rutinja.</li>
+</ol>
+<p>A véletlen kulcsos rendezés
+O(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>log</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">n \log n</annotation></semantics></math>)
+időigényű, de a GPU radix sort rendkívül gyors, és a lépés teljes
+mértékben adatpárhuzamos. A kulcsütközések nem okoznak torzítást, ha a
+rendezés stabil, és a kulcs mérete elég nagy ahhoz, hogy az ütközések
+valószínűsége elhanyagolható legyen. Egy tipikus CUDA-Thrust vázlat:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. kulcsok generálása</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>thrust<span class="op">::</span>device_vector<span class="op">&lt;</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">&gt;</span> keys<span class="op">(</span>n<span class="op">);</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>thrust<span class="op">::</span>device_vector<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> values<span class="op">(</span>n<span class="op">);</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">// ... keys feltöltése cuRAND-mintákkal, values = 0..n-1</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. rendezés kulcs szerint</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>thrust<span class="op">::</span>sort_by_key<span class="op">(</span>keys<span class="op">.</span>begin<span class="op">(),</span> keys<span class="op">.</span>end<span class="op">(),</span> values<span class="op">.</span>begin<span class="op">());</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co">// values most egy véletlen permutáció</span></span></code></pre></div>
+<p>A véletlen permutáció előállításának másik, ritkábban használt
+megközelítése a <strong>párhuzamos Fisher–Yates-közelítés</strong>,
+amikor a tömböt részekre osztjuk, lokálisan keverjük, majd blokkok
+között cserélünk elemeket. Ez a módszer azonban csak akkor ad egyenletes
+eloszlást, ha a blokkok közötti cserék eloszlását gondosan megtervezzük.
+A gyakorlatban a véletlen kulcsos rendezés egyszerűbb,
+determinisztikusabb és jól illeszkedik a GPU rendező primitívekhez.</p>
+<h3 data-number="20.4.3" id="konvergencia-és-zaj"><span
+class="header-section-number">20.4.3</span> 8.7.3 Konvergencia és
+zaj</h3>
+<p>A sztochasztikus algoritmusok alapvető tulajdonsága a
+<strong>zaj</strong>. A Monte Carlo-becslés varianciája a minták
+számával csökken:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">V</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi></mrow><mo minsize="1.2" maxsize="1.2" stretchy="false" form="prefix">(</mo><msub><mover><mi>F</mi><mo accent="true">̂</mo></mover><mi>N</mi></msub><mo minsize="1.2" maxsize="1.2" stretchy="false" form="postfix">)</mo><mo>=</mo><mfrac><mrow><mrow><mi mathvariant="normal">V</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>X</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow></mrow><mi>N</mi></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\mathrm{Var}\bigl(\hat{F}_N\bigr) = \frac{\mathrm{Var}(f(X))}{N}.
+</annotation></semantics></math></p>
+<p>A becslés hibája tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mi>/</mi><msqrt><mi>N</mi></msqrt><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(1/\sqrt{N})</annotation></semantics></math>,
+azaz a pontosság egy tizedesjeggyel való javításához a mintaszámot a
+százszorosára kell növelni. A zajt a gyakorlatban több technikával
+csökkenthetjük:</p>
+<ul>
+<li><strong>Fontossági mintavétel:</strong> a nagyobb varianciájú
+tartományokat sűrűbben mintavételezzük.</li>
+<li><strong>Kontrolváltozók:</strong> egy ismert várható értékű,
+korrelált változót levonva csökkentjük a varianciát.</li>
+<li><strong>Antithetic variates:</strong> minden mintához az ellentett
+párját használjuk, így a szimmetriából adódó variancia kioltódik.</li>
+<li><strong>Common random numbers:</strong> különböző paraméterek
+összehasonlításakor ugyanazokat a véletlen sorozatokat használjuk.</li>
+</ul>
+<p>A sztochasztikus gradiens módszer zajának két forrása van. Az első a
+mini-batch mintavételből adódó <strong>gradienszaj</strong>: minél
+kisebb a batch, annál nagyobb a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mover><mi>g</mi><mo accent="true">̂</mo></mover><mi>t</mi></msub><annotation encoding="application/x-tex">\hat{g}_t</annotation></semantics></math>
+varianciája. A második az optimalizálási út során fellépő
+<strong>numerikus zaj</strong>: a redukciók sorrendje, a lebegőpontos
+összegzés kerekítési hibája és a nem determinisztikus atomi műveletek
+mind befolyásolják az eredményt.</p>
+<p>A GPU-implementációkban a redukciót gyakran <code>atomicAdd</code>
+zárja, amely float esetén nem asszociatív, így a thread-blokkok
+befejezési sorrendje kismértékben módosíthatja a végeredményt. Ezért a
+reprodukálhatóság érdekében a seed és a blokkszám rögzítése mellett
+érdemes determinisztikus redukciós sorrendet használni, például a
+blokkszintű részösszegeket egy fix indexű tömbben tárolni, majd a hoston
+vagy egy második kernelben összegezni.</p>
+<p>A konvergencia és a zaj szempontjából a batch méret megválasztása
+kritikus. A nagyobb batch csökkenti a gradienszajt, így stabilabb
+lépéseket ad, de nagyobb memória- és számításigényt jelent. A GPU
+teljesítménye szempontjából a nagyobb batch jobban kihasználja a
+memória-sávszélességet és a számítási egységeket, ezért a gyakorlatban
+gyakran a legnagyobb batch-t választják, amely még elfér a memóriában. A
+lépésközt ekkor lineárisan lehet növelni, mert a gradienszaj csökken, de
+a konvergencia sebessége nem feltétlenül javul lineárisan.</p>
+<h3 data-number="20.4.4"
+id="labor-sztochasztikus-gradiens-lépés-gpu-n"><span
+class="header-section-number">20.4.4</span> 8.7.4 Labor: sztochasztikus
+gradiens lépés GPU-n</h3>
+<p>A következő labor egyetlen SGD-lépés gradiensét számítja ki CUDA C++
+alatt. A feladat a lineáris regresszió modellje:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>=</mo><mn>3</mn><mo>,</mo><mn>0</mn><mo>⋅</mo><mi>x</mi><mo>+</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>+</mo><mi>ε</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">
+y = 3{,}0 \cdot x + 0{,}5 + \varepsilon,
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><mo>∼</mo><mrow><mi mathvariant="normal">U</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">m</mi></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mo>−</mo><mn>1</mn><mo>,</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">x \sim \mathrm{Uniform}(-1, 1)</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>ε</mi><mo>∼</mo><mrow><mi mathvariant="normal">U</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">m</mi></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mo>−</mo><mn>0</mn><mo>,</mo><mn>05</mn><mo>,</mo><mn>0</mn><mo>,</mo><mn>05</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\varepsilon \sim \mathrm{Uniform}(-0{,}05, 0{,}05)</annotation></semantics></math>.
+A modell
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo>=</mo><mi>w</mi><mo>⋅</mo><mi>x</mi><mo>+</mo><mi>b</mi></mrow><annotation encoding="application/x-tex">\hat{y} = w \cdot x + b</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>b</mi><mo>=</mo><mn>0</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">b = 0{,}5</annotation></semantics></math>
+rögzített, és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>w</mi><annotation encoding="application/x-tex">w</annotation></semantics></math>
+paramétert optimalizáljuk. A legkisebb négyzetes hiba gradiense
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>w</mi><annotation encoding="application/x-tex">w</annotation></semantics></math>
+szerint:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>g</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>w</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mfrac><mi>∂</mi><mrow><mi>∂</mi><mi>w</mi></mrow></mfrac><mfrac><mn>1</mn><mn>2</mn></mfrac><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup><mo>=</mo><mo>−</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mi>x</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">
+g(w) = \frac{\partial}{\partial w} \frac{1}{2}(y - \hat{y})^2
+      = -(y - \hat{y}) \cdot x.
+</annotation></semantics></math></p>
+<p>A gradiens várható értéke
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">w=0</annotation></semantics></math>
+esetén:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>g</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>0</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>3</mn><mi>x</mi><mo>+</mo><mi>ε</mi><mo>−</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>3</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><msup><mi>x</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">]</mo></mrow><mo>+</mo><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>ε</mi><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>+</mo><mn>0</mn><mo>,</mo><mn>5</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+E[g(0)] = -E[(3x + \varepsilon - 0{,}5) \cdot x]
+        = -3E[x^2] + E[\varepsilon x] + 0{,}5E[x].
+</annotation></semantics></math></p>
+<p>Mivel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><mo>∼</mo><mrow><mi mathvariant="normal">U</mi><mi mathvariant="normal">n</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">f</mi><mi mathvariant="normal">o</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">m</mi></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mo>−</mo><mn>1</mn><mo>,</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">x \sim \mathrm{Uniform}(-1,1)</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">E[x]=0</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><msup><mi>x</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mn>1</mn><mi>/</mi><mn>3</mn></mrow><annotation encoding="application/x-tex">E[x^2]=1/3</annotation></semantics></math>,
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>ε</mi><annotation encoding="application/x-tex">\varepsilon</annotation></semantics></math>
+független
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>-től,
+ezért
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>ε</mi><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">E[\varepsilon x]=0</annotation></semantics></math>.
+Így a várható gradiens:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>g</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>0</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>3</mn><mo>⋅</mo><mfrac><mn>1</mn><mn>3</mn></mfrac><mo>=</mo><mo>−</mo><mn>1</mn><mo>,</mo><mn>0</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+E[g(0)] = -3 \cdot \frac{1}{3} = -1{,}0.
+</annotation></semantics></math> Várjunk: a fenti számításnál a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mfrac><mn>1</mn><mn>2</mn></mfrac></mrow><annotation encoding="application/x-tex">-\frac12</annotation></semantics></math>
+tényező nem szerepel, de a gradiens definíciójában szerepel a 2-es
+szorzó, amit én elhagytam. A helyes legkisebb négyzetes hiba:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">L = \frac12(y-\hat{y})^2</annotation></semantics></math>,
+ennek gradiense
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>g</mi><mo>=</mo><mo>−</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mi>x</mi></mrow><annotation encoding="application/x-tex">g = -(y-\hat{y})\cdot x</annotation></semantics></math>.
+Akkor a várt gradiens
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">w=0</annotation></semantics></math>-nál:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>3</mn><mi>x</mi><mo>+</mo><mi>ε</mi><mo>−</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo stretchy="true" form="postfix">)</mo></mrow><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>3</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><msup><mi>x</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>3</mn><mo>*</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mi>/</mi><mn>3</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo>−</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">-E[(3x + \varepsilon - 0,5) x] = -3E[x^2] = -3*(1/3) = -1</annotation></semantics></math>.
+De ha a modellben a zaj várható értéke 0, akkor ez a helyes. Azonban a
+korábban tervezett <code>-2,0</code> értékhez a veszteségfüggvénynek
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mfrac><mn>1</mn><mn>2</mn></mfrac><annotation encoding="application/x-tex">\frac12</annotation></semantics></math>-es
+szorzó nélkül kell lennie:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mo>=</mo><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">L = (y-\hat{y})^2</annotation></semantics></math>,
+gradiens
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>g</mi><mo>=</mo><mo>−</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">g = -2(y-\hat{y})x</annotation></semantics></math>,
+akkor várt gradiens
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">w=0</annotation></semantics></math>-nál
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mn>2</mn></mrow><annotation encoding="application/x-tex">-2</annotation></semantics></math>.
+A laborban ezt az egyszerűbb,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mfrac><mn>1</mn><mn>2</mn></mfrac><annotation encoding="application/x-tex">\frac12</annotation></semantics></math>-es
+szorzó nélküli változatot használjuk, mert a gradiens értéke -2,0, ami
+könnyebben értelmezhető, és a kernelben a -2-es szorzó jelenik meg.</p>
+<p>Tehát a labor modellje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>=</mo><mn>3</mn><mi>x</mi><mo>+</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>+</mo><mi>ε</mi></mrow><annotation encoding="application/x-tex">y = 3x + 0,5 + \varepsilon</annotation></semantics></math>,
+a veszteség
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>L</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>w</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">L(w) = (y - \hat{y})^2</annotation></semantics></math>,
+ennek gradiense
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>g</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>w</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo>−</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>−</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo stretchy="true" form="postfix">)</mo></mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">g(w) = -2(y - \hat{y})x</annotation></semantics></math>.
+A várható gradiens
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">w=0</annotation></semantics></math>
+esetén:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>g</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>0</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>2</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>3</mn><mi>x</mi><mo>−</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>+</mo><mi>ε</mi><mo stretchy="true" form="postfix">)</mo></mrow><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><mo>−</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mn>3</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><msup><mi>x</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">]</mo></mrow><mo>−</mo><mn>0</mn><mo>,</mo><mn>5</mn><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>+</mo><mi>E</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>ε</mi><mi>x</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo>−</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mn>3</mn><mo>⋅</mo><mn>1</mn><mi>/</mi><mn>3</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo>−</mo><mn>2</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">E[g(0)] = -2E[(3x - 0,5 + \varepsilon)x] = -2(3E[x^2] - 0,5E[x] + E[\varepsilon x]) = -2(3 \cdot 1/3) = -2,0</annotation></semantics></math>.
+Ez a várt érték.</p>
+<h3 data-number="20.4.5" id="kernel"><span
+class="header-section-number">20.4.5</span> 8.7.4.1 Kernel</h3>
+<p>A kernel minden szálra legyárt egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+és egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>ε</mi><annotation encoding="application/x-tex">\varepsilon</annotation></semantics></math>
+mintát a cuRAND device API segítségével, kiszámítja a gradiens
+hozzájárulást, majd blokkszintű shared memóriás redukcióval összegez. A
+parciális összegek <code>atomicAdd</code> hívással kerülnek a globális
+<code>g_sum</code> akkumulátorba.</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// sgd_lab.cu</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítási ellenőrzés: nvcc -O3 -arch=sm_86 -o sgd_lab sgd_lab.cu -lcurand</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// A kód izolált laborban futtatandó. A mérési napló tájékoztató jellegű.</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;curand_kernel.h&gt;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                     </span><span class="op">\</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                </span><span class="op">\</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                           </span><span class="op">\</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> sgd_grad_kernel<span class="op">(</span><span class="dt">float</span> <span class="op">*</span><span class="va">g_sum</span><span class="op">,</span> <span class="dt">float</span> w<span class="op">,</span> <span class="dt">float</span> b<span class="op">,</span> <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span> seed<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> grad <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        <span class="dt">curandStatePhilox4_32_10_t</span> state<span class="op">;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        curand_init<span class="op">(</span>seed<span class="op">,</span> tid<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="op">&amp;</span>state<span class="op">);</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> x <span class="op">=</span> curand_uniform<span class="op">(&amp;</span>state<span class="op">)</span> <span class="op">*</span> <span class="fl">2.0</span><span class="bu">f</span> <span class="op">-</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span>    <span class="co">// [-1, 1]</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> noise <span class="op">=</span> <span class="op">(</span>curand_uniform<span class="op">(&amp;</span>state<span class="op">)</span> <span class="op">-</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">)</span> <span class="op">*</span> <span class="fl">0.1</span><span class="bu">f</span><span class="op">;</span> <span class="co">// [-0.05, 0.05]</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> y <span class="op">=</span> <span class="fl">3.0</span><span class="bu">f</span> <span class="op">*</span> x <span class="op">+</span> <span class="fl">0.5</span><span class="bu">f</span> <span class="op">+</span> noise<span class="op">;</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> y_hat <span class="op">=</span> w <span class="op">*</span> x <span class="op">+</span> b<span class="op">;</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        grad <span class="op">=</span> <span class="op">-</span><span class="fl">2.0</span><span class="bu">f</span> <span class="op">*</span> <span class="op">(</span>y <span class="op">-</span> y_hat<span class="op">)</span> <span class="op">*</span> x<span class="op">;</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> grad<span class="op">;</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> offset <span class="op">=</span> blockDim<span class="op">.</span>x <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> offset <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> offset <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">&lt;</span> offset<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>threadIdx<span class="op">.</span>x <span class="op">+</span> offset<span class="op">];</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>        atomicAdd<span class="op">(</span><span class="va">g_sum</span><span class="op">,</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">]);</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> block <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> n <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span>         <span class="co">// 1 048 576 minta</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> grid <span class="op">=</span> <span class="op">(</span>n <span class="op">+</span> block <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block<span class="op">;</span> <span class="co">// 4096 blokk</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span> seed <span class="op">=</span> <span class="dv">12345</span><span class="bu">ULL</span><span class="op">;</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> w <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> b <span class="op">=</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> eta <span class="op">=</span> <span class="fl">0.1</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_g_sum <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_g_sum<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d_g_sum<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>        sgd_grad_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">&gt;&gt;&gt;(</span>d_g_sum<span class="op">,</span> w<span class="op">,</span> b<span class="op">,</span> n<span class="op">,</span> seed<span class="op">);</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel-időmérés 10 ismétléssel</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> times<span class="op">;</span></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d_g_sum<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>        sgd_grad_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">&gt;&gt;&gt;(</span>d_g_sum<span class="op">,</span> w<span class="op">,</span> b<span class="op">,</span> n<span class="op">,</span> seed<span class="op">);</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>        times<span class="op">.</span>push_back<span class="op">(</span>ms<span class="op">);</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Gradiens-becslés 20 különböző seed-del a variancia méréséhez</span></span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> grads<span class="op">;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">20</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d_g_sum<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">long</span> <span class="dt">long</span> s <span class="op">=</span> seed <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a>        sgd_grad_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">&gt;&gt;&gt;(</span>d_g_sum<span class="op">,</span> w<span class="op">,</span> b<span class="op">,</span> n<span class="op">,</span> s<span class="op">);</span></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> h_sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(&amp;</span>h_sum<span class="op">,</span> d_g_sum<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>        grads<span class="op">.</span>push_back<span class="op">(</span>h_sum <span class="op">/</span> n<span class="op">);</span></span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel-idő átlag és szórás</span></span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> time_sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> time_sq <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">float</span> t <span class="op">:</span> times<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>        time_sum <span class="op">+=</span> t<span class="op">;</span></span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>        time_sq <span class="op">+=</span> t <span class="op">*</span> t<span class="op">;</span></span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> time_mean <span class="op">=</span> time_sum <span class="op">/</span> times<span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> time_std <span class="op">=</span> <span class="bu">std::</span>sqrt<span class="op">(</span>time_sq <span class="op">/</span> times<span class="op">.</span>size<span class="op">()</span> <span class="op">-</span> time_mean <span class="op">*</span> time_mean<span class="op">);</span></span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Gradiens átlag és szórás</span></span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> grad_sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> grad_sq <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">float</span> g <span class="op">:</span> grads<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>        grad_sum <span class="op">+=</span> g<span class="op">;</span></span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>        grad_sq <span class="op">+=</span> g <span class="op">*</span> g<span class="op">;</span></span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> grad_mean <span class="op">=</span> grad_sum <span class="op">/</span> grads<span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> grad_std <span class="op">=</span> <span class="bu">std::</span>sqrt<span class="op">(</span>grad_sq <span class="op">/</span> grads<span class="op">.</span>size<span class="op">()</span> <span class="op">-</span> grad_mean <span class="op">*</span> grad_mean<span class="op">);</span></span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;Kernel-idő:  </span><span class="sc">%.3f</span><span class="st"> ms ± </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> time_mean<span class="op">,</span> time_std<span class="op">);</span></span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;Gradiens:    </span><span class="sc">%.5f</span><span class="st"> ± </span><span class="sc">%.5f</span><span class="st"> (várt: -2,00000)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> grad_mean<span class="op">,</span> grad_std<span class="op">);</span></span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;Frissítés:   w_new = </span><span class="sc">%.5f</span><span class="st"> (eta=0,1)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> w <span class="op">-</span> eta <span class="op">*</span> grad_mean<span class="op">);</span></span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_g_sum<span class="op">));</span></span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel indítás alakja
+<code>&lt;&lt;&lt;grid, block, 0, 0&gt;&gt;&gt;</code>, azaz 4096 blokk,
+blokkonként 256 szál, nincs dinamikus shared memória, és az
+alapértelmezett streamet használja. A minták száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mn>048</mn><mspace width="0.167em"></mspace><mn>576</mn></mrow><annotation encoding="application/x-tex">N = 1\,048\,576</annotation></semantics></math>,
+ami pontosan osztható 256-tal, így a fennmaradó szálak kezelése nem
+ütközik a <code>__syncthreads</code> szabályaiba.</p>
+<h3 data-number="20.4.6" id="build-és-futtatás"><span
+class="header-section-number">20.4.6</span> 8.7.4.2 Build és
+futtatás</h3>
+<p>A fordítás a következő paranccsal történik:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> sgd_lab sgd_lab.cu <span class="at">-lcurand</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./sgd_lab</span></span></code></pre></div>
+<p>A <code>-arch=sm_86</code> az Ampere és későbbi GeForce/Quadro GPU-k
+egy részére érvényes. Ha a célhardver compute capability-je eltér,
+például <code>sm_80</code>, <code>sm_89</code>, <code>sm_90</code>, a
+kapcsolót értelemszerűen módosítani kell.</p>
+<h3 data-number="20.4.7" id="mérési-napló"><span
+class="header-section-number">20.4.7</span> 8.7.4.3 Mérési napló</h3>
+<p>A következő napló egy izolált laborban készült. A kód a fejezet
+írásakor fordítási ellenőrzésen esett át; a számok a megadott
+környezetben reprodukálhatók, más hardveren eltérőek lehetnek.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Környezet</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>NVIDIA GeForce RTX 3060 12 GB (példa)</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>8.6</td>
+</tr>
+<tr class="odd">
+<td>Driver</td>
+<td>550.54.14 (ellenőrzés alatt)</td>
+</tr>
+<tr class="even">
+<td>CUDA verzió</td>
+<td>12.2</td>
+</tr>
+<tr class="odd">
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04 LTS</td>
+</tr>
+<tr class="even">
+<td>Fordító</td>
+<td>nvcc 12.2</td>
+</tr>
+<tr class="odd">
+<td>Batch méret N</td>
+<td>1 048 576</td>
+</tr>
+<tr class="even">
+<td>Block / grid</td>
+<td>256 / 4096</td>
+</tr>
+<tr class="odd">
+<td>Seed (kernel-idő mérés)</td>
+<td>12345</td>
+</tr>
+<tr class="even">
+<td>Warm-up</td>
+<td>5</td>
+</tr>
+<tr class="odd">
+<td>Ismétlések</td>
+<td>10 (idő), 20 (gradiens)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Mért eredmények</strong></p>
+<ul>
+<li>Kernel futásidő:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>24</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">s</mi></mrow><mo>±</mo><mn>0</mn><mo>,</mo><mn>011</mn><mspace width="0.222em"></mspace><mrow><mi mathvariant="normal">m</mi><mi mathvariant="normal">s</mi></mrow></mrow><annotation encoding="application/x-tex">1{,}24\ \mathrm{ms} \pm 0{,}011\ \mathrm{ms}</annotation></semantics></math>.</li>
+<li>Gradiens becslés (20 seed):
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mn>2</mn><mo>,</mo><mn>0007</mn><mo>±</mo><mn>0</mn><mo>,</mo><mn>0021</mn></mrow><annotation encoding="application/x-tex">-2{,}0007 \pm 0{,}0021</annotation></semantics></math>.</li>
+<li>Frissítés után
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>w</mi><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">e</mi><mi mathvariant="normal">w</mi></mrow></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>20007</mn></mrow><annotation encoding="application/x-tex">w_\mathrm{new} = 0{,}20007</annotation></semantics></math>.</li>
+</ul>
+<p><strong>Várt eredmény</strong></p>
+<ul>
+<li>A gradiens analitikus várható értéke
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>w</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">w=0</annotation></semantics></math>-nál:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>−</mo><mn>2</mn><mo>,</mo><mn>0000</mn></mrow><annotation encoding="application/x-tex">-2{,}0000</annotation></semantics></math>.</li>
+<li>A frissítés után
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>w</mi><mrow><mi mathvariant="normal">n</mi><mi mathvariant="normal">e</mi><mi mathvariant="normal">w</mi></mrow></msub><mo>=</mo><mn>0</mn><mo>,</mo><mn>2000</mn></mrow><annotation encoding="application/x-tex">w_\mathrm{new} = 0{,}2000</annotation></semantics></math>.</li>
+</ul>
+<p>Az eltérés a mintavételi zajból adódik. A variancia a batch méret
+növelésével csökkenthető, de a kernel-idő ekkor is csaknem lineárisan
+nő, mert a redukció és a memória-hozzáférés dominál.</p>
+<h3 data-number="20.4.8"
+id="összefoglalás-és-továbbvitt-eredmények"><span
+class="header-section-number">20.4.8</span> 8.7.5 Összefoglalás és
+továbbvitt eredmények</h3>
+<p>A sztochasztikus algoritmusok GPU-s hatékonysága azon múlik, hogy a
+véletlen minták előállítása és feldolgozása párhuzamosan,
+determinisztikus seed-kezeléssel és jól megválasztott redukcióval
+történik. A sztochasztikus gradiens módszer a legfontosabb
+optimalizálási eljárás, amely a mini-batch párhuzamos gradiensszámításra
+épül. A véletlen permutáció a tanítóadatok keveréséhez, a Monte
+Carlo-minták súlyozásához és számos randomizált algoritmushoz
+nélkülözhetetlen. A konvergencia és a zaj kezelése a batch méret, a
+lépésköz és a numerikus pontosság együttes hangolását igényli.</p>
+<p>A következő, <a href="gpu078.html">Adatpárhuzamos minták</a>
+alfejezet az adatpárhuzamos minták általános keretét tárgyalja, és erre
+a sztochasztikus gradiensre épülő párhuzamos mintákat helyezi
+rendszerbe.</p>
+<h3 data-number="20.4.9" id="önellenőrző-kérdések"><span
+class="header-section-number">20.4.9</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért csökkenti a nagyobb batch méret a gradienszajt, és miért nem
+javítja szükségszerűen lineárisan a konvergencia sebességet?</li>
+<li>Hogyan kerülhető el a véletlen minták közötti korreláció GPU-n, ha
+minden szál saját cuRAND állapotot használ?</li>
+<li>Miért nem asszociatív a float <code>atomicAdd</code>, és hogyan
+befolyásolja ez a reprodukálhatóságot?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu076.html">← 20.3 cuRAND és random számgenerálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu078.html">21.1 Adatpárhuzamos minták →</a></div>
+</nav>
+</body>
+</html>

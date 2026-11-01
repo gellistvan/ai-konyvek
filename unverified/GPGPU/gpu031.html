@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>9.2 Thread block clusters – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch08">9 Cooperative groups, thread block clusters és grid sync</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu030.html">← 9.1 Cooperative groups alapok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu032.html">9.3 Grid-szintű szinkronizáció →</a></div>
+</nav>
+<h2 data-number="9.2" id="gpu031"><span
+class="header-section-number">9.2</span> Thread block clusters</h2>
+<p>A thread block cluster a cooperative groups modell legfontosabb
+újítása a Hopper-generációtól kezdve. A korábbi fejezetben megismert
+<code>thread_group</code>, <code>tiled_partition</code> és blokk-szintű
+csoportok a blokk határain belül maradtak. A klaszter ezt a határt lépi
+át: több, egyidejűleg futó blokkot fog össze egy szoros együttműködésre
+képes csoportba, és ehhez a hardver egy új memóriateret is ad: a
+distributed shared memory-t (DSMEM). Ebben az alfejezetben a klaszter
+fogalmát, a DSMEM címzését, a <code>cluster.sync()</code>
+szinkronizációt és a tipikus hibákat járjuk körül, majd egy kisméretű,
+ellenőrizhető laborral zárunk.</p>
+<figure>
+<img src="assets/gpu031-diagram-1.png"
+alt="Klaszter és distributed shared memory - A klaszter több blokkot fog össze; a blokkok a DSMEM-en keresztül érhetik el egymás shared memóriáját, és cluster.sync() hangolja össze őket." />
+<figcaption aria-hidden="true">Klaszter és distributed shared memory - A
+klaszter több blokkot fog össze; a blokkok a DSMEM-en keresztül érhetik
+el egymás shared memóriáját, és cluster.sync() hangolja össze
+őket.</figcaption>
+</figure>
+<h3 data-number="9.2.1" id="miért-van-szükség-klaszterekre"><span
+class="header-section-number">9.2.1</span> Miért van szükség
+klaszterekre?</h3>
+<p>A hagyományos CUDA-végrehajtási modellben a blokkok függetlenek. A
+specifikáció garantálja, hogy a blokkok tetszőleges sorrendben,
+tetszőleges számú SM-en futhatnak, és közöttük nincs biztonságos,
+alacsony késleltetésű kommunikáció. A blokkok közötti adatcsere
+kizárólag a global memórián keresztül történhet, amihez legalább egy
+kernelhatár vagy atomi művelet és megfelelő memória-fence szükséges. Ez
+a modell nagyfokú skálázhatóságot ad, de számos algoritmusban – például
+stencil-számítások halo-cseréjénél, mátrix-szorzásnál, ahol a blokkok
+közösen használnak egy nagyobb csempét, vagy olyan redukcióknál, ahol a
+blokkok közötti fast path hasznos – a global memória körülményessé és
+lassúvá teszi az együttműködést.</p>
+<p>A thread block cluster ezt a korlátot oldja fel. A klaszter egy
+olyan, a hardver által együtt ütemezett blokkcsoport, amelynek tagjai
+hozzáférhetnek egymás shared memóriájához. Ez a distributed shared
+memory (DSMEM) a klaszterhez tartozó blokkok shared memóriaterületének
+logikai uniója. A blokk továbbra is a szinkronizáció alapegysége
+(<code>__syncthreads()</code>), de a klaszter egy új szintet ad:
+<code>cluster.sync()</code>, amely a klaszter összes blokkját
+szinkronizálja. A klaszterek tehát a blokkok közötti finomszemcsés,
+alacsony késleltetésű adatcserét teszik lehetővé anélkül, hogy a
+kernelnek vissza kellene térnie a hostra, vagy global memórián keresztül
+kellene koordinálnia.</p>
+<p>Fontos megkülönböztetni a klasztert a grid-szintű szinkronizációtól.
+A klaszter egy kisebb, hardveresen garantáltan együtt ütemezett csoport,
+míg a grid-szintű szinkronizáció az egész gridre vonatkozik, és gyakran
+csak akkor működik, ha az összes blokk egyszerre rezidens az eszközön. A
+klaszterek így egy közbülső, gyakran hatékonyabb együttműködési szintet
+adnak, különösen akkor, ha a teljes grid szinkronizálása nem lehetséges
+vagy nem kívánatos. A grid-szintű szinkronizáció részleteit a következő
+alfejezet tárgyalja.</p>
+<h3 data-number="9.2.2" id="klaszterek-hardveres-támogatása"><span
+class="header-section-number">9.2.2</span> Klaszterek hardveres
+támogatása</h3>
+<p>A thread block clustert a Hopper-architektúra (compute capability
+9.0) vezette be, és a Blackwell (sm_100) is támogatja. A klaszterek
+használatához a kernelben meg kell adni a klaszter dimenzióit a
+<code>__cluster_dims__</code> attribútummal, például:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> __cluster_dims__<span class="op">(</span><span class="dv">2</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span> my_kernel<span class="op">(...)</span></span></code></pre></div>
+<p>Ez azt jelenti, hogy minden klaszter 2×1×1, azaz összesen 2 blokkot
+tartalmaz. A launch konfigurációban a grid dimenzió ekkor nem a blokkok,
+hanem a klaszterek számát adja meg. Ha a híváskor
+<code>&lt;&lt;&lt;numClusters, blockDim, sharedBytes, stream&gt;&gt;&gt;</code>
+szerepel, akkor a hardver <code>numClusters</code> darab klasztert hoz
+létre, és minden klaszterben a <code>__cluster_dims__</code> által
+meghatározott számú blokk fut. A tényleges blokkszám tehát
+<code>numClusters * clusterDim.x * clusterDim.y * clusterDim.z</code>.</p>
+<p>A klaszterek méretét a hardver korlátozza. A Hopper-generációban a
+klaszter legfeljebb 8 blokkot tartalmazhat, és a klaszter dimenziói
+egyenként legfeljebb 8 értéket vehetnek fel, de a szorzatuk nem
+haladhatja meg a 8-at. A pontos korlátokat futásidőben lekérdezhetjük a
+<code>cudaDeviceGetAttribute</code> függvénnyel:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> clusterLaunchSupported <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> maxClusterDim<span class="op">[</span><span class="dv">3</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">,</span><span class="dv">0</span><span class="op">,</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetAttribute<span class="op">(&amp;</span>clusterLaunchSupported<span class="op">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>                                  cudaDevAttrClusterLaunch<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetAttribute<span class="op">(&amp;</span>maxClusterDim<span class="op">[</span><span class="dv">0</span><span class="op">],</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>                                  cudaDevAttrMaxClusterDimX<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetAttribute<span class="op">(&amp;</span>maxClusterDim<span class="op">[</span><span class="dv">1</span><span class="op">],</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>                                  cudaDevAttrMaxClusterDimY<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaDeviceGetAttribute<span class="op">(&amp;</span>maxClusterDim<span class="op">[</span><span class="dv">2</span><span class="op">],</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>                                  cudaDevAttrMaxClusterDimZ<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span></code></pre></div>
+<p>Emellett az <code>cudaOccupancyMaxActiveClusters</code> lekérdezi,
+hogy adott kernel és launch-konfiguráció mellett hány klaszter lehet
+egyidejűleg aktív. Ez az API figyelembe veszi a regiszter- és shared
+memory korlátokat, valamint a klaszterek hardveres erőforrásigényét.</p>
+<p>A klaszterek fizikai megvalósításához a Hopper SM-ek között dedikált,
+nagy sávszélességű interconnect áll rendelkezésre. Ez teszi lehetővé,
+hogy egy blokk egy másik, ugyanabban a klaszterben futó blokk shared
+memóriáját olvassa vagy írja anélkül, hogy a global memória
+hierarchiáján keresztül kellene mennie. A DSMEM-hozzáférés késleltetése
+alacsonyabb, mint a global memória, de magasabb, mint a saját shared
+memória elérése. A tényleges teljesítmény a klaszter méretétől, az SM-ek
+közötti topológiától és a hozzáférési mintától függ. A hardveres
+támogatás az egyik fő oka annak, hogy a klaszterek csak az újabb
+architektúrákon érhetők el.</p>
+<h3 data-number="9.2.3"
+id="distributed-shared-memory-fogalma-és-címzése"><span
+class="header-section-number">9.2.3</span> Distributed shared memory:
+fogalma és címzése</h3>
+<p>A distributed shared memory a klaszterhez tartozó blokkok shared
+memóriáinak összessége. Minden blokk továbbra is saját, privát shared
+memóriával rendelkezik, amelynek méretét a kernel launch
+<code>shared_bytes</code> paramétere határozza meg. A DSMEM ezt a privát
+területet teszi elérhetővé a klaszter többi blokkja számára.</p>
+<p>A DSMEM eléréséhez a <code>cooperative_groups::cluster_group</code>
+osztály szolgál. A klaszter csoportot a kernelben a következőképpen
+kapjuk meg:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cooperative_groups.h&gt;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> cg <span class="op">=</span> cooperative_groups<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> __cluster_dims__<span class="op">(</span><span class="dv">2</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span> dsmem_kernel<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    cg<span class="op">::</span>cluster_group cluster <span class="op">=</span> cg<span class="op">::</span>this_cluster<span class="op">();</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cluster_group</code> fontosabb metódusai:</p>
+<ul>
+<li><code>cluster.block_rank()</code>: a hívó blokk rangja a klaszteren
+belül (0 és <code>dim_blocks()-1</code> között).</li>
+<li><code>cluster.dim_blocks()</code>: a klaszter dimenziói
+(<code>dim3</code> típus).</li>
+<li><code>cluster.num_blocks()</code>: a klaszterben lévő blokkok teljes
+száma.</li>
+<li><code>cluster.sync()</code>: klaszter-szintű barrier.</li>
+<li><code>cluster.map_shared_rank(void* addr, int rank)</code>: a
+megadott saját shared memory címhez visszaadja a <code>rank</code> rangú
+blokk megfelelő shared memory-címét.</li>
+</ul>
+<p>A <code>map_shared_rank</code> kulcsfontosságú: ez képezi le a
+DSMEM-címeket. Az <code>addr</code> paraméter a hívó blokk shared
+memóriájának egy érvényes címe, a <code>rank</code> pedig a célblokk
+rangja a klaszteren belül. A visszatérési érték egy pointer a célblokk
+shared memóriájában ugyanarra a relatív címre. Például ha a saját
+blokkban az <code>smem</code> tömb a shared memória elején van, akkor a
+másik blokk ugyanazon <code>smem</code> tömbjének első elemét a
+<code>cluster.map_shared_rank(smem, other_rank)</code> címen érjük
+el.</p>
+<p>Fontos megérteni, hogy a DSMEM-hozzáférés nem igényel explicit
+másolást. A pointer közvetlenül a távoli blokk shared memóriájára mutat,
+ezért az olvasás és írás a hardveres interconnecten keresztül történik.
+A hozzáférés azonban nem tranzakcionális, és a memória-láthatóságot
+explicit szinkronizációval kell biztosítani.</p>
+<p>A DSMEM használatakor a shared memória mérete továbbra is blokkonként
+értendő. Ha minden blokk például 32 KiB shared memóriát allokál, akkor
+egy 4 blokkos klaszter összesen 128 KiB DSMEM-et tesz elérhetővé a
+klaszter számára. A klaszter teljes DSMEM-mérete azonban nem haladhatja
+meg a hardver által támogatott maximális klaszter-szintű shared memória
+korlátot. Ezt a <code>cudaDevAttrMaxClusterSharedMemory</code>
+attribútummal kérdezhetjük le. A gyakorlatban a klaszterek használata
+növeli az egy blokkra jutó erőforrásigényt, ezért az occupancy
+csökkenhet.</p>
+<h3 data-number="9.2.4" id="cluster.sync-és-a-dsmem-láthatósága"><span
+class="header-section-number">9.2.4</span> cluster.sync() és a DSMEM
+láthatósága</h3>
+<p>A <code>cluster.sync()</code> a klaszter összes blokkja számára egy
+közös barrier. Amikor egy blokk meghívja, a hardver megvárja, amíg a
+klaszter minden blokkja eléri ugyanezt a hívást, majd minden blokk
+folytatja a végrehajtást. Ez hasonló a <code>__syncthreads()</code>-hez,
+de nem csak a blokkon belüli szálakat, hanem a klaszter összes
+blokkjának összes szálát szinkronizálja.</p>
+<p>A <code>cluster.sync()</code> a DSMEM-műveletek láthatóságát is
+garantálja. A memória-láthatóság szempontjából a klaszter-szinkronizáció
+biztosítja, hogy a barrier előtt végrehajtott összes DSMEM-írás a
+barrier után minden blokk számára látható legyen. Ez a szemantika
+fontos: ha egy blokk ír a saját shared memóriájába, majd
+<code>cluster.sync()</code>-et hív, akkor a klaszter többi blokkja a
+<code>cluster.sync()</code> utáni olvasással biztonságosan láthatja az
+írt értékeket. Ha viszont egy blokk egy másik blokk shared memóriájába
+ír, akkor a láthatóságot a <code>cluster.sync()</code> után garantálja a
+hardver, de a részleges frissítések és a versenyhelyzetek elkerülése
+érdekében a klaszter-szintű írásokat is szinkronizálni kell.</p>
+<p>A <code>cluster.sync()</code> minden blokkban ugyanazt a hívást
+jelenti, de a hívás feltételesen is elhelyezhető, ha a feltétel a
+klaszter minden blokkjában ugyanazt az eredményt adja. Ha a feltétel nem
+uniform a klaszteren belül, a program holtpontra futhat, mert egyes
+blokkok sosem érik el a barriert.</p>
+<p>A <code>cluster.sync()</code> használata előtt érdemes megfontolni a
+blokkon belüli <code>__syncthreads()</code>-et is. A
+<code>cluster.sync()</code> nem helyettesíti a blokkszintű
+szinkronizációt. Ha egy blokk szálai egymással is osztoznak a saját
+shared memórián, akkor a blokkszintű barrierre továbbra is szükség van,
+mielőtt a klaszter többi blokkja olvashatná az adatokat. A két szint
+egymásra épül: először a blokkon belüli konzisztenciát biztosítjuk, majd
+a klaszterszintű konzisztenciát.</p>
+<h3 data-number="9.2.5"
+id="gyakorlati-példa-dsmem-adatcsere-klaszterben"><span
+class="header-section-number">9.2.5</span> Gyakorlati példa:
+DSMEM-adatcsere klaszterben</h3>
+<p>Az alábbi CUDA C++ példa egy kétblokkos klasztert indít, amelyben
+mindkét blokk inicializálja a saját shared memóriáját, majd a
+klaszter-szinkronizáció után mindkét blokk kiolvassa a másik blokk egy
+értékét, és ellenőrzi annak helyességét. A példa a DSMEM alapvető
+működését mutatja be, és közben gyakorolja a klaszter lekérdezését, a
+<code>map_shared_rank</code> használatát és a
+<code>cluster.sync()</code>-et.</p>
+<p>A kernel:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), nvcc 12.4, -arch=sm_90</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cooperative_groups.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> cg <span class="op">=</span> cooperative_groups<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">                  </span><span class="op">\</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                        </span><span class="op">\</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> __cluster_dims__<span class="op">(</span><span class="dv">2</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>dsmem_exchange_kernel<span class="op">(</span><span class="dt">int</span><span class="op">*</span> d_result<span class="op">)</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">int</span> smem<span class="op">[];</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    cg<span class="op">::</span>cluster_group cluster <span class="op">=</span> cg<span class="op">::</span>this_cluster<span class="op">();</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> block_rank <span class="op">=</span> cluster<span class="op">.</span>block_rank<span class="op">();</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> tid <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Inicializálás: minden blokk feltölti a saját shared memóriáját.</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    Az érték a blokk rangjától és a szál indexétől függ,</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    így a távoli blokk értéke egyértelműen azonosítható.</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>        smem<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> block_rank <span class="op">*</span> <span class="dv">1000</span> <span class="op">+</span> tid<span class="op">;</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. Blokkszintű barrier: a saját shared memória írásai befejeződnek.</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Klaszter-szinkronizáció: garantálja, hogy mindkét blokk</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    elvégezte az inicializálást, és a DSMEM-írások láthatóak.</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>    cluster<span class="op">.</span>sync<span class="op">();</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. A másik blokk rangjának meghatározása.</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    Kétblokkos klaszterben ez egyszerű: 1 - block_rank.</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> remote_rank <span class="op">=</span> <span class="dv">1</span> <span class="op">-</span> block_rank<span class="op">;</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. A távoli blokk shared memóriájának elérése.</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span><span class="op">*</span> remote_smem <span class="op">=</span> cluster<span class="op">.</span>map_shared_rank<span class="op">(</span>smem<span class="op">,</span> remote_rank<span class="op">);</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 6. Ellenőrzés: a 0. szál elvégzi a tényleges összehasonlítást.</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A várt érték a távoli blokk 0. szálának inicializált értéke.</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> expected <span class="op">=</span> remote_rank <span class="op">*</span> <span class="dv">1000</span> <span class="op">+</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> actual   <span class="op">=</span> remote_smem<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ha az érték megegyezik, a sikert 0-val, ellenkező esetben 1-gyel jelöljük.</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Az eredményt a global memóriába írjuk, ahol a host ellenőrizheti.</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> cluster_idx <span class="op">=</span> blockIdx<span class="op">.</span>x<span class="op">;</span> <span class="co">// egyetlen klasztert indítunk</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>        d_result<span class="op">[</span>cluster_idx <span class="op">*</span> <span class="dv">2</span> <span class="op">+</span> block_rank<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>actual <span class="op">==</span> expected<span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel launch paraméterei:</p>
+<ul>
+<li>grid: <code>1</code> klaszter (mivel
+<code>__cluster_dims__(2,1,1)</code>, ez 2 blokkot jelent),</li>
+<li>block: <code>256</code> szál,</li>
+<li>shared memória: <code>256 * sizeof(int)</code> bájt,</li>
+<li>stream: alapértelmezett (0).</li>
+</ul>
+<p>A hostoldali vezérlő:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> numClusters <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> blockDim <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> sharedBytes <span class="op">=</span> blockDim <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">);</span> <span class="co">// 1024 bájt</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszköztámogatás ellenőrzése (Hopper vagy újabb)</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> clusterSupported <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceGetAttribute<span class="op">(&amp;</span>clusterSupported<span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>                                      cudaDevAttrClusterLaunch<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>clusterSupported<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;A klaszterek nem támogatottak ezen az eszközön.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kimeneti tömb allokálása: klaszterenként 2 eredmény</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span><span class="op">*</span> d_result <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_result<span class="op">,</span> numClusters <span class="op">*</span> <span class="dv">2</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d_result<span class="op">,</span> <span class="bn">0xFF</span><span class="op">,</span> numClusters <span class="op">*</span> <span class="dv">2</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel indítás</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    dsmem_exchange_kernel<span class="op">&lt;&lt;&lt;</span>numClusters<span class="op">,</span> blockDim<span class="op">,</span> sharedBytes<span class="op">&gt;&gt;&gt;(</span>d_result<span class="op">);</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmény átmásolása és ellenőrzése</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> h_result<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_result<span class="op">,</span> d_result<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>h_result<span class="op">),</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>                          cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> pass <span class="op">=</span> <span class="op">(</span>h_result<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">&amp;&amp;</span> <span class="op">(</span>h_result<span class="op">[</span><span class="dv">1</span><span class="op">]</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;DSMEM exchange: </span><span class="sc">%s</span><span class="st"> (block0=</span><span class="sc">%d</span><span class="st">, block1=</span><span class="sc">%d</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>                pass <span class="op">?</span> <span class="st">&quot;OK&quot;</span> <span class="op">:</span> <span class="st">&quot;FAIL&quot;</span><span class="op">,</span> h_result<span class="op">[</span><span class="dv">0</span><span class="op">],</span> h_result<span class="op">[</span><span class="dv">1</span><span class="op">]);</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_result<span class="op">));</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> pass <span class="op">?</span> EXIT_SUCCESS <span class="op">:</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítási parancs:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_90 <span class="at">-O3</span> <span class="at">-o</span> dsmem_exchange dsmem_exchange.cu</span></code></pre></div>
+<p>Futtatás:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./dsmem_exchange</span></span></code></pre></div>
+<p>A program kimenete sikeres futás esetén:</p>
+<pre><code>DSMEM exchange: OK (block0=0, block1=1)</code></pre>
+<p>Magyarázat a kódhoz:</p>
+<ul>
+<li>A <code>__cluster_dims__(2,1,1)</code> attribútum biztosítja, hogy
+minden klaszter két blokkot tartalmazzon. A launch
+<code>numClusters</code> értéke a klaszterek száma, nem a blokkok száma;
+itt 1 klasztert indítunk, tehát 2 blokk fut.</li>
+<li>A blokk rangját a <code>cluster.block_rank()</code> adja vissza. Ez
+a rang a klaszteren belüli pozíciót jelöli, és a klaszter minden
+blokkjában egyedi.</li>
+<li>Az <code>extern __shared__ int smem[]</code> a blokk saját shared
+memóriáját deklarálja, méretét a launch <code>sharedBytes</code>
+paramétere adja meg.</li>
+<li>A <code>map_shared_rank(smem, remote_rank)</code> a saját
+<code>smem</code> tömb kezdőcíméből kiszámítja a
+<code>remote_rank</code> rangú blokk megfelelő shared memóriacímét. A
+visszakapott pointerrel közvetlenül olvashatjuk a távoli blokk
+adatait.</li>
+<li>A <code>cluster.sync()</code> a klaszter összes blokkját
+szinkronizálja. A példában azért szükséges, mert a távoli olvasás előtt
+mindkét blokknek be kell fejeznie a saját shared memóriájának
+feltöltését, és a DSMEM-írásoknak láthatóvá kell válniuk.</li>
+<li>Az eredményt a global memóriába írjuk, mert a host csak azt érheti
+el. A <code>d_result</code> tömb indexelése a klaszter indexét és a
+blokk rangját használja. Itt egyetlen klasztert indítunk, ezért
+<code>blockIdx.x</code> értéke 0, és a két blokk rangja 0 és 1.</li>
+</ul>
+<p>A példa szándékosan egyszerű, hogy a klaszter és a DSMEM alapjait
+hangsúlyozza. Valós algoritmusokban a DSMEM-et jellemzően nagyobb
+csempék megosztására, halo-cserére vagy blokkok közötti redukcióra
+használják, ahol a blokkok közötti finomszemcsés adatcsere sávszélesség-
+vagy késleltetéskritikus.</p>
+<h3 data-number="9.2.6" id="tipikus-hibák-és-megoldásaik"><span
+class="header-section-number">9.2.6</span> Tipikus hibák és
+megoldásaik</h3>
+<p>A klaszterek és a DSMEM használata során több gyakori hiba fordul
+elő. Az alábbi lista a leggyakoribbakat foglalja össze.</p>
+<p><strong>1. Nem támogatott hardveren való futtatás.</strong><br />
+A klaszterek csak compute capability 9.0 (Hopper) vagy újabb eszközökön
+érhetők el. Ha a kódot régebbi GPU-n futtatjuk, a kernel indítása hibát
+ad, vagy a program rosszul viselkedik. Mindig ellenőrizzük a
+<code>cudaDevAttrClusterLaunch</code> attribútumot, és adjunk értelmes
+hibaüzenetet, ha az eszköz nem támogatja a klasztereket.</p>
+<p><strong>2. A klaszter dimenzióinak helytelen megadása.</strong><br />
+A <code>__cluster_dims__</code> attribútumban megadott dimenziók
+szorzatának nem szabad meghaladnia a hardveres korlátot (Hopper esetén
+8-at). Emellett a dimenziók nem lehetnek 0 vagy negatívak. Ha a
+dimenziószorzat túl nagy, a kernel indítása meghiúsul. A maximális
+méretet a <code>cudaDevAttrMaxClusterDim*</code> attribútumokkal
+kérdezhetjük le, és a kernelben is ellenőrizhetjük a
+<code>cluster.num_blocks()</code> értékét.</p>
+<p><strong>3. A grid dimenzió félreértelmezése.</strong><br />
+Ha a kernel <code>__cluster_dims__</code> attribútummal rendelkezik, a
+<code>&lt;&lt;&lt;grid, block, shared, stream&gt;&gt;&gt;</code> launch
+<code>grid</code> paramétere a klaszterek számát jelenti, nem a blokkok
+számát. Ez a hagyományos CUDA-modelltől eltérő szemlélet. Ha valaki
+tévesen blokkszámként adja meg a gridet, a tényleges blokkszám a
+klaszterdimenziók szorzatával nagyobb lesz, ami hibás indexeléshez,
+out-of-bounds hozzáféréshez vagy nem várt teljesítményhez vezet. A
+megoldás: a gridet mindig a kívánt klaszterszámra állítsuk, és a
+blokkindexeket a <code>cluster.block_rank()</code> segítségével
+számítsuk.</p>
+<p><strong>4. Hiányzó vagy rosszul elhelyezett
+<code>cluster.sync()</code>.</strong><br />
+A DSMEM-hozzáférések előtt a klasztert szinkronizálni kell, különben a
+távoli blokk írásai még nem láthatóak. A <code>cluster.sync()</code>-et
+minden olyan ponton meg kell hívni, ahol a blokkok közötti adatfüggőség
+van. Gyakori hiba, hogy a fejlesztő csak <code>__syncthreads()</code>-et
+használ, és elfelejti a klaszterszintű barriert. A
+<code>cluster.sync()</code> nem helyettesíti a blokkszintű
+szinkronizációt; a kettőt együtt kell használni. Ha egy blokk ír a saját
+shared memóriájába, majd a klaszter többi blokkja olvassa azt, a
+sorrend: blokkszintű írás, <code>__syncthreads()</code>,
+<code>cluster.sync()</code>, majd a távoli olvasás.</p>
+<p><strong>5. A <code>map_shared_rank</code> helytelen
+használata.</strong><br />
+A <code>map_shared_rank</code> csak a hívó blokk saját shared
+memóriájában érvényes címet fogad el. Ha global vagy local memóriacímet
+adunk át, a viselkedés definiálatlan. Emellett a <code>rank</code>
+paraméternek a klaszteren belüli érvényes rangot kell megadnia; a 0 és
+<code>cluster.num_blocks()-1</code> közötti tartományból. Ha a rang
+érvénytelen, a hardver hibát jelezhet, vagy a program rossz
+memóriaterületre mutat. A rangokat mindig a
+<code>cluster.block_rank()</code> és a <code>cluster.dim_blocks()</code>
+alapján számítsuk.</p>
+<p><strong>6. DSMEM-versenyhelyzetek.</strong><br />
+A DSMEM nem tranzakcionális, és a blokkok közötti egyidejű olvasás/írás
+versenyhelyzethez vezethet. Ha két blokk ugyanazt a távoli shared
+memóriacímet írja, az eredmény definiálatlan. Az ilyen mintákat atomi
+műveletekkel vagy gondos szinkronizációval kell elkerülni. A
+gyakorlatban a DSMEM-et tipikusan úgy használjuk, hogy minden blokk a
+saját shared memóriájába ír, és a többi blokk csak olvas, vagy explicit
+feladatmegosztással biztosítjuk, hogy ne legyen ütközés.</p>
+<p><strong>7. Occupancy-csökkenés és
+erőforrás-túlfoglalás.</strong><br />
+A klaszterek használata megnöveli az SM-ek erőforrásigényét, mert több
+blokkot kell egyidejűleg rezidensen tartani, és a DSMEM-interconnect
+sávszélességét is figyelembe kell venni. Ha a klaszter túl nagy,
+előfordulhat, hogy egyetlen klaszter sem fér el az SM-eken, vagy az
+occupancy drasztikusan lecsökken. Az
+<code>cudaOccupancyMaxActiveClusters</code> API-val ellenőrizhetjük,
+hogy adott konfiguráció mellett hány klaszter lehet aktív.
+Optimalizáláskor érdemes a klaszterméretet a valós adatfüggőségekhez
+igazítani, nem pedig a maximálisat használni.</p>
+<p><strong>8. A kernel-attribútum és a launch konfiguráció
+eltérése.</strong><br />
+A <code>__cluster_dims__</code> attribútumot a kernel definíciójában
+kell megadni, és a launch során nem lehet felülírni. Ha a kernelben
+<code>__cluster_dims__(2,1,1)</code> szerepel, akkor a hívásnak nem
+lehet más klaszterdimenziója. A <code>cudaLaunchKernelEx</code> API-val
+dinamikusan is megadhatók a klaszterdimenziók, de ebben az esetben a
+kernelnek nem szabad <code>__cluster_dims__</code> attribútummal
+rendelkeznie. A két módszer keverése hibát okoz.</p>
+<h3 data-number="9.2.7"
+id="labor-klaszterkonfiguráció-és-dsmem-kernel"><span
+class="header-section-number">9.2.7</span> Labor: klaszterkonfiguráció
+és DSMEM-kernel</h3>
+<p>Ez a labor a fenti példát bővíti ki több klaszter indításával, és
+méri a DSMEM-hozzáférés alapvető teljesítményjellemzőit. A labor célja,
+hogy az olvasó saját környezetében reprodukálja a klaszterek működését,
+és mérési naplót készítsen.</p>
+<p><strong>Cél:</strong><br />
+Egy olyan CUDA C++ program futtatása, amely több klasztert indít, minden
+klaszter két blokkot tartalmaz, és a blokkok a DSMEM-en keresztül
+cserélnek adatot. A program méri a kernel futásidejét, a klaszterek
+számának hatását, és ellenőrzi az eredmények helyességét.</p>
+<p><strong>Kód:</strong><br />
+A fenti példa kódját módosítjuk úgy, hogy a <code>numClusters</code>
+értéke paraméterezhető legyen, és a kimeneti tömb mérete
+<code>numClusters * 2</code> legyen. Emellett a kernelben a klaszter
+indexét kiszámítjuk a blokkindexből és a klaszterdimenzióból, hogy több
+klaszter esetén is helyes legyen az eredmény indexelése. A kernel:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> __cluster_dims__<span class="op">(</span><span class="dv">2</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>dsmem_exchange_kernel<span class="op">(</span><span class="dt">int</span><span class="op">*</span> d_result<span class="op">,</span> <span class="dt">int</span> numClusters<span class="op">)</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">int</span> smem<span class="op">[];</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    cg<span class="op">::</span>cluster_group cluster <span class="op">=</span> cg<span class="op">::</span>this_cluster<span class="op">();</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> block_rank <span class="op">=</span> cluster<span class="op">.</span>block_rank<span class="op">();</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> tid <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        smem<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> block_rank <span class="op">*</span> <span class="dv">1000</span> <span class="op">+</span> tid<span class="op">;</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>    cluster<span class="op">.</span>sync<span class="op">();</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> remote_rank <span class="op">=</span> <span class="dv">1</span> <span class="op">-</span> block_rank<span class="op">;</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span><span class="op">*</span> remote_smem <span class="op">=</span> cluster<span class="op">.</span>map_shared_rank<span class="op">(</span>smem<span class="op">,</span> remote_rank<span class="op">);</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> expected <span class="op">=</span> remote_rank <span class="op">*</span> <span class="dv">1000</span> <span class="op">+</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> actual   <span class="op">=</span> remote_smem<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A klaszter indexe a blokk indexéből és a klaszterdimenzióból számítható.</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Mivel a gridDim.x a klaszterek száma, a blokk indexek lineárisan nőnek.</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A klaszter index = blockIdx.x / cluster.dim_blocks().x</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">int</span> cluster_idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">/</span> cluster<span class="op">.</span>dim_blocks<span class="op">().</span>x<span class="op">;</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>        d_result<span class="op">[</span>cluster_idx <span class="op">*</span> <span class="dv">2</span> <span class="op">+</span> block_rank<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>actual <span class="op">==</span> expected<span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A hostkódban a <code>numClusters</code> értékét parancssori
+argumentumként olvassuk be, és a méréshez <code>cudaEvent</code>-eket
+használunk. A mérési ciklus előtt egy warm-up hívást végzünk, majd 10
+iterációt mérünk, és kiszámítjuk az átlagos futásidőt és a szórást. A
+mérés során a GPU órajelét és a power limitet rögzítjük, hogy a
+reprodukálhatóság biztosított legyen.</p>
+<p><strong>Buildparancs:</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_90 <span class="at">-O3</span> <span class="at">-o</span> dsmem_lab dsmem_lab.cu</span></code></pre></div>
+<p><strong>Futtatási parancs:</strong></p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./dsmem_lab</span> 4</span></code></pre></div>
+<p>Ahol a <code>4</code> a klaszterek száma. A program kimenete
+tartalmazza a helyesség-ellenőrzést és a mért időket.</p>
+<p><strong>GPU-konfiguráció (példa):</strong><br />
+- GPU: NVIDIA H100 PCIe 80 GB<br />
+- Compute capability: 9.0<br />
+- Driver: 550.54.15<br />
+- CUDA: 12.4<br />
+- Órajel: rögzített (alapértelmezett)<br />
+- Power limit: 350 W (alapértelmezett)<br />
+- ECC: kikapcsolva<br />
+- MIG: nem aktív<br />
+- Virtualizáció: nincs<br />
+- Háttérterhelés: nincs</p>
+<p><strong>Mérési napló (illusztratív, nem valós mérés):</strong><br />
+Az alábbi táblázat egy lehetséges mérési naplót mutat. A számok a labor
+elvégzése előtt csak példák; a tényleges értékeket az olvasónak kell
+megmérnie a saját izolált környezetében.</p>
+<table>
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 11%" />
+<col style="width: 16%" />
+<col style="width: 10%" />
+<col style="width: 6%" />
+<col style="width: 19%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Klaszterek száma</th>
+<th>Blokkok száma</th>
+<th>Átlag futásidő (µs)</th>
+<th>Szórás (µs)</th>
+<th>Helyes?</th>
+<th>Occupancy (klaszter/SM)</th>
+<th>Shared memory / blokk (B)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>2</td>
+<td>12.4</td>
+<td>0.8</td>
+<td>igen</td>
+<td>1</td>
+<td>1024</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>8</td>
+<td>13.1</td>
+<td>1.1</td>
+<td>igen</td>
+<td>2</td>
+<td>1024</td>
+</tr>
+<tr class="odd">
+<td>8</td>
+<td>16</td>
+<td>14.9</td>
+<td>1.5</td>
+<td>igen</td>
+<td>4</td>
+<td>1024</td>
+</tr>
+</tbody>
+</table>
+<p>A futásidő a kernel teljes végrehajtását méri, beleértve a
+DSMEM-hozzáférést is. A szórás a 10 ismétlésből számított szórás. Az
+occupancy oszlop a <code>cudaOccupancyMaxActiveClusters</code> által
+visszaadott aktív klaszterek számát mutatja SM-enként. A mérési naplóban
+fel kell tüntetni a driver- és CUDA-verziót, valamint az órajel- és
+power limit beállításokat is.</p>
+<p><strong>Várt eredmény:</strong><br />
+A program minden klaszterben mindkét blokkra 0-t ír a kimeneti tömbbe,
+ami azt jelzi, hogy a DSMEM-csere sikeres volt. Ha bármelyik érték 1,
+akkor a távoli olvasás hibás, és a hibát a fenti tipikus hibák alapján
+kell diagnosztizálni. A futásidő a klaszterek számával enyhén nőhet,
+mert a DSMEM-hozzáférés késleltetése és a hardveres ütemezés terhelése
+nő. A pontos értékek erősen függenek az adott GPU-tól és a rendszer
+konfigurációjától.</p>
+<p><strong>Fontos biztonsági megjegyzés:</strong><br />
+A klaszterkernelt izolált környezetben futtassuk, mert a hibás
+klaszterdimenzió vagy szinkronizáció eszközleállást okozhat. A
+<code>nvidia-smi</code> segítségével figyeljük az eszköz állapotát, és
+állítsunk be timeoutot a futtatáshoz. Többfelhasználós GPU-n kerüljük a
+klaszterek használatát, vagy gondoskodjunk a szomszédos terhelés
+izolálásáról.</p>
+<h3 data-number="9.2.8" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">9.2.8</span> Összefoglalás és önellenőrző
+kérdés</h3>
+<p>A thread block cluster a Hopper-generáció által bevezetett hardveres
+együttműködési szint, amely lehetővé teszi, hogy több blokk szorosan
+együttműködjön egy klaszteren belül. A distributed shared memory a
+klaszter blokkjainak shared memóriáit egyesíti, és a
+<code>map_shared_rank</code> segítségével a blokkok közvetlenül elérik
+egymás shared memóriáját. A <code>cluster.sync()</code> klaszterszintű
+barriert biztosít, amely a DSMEM-műveletek láthatóságát is garantálja. A
+klaszterek használata új lehetőségeket nyit a blokkok közötti
+finomszemcsés kommunikációra, de gondos konfigurációt és hibakezelést
+igényel.</p>
+<p><strong>Önellenőrző kérdés:</strong><br />
+Mi a különbség a <code>__syncthreads()</code> és a
+<code>cluster.sync()</code> között, és miért van szükség mindkettőre, ha
+egy klaszter blokkja DSMEM-en keresztül olvassa egymás adatait? Válaszát
+indokolja egy rövid példával.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu030.html">← 9.1 Cooperative groups alapok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu032.html">9.3 Grid-szintű szinkronizáció →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>5.3 Launch bounds, blockméret és gridméret – GPGPU – általános
+célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz1">I. RÉSZ – Alapok és GPU-architektúra</a> › <a href="index.html#gpuch04">5 CUDA execution model: thread, block, grid és warp</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu015.html">← 5.2 Warp-szintű végrehajtás és divergence</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu017.html">5.4 A végrehajtási modell korlátai →</a></div>
+</nav>
+<h2 data-number="5.3" id="gpu016"><span
+class="header-section-number">5.3</span> Launch bounds, blockméret és
+gridméret</h2>
+<p>A launch konfiguráció – a grid és a block mérete, valamint a hozzájuk
+tartozó erőforrás-korlátok – nem csupán formai paraméter. Ugyanaz a
+kernel, ugyanazon a GPU-n, ugyanazon az adathalmazon jelentősen eltérő
+futásidőt produkálhat, ha a blokkméretet 64-ről 128-ra vagy a
+gridméretet az adatméret pontos felosztásáról grid-stride ciklusra
+változtatjuk. Ebben az alfejezetben azt vizsgáljuk, hogyan hatnak ezek a
+paraméterek a foglaltságra, a regiszternyomásra, a memória-hozzáférésre
+és a teljes feladat lefedésére. A cél nem egy univerzális recept, hanem
+egy mérésen alapuló, a hardver korlátaira érzékeny döntési folyamat
+kialakítása.</p>
+<h3 data-number="5.3.1" id="a-launch-paraméterek-jelentősége"><span
+class="header-section-number">5.3.1</span> A launch paraméterek
+jelentősége</h3>
+<p>A CUDA programozási modellben a kernelindítás a
+<code>&lt;&lt;&lt;grid, block, shared_bytes, stream&gt;&gt;&gt;</code>
+szintaxissal történik. A <code>grid</code> és a <code>block</code> a
+végrehajtási hierarchia két szintjét adják meg: a <code>block</code> az
+egy SM-re ütemezhető szálcsoportot, a <code>grid</code> pedig az egész
+kernelindítás során létrehozott blokkok halmazát jelenti. A
+<code>shared_bytes</code> a dinamikusan lefoglalt megosztott memória
+mérete bájtban, a <code>stream</code> pedig az aszinkron végrehajtási
+folyam azonosítója.</p>
+<p>A launch paraméterek teljesítményre gyakorolt hatása négy fő
+mechanizmuson keresztül érvényesül:</p>
+<ol type="1">
+<li><p><strong>Foglaltság (occupancy):</strong> az SM-en egyidejűleg
+aktív warpok száma osztva a hardver által maximálisan támogatott warpok
+számával. A magasabb foglaltság több szálat tart „repülőben”, ami segíti
+a memóriahozzáférések és az utasítások késleltetésének elrejtését. A
+blokkméret közvetlenül befolyásolja, hány blokk fér el egy SM-en, így a
+foglaltságot is.</p></li>
+<li><p><strong>Divergencia:</strong> a warp 32 szálból áll, és a szálak
+egyszerre hajtódnak végre. Ha a feltételes elágazás a warp egyes szálait
+más útra kényszeríti, akkor mindkét útvonalat végre kell hajtani, és a
+párhuzamosság csökken. A blokkméret nem változtatja meg a warp méretét,
+de a blokk szálainak száma és a munkamegosztás befolyásolhatja a
+divergencia-eloszlást. A jól megválasztott blokkméret például lehetővé
+teszi, hogy a divergens ágak kisebb blokkokba rendeződjenek, vagy éppen
+elkerülhető a felesleges divergeciát okozó indexelés.</p></li>
+<li><p><strong>Erőforrás-korlátok:</strong> minden SM véges számú
+regiszterrel, megosztott memóriával és maximális blokk- illetve
+warpszámmal rendelkezik. A launch konfiguráció határozza meg, hogy egy
+blokk hány regisztert és mennyi shared memómiát használ; ha ezek túl
+nagyok, csökken az aktív blokkok száma, és ezzel a foglaltság. A launch
+bounds direktívák segítségével a fordító tudomására hozhatjuk a kívánt
+blokkméretet, ezzel befolyásolva a regiszterallokációt.</p></li>
+<li><p><strong>Memória-hozzáférési minta:</strong> a globális memória
+sávszélessége akkor a legjobb, ha egy warp 32 szálának hozzáférései
+egyetlen 128 bájtos szegmensbe esnek, és a hozzáférések egyesíthetők. A
+blokkméret és a gridméret befolyásolja, hogy az egyes szálak mely
+adatelemeket dolgoznak fel, és így a memória-hozzáférések elrendezését.
+A grid-stride ciklus például megváltoztathatja a hozzáférési mintát,
+mert a szálak nem egymás melletti elemeket, hanem nagyobb lépésközzel
+elhelyezkedő elemeket olvasnak, ami csökkentheti a coalescing
+hatékonyságát – hacsak a lépésköz nem többszöröse a warp által lefedett
+adatméretnek.</p></li>
+</ol>
+<p>A launch paraméterek optimalizálása tehát nem független az adott
+kernel memória-hozzáférési mintájától, divergencia-szerkezetétől és
+erőforrás-igényétől. Emiatt a mérés elengedhetetlen.</p>
+<h3 data-number="5.3.2" id="blockméret-és-foglaltság"><span
+class="header-section-number">5.3.2</span> Blockméret és foglaltság</h3>
+<p>A blockméret a blokkban lévő szálak száma; a CUDA-ban ez 1 és 1024
+között lehet, de a gyakorlatban a 32 többszöröse éri el a legjobb
+teljesítményt, mert így nincs részlegesen kitöltött warp. A blockméret
+megválasztása több tényező eredője.</p>
+<p><strong>Minimális blockméret.</strong> A túl kicsi blokk, például 32
+szál (1 warp), alacsony foglaltsághoz vezethet, mert egy SM-re a hardver
+által engedett maximális blokkszám korlátozott. Ha egy SM legfeljebb 16
+blokkot tud fogadni, és minden blokk 32 szálból áll, akkor az SM-en
+legfeljebb 16 warp lehet aktív – ami jóval alatta marad a modern GPU-k
+maximális 48–64 warpjának. A memóriahozzáférési késleltetések
+elrejtéséhez sok aktív warp kell, így a 32 szálas blokk általában nem
+optimális, kivéve, ha a kernel nagyon kevés regisztert használ, vagy ha
+a feladat természetéből adódóan a blokkok közötti szinkronizáció
+szükséges.</p>
+<p><strong>Maximális blockméret.</strong> Az 1024 szálas blokk elvileg
+maximalizálja a blokkon belüli párhuzamosságot, de három korláttal
+találkozik. Először is a regiszterhasználat: ha a kernel szálanként 64
+regisztert használ, egy 1024 szálas blokk 64 × 1024 = 65 536 regisztert
+igényel. Ha az SM regiszterfájlja 65 536 regiszteres, akkor egyetlen
+ilyen blokk lefoglalja a teljes regiszterkészletet, így az SM-en csak
+egy blokk lehet aktív, ami alacsony foglaltságot eredményez. Másodszor a
+shared memory: ha a kernel blokkonként 48 KiB shared memómiát használ,
+és az SM csak 100 KiB-ot tud adni, akkor két blokk fér el, de a harmadik
+már nem. Harmadszor a hardver korlátja: a sm_80 architektúrák általában
+legfeljebb 1024 szálat támogatnak blokkonként, így ez a felső határ, de
+a tényleges maximumot a regiszter- és shared memory korlátok lejjebb
+szoríthatják.</p>
+<p><strong>Optimális tartomány.</strong> A legtöbb számításintenzív
+kernel esetén a 128–256 szálas blokk jó kiindulópont. Ez a tartomány
+gyakran elegendő regisztert hagy szálanként ahhoz, hogy a foglaltság 50%
+fölött maradjon, miközben a blokk elég nagy a megosztott memória
+hatékony kihasználásához. A pontos optimumot méréssel kell meghatározni,
+mert a kernel erőforrás-igénye és a memória-hozzáférési minta erősen
+befolyásolja.</p>
+<p>A foglaltságot a CUDA Occupancy Calculator vagy a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API
+segítségével számíthatjuk ki a kernel regiszter- és shared memória
+igénye alapján. A gyakorlatban azonban a foglaltság nem az egyetlen
+mérték: egy alacsonyabb foglaltsággal futó, de jobban optimalizált
+memória-hozzáférésű kernel gyorsabb lehet, mint egy magas foglaltságú,
+de rosszul coalescingelt változat.</p>
+<h3 data-number="5.3.3" id="regiszterhasználat-és-launch-bounds"><span
+class="header-section-number">5.3.3</span> Regiszterhasználat és launch
+bounds</h3>
+<p>A regiszterek a leggyorsabb on-chip memóriát jelentik, de számuk
+véges. A túlzott regiszterhasználat „spill”-hez vezet: a fordító a
+lokális memóriába (ami valójában a globális memória) írja ki a
+regiszterek tartalmát, mert nem fér mindegyik a regiszterfájlba. Ez
+drámaian lassíthatja a kernelt, mert a lokális memória hozzáférések a
+globális memória sávszélességét használják.</p>
+<p>A launch bounds segítségével a programozó a kernel definíciójában
+megadhatja a maximális blokkméretet és a minimális blokkszámot
+SM-enként. Ez a direktíva arra utasítja a fordítót, hogy a
+regiszterallokációt úgy végezze, hogy az adott korlátozás teljesüljön.
+Példa:</p>
+<pre class="cuda"><code>__global__ void
+__launch_bounds__(256, 4)
+myKernel(float* data, int n) {
+    // kernel törzs
+}</code></pre>
+<p>Itt azt kérjük, hogy a kernel 256 szálas blokkokat használjon, és
+SM-enként legalább 4 blokk legyen aktív. A fordító ennek megfelelően
+korlátozza a regiszterhasználatot szálanként, hogy a 4 blokk elférjen.
+Ha a kernel logikája túl sok regisztert igényel, a fordító spillelni
+fog, de legalább eléri a megadott foglaltságot.</p>
+<p>A launch bounds használata kényes egyensúly: a túl szigorú korlát
+(például 1024 szálas blokk és 8 blokk SM-enként) olyan alacsony
+regiszterlimitet szabhat, hogy a kernel túl sok lokális memória
+hozzáférést végez, és a teljesítmény zuhan. Ezért a launch bounds
+direktívát mindig méréssel kell validálni.</p>
+<p>A regiszterhasználatot a <code>nvcc</code>
+<code>--ptxas-options=-v</code> kapcsolójával olvashatjuk ki a fordítás
+során, vagy a Nsight Compute segítségével.</p>
+<h3 data-number="5.3.4" id="többdimenziós-block-és-grid"><span
+class="header-section-number">5.3.4</span> Többdimenziós block és
+grid</h3>
+<p>A CUDA a <code>dim3</code> típuson keresztül támogatja az 1D, 2D és
+3D blokk- és griddimenziókat. Ez kényelmes, ha a feladat természetes
+módon többdimenziós, például képfeldolgozásnál, mátrixműveleteknél vagy
+térbeli szimulációknál.</p>
+<p>A blokkdimenzió a <code>blockDim.x</code>, <code>blockDim.y</code>,
+<code>blockDim.z</code> mezőkkel érhető el, a blokk indexe pedig
+<code>blockIdx.x</code>, <code>blockIdx.y</code>,
+<code>blockIdx.z</code>. A szál globális indexét ezekből számíthatjuk
+ki. Például egy 2D-s kép feldolgozásánál:</p>
+<pre class="cuda"><code>__global__ void processImage(unsigned char* img, int width, int height) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x &lt; width &amp;&amp; y &lt; height) {
+        img[y * width + x] = 255 - img[y * width + x]; // inverz
+    }
+}</code></pre>
+<p>Itt a grid és a block is 2D, például
+<code>dim3 block(16, 16); dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);</code>.</p>
+<p>A többdimenziós blokkok előnye, hogy a blokkon belüli szálak
+egymáshoz közeli adatelemeket dolgoznak fel, ami javíthatja a shared
+memory kihasználását és a coalescinget. Például egy 16×16-os blokk a kép
+egy csempéjét fedi le, és a szálak közötti kommunikáció a shared memory
+révén hatékony.</p>
+<p>A többdimenziós grid hátránya, hogy a grid mérete korlátozott: a
+CUDA-ban a <code>gridDim.x</code> maximális értéke 2^31−1, a
+<code>gridDim.y</code> és <code>gridDim.z</code> viszont 65535 (a
+legtöbb architektúrán). Ezért ha a feladat dimenziója nagyobb, mint a
+maximális griddimenzió, akkor szükség lehet a grid-stride ciklusra vagy
+a dimenziók átalakítására.</p>
+<h3 data-number="5.3.5"
+id="grid-stride-loop-és-perzisztens-kernelek"><span
+class="header-section-number">5.3.5</span> Grid-stride loop és
+perzisztens kernelek</h3>
+<p>A grid-stride loop egy olyan kernelminta, amelyben a grid mérete nem
+egyezik meg a feldolgozandó elemek számával, hanem a szálak egymás után
+több elemet dolgoznak fel, ciklikusan lépegetve a grid teljes méretével.
+Ez lehetővé teszi, hogy a grid méretét a hardver erőforrásaihoz
+igazítsuk, ne pedig az adat méretéhez.</p>
+<p>Példa vektorösszeadásra, ahol a vektor hossza <code>n</code>, és a
+grid méretét úgy választjuk, hogy az aktív szálak száma a GPU SM-jeinek
+számához igazodjon:</p>
+<pre class="cuda"><code>__global__ void saxpy_grid_stride(float* y, const float* x, float a, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i &lt; n; i += stride) {
+        y[i] = a * x[i] + y[i];
+    }
+}</code></pre>
+<p>A kernelindításnál a grid méretét például az SM-ek száma × a
+blokkonkénti szálak száma alapján választhatjuk meg, így biztosítva,
+hogy minden SM-re jusson munka, de a teljes grid nem nagyobb, mint
+amennyi szálat a GPU egyszerre futtatni tud. Ez csökkenti a
+kernelindítási és blokkütemezési többletterhet, és lehetővé teszi, hogy
+a szálak hosszabb életűek legyenek.</p>
+<p>A grid-stride loop előnyei:</p>
+<ul>
+<li><strong>Rugalmas erőforrás-használat:</strong> a grid mérete állandó
+lehet, függetlenül az adatmérettől, így a kernelindítás egyszerűbbé
+válik.</li>
+<li><strong>Jobb terheléselosztás:</strong> ha a feladat elemenkénti
+költsége változó, a ciklikus beosztás kiegyensúlyozza a terhelést, mert
+minden szál több, nem feltétlenül szomszédos elemet dolgoz fel.</li>
+<li><strong>Kevesebb launch overhead:</strong> nagy adathalmazoknál a
+többszöri kernelindítás helyett egyetlen kernel folyamatosan
+dolgozik.</li>
+</ul>
+<p>Hátrányai:</p>
+<ul>
+<li><strong>Coalescing romolhat:</strong> ha a stride nagyobb, mint 1, a
+szálak nem feltétlenül egymás melletti memóriacímeket olvasnak. A
+<code>stride</code> értéke a grid teljes szélessége, ami általában
+nagyobb, mint a warp mérete. Emiatt a globális memória-hozzáférések
+szétszórtabbak lehetnek. Ez enyhíthető, ha a cikluson belül a szálak
+egymás melletti elemeket dolgoznak fel (például úgy, hogy a stride a
+grid szélessége, de a lépés a blokkszám × blokkméret, és a
+memória-hozzáférési minta ilyenkor is 32 egymást követő elemet fed le,
+ha a stride többszöröse a warp méretének – de ez csak akkor igaz, ha a
+grid mérete a warp méretének többszöröse, ami általában teljesül). A
+részletes elemzés a memória-hozzáférési fejezetben található.</li>
+</ul>
+<p>A grid-stride loopot gyakran használják perzisztens kerneleknél, ahol
+a kernel az egész adatfeldolgozást egyetlen indítással elvégzi, és
+közben a szálak szinkronizálhatnak a grid szintjén (ha a hardver
+támogatja a cooperative groups grid sync-et). Ez a minta a nagyobb
+rendszerekben, például a mélytanulási kernelekben is megjelenik.</p>
+<h3 data-number="5.3.6"
+id="gyakorlati-útmutató-a-blockméret-és-gridméret-kiválasztásához"><span
+class="header-section-number">5.3.6</span> Gyakorlati útmutató a
+blockméret és gridméret kiválasztásához</h3>
+<p>Nincs univerzális optimum, de a következő lépések segítenek a jó
+kiindulópont megtalálásában:</p>
+<ol type="1">
+<li><p><strong>Határozzuk meg a kernel erőforrás-igényét.</strong>
+Fordítsuk le a kernelt <code>--ptxas-options=-v</code> kapcsolóval, hogy
+lássuk a regiszterhasználatot és a shared memory igényt. Ez alapján
+becsüljük meg a maximálisan aktív blokkokat SM-enként a hardver
+specifikációi alapján.</p></li>
+<li><p><strong>Válasszunk kezdeti blokkméretet.</strong> Általános célú
+kerneleknél 128 vagy 256 szál. Ha a kernel sok regisztert használ,
+csökkentsük a blokkméretet, hogy a foglaltság magas maradjon. Ha a
+kernel kevés regisztert használ, próbáljunk nagyobb blokkot.</p></li>
+<li><p><strong>Számítsuk ki a grid méretét.</strong> Ha az adatméret
+ismert, a legegyszerűbb a <code>(n + blockDim.x - 1) / blockDim.x</code>
+képlet. Ha a feladat mérete változó, használjunk grid-stride loopot, és
+rögzítsük a grid méretét az SM-ek száma alapján.</p></li>
+<li><p><strong>Mérjünk.</strong> Futtassuk a kernelt különböző
+blokkméretekkel (32, 64, 128, 256, 512, 1024) és rögzítsük a futásidőt.
+A mérési eredmények alapján válasszuk ki az optimumot. Ne feledjük, hogy
+a mérési környezet befolyásolhatja az eredményt (hőmérséklet, órajel,
+driver verzió).</p></li>
+<li><p><strong>Használjuk a launch bounds direktívát, ha
+szükséges.</strong> Ha a regiszterhasználat miatt a foglaltság alacsony,
+próbáljuk meg a launch bounds segítségével növelni a foglaltságot, de
+mérjük a hatást.</p></li>
+</ol>
+<h3 data-number="5.3.7"
+id="labor-blockméret--és-gridméret-kísérlet"><span
+class="header-section-number">5.3.7</span> Labor: blockméret- és
+gridméret-kísérlet</h3>
+<p>A labor célja, hogy a hallgató saját környezetében megmérje egy
+egyszerű, de memóriaigényes kernel teljesítményét különböző launch
+konfigurációk mellett. A kód CUDA C++ nyelvű, és egy vektoriális SAXPY
+műveletet valósít meg. A mérési eredmények itt illusztratívak; minden
+hallgatónak a saját, rögzített GPU-ján kell elvégeznie a mérést.</p>
+<h3 data-number="5.3.8" id="kernelkód"><span
+class="header-section-number">5.3.8</span> Kernelkód</h3>
+<p>A kernel egyetlen vektoros <code>y = a*x + y</code> műveletet végez,
+ahol <code>n</code> elem hosszú a tömb. A kernel két változatban készül:
+az egyik hagyományos gridmérettel, a másik grid-stride loopot
+használ.</p>
+<pre class="cuda"><code>// saxpy_kernel.cu
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+
+// Hagyományos kernel: minden szál egy elemet dolgoz fel
+__global__ void saxpy_direct(float* y, const float* x, float a, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        y[idx] = a * x[idx] + y[idx];
+    }
+}
+
+// Grid-stride kernel: a grid mérete rögzített, a szálak ciklikusan lépkednek
+__global__ void saxpy_grid_stride(float* y, const float* x, float a, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i &lt; n; i += stride) {
+        y[i] = a * x[i] + y[i];
+    }
+}
+
+// Hibakezelő makró
+#define CHECK_CUDA(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, &quot;CUDA hiba: %s (%s:%d)\n&quot;, cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+int main(int argc, char** argv) {
+    // Alapértelmezett méret: 16 Mi elem (64 MiB float-onként)
+    const int n = 1 &lt;&lt; 24;
+    const float a = 2.0f;
+
+    float *x_host = (float*)malloc(n * sizeof(float));
+    float *y_host = (float*)malloc(n * sizeof(float));
+    for (int i = 0; i &lt; n; ++i) {
+        x_host[i] = 1.0f;
+        y_host[i] = 2.0f;
+    }
+
+    float *x_dev, *y_dev;
+    CHECK_CUDA(cudaMalloc(&amp;x_dev, n * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&amp;y_dev, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(x_dev, x_host, n * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(y_dev, y_host, n * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Méréshez használt blokkméretek
+    int blockSizes[] = {32, 64, 128, 256, 512, 1024};
+    int numBlockSizes = sizeof(blockSizes) / sizeof(blockSizes[0]);
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&amp;start));
+    CHECK_CUDA(cudaEventCreate(&amp;stop));
+
+    printf(&quot;n = %d, a = %.1f\n&quot;, n, a);
+    printf(&quot;Kernel tipus, blockmeret, gridmeret, ido (ms)\n&quot;);
+
+    for (int k = 0; k &lt; numBlockSizes; ++k) {
+        int blockSize = blockSizes[k];
+        int gridSize = (n + blockSize - 1) / blockSize;
+
+        // Hagyományos kernel mérése
+        CHECK_CUDA(cudaEventRecord(start, 0));
+        saxpy_direct&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(y_dev, x_dev, a, n);
+        CHECK_CUDA(cudaEventRecord(stop, 0));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float msDirect;
+        CHECK_CUDA(cudaEventElapsedTime(&amp;msDirect, start, stop));
+        printf(&quot;Direct, %d, %d, %.4f\n&quot;, blockSize, gridSize, msDirect);
+
+        // Grid-stride kernel mérése
+        CHECK_CUDA(cudaEventRecord(start, 0));
+        saxpy_grid_stride&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(y_dev, x_dev, a, n);
+        CHECK_CUDA(cudaEventRecord(stop, 0));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float msStride;
+        CHECK_CUDA(cudaEventElapsedTime(&amp;msStride, start, stop));
+        printf(&quot;GridStride, %d, %d, %.4f\n&quot;, blockSize, gridSize, msStride);
+    }
+
+    CHECK_CUDA(cudaMemcpy(y_host, y_dev, n * sizeof(float), cudaMemcpyDeviceToHost));
+    // Ellenőrzés: minden elemnek 4.0-nak kell lennie (a*x + y = 2*1+2=4)
+    bool ok = true;
+    for (int i = 0; i &lt; n; ++i) {
+        if (fabs(y_host[i] - 4.0f) &gt; 1e-6f) {
+            ok = false;
+            break;
+        }
+    }
+    printf(&quot;Validacio: %s\n&quot;, ok ? &quot;sikeres&quot; : &quot;hibas&quot;);
+
+    free(x_host);
+    free(y_host);
+    CHECK_CUDA(cudaFree(x_dev));
+    CHECK_CUDA(cudaFree(y_dev));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    return 0;
+}</code></pre>
+<h3 data-number="5.3.9" id="build-és-futtatás"><span
+class="header-section-number">5.3.9</span> Build és futtatás</h3>
+<p>A kódot CUDA toolkit 12.x verzióval (a telepített verzió
+ellenőrizendő) fordíthatjuk:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> saxpy_benchmark saxpy_kernel.cu</span></code></pre></div>
+<p>A <code>-arch=sm_80</code> az NVIDIA Ampere generációhoz tartozik; a
+hallgató a saját GPU-jának compute capability-jét adja meg. A
+futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./saxpy_benchmark</span></span></code></pre></div>
+<h3 data-number="5.3.10" id="mérési-környezet-helyőrző"><span
+class="header-section-number">5.3.10</span> Mérési környezet
+(helyőrző)</h3>
+<p>A labor megköveteli a pontos környezet rögzítését. Példa arra, hogy
+mit kell megadni:</p>
+<ul>
+<li><strong>GPU:</strong> NVIDIA GeForce RTX 3080 (példa, cserélendő a
+tényleges modellre)</li>
+<li><strong>Driver:</strong> 550.54.14 (példa)</li>
+<li><strong>CUDA:</strong> 12.4 (példa)</li>
+<li><strong>Compute capability:</strong> 8.6</li>
+<li><strong>OS:</strong> Ubuntu 22.04 LTS</li>
+<li><strong>Power limit:</strong> alapértelmezett</li>
+<li><strong>ECC:</strong> nincs (consumer GPU)</li>
+<li><strong>MIG:</strong> nem aktív</li>
+<li><strong>Háttérterhelés:</strong> nincs</li>
+</ul>
+<p>A mérés előtt legalább 5-10 ismétlést kell végezni, és az átlagot,
+valamint a szórást vagy percentilist közölni. Az alábbi napló egy
+lehetséges futás illusztratív kimenetét mutatja; a valós értékek a
+hallgató saját méréséből származnak.</p>
+<h3 data-number="5.3.11" id="mérési-napló-illusztratív"><span
+class="header-section-number">5.3.11</span> Mérési napló
+(illusztratív)</h3>
+<p>A táblázatban a „mért” oszlop a példa kedvéért szerepel, és nem valós
+hardverről származik. A hallgatónak a saját mérését kell ide
+beillesztenie, és a várt értékkel összevetnie.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Kernel típus</th>
+<th>Blockméret</th>
+<th>Gridméret</th>
+<th>Mért idő (ms)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Direct</td>
+<td>32</td>
+<td>524288</td>
+<td>1.24</td>
+<td>Alacsony foglaltság, sok blokk</td>
+</tr>
+<tr class="even">
+<td>Direct</td>
+<td>64</td>
+<td>262144</td>
+<td>0.98</td>
+<td>Jobb foglaltság</td>
+</tr>
+<tr class="odd">
+<td>Direct</td>
+<td>128</td>
+<td>131072</td>
+<td>0.82</td>
+<td>Jó foglaltság, coalescing</td>
+</tr>
+<tr class="even">
+<td>Direct</td>
+<td>256</td>
+<td>65536</td>
+<td>0.79</td>
+<td>Legjobb eredmény</td>
+</tr>
+<tr class="odd">
+<td>Direct</td>
+<td>512</td>
+<td>32768</td>
+<td>0.81</td>
+<td>Kicsit rosszabb</td>
+</tr>
+<tr class="even">
+<td>Direct</td>
+<td>1024</td>
+<td>16384</td>
+<td>0.84</td>
+<td>Regiszterlimit, kevesebb aktív blokk</td>
+</tr>
+<tr class="odd">
+<td>GridStride</td>
+<td>32</td>
+<td>524288</td>
+<td>1.21</td>
+<td>Hasonló, mint direct</td>
+</tr>
+<tr class="even">
+<td>GridStride</td>
+<td>64</td>
+<td>262144</td>
+<td>0.95</td>
+<td>-</td>
+</tr>
+<tr class="odd">
+<td>GridStride</td>
+<td>128</td>
+<td>131072</td>
+<td>0.80</td>
+<td>-</td>
+</tr>
+<tr class="even">
+<td>GridStride</td>
+<td>256</td>
+<td>65536</td>
+<td>0.78</td>
+<td>Legjobb</td>
+</tr>
+<tr class="odd">
+<td>GridStride</td>
+<td>512</td>
+<td>32768</td>
+<td>0.82</td>
+<td>-</td>
+</tr>
+<tr class="even">
+<td>GridStride</td>
+<td>1024</td>
+<td>16384</td>
+<td>0.85</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="5.3.12" id="várt-eredmény"><span
+class="header-section-number">5.3.12</span> Várt eredmény</h3>
+<p>A várt tendencia az, hogy a blokkméret növelése 128-ig javítja a
+foglaltságot és csökkenti a futásidőt; 256 környékén van az optimum; 512
+és 1024 esetén a regiszterhasználat miatt csökken az aktív blokkok
+száma, így a foglaltság romlik, és a futásidő kismértékben nő. A
+grid-stride változat hasonló eredményt ad, mert ebben az egyszerű
+esetben nincs különbség a memória-hozzáférési mintában; a grid-stride
+előnyei inkább változó adatméretnél vagy perzisztens kerneleknél
+mutatkoznak.</p>
+<p>A mért és a várt eredmény eltérése hibás mérési körülményekre, nem
+megfelelő warm-upra vagy a GPU háttérterhelésére utalhat. A hallgatónak
+ezt a szempontot is elemeznie kell.</p>
+<h3 data-number="5.3.13" id="gyakori-hibák-és-elkerülésük"><span
+class="header-section-number">5.3.13</span> Gyakori hibák és
+elkerülésük</h3>
+<ol type="1">
+<li><p><strong>Túl nagy blokkméret, amely meghaladja az 1024
+szálat.</strong> A CUDA ezt fordítási hibaként jelzi, de ha dinamikus
+blokkméretet használunk, futásidőben
+<code>cudaErrorInvalidConfiguration</code> hibát kapunk. Ellenőrizzük
+mindig, hogy
+<code>blockDim.x * blockDim.y * blockDim.z &lt;= 1024</code>.</p></li>
+<li><p><strong>Túl kicsi gridméret, amely nem fedi le az
+adatot.</strong> Ha a gridméretet a
+<code>(n + blockSize - 1) / blockSize</code> képlettel számoljuk, az
+lefedi az adatot, de ha hibásan kerekítünk, vagy a
+<code>gridDim.x</code> maximális értékét túllépjük, akkor egyes elemek
+feldolgozatlanul maradnak. A grid-stride loop ezt a problémát elegánsan
+kezeli, mert a szálak ciklikusan bejárják a teljes tömböt.</p></li>
+<li><p><strong>A grid-stride loopban a stride hibás
+kiszámítása.</strong> A stride-ot a <code>blockDim.x * gridDim.x</code>
+adja, nem pedig a <code>gridDim.x</code> önmagában. Ha elfelejtjük a
+blokkméretet, a ciklus nem járja be az összes elemet.</p></li>
+<li><p><strong>Az indexelés túlcsordulása.</strong> A
+<code>blockIdx.x * blockDim.x + threadIdx.x</code> kifejezés 64 bites is
+lehet, ha a grid nagy. Az <code>int</code> típus 32 bites, és nagy
+adathalmazoknál túlcsordulhat. Használjunk <code>size_t</code> vagy
+<code>long long</code> típust az indexekhez, különösen ha <code>n</code>
+nagyobb, mint 2^31.</p></li>
+<li><p><strong>A regiszterhasználat figyelmen kívül hagyása.</strong> Ha
+a kernel túl sok regisztert használ, a foglaltság leesik, és a
+teljesítmény romlik. A <code>--ptxas-options=-v</code> kapcsolóval
+ellenőrizzük, és szükség esetén alkalmazzuk a launch bounds direktívát
+vagy csökkentsük a blokkméretet.</p></li>
+<li><p><strong>A mérés hiányos.</strong> Csak egyetlen futás, nincs
+warm-up, nincs ismétlés. A valós méréshez legalább 5-10 ismétlés kell,
+és az átlagot, szórást kell közölni. A mérési körülményeket mindig
+rögzíteni kell.</p></li>
+</ol>
+<h3 data-number="5.3.14" id="összefoglalás"><span
+class="header-section-number">5.3.14</span> Összefoglalás</h3>
+<p>A launch paraméterek – a blockméret, a gridméret és a launch bounds –
+közvetlenül befolyásolják a GPU foglaltságát, erőforrás-kihasználását és
+végső soron a kernel futásidejét. A blokkméretet a kernel regiszter- és
+shared memory igénye, valamint a hardver korlátai határozzák meg. A
+gridméretet az adatméret és a kívánt párhuzamosság alapján választjuk
+meg; a grid-stride loop rugalmas megoldást kínál, ha az adatméret
+változó vagy nagyobb, mint a maximális griddimenzió. A többdimenziós
+blokkok és gridek természetes illeszkedést biztosítanak a többdimenziós
+problémákhoz.</p>
+<p>A helyes konfiguráció megtalálása mindig mérést igényel. A laborban
+bemutatott SAXPY példa jól szemlélteti, hogy a blokkméret 256 körül
+optimális, de ez a konkrét kernelre és hardverre érvényes. A hallgató
+feladata, hogy ezt a módszert saját környezetében alkalmazza, és a
+mérési eredményeket kritikusan értékelje.</p>
+<p><strong>Önellenőrző kérdések:</strong></p>
+<ol type="1">
+<li>Miért csökkenhet a foglaltság, ha a blokkméret 1024-re nő, még akkor
+is, ha a hardver támogatja az 1024 szálas blokkot?</li>
+<li>Hogyan működik a grid-stride loop, és mikor előnyös?</li>
+<li>Milyen hibát okozhat, ha a grid-stride loopban a stride értékét
+<code>gridDim.x</code>-nek számoljuk <code>blockDim.x * gridDim.x</code>
+helyett?</li>
+<li>Mi a szerepe a <code>__launch_bounds__</code> direktívának, és
+milyen kockázatai vannak a használatának?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu015.html">← 5.2 Warp-szintű végrehajtás és divergence</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu017.html">5.4 A végrehajtási modell korlátai →</a></div>
+</nav>
+</body>
+</html>

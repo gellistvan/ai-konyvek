@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>33.3 Optimalizálás és mérés – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Mérnökség és záróprojekt</a> › <a href="index.html#gpuch32">33 Záróprojekt: optimalizált GPGPU rendszer</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu127.html">← 33.2 Kernelimplementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu129.html">33.4 Validáció és dokumentáció →</a></div>
+</nav>
+<h2 data-number="33.3" id="gpu128"><span
+class="header-section-number">33.3</span> Optimalizálás és mérés</h2>
+<p>A záróprojekt ezen szakasza a <a
+href="gpu127.html">Kernelimplementáció</a> alfejezetben elkészült,
+funkcionálisan már helyes kernel teljesítményét veszi célba. A hangsúly
+nem az újabb funkciókon, hanem a mérésen, a profilkép értelmezésén és a
+hangolási döntések igazolásán van. A fejezet egy kis, ellenőrizhető 1D
+stencil kernelt használ, mert ezen a tiling, az occupancy és a
+stream-alapú átfedés hatása jól elkülöníthető, a numerikus ellenőrzés
+pedig triviális.</p>
+<h3 data-number="33.3.1"
+id="a-teljesítmény-hangolása-mint-mérésvezérelt-folyamat"><span
+class="header-section-number">33.3.1</span> A teljesítmény hangolása
+mint mérésvezérelt folyamat</h3>
+<p>A teljesítmény hangolása nem azt jelenti, hogy „kipróbálunk néhány
+trükköt, és megnézzük, gyorsabb lett-e”. Ez egy irányított kísérleti
+ciklus:</p>
+<ol type="1">
+<li><strong>Baseline rögzítése:</strong> a jelenlegi változat
+futásideje, átbocsátóképessége, erőforrás-használata és környezeti
+paraméterei.</li>
+<li><strong>Profilkép készítése:</strong> Nsight Compute vagy Nsight
+Systems segítségével megállapítjuk, hogy a kernel mire vár: memóriára,
+számításra, szinkronizációra vagy ütemezésre.</li>
+<li><strong>Hipotézis:</strong> a profilkép alapján megfogalmazzuk, mi a
+szűk keresztmetszet, és milyen beavatkozás javíthat rajta.</li>
+<li><strong>Beavatkozás:</strong> egyetlen változtatást hajtunk végre,
+például shared memory tilinget vezetünk be, módosítjuk a blokkméretet,
+vagy streamre bontjuk a feldolgozást.</li>
+<li><strong>Mérés és döntés:</strong> a változtatást ugyanazon a
+bemeneten, azonos környezetben megmérjük; ha javult, megtartjuk, ha
+romlott, visszaállítjuk, és finomítjuk a hipotézist.</li>
+</ol>
+<p>A folyamat legfontosabb eleme a mérés. GPU-n egyetlen futásidő nem
+bizonyíték: a boost-órajel, a hőmérséklet, a driver ütemezése és a
+háttérterhelés is torzíthat. Ezért minden állítást ismételt méréssel,
+szórással és rögzített környezettel kell alátámasztani.</p>
+<h3 data-number="33.3.2" id="rögzített-környezet"><span
+class="header-section-number">33.3.2</span> Rögzített környezet</h3>
+<p>Mielőtt bármit mérünk, rögzíteni kell a környezetet. A laborban
+használt minta-konfiguráció:</p>
+<pre><code>GPU:                NVIDIA RTX 4060 (izolált labor)
+Compute capability: 8.9
+Driver:             550.54.14
+CUDA:               12.4
+OS:                 Ubuntu 22.04, kernel 6.5
+Power limit:        default
+ECC:                off
+MIG:                off
+Háttérterhelés:     nincs más GPU-folyamat</code></pre>
+<p>Ez a mező a tényleges eszközhöz igazítandó. A mérési jegyzőkönyvben
+akkor is szerepelnie kell, ha csak saját fejlesztőgépen dolgozunk.</p>
+<h3 data-number="33.3.3" id="mérési-protokoll"><span
+class="header-section-number">33.3.3</span> Mérési protokoll</h3>
+<p>A kernel időmérésre a <code>cudaEvent_t</code> a legmegbízhatóbb,
+mert a GPU streamjén belül mér, és nem tartalmazza a host oldali
+<code>std::chrono</code> késleltetéseit. A minta:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">// Warm-up</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    stencil_naive<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co">// Mérés: legalább 10 ismétlés</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> iters <span class="op">=</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> iters<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    stencil_naive<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> elapsed_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>elapsed_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>elapsed_ms <span class="op">/=</span> iters<span class="op">;</span></span></code></pre></div>
+<p>Az átlag mellett a relatív szórást is közölni kell. Ha a szórás 5
+%-nál nagyobb, akkor a mérés nem tekinthető stabilnak: ellenőrizni kell
+a boost-órajelet, a hőmérsékletet, a háttérfolyamatokat vagy a kernelben
+lévő nem determinisztikus műveleteket.</p>
+<p>A sávszélességet mindig a tényleges adatmozgatásra számítjuk, nem a
+névleges csúcsértékre. Az 1D, 3 pontos stencil esetén a naiv kernel
+minden kimeneti elemhez 3 bemeneti olvasást és 1 kimeneti írást végez
+float pontossággal. Ez kimeneti elemenként <code>(3 + 1) * 4 = 16</code>
+bájt. A tiled változat a halókból adódó kis többlettől eltekintve
+elemenként 1 olvasást és 1 írást végez, azaz
+<code>(1 + 1) * 4 = 8</code> bájtot. A mérési jegyzőkönyvben mindkét
+adatot fel kell tüntetni, mert a „GB/s” csak így értelmezhető.</p>
+<h3 data-number="33.3.4" id="tiling-a-memóriaforgalom-csökkentése"><span
+class="header-section-number">33.3.4</span> Tiling: a memóriaforgalom
+csökkentése</h3>
+<p>Az 1D stencil számítása:</p>
+<pre><code>out[i] = (in[i - 1] + in[i] + in[i + 1]) / 3.0f;</code></pre>
+<p>A naiv kernel közvetlenül a globális memóriából olvassa a három
+bemeneti elemet:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> stencil_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="op">-</span>RADIUS<span class="op">;</span> r <span class="op">&lt;=</span> RADIUS<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> j <span class="op">=</span> min<span class="op">(</span>max<span class="op">(</span>i <span class="op">+</span> r<span class="op">,</span> <span class="dv">0</span><span class="op">),</span> n <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>        acc <span class="op">+=</span> in<span class="op">[</span>j<span class="op">];</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> acc <span class="op">/</span> <span class="op">(</span><span class="dv">2</span> <span class="op">*</span> RADIUS <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt minden bemeneti elemet három különböző szál is beolvas. Az L2
+cache sokat elnyelhet, de a memóriaforgalom akkor is nagyobb a
+szükségesnél. A shared memory tiling lényege, hogy a blokk betölti a
+szükséges bemeneti tartományt a gyors on-chip memóriába, majd a belső
+számítások már onnan dolgoznak:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> stencil_tiled<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">float</span> s<span class="op">[];</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> local <span class="op">=</span> threadIdx<span class="op">.</span>x <span class="op">+</span> RADIUS<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>local<span class="op">]</span> <span class="op">=</span> in<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">&lt;</span> RADIUS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> left <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">-</span> RADIUS <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>left <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> in<span class="op">[</span>left<span class="op">]</span> <span class="op">:</span> in<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> right <span class="op">=</span> <span class="op">(</span>blockIdx<span class="op">.</span>x <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>blockDim<span class="op">.</span>x <span class="op">+</span> RADIUS <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">(</span>right <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> in<span class="op">[</span>right<span class="op">]</span> <span class="op">:</span> in<span class="op">[</span>n <span class="op">-</span> <span class="dv">1</span><span class="op">];</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="op">-</span>RADIUS<span class="op">;</span> r <span class="op">&lt;=</span> RADIUS<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>            acc <span class="op">+=</span> s<span class="op">[</span>local <span class="op">+</span> r<span class="op">];</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> acc <span class="op">/</span> <span class="op">(</span><span class="dv">2</span> <span class="op">*</span> RADIUS <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel indítása dinamikus shared memory-val:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> block <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> shared_bytes <span class="op">=</span> <span class="op">(</span>block <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> RADIUS<span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>stencil_tiled<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> shared_bytes<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span></code></pre></div>
+<p>A <code>__syncthreads()</code> garantálja, hogy minden szál befejezte
+a shared memóriába írást, mielőtt bármelyik olvasná azt. A tiling itt
+azért hatékony, mert a 3 pontos stencil átfedő ablakokat használ: a
+blokk belső elemeit többször is felhasználjuk, de globális memóriából
+mindegyiket csak egyszer olvassuk be. A halókezelés a blokkhatároknál a
+szomszédos elemeket is elérhetővé teszi.</p>
+<h3 data-number="33.3.5" id="bank-conflict-a-tiled-stencilben"><span
+class="header-section-number">33.3.5</span> Bank conflict a tiled
+stencilben</h3>
+<p>A shared memóriás olvasás <code>s[local - 1]</code>,
+<code>s[local]</code>, <code>s[local + 1]</code> mintája szomszédos
+szálak esetén átfedő bankokat érint, ezért 2-way bank conflictot
+okozhat. Ez a jelen laborban nem domináns, mert a globális
+memóriaforgalom csökkenése nagyobb nyereséget ad, de Nsight Compute
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>
+metrikájával ellenőrizhető. Súlyosabb stencileknél érdemes a betöltést
+úgy átszervezni, hogy a szálak először a saját középső elemüket töltsék
+be, majd a szomszédos elemeket regiszterből vagy warp shuffle-lel
+cseréljék. A fejezet laborjában azonban a memóriaforgalom és az
+occupancy áll a középpontban.</p>
+<h3 data-number="33.3.6" id="occupancy-és-launch-paraméterek"><span
+class="header-section-number">33.3.6</span> Occupancy és launch
+paraméterek</h3>
+<p>A tiling önmagában nem elég, ha a kernel nem tud elég aktív warpot
+futtatni a késleltetés elrejtéséhez. Az occupancy azt mutatja meg, hogy
+az SM-en elérhető maximális warpszámhoz képest mennyi aktív warp
+van:</p>
+<pre><code>occupancy = aktív warpok / maximális warpok SM-enként</code></pre>
+<p>A korlátokat a regiszterhasználat és a shared memory adja. A
+példakódban a <code>stencil_tiled</code> <code>block = 256</code>
+mérettel és <code>shared_bytes = (256 + 2) * 4 = 1032</code> bájttal
+fut. Ha a fordító 32 regisztert használ szálanként, és az SM-enkénti
+regiszterkeret 65 536, akkor a regiszterkorlát:</p>
+<pre><code>65536 / (256 * 32) = 8 blokk</code></pre>
+<p>A shared memory korlátot 100 KB SM-enkénti kerettel számolva:</p>
+<pre><code>100 * 1024 / 1032 ≈ 99 blokk</code></pre>
+<p>A hardveres blokkszám-korlát és a warpszám-korlát is közbeszólhat, de
+ebben a példában a regiszterkorlát 8 blokkot enged, ami 8 × 8 = 64 aktív
+warp. Ha az SM maximális warpszáma 64, akkor az elméleti occupancy 100
+%. Ez kedvező, de nem szabad vakon maximalizálni.</p>
+<p>Az alacsonyabb occupancy nem mindig rossz. Ha egy kernel
+compute-bound, és a szálaknak több regiszterre van szükségük, a magas
+blokkszám miatti regiszterkiömlés (spill) drágább lehet, mint a kisebb
+foglaltság. Ilyenkor a <code>__launch_bounds__</code> direktíva segíthet
+a fordítónak a regiszterhasználat korlátozásában:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>__global__ __launch_bounds__<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">2</span><span class="op">)</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> stencil_tiled<span class="op">(...)</span> <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span></code></pre></div>
+<p>Ez azt mondja a fordítónak, hogy SM-enként legalább 2 blokkot
+szeretnénk futtatni. A <code>nvcc</code> ekkor úgy osztja el a
+regisztereket, hogy a cél elérhető legyen. A
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API-val a
+futásidőben is lekérdezhetjük a tényleges foglaltságot:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> num_blocks_per_sm <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaOccupancyMaxActiveBlocksPerMultiprocessor<span class="op">(</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>num_blocks_per_sm<span class="op">,</span> stencil_tiled<span class="op">,</span> block<span class="op">,</span> shared_bytes<span class="op">));</span></span></code></pre></div>
+<p>A laborban érdemes a blokkméretet 128, 256 és 512 között is
+megvizsgálni. A túl kicsi blokk növeli a halók relatív költségét, a túl
+nagy blokk csökkenti az ütemezési rugalmasságot, és a tail-effect miatt
+az utolsó blokk kihasználatlan lehet. A profilelemzőben a
+<code>launch__occupancy_per_%</code> vagy a Nsight Compute
+<code>Occupancy</code> szekciója megmutatja a tényleges értéket.</p>
+<h3 data-number="33.3.7" id="streamek-és-átfedés"><span
+class="header-section-number">33.3.7</span> Streamek és átfedés</h3>
+<p>A záróprojekt gyakran nem egyetlen kernelből áll: host-device
+másolás, több kernel és utófeldolgozás is tartozik hozzá. Ha a host
+sorosan vár minden lépésre, a GPU kihasználatlan marad. A stream-ek
+segítségével a memóriamásolást és a kernelszámítást átfedhetjük.</p>
+<p>Az 1D stencil streamesített változata a bemenetet négy darabra
+bontja, és minden darabhoz aszinkron másolást, kernelindítást és
+visszamásolást rendel:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> num_chunks <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> chunk_size <span class="op">=</span> n <span class="op">/</span> num_chunks<span class="op">;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> <span class="dt">int</span> streams_count <span class="op">=</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaStream_t</span> streams<span class="op">[</span>streams_count<span class="op">];</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&lt;</span> streams_count<span class="op">;</span> <span class="op">++</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>streams<span class="op">[</span>s<span class="op">]));</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span><span class="op">*</span> pinned_in <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span><span class="op">*</span> pinned_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>pinned_in<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>CHECK<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>pinned_out<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> c <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> c <span class="op">&lt;</span> num_chunks<span class="op">;</span> <span class="op">++</span>c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> offset <span class="op">=</span> c <span class="op">*</span> chunk_size<span class="op">;</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> stream <span class="op">=</span> streams<span class="op">[</span>c <span class="op">%</span> streams_count<span class="op">];</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>d_in <span class="op">+</span> offset<span class="op">,</span> pinned_in <span class="op">+</span> offset<span class="op">,</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>                          chunk_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>                          cudaMemcpyHostToDevice<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>    stencil_tiled<span class="op">&lt;&lt;&lt;(</span>chunk_size <span class="op">+</span> block <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block<span class="op">,</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>                    block<span class="op">,</span> shared_bytes<span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        d_in <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span> chunk_size<span class="op">);</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>pinned_out <span class="op">+</span> offset<span class="op">,</span> d_out <span class="op">+</span> offset<span class="op">,</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>                          chunk_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>                          cudaMemcpyDeviceToHost<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&lt;</span> streams_count<span class="op">;</span> <span class="op">++</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>streams<span class="op">[</span>s<span class="op">]));</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fontos, hogy a host memória pinned (<code>cudaMallocHost</code>)
+legyen: a lapozható memóriából a DMA-motor nem tud aszinkron módon
+másolni. Az átfedés akkor működik, ha a másolások és a kernelek
+különböző streamekhez tartoznak, és a GPU-nak van szabad másoló és
+számító egysége. A Nsight Systems timeline nézete mutatja meg, hogy a
+H2D másolás, a kernel és a D2H másolás valóban átfed-e.</p>
+<p>Ha csak egy streamet használunk, a hívások sorba állnak. A streames
+változat akkor hoz nyereséget, ha a másolási idő összemérhető a
+kernelidővel. Ha a kernel sokkal lassabb, mint a másolás, az átfedésből
+származó nyereség kicsi, és a több stream csak bonyolítja a kódot. Ezért
+ezt is méréssel kell igazolni.</p>
+<h3 data-number="33.3.8" id="benchmark-és-összehasonlítás"><span
+class="header-section-number">33.3.8</span> Benchmark és
+összehasonlítás</h3>
+<p>A hangolás során minden változatot ugyanazzal a bemenettel,
+pontossággal és mérési protokollal kell összehasonlítani. A laborban az
+alábbi négy változatot érdemes megmérni:</p>
+<table>
+<colgroup>
+<col style="width: 8%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+<col style="width: 11%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Változat</th>
+<th style="text-align: right;">Rács</th>
+<th style="text-align: right;">Blokk</th>
+<th style="text-align: right;">Shared</th>
+<th style="text-align: right;">Regiszter</th>
+<th style="text-align: right;">Kernelidő</th>
+<th style="text-align: right;">Effektív sávszélesség</th>
+<th style="text-align: right;">Relatív</th>
+<th style="text-align: right;">Szórás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Naiv</td>
+<td style="text-align: right;">262144</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">0 B</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">1,0×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+<tr class="even">
+<td>Tiled</td>
+<td style="text-align: right;">262144</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1032 B</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">[mért]×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+<tr class="odd">
+<td>Tiled, hangolt blokk</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">[mért]×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+<tr class="even">
+<td>Tiled, 2 stream</td>
+<td style="text-align: right;">[mért]</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">1032 B</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">[mért] ms</td>
+<td style="text-align: right;">[mért] GB/s</td>
+<td style="text-align: right;">[mért]×</td>
+<td style="text-align: right;">[mért]</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban a <code>[mért]</code> mezőket a labor során kell
+kitölteni. A „várt” becslést a memóriamodellből adhatjuk meg. Ha a
+bemenet <code>N = 2^26</code> float elem, a naiv kernel
+<code>N * 16</code> bájtot mozgat, a tiled pedig körülbelül
+<code>N * 8</code> bájtot. Egy 400 GB/s effektív sávszélességet
+feltételezve a modell szerinti várt érték:</p>
+<pre><code>naiv:   2^26 * 16 / 400e9 ≈ 2,68 ms
+tiled:  2^26 *  8 / 400e9 ≈ 1,34 ms</code></pre>
+<p>Ez a várt érték csak modellszámítás, nem ellenőrzött hardveres mérés.
+A laborban a tényleges mért értékek eltérhetnek a modelltől; az eltérés
+elemzése éppen a tanulási cél része. Ha a tiled változat mért értéke nem
+közelíti a becslést, akkor a profilkép alapján keresni kell az okot:
+lehet bank conflict, alacsony occupancy, vagy a halók miatti
+többlet.</p>
+<h3 data-number="33.3.9" id="nsight-alapú-optimalizálás"><span
+class="header-section-number">33.3.9</span> Nsight-alapú
+optimalizálás</h3>
+<p>A Nsight Compute a kernelen belüli metrikákat mutatja meg. A laborban
+használt parancsok:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_89 <span class="at">-lineinfo</span> stencil.cu <span class="at">-o</span> stencil</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Teljes profil</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--csv</span> ./stencil <span class="at">--n</span> 67108864 <span class="at">--block</span> 256 <span class="op">&gt;</span> ncu_naive.csv</span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Célzott mérés</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--section</span> SpeedOfLight <span class="dt">\</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">--section</span> Occupancy <span class="dt">\</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">--section</span> MemoryWorkloadAnalysis <span class="dt">\</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>    ./stencil <span class="at">--n</span> 67108864 <span class="at">--block</span> 256</span></code></pre></div>
+<p>A következő metrikákat érdemes figyelni:</p>
+<ul>
+<li><code>gpu__time_duration.avg</code>: a kernel átlagos
+futásideje.</li>
+<li><code>sm__throughput.avg.pct_of_peak_sustained_elapsed</code>: az
+SM-ek kihasználtsága a csúcsteljesítményhez képest.</li>
+<li><code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code>: a
+globális memóriából beolvasott 32 bájtos szektorok száma. A naiv és
+tiled változat között itt kell jelentős csökkenést látni.</li>
+<li><code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>:
+shared memory bank conflict.</li>
+<li><code>launch__occupancy_limit_shared_mem</code>: a shared memory
+miatti occupancy korlát.</li>
+<li><code>smsp__average_warp_latency_per_inst.ratio</code>: átlagos
+warp-késleltetés.</li>
+</ul>
+<p>A Nsight Systems a teljes alkalmazás idővonalát mutatja. A streames
+változat ellenőrzésére:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nsys</span> profile <span class="at">--stats</span><span class="op">=</span>true ./stencil <span class="at">--streams</span> 2</span></code></pre></div>
+<p>Az elkészült <code>report.nsys-rep</code> fájlban a <code>H2D</code>,
+<code>kernel</code> és <code>D2H</code> sávok átfedése vizuálisan
+ellenőrizhető. Ha a sávok szorosan egymás után következnek, akkor az
+átfedés nem jött létre, és a memóriamásolás valószínűleg lapozható
+memóriából történik, vagy a stream szinkronizációs pontja sorosít.</p>
+<h3 data-number="33.3.10" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">33.3.10</span> Tipikus hibák és helyes
+megoldások</h3>
+<ol type="1">
+<li><p><strong>Túl korai optimalizálás mérés nélkül.</strong><br />
+Hiba: valaki a kód első változatába azonnal beépíti a tilinget, az
+occupancy-hangolást és a streameket, de nem készít baseline-t.<br />
+Helyes: először a naiv verziót mérjük meg, és a profilkép alapján
+döntünk.</p></li>
+<li><p><strong>Csak a kernelidőt nézzük, a host-device másolást
+nem.</strong><br />
+Hiba: a kernel gyors, de a teljes alkalmazás lassú a sok
+<code>cudaMemcpy</code> miatt.<br />
+Helyes: a mérési naplóban külön soroljuk fel a H2D, a kernel és a D2H
+időket.</p></li>
+<li><p><strong>Az occupancy-t öncélként maximalizáljuk.</strong><br />
+Hiba: a regiszterhasználatot mesterségesen leszorítjuk, ami spillt okoz,
+csak hogy magasabb legyen az occupancy.<br />
+Helyes: az occupancy-t a profilkép kontextusában értelmezzük. Ha a
+kernel memória-késleltetésre vár, akkor hasznos a magas foglaltság; ha
+számításkorlátos, akkor a kevesebb aktív warp is elég lehet.</p></li>
+<li><p><strong>Bank conflict figyelmen kívül hagyása.</strong><br />
+Hiba: a tiled stencil szomszédos <code>s[local - 1]</code>,
+<code>s[local]</code>, <code>s[local + 1]</code> olvasása 2-way
+conflictot okoz, de ezt nem ellenőrizzük.<br />
+Helyes: a Nsight Compute metrikájával mérjük, és szükség esetén a
+betöltési mintát vagy a paddinget módosítjuk.</p></li>
+<li><p><strong>Nem elegendő ismétlés vagy hideg cache.</strong><br />
+Hiba: egyetlen futásból vonunk le következtetést.<br />
+Helyes: warm-up után legalább 10 ismétlést mérünk, és közöljük a
+szórást.</p></li>
+<li><p><strong>Változó órajel és hőmérséklet.</strong><br />
+Hiba: a GPU boost-órajele a mérés közben ingadozik, a mérési naplóban
+mégis állandó csúcsértékkel számolunk.<br />
+Helyes: a mérés előtt rögzítjük a power limitet, az órajelet és a
+hőmérsékletet; szükség esetén <code>nvidia-smi</code> naplót
+készítünk.</p></li>
+<li><p><strong>Stream esetén lapozható host memória.</strong><br />
+Hiba: <code>cudaMalloc</code>-cal foglalt host memóriából
+<code>cudaMemcpyAsync</code>-et hívunk, ami valójában szinkron
+másolásként viselkedik.<br />
+Helyes: <code>cudaMallocHost</code> vagy <code>cudaHostRegister</code>
+használata.</p></li>
+<li><p><strong>Nem ellenőrzött kernelhiba.</strong><br />
+Hiba: a kernel indítása után nem hívunk <code>cudaGetLastError</code>-t,
+és a mérési eredményt hibás kernelre is rögzítjük.<br />
+Helyes: minden API-hívást ellenőrizni kell, a mérés előtt
+<code>cudaDeviceSynchronize</code>-et hívunk.</p></li>
+</ol>
+<h3 data-number="33.3.11" id="labor-nsight-alapú-optimalizálás"><span
+class="header-section-number">33.3.11</span> Labor: Nsight-alapú
+optimalizálás</h3>
+<h3 data-number="33.3.12" id="kiinduló-kód"><span
+class="header-section-number">33.3.12</span> Kiinduló kód</h3>
+<p>A labor az alábbi, teljes példát használja. A kód FP32 pontossággal,
+1D, 3 pontos stencilt számol, és parancssori argumentumokból veszi az
+<code>n</code> méretet, a blokkméretet és a streamszámot.</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">// stencil.cu</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -O3 -arch=sm_89 -lineinfo stencil.cu -o stencil</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;algorithm&gt;</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                               </span><span class="op">\</span></span>
+<span id="cb16-9"><a href="#cb16-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                        </span><span class="op">\</span></span>
+<span id="cb16-10"><a href="#cb16-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb16-11"><a href="#cb16-11" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">             </span><span class="op">\</span></span>
+<span id="cb16-12"><a href="#cb16-12" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">  </span><span class="op">\</span></span>
+<span id="cb16-13"><a href="#cb16-13" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span><span class="dv">1</span><span class="op">);</span><span class="pp">                                              </span><span class="op">\</span></span>
+<span id="cb16-14"><a href="#cb16-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                              </span><span class="op">\</span></span>
+<span id="cb16-15"><a href="#cb16-15" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb16-16"><a href="#cb16-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-17"><a href="#cb16-17" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="dt">int</span> RADIUS <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb16-18"><a href="#cb16-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-19"><a href="#cb16-19" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> stencil_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span></span>
+<span id="cb16-20"><a href="#cb16-20" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-21"><a href="#cb16-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb16-22"><a href="#cb16-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb16-23"><a href="#cb16-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-24"><a href="#cb16-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb16-25"><a href="#cb16-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="op">-</span>RADIUS<span class="op">;</span> r <span class="op">&lt;=</span> RADIUS<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-26"><a href="#cb16-26" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> j <span class="op">=</span> <span class="bu">std::</span>min<span class="op">(</span><span class="bu">std::</span>max<span class="op">(</span>i <span class="op">+</span> r<span class="op">,</span> <span class="dv">0</span><span class="op">),</span> n <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb16-27"><a href="#cb16-27" aria-hidden="true" tabindex="-1"></a>        acc <span class="op">+=</span> in<span class="op">[</span>j<span class="op">];</span></span>
+<span id="cb16-28"><a href="#cb16-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-29"><a href="#cb16-29" aria-hidden="true" tabindex="-1"></a>    out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> acc <span class="op">/</span> <span class="op">(</span><span class="dv">2</span> <span class="op">*</span> RADIUS <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb16-30"><a href="#cb16-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-31"><a href="#cb16-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-32"><a href="#cb16-32" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> stencil_tiled<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span></span>
+<span id="cb16-33"><a href="#cb16-33" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-34"><a href="#cb16-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">float</span> s<span class="op">[];</span></span>
+<span id="cb16-35"><a href="#cb16-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb16-36"><a href="#cb16-36" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> local <span class="op">=</span> threadIdx<span class="op">.</span>x <span class="op">+</span> RADIUS<span class="op">;</span></span>
+<span id="cb16-37"><a href="#cb16-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-38"><a href="#cb16-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-39"><a href="#cb16-39" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>local<span class="op">]</span> <span class="op">=</span> in<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb16-40"><a href="#cb16-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-41"><a href="#cb16-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-42"><a href="#cb16-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">&lt;</span> RADIUS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-43"><a href="#cb16-43" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> left <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">-</span> RADIUS <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb16-44"><a href="#cb16-44" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>left <span class="op">&gt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> in<span class="op">[</span>left<span class="op">]</span> <span class="op">:</span> in<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb16-45"><a href="#cb16-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-46"><a href="#cb16-46" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> right <span class="op">=</span> <span class="op">(</span>blockIdx<span class="op">.</span>x <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb16-47"><a href="#cb16-47" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>blockDim<span class="op">.</span>x <span class="op">+</span> RADIUS <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span></span>
+<span id="cb16-48"><a href="#cb16-48" aria-hidden="true" tabindex="-1"></a>            <span class="op">(</span>right <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> in<span class="op">[</span>right<span class="op">]</span> <span class="op">:</span> in<span class="op">[</span>n <span class="op">-</span> <span class="dv">1</span><span class="op">];</span></span>
+<span id="cb16-49"><a href="#cb16-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-50"><a href="#cb16-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-51"><a href="#cb16-51" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb16-52"><a href="#cb16-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-53"><a href="#cb16-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-54"><a href="#cb16-54" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb16-55"><a href="#cb16-55" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="op">-</span>RADIUS<span class="op">;</span> r <span class="op">&lt;=</span> RADIUS<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-56"><a href="#cb16-56" aria-hidden="true" tabindex="-1"></a>            acc <span class="op">+=</span> s<span class="op">[</span>local <span class="op">+</span> r<span class="op">];</span></span>
+<span id="cb16-57"><a href="#cb16-57" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb16-58"><a href="#cb16-58" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> acc <span class="op">/</span> <span class="op">(</span><span class="dv">2</span> <span class="op">*</span> RADIUS <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb16-59"><a href="#cb16-59" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-60"><a href="#cb16-60" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb16-61"><a href="#cb16-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-62"><a href="#cb16-62" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span><span class="op">**</span> argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-63"><a href="#cb16-63" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n <span class="op">=</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">?</span> <span class="bu">std::</span>atoi<span class="op">(</span>argv<span class="op">[</span><span class="dv">1</span><span class="op">])</span> <span class="op">:</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">26</span><span class="op">);</span></span>
+<span id="cb16-64"><a href="#cb16-64" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> block <span class="op">=</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">2</span><span class="op">)</span> <span class="op">?</span> <span class="bu">std::</span>atoi<span class="op">(</span>argv<span class="op">[</span><span class="dv">2</span><span class="op">])</span> <span class="op">:</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb16-65"><a href="#cb16-65" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> streams_count <span class="op">=</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">3</span><span class="op">)</span> <span class="op">?</span> <span class="bu">std::</span>atoi<span class="op">(</span>argv<span class="op">[</span><span class="dv">3</span><span class="op">])</span> <span class="op">:</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb16-66"><a href="#cb16-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-67"><a href="#cb16-67" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb16-68"><a href="#cb16-68" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_in <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb16-69"><a href="#cb16-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb16-70"><a href="#cb16-70" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_in<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb16-71"><a href="#cb16-71" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMallocHost<span class="op">(&amp;</span>h_out<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb16-72"><a href="#cb16-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-73"><a href="#cb16-73" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-74"><a href="#cb16-74" aria-hidden="true" tabindex="-1"></a>        h_in<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>i <span class="op">%</span> <span class="dv">1000</span><span class="op">)</span> <span class="op">*</span> <span class="fl">0.001</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb16-75"><a href="#cb16-75" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-76"><a href="#cb16-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-77"><a href="#cb16-77" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_in <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb16-78"><a href="#cb16-78" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb16-79"><a href="#cb16-79" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_in<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb16-80"><a href="#cb16-80" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_out<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb16-81"><a href="#cb16-81" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_in<span class="op">,</span> h_in<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb16-82"><a href="#cb16-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-83"><a href="#cb16-83" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> grid <span class="op">=</span> <span class="op">(</span>n <span class="op">+</span> block <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block<span class="op">;</span></span>
+<span id="cb16-84"><a href="#cb16-84" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> shared_bytes <span class="op">=</span> <span class="op">(</span>block <span class="op">+</span> <span class="dv">2</span> <span class="op">*</span> RADIUS<span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb16-85"><a href="#cb16-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-86"><a href="#cb16-86" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb16-87"><a href="#cb16-87" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb16-88"><a href="#cb16-88" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb16-89"><a href="#cb16-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-90"><a href="#cb16-90" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb16-91"><a href="#cb16-91" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-92"><a href="#cb16-92" aria-hidden="true" tabindex="-1"></a>        stencil_naive<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb16-93"><a href="#cb16-93" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-94"><a href="#cb16-94" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb16-95"><a href="#cb16-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-96"><a href="#cb16-96" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> iters <span class="op">=</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb16-97"><a href="#cb16-97" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb16-98"><a href="#cb16-98" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> iters<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-99"><a href="#cb16-99" aria-hidden="true" tabindex="-1"></a>        stencil_naive<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb16-100"><a href="#cb16-100" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-101"><a href="#cb16-101" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb16-102"><a href="#cb16-102" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb16-103"><a href="#cb16-103" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-104"><a href="#cb16-104" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> naive_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb16-105"><a href="#cb16-105" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>naive_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb16-106"><a href="#cb16-106" aria-hidden="true" tabindex="-1"></a>    naive_ms <span class="op">/=</span> iters<span class="op">;</span></span>
+<span id="cb16-107"><a href="#cb16-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-108"><a href="#cb16-108" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb16-109"><a href="#cb16-109" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> iters<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-110"><a href="#cb16-110" aria-hidden="true" tabindex="-1"></a>        stencil_tiled<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> shared_bytes<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb16-111"><a href="#cb16-111" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-112"><a href="#cb16-112" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb16-113"><a href="#cb16-113" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb16-114"><a href="#cb16-114" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-115"><a href="#cb16-115" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> tiled_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb16-116"><a href="#cb16-116" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>tiled_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb16-117"><a href="#cb16-117" aria-hidden="true" tabindex="-1"></a>    tiled_ms <span class="op">/=</span> iters<span class="op">;</span></span>
+<span id="cb16-118"><a href="#cb16-118" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-119"><a href="#cb16-119" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;naive: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> naive_ms<span class="op">);</span></span>
+<span id="cb16-120"><a href="#cb16-120" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;tiled: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> tiled_ms<span class="op">);</span></span>
+<span id="cb16-121"><a href="#cb16-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-122"><a href="#cb16-122" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_in<span class="op">));</span></span>
+<span id="cb16-123"><a href="#cb16-123" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_out<span class="op">));</span></span>
+<span id="cb16-124"><a href="#cb16-124" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFreeHost<span class="op">(</span>h_in<span class="op">));</span></span>
+<span id="cb16-125"><a href="#cb16-125" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFreeHost<span class="op">(</span>h_out<span class="op">));</span></span>
+<span id="cb16-126"><a href="#cb16-126" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb16-127"><a href="#cb16-127" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="33.3.13" id="feladatok"><span
+class="header-section-number">33.3.13</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Baseline:</strong> futtasd a naiv és a tiled változatot
+<code>n = 67 108 864</code> mérettel, <code>block = 256</code>
+blokkmérettel. Töltsd ki a mérési napló táblázatát. Számítsd ki az
+effektív sávszélességet a tényleges adatmozgatásból.</p></li>
+<li><p><strong>Tiling elemzése:</strong> készíts Nsight Compute profilt
+a naiv és a tiled kernelről. Hasonlítsd össze a
+<code>gpu__time_duration.avg</code> és a globális memória szektorok
+számát. Fogalmazd meg, hogy a tiling miért változtatta meg a
+memóriaforgalmat.</p></li>
+<li><p><strong>Occupancy hangolás:</strong> futtasd a tiled kernelt
+<code>block = 128</code>, <code>256</code>, <code>512</code> értékekkel.
+Jegyezd fel a regiszterhasználatot és a shared memory méretet. A Nsight
+Compute <code>Occupancy</code> szekciójával ellenőrizd a foglaltságot.
+Döntsd el, melyik blokkméret a legjobb, és indokold meg.</p></li>
+<li><p><strong>Streamek:</strong> implementáld a 2 streames változatot a
+fenti minta alapján. Készíts Nsight Systems profilt, és ellenőrizd a
+H2D, kernel és D2H átfedést. Ha nincs átfedés, keresd meg a sorosítás
+okát.</p></li>
+<li><p><strong>Dokumentáció:</strong> a mérési naplóban tüntesd fel a
+GPU típusát, a drivert, a CUDA-verziót, az FP32 pontosságot, a warm-up
+és ismétlésszámot, az átlagot és a szórást. A mért eredményt külön
+oszlopban jelöld, a modellből számított várt értéket pedig
+külön.</p></li>
+</ol>
+<h3 data-number="33.3.14" id="példa-mérési-napló"><span
+class="header-section-number">33.3.14</span> Példa mérési napló</h3>
+<pre><code>GPU:                NVIDIA RTX 4060 (izolált labor)
+Driver:             550.54.14
+CUDA:               12.4
+Precision:          FP32
+Bemenet:            1D float, n = 2^26
+Warm-up:            5
+Ismétlés:           20
+Várt modell:        naive ~2,68 ms, tiled ~1,34 ms
+
+Változat                  Blokk   Kernelidő   Eff. sávsz.   Relatív   Szórás
+naive                     256     [mért] ms   [mért] GB/s   1,00×     [mért]
+tiled                     256     [mért] ms   [mért] GB/s   [mért]×   [mért]
+tiled + block hangolás    [mért]  [mért] ms   [mért] GB/s   [mért]×   [mért]
+tiled + 2 stream          256     [mért] ms   [mért] GB/s   [mért]×   [mért]</code></pre>
+<p>A táblázatot a labor során tényleges mérésekkel kell kitölteni. A
+várt érték csak tájékoztató modellszámítás, nem helyettesíti a
+reprodukálható futást.</p>
+<h3 data-number="33.3.15" id="önellenőrző-kérdés"><span
+class="header-section-number">33.3.15</span> Önellenőrző kérdés</h3>
+<p>Miért nem elegendő a kernelidőt nézni akkor, ha a zárórendszer
+host-device másolást is végez?<br />
+<strong>Válaszvázlat:</strong> A teljes alkalmazás futásideje a H2D
+másolás, a kernel és a D2H másolás összege, illetve átfedés esetén azok
+időbeli ütemezése. Ha csak a kernelidőt mérjük, nem látjuk a lapozható
+memória, a szinkron másolás vagy a stream nélküli sorosítás hatását. A
+Nsight Systems timeline és külön eseményekkel mért fázisidők együttesen
+mutatják meg, hol vész el az idő, és hol érdemes streameket vagy pinned
+memóriát bevezetni.</p>
+<h3 data-number="33.3.16" id="összegzés"><span
+class="header-section-number">33.3.16</span> Összegzés</h3>
+<p>A teljesítmény hangolása a záróprojektben nem egyetlen nagy
+optimalizálás, hanem egymásra épülő, méréssel igazolt lépések sorozata.
+A tiling csökkenti a globális memóriaforgalmat, az occupancy-hangolás a
+késleltetés elrejtését javítja, a streamek pedig a másolás és számítás
+átfedését teszik lehetővé. Minden beavatkozást ugyanazon bemeneten,
+rögzített környezetben kell mérni, és a profilképnek meg kell erősítenie
+a várt hatást. Csak így lehet különválasztani a valódi nyereséget a
+zajtól, és így készíthető elő a <a href="gpu129.html">Validáció és
+dokumentáció</a> alfejezetben következő validációs és dokumentációs
+szakasz.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu127.html">← 33.2 Kernelimplementáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu129.html">33.4 Validáció és dokumentáció →</a></div>
+</nav>
+</body>
+</html>

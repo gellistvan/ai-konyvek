@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>27.3 TPU programozási modell – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch26">27 TPU architektúra és XLA</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu103.html">← 27.2 XLA és a gráffordítás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu105.html">27.4 TPU vs. GPU →</a></div>
+</nav>
+<h2 data-number="27.3" id="gpu104"><span
+class="header-section-number">27.3</span> TPU programozási modell</h2>
+<p>A TPU programozási modellje nem a CUDA kernelmodelljének átirata. A
+TPU-n a fejlesztő ritkán írja meg utasításszinten, hogy egy szorzóegység
+mit tegyen egy adott órajelben. Ehelyett egy magas szintű numerikus
+függvényt ad meg, amelyet az XLA fordító eszközspecifikus HLO-gráffá
+alakít, a TPU-futtató pedig ezt a gráfot hajtja végre a szisztolikus
+tömbökön, a HBM-ben és az eszközök közötti nagy sávszélességű
+interconnecten keresztül. Ebben az alfejezetben a használat oldaláról
+vizsgáljuk ezt a modellt: hogyan kerül az adat a TPU-ra, hogyan
+daraboljuk fel (sharding), és hogyan fejezzük ki az eszközök közötti
+kommunikációt kollektívákkal.</p>
+<p>A fejezet elsősorban a JAX/XLA eszközláncot használja, mert ez adja a
+legátláthatóbb képet a TPU programozásáról. A bemutatott JAX-kódot a
+laboratóriumban kell futtatni; a kéziratban fordítási és alaki
+ellenőrzésű mintaként szerepel, nem valós TPU-futásból származó
+mérésként.</p>
+<h3 data-number="27.3.1" id="a-tpu-használatának-rétegződése"><span
+class="header-section-number">27.3.1</span> A TPU használatának
+rétegződése</h3>
+<p>A TPU használatakor három szintet érdemes megkülönböztetni:</p>
+<ol type="1">
+<li><strong>A Python/vezérlő szint</strong> a TPU VM-en fut. Itt építjük
+fel a számítási gráfot, itt kezeljük az adatokat, és itt hívjuk meg a
+JAX-függvényeket. Ez a szint hasonlít a CUDA host oldalához, de a TPU-n
+a CPU nem a GPU-hoz hasonlóan ad ki futószalag-parancsokat; a JAX/XLA a
+teljes függvényt lefordítja, majd a TPU-ra küldi.</li>
+<li><strong>Az XLA HLO-szint</strong> az a közös gráfábrázolás, amelyet
+a <code>gpu103</code> alfejezet tárgyalt. A HLO-gráfban már megjelennek
+a <code>all-reduce</code>, <code>all-gather</code>,
+<code>reduce-scatter</code> kollektív műveletek, valamint a
+TPU-specifikus <code>dot</code>, <code>convolution</code> és szeletelő
+műveletek.</li>
+<li><strong>Az eszközszint</strong> a TPU TensorCore-jait, vektoros
+egységeit, HBM-jét és ICI-interconnectjét foglalja magában. A programozó
+itt nem ütemez sorrendet, hanem a XLA backend erőforrás-allokációjától
+kapja a futás ütemezését.</li>
+</ol>
+<p>A JAX-ben a TPU-eszközöket a <code>jax.devices()</code> listázza. Egy
+Cloud TPU v4-8 például általában négy TPU-chipet és nyolc
+TensorCore-eszközt mutat a processz számára; a
+<code>jax.local_devices()</code> a helyi, <code>jax.devices()</code> a
+teljes processzhez tartozó eszközöket adja. A
+<code>jax.default_backend()</code> megmondja, hogy a processz éppen
+TPU-t, GPU-t vagy CPU-t használ-e. Mielőtt bármilyen kollektívát írunk,
+ezt ellenőrizni kell, mert a CPU-s fejlesztői gépen a <code>psum</code>
+is működhet, de akkor nem TPU-összeköttetésen fut.</p>
+<p>A TPU használat tipikus folyamata:</p>
+<ol type="1">
+<li>Meghatározzuk a számítási függvényt egy vagy több tömb
+bemenetére.</li>
+<li>Meghatározzuk az adatelosztást: melyik eszköz melyik szeletet
+kapja.</li>
+<li>A JAX/XLA lefordítja a függvényt, és a kollektív műveleteket
+beágyazza a gráfba.</li>
+<li>A host CPU elküldi a bemenő adatokat a TPU HBM-jébe; az eszközök
+kiszámítják a lokális részeredményeket, majd szükség szerint
+kommunikálnak.</li>
+<li>Az eredményt a hostra kért <code>block_until_ready()</code> vagy
+<code>jax.device_get()</code> hívással szinkronizáljuk.</li>
+</ol>
+<h3 data-number="27.3.2"
+id="sharding-az-adatelosztás-explicit-leírása"><span
+class="header-section-number">27.3.2</span> Sharding: az adatelosztás
+explicit leírása</h3>
+<p>A TPU-programozásban a sharding azt mondja meg, hogy egy logikai tömb
+melyik tengelye melyik fizikai eszközre kerül. A legegyszerűbb
+adatpárhuzamos esetben a batch tengelyt vágjuk fel: minden eszköz a
+batch egy darabját számolja, a modell paraméterei pedig replikáltak. A
+JAX ezt kétféleképpen fejezi ki: implicit módon a <code>pmap</code>-pel,
+vagy explicit módon a <code>Mesh</code> és a <code>PartitionSpec</code>
+segítségével.</p>
+<p>A <code>pmap</code> a bemenő tömb 0. tengelye mentén osztja el az
+adatot az eszközök között. A <code>pmap</code>-pel leképezett függvény
+minden eszközön ugyanazt a számítást végzi, de a saját szeletén. A
+<code>pmap(..., axis_name='i')</code> megnevezett tengelyt ad a
+leképezésnek; a kollektívák erre a névre hivatkoznak.</p>
+<p>A <code>Mesh</code> és <code>PartitionSpec</code> ezzel szemben nem
+igényli a 0. tengelyre épülő leképezést. A <code>Mesh</code> egy logikai
+topológiát ad az eszközöknek:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> Mesh, NamedSharding, PartitionSpec</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>devices <span class="op">=</span> jax.devices()</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>mesh <span class="op">=</span> Mesh(devices, axis_names<span class="op">=</span>(<span class="st">&#39;data&#39;</span>, <span class="st">&#39;model&#39;</span>))</span></code></pre></div>
+<p>Itt a <code>data</code> tengely az adatpárhuzamos, a
+<code>model</code> tengely a modellpárhuzamos tengely. Egy négyeszközös
+mesh például lehet <code>('data', 'model')</code> shape
+<code>(4, 1)</code>, vagy egy kétdimenziós <code>(2, 2)</code>
+topológia. A <code>PartitionSpec</code> azt mondja meg, hogy a logikai
+tömb tengelyei hogyan képeződnek a mesh tengelyekre:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># (batch, d_model) alakú tömb: batch a data, d_model replikált</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>spec <span class="op">=</span> PartitionSpec(<span class="st">&#39;data&#39;</span>, <span class="va">None</span>)</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>sharding <span class="op">=</span> NamedSharding(mesh, spec)</span></code></pre></div>
+<p>A <code>None</code> azt jelenti, hogy az adott logikai tengely nem
+kerül felosztásra, hanem replikálódik. Az alábbi táblázat a leggyakoribb
+eseteket foglalja össze:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Logikai alak</th>
+<th><code>PartitionSpec</code></th>
+<th>Hatás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>(B, D)</code></td>
+<td><code>('data', None)</code></td>
+<td>batch felosztva, <code>D</code> replikált</td>
+</tr>
+<tr class="even">
+<td><code>(B, L, D)</code></td>
+<td><code>('data', 'model', None)</code></td>
+<td>batch és szekvencia dimenzió is felosztva</td>
+</tr>
+<tr class="odd">
+<td><code>(D_in, D_out)</code></td>
+<td><code>(None, 'model')</code></td>
+<td>súlymátrix kimenő oszlopai felosztva</td>
+</tr>
+<tr class="even">
+<td><code>(D_in, D_out)</code></td>
+<td><code>('model', 'data')</code></td>
+<td>kétdimenziós modell- és adatpárhuzamosság</td>
+</tr>
+</tbody>
+</table>
+<p>Az explicit sharding előnye, hogy nem kényszeríti a fejlesztőt a 0.
+tengelyre, és ugyanazt a mesh-t több függvény is használhatja. A JAX
+kódban az adatot a <code>jax.device_put</code> segítségével tehetjük egy
+adott shardingra:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jax.numpy.arange(<span class="dv">32</span>, dtype<span class="op">=</span>jax.numpy.float32)</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>x_sharded <span class="op">=</span> jax.device_put(x, sharding)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(x_sharded.sharding)</span></code></pre></div>
+<p>A <code>jax.device_put</code> nem feltétlenül másol azonnal; a JAX a
+késleltetett végrehajtás miatt a másolást a tényleges használatkor
+ütemezheti. Ezért a host-device kapcsolat tárgyalásakor külön figyelni
+kell a szinkronizációra.</p>
+<h3 data-number="27.3.3" id="kollektívák-a-tpu-n"><span
+class="header-section-number">27.3.3</span> Kollektívák a TPU-n</h3>
+<p>A kollektív műveletek azok a kommunikációs primitívek, amelyek a mesh
+tengely mentén összehangolják az eszközöket. A JAX a
+<code>jax.lax</code> modulban kínálja őket; az XLA ezeket a TPU
+ICI-hálózatán hajtja végre. A leggyakoribb kollektívák:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>JAX művelet</th>
+<th>XLA HLO művelet</th>
+<th>Művelet</th>
+<th>Tipikus használat</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>jax.lax.psum</code></td>
+<td><code>AllReduce</code></td>
+<td>tengely menti összeg, az eredmény minden eszközre replikálódik</td>
+<td>gradiensszummázás adatpárhuzamos tanításnál</td>
+</tr>
+<tr class="even">
+<td><code>jax.lax.pmean</code></td>
+<td><code>AllReduce</code></td>
+<td>tengely menti átlag</td>
+<td>gradiensátlagolás, normalizálás</td>
+</tr>
+<tr class="odd">
+<td><code>jax.lax.all_gather</code></td>
+<td><code>AllGather</code></td>
+<td>az osztott tengelyt összegyűjti minden eszközön</td>
+<td>szekvenciális modellben aktivációs tenzorok összegyűjtése</td>
+</tr>
+<tr class="even">
+<td><code>jax.lax.reduce_scatter</code></td>
+<td><code>ReduceScatter</code></td>
+<td>tengely menti redukció, majd szétosztás</td>
+<td>modellpárhuzamos visszaterjesztés</td>
+</tr>
+<tr class="odd">
+<td><code>jax.lax.all_to_all</code></td>
+<td><code>AllToAll</code></td>
+<td>minden eszköz a saját adatszeletét más eszköznek küldi</td>
+<td>Mixture-of-Experts routing</td>
+</tr>
+<tr class="even">
+<td><code>jax.lax.collective_permute</code></td>
+<td><code>CollectivePermute</code></td>
+<td>környező eszközökre másolás</td>
+<td>pipeline párhuzamosság, stencil a chiphatáron</td>
+</tr>
+<tr class="odd">
+<td><code>jax.lax.ppermute</code></td>
+<td><code>CollectivePermute</code></td>
+<td>páronkénti permutáció</td>
+<td>TPU chipösszeköttetés kihasználása</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>psum</code> a legfontosabb. Ha egy tömböt az <code>i</code>
+tengely mentén shardolunk, akkor a <code>psum(x, axis_name='i')</code> a
+tengelyhez tartozó eszközökön az azonos pozíciójú elemeket összeadja, és
+a teljes összeget minden eszközre elhelyezi. A kimenet alakja megegyezik
+a bemenet alakjával, de az értéke replikált.</p>
+<p>Például négy eszköz és <code>x = [0, 1, 2, 3]</code> esetén, ha a 0.
+tengelyt shardoljuk az <code>i</code> tengely mentén, minden eszköz
+egy-egy skalárt kap. A <code>psum</code> eredménye minden eszközön
+<code>6.0</code>, a <code>pmean</code> eredménye pedig
+<code>1.5</code>.</p>
+<p>A <code>pmap</code>-pel a kollektíva így fejezhető ki:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># x.shape == (num_devices,) a didaktikus példában</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jnp.arange(jax.device_count(), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>sum_fn <span class="op">=</span> jax.pmap(</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">lambda</span> v: jax.lax.psum(v, axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>),</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>,</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>y <span class="op">=</span> sum_fn(x)</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(jax.device_get(y))</span></code></pre></div>
+<p>A <code>axis_name='i'</code> paraméternek ugyanannak a névnek kell
+lennie, mint amit a <code>jax.lax.psum</code> használ. Ha eltér, a JAX
+fordítási időben hibát ad, mert a kollektíva nem tudja, melyik
+leképezési tengelyre vonatkozik.</p>
+<p>A <code>pmap</code> implicit módon a 0. tengely mentén shardol.
+Komolyabb programokban az explicit <code>shard_map</code> vagy a
+<code>pjit</code> ad teljesebb irányítást. A <code>shard_map</code> a
+mesh-et és a bemeneti/kimeneti shardingokat külön paraméterként kapja,
+így a függvény törzse már a shardolt tömbökön dolgozik:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.experimental.shard_map <span class="im">import</span> shard_map</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">@shard_map</span>(mesh<span class="op">=</span>mesh, in_specs<span class="op">=</span>PartitionSpec(<span class="st">&#39;data&#39;</span>), out_specs<span class="op">=</span>PartitionSpec())</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> all_reduce_result(v):</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jax.lax.psum(v, axis_name<span class="op">=</span><span class="st">&#39;data&#39;</span>)</span></code></pre></div>
+<p>Az <code>out_specs=PartitionSpec()</code> azt jelenti, hogy a kimenet
+minden mesh-eszközön replikált, azaz nincs felosztott tengelye. Ez a
+forma azért hasznos, mert a kollektíva és a sharding ugyanabban a
+függvényben válik leírhatóvá, és az XLA a szükséges kommunikációt
+automatikusan beilleszti a gráfba.</p>
+<h3 data-number="27.3.4" id="sharding-és-kollektíva-kapcsolata"><span
+class="header-section-number">27.3.4</span> Sharding és kollektíva
+kapcsolata</h3>
+<p>A sharding nem önmagában létrehoz kommunikációt. A
+<code>jax.device_put</code> például csak elhelyezi az adatot, de nem
+mozgatja az eszközök között. A kollektíva akkor jön létre, amikor a
+számítási gráf egyik műveletének kimenete más eszközök adatát igényli.
+Az XLA ezt a konverziót a HLO-gráf optimalizálása során végzi el.</p>
+<p>Az adatpárhuzamos tanítás klasszikus lépése jól mutatja ezt:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.pmap</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> step(params, x, y):</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    grads <span class="op">=</span> compute_loss_grad(params, x, y)   <span class="co"># eszközönkénti lokális gradiens</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    grads <span class="op">=</span> jax.lax.pmean(grads, axis_name<span class="op">=</span><span class="st">&#39;batch&#39;</span>)</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> update(params, grads)</span></code></pre></div>
+<p>A <code>x</code> és <code>y</code> batch-tengelyét a
+<code>pmap</code> szétosztja az eszközök között; a <code>params</code>
+replikált. A <code>compute_loss_grad</code> minden eszközön a saját
+batch-szeletéből számol gradienst. A <code>pmean</code> ezeket az
+eszközönkénti gradienseket átlagolja, és az átlagot minden eszközre
+visszaírja. Az XLA HLO-gráfban egy <code>AllReduce</code> művelet
+jelenik meg, amely a TPU ICI-hálózatán redukál.</p>
+<p>A sharding és a kollektíva hibás illesztése a leggyakoribb
+hibaforrás. Ha például a <code>PartitionSpec</code> a
+modellparamétereket is felosztja, de a gradiensfrissítés csak az adat
+tengely mentén átlagol, akkor az eszközökön lévő paraméterszeletek
+divergálnak. A szabály az, hogy a kollektíva tengelyének pontosan azt a
+mesh-tengelyt kell jelölnie, amely mentén az adat fel van darabolva, és
+a kimenet shardingjának meg kell egyeznie a következő művelet bemeneti
+elvárásával.</p>
+<h3 data-number="27.3.5" id="host-device-kapcsolat-a-tpu-n"><span
+class="header-section-number">27.3.5</span> Host-device kapcsolat a
+TPU-n</h3>
+<p>A CUDA-hoz hasonlóan a TPU-s programban is külön kell választani a
+host CPU memóriáját és a TPU HBM-jét. A JAX az eszközön tárolt tömböket
+<code>jax.Array</code> objektumként adja vissza. A Python oldal ezekre
+hivatkozik, de az adat fizikailag a TPU HBM-jében van, vagy éppen a host
+és az eszköz közötti DMA-pufferen utazik.</p>
+<p>A host-device kapcsolat legfontosabb műveletei:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Művelet</th>
+<th>Hatás</th>
+<th>Szinkron?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>jax.device_put(x, device)</code></td>
+<td>host-tömb elhelyezése egy eszközön vagy sharding szerint</td>
+<td>nem feltétlenül blokkol</td>
+</tr>
+<tr class="even">
+<td><code>jax.device_get(arr)</code></td>
+<td>eszköztömb visszamásolása a hostra</td>
+<td>általában blokkol</td>
+</tr>
+<tr class="odd">
+<td><code>arr.block_until_ready()</code></td>
+<td>megvárja, amíg a tömb előáll</td>
+<td>blokkol</td>
+</tr>
+<tr class="even">
+<td><code>arr.sharding</code></td>
+<td>lekérdezi, hogyan van az adat felosztva</td>
+<td>nem blokkol</td>
+</tr>
+<tr class="odd">
+<td><code>jax.make_array_from_callback</code></td>
+<td>nagy tömbök feltöltése szeletenként</td>
+<td>nem blokkol</td>
+</tr>
+</tbody>
+</table>
+<p>A JAX alapértelmezésben aszinkron végrehajtást használ, hasonlóan a
+CUDA streamhez. Egy függvényhívás visszatérhet úgy, hogy a tényleges
+TPU-számítás még nem fejeződött be. Ezért ha mérünk, a
+<code>block_until_ready()</code> hívásnak a mérési idő lezárása előtt
+kell szerepelnie.</p>
+<p>Fontos megkülönböztetés: a kollektív műveletek nem a host CPU-n
+keresztül mennek. A <code>psum</code> esetén a TPU-chipk közötti
+ICI-interconnect (a v4-8 esetén nagy sávszélességű board-szintű
+kapcsolat) közvetlenül továbbítja az adatot. A host CPU csak elindítja a
+műveletet, és a szinkronizációkor vár rá. Ha a host és az eszköz közötti
+PCIe vagy hálózati kapcsolat lenne az adatcsere útja, a kollektíva
+sávszélessége drámaian romlana; a TPU-programok ezért igyekeznek a
+kollektívákat az eszközök között tartani, és a hostra csak az ellenőrző
+pontokat, naplózást vagy a felhasználói eredményt másolni.</p>
+<p>A tipikus adatpárhuzamos minta host-device szempontból:</p>
+<ol type="1">
+<li>A host CPU beolvassa a batch-t, és <code>jax.device_put</code>
+segítségével a megfelelő shardingra helyezi.</li>
+<li>A modellparamétereket replikáltan tartjuk; inicializálás után a TPU
+HBM-ben maradnak.</li>
+<li>Minden lépésben a TPU kiszámítja a lokális gradienseket, majd
+<code>pmean</code> segítségével átlagol.</li>
+<li>A host csak a veszteséget és a metrikákat kéri le; ez ritkán,
+például logoláskor történik.</li>
+<li>A <code>jax.device_get</code> hívást nem szabad a tanító ciklus
+belsejébe tenni, mert minden alkalommal szinkronizál és hostra
+másol.</li>
+</ol>
+<h3 data-number="27.3.6" id="gyakorlati-minta-all-reduce-a-tpu-n"><span
+class="header-section-number">27.3.6</span> Gyakorlati minta: all-reduce
+a TPU-n</h3>
+<p>A következő labor egy minimális, ellenőrizhető példát ad a TPU
+kollektívákra. A cél az, hogy a <code>psum</code> all-reduce
+szemantikáját numerikusan ellenőrizzük. A példa négy (vagy a
+rendelkezésre álló számú) eszközt használ, és a 0. tengely mentén
+shardol egy <code>[0, 1, 2, 3]</code> vektort.</p>
+<p>A labor elsődleges kódja JAX; a GPU-s baseline-t azért adjuk meg,
+mert a könyv laborformátuma rögzített gyorsító-konfigurációt és mérési
+naplót ír elő. A TPU-rész nem CUDA; a GPU-s baseline csak numerikus
+összehasonlításra szolgál.</p>
+<h3 data-number="27.3.7" id="jaxtpu-kód"><span
+class="header-section-number">27.3.7</span> JAX/TPU kód</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># JAX (Python) — TPU all-reduce psum példa</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A példa fordítási és alaki ellenőrzésű; valós TPU-n a laboratóriumban futtatandó.</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> os</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> main():</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="co"># TPU környezetben a platform beállítható:</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="co"># export JAX_PLATFORMS=tpu</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A processz által látott eszközök:</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    devices <span class="op">=</span> jax.devices()</span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">not</span> devices:</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">raise</span> <span class="pp">RuntimeError</span>(<span class="st">&quot;Nincs elérhető JAX/XLA-eszköz.&quot;</span>)</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    n <span class="op">=</span> jax.device_count()</span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;JAX backend: </span><span class="sc">{</span>jax<span class="sc">.</span>default_backend()<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Eszközök: </span><span class="sc">{</span>devices<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Eszközszám: </span><span class="sc">{</span>n<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Bemenet: n eszköz, n elem, a pmap a 0. tengelyt osztja el.</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Minden eszköz egy skalárt kap: 0, 1, 2, ...</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> jnp.arange(n, dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    <span class="co"># All-reduce összeg a &#39;i&#39; tengely mentén.</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    sum_fn <span class="op">=</span> jax.pmap(</span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>        <span class="kw">lambda</span> v: jax.lax.psum(v, axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>),</span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>        axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>,</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> sum_fn(x)</span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    <span class="co"># All-reduce átlag.</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    mean_fn <span class="op">=</span> jax.pmap(</span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>        <span class="kw">lambda</span> v: jax.lax.pmean(v, axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>),</span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>        axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>,</span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    z <span class="op">=</span> mean_fn(x)</span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    <span class="co"># All-gather: a shardolt tengelyt minden eszközön összegyűjti.</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    gather_fn <span class="op">=</span> jax.pmap(</span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>        <span class="kw">lambda</span> v: jax.lax.all_gather(v, axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>),</span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>        axis_name<span class="op">=</span><span class="st">&#39;i&#39;</span>,</span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>    g <span class="op">=</span> gather_fn(x)</span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Hostra másolás; ez szinkronizál.</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    y_host <span class="op">=</span> jax.device_get(y)</span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>    z_host <span class="op">=</span> jax.device_get(z)</span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a>    g_host <span class="op">=</span> jax.device_get(g)</span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>    expected_sum <span class="op">=</span> <span class="bu">float</span>(n <span class="op">*</span> (n <span class="op">-</span> <span class="dv">1</span>) <span class="op">/</span> <span class="dv">2</span>)</span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>    expected_mean <span class="op">=</span> expected_sum <span class="op">/</span> n</span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Bemenet: </span><span class="sc">{</span>jax<span class="sc">.</span>device_get(x)<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;psum várt (minden eszköz): </span><span class="sc">{</span>expected_sum<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;psum mért : </span><span class="sc">{</span>y_host<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;pmean várt (minden eszköz): </span><span class="sc">{</span>expected_mean<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;pmean mért: </span><span class="sc">{</span>z_host<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;all_gather shape: </span><span class="sc">{</span>g_host<span class="sc">.</span>shape<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;all_gather érték:</span><span class="ch">\n</span><span class="sc">{</span>g_host<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Explicit sharding ellenőrzés ugyanazon a mesh-en:</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>    mesh <span class="op">=</span> jax.sharding.Mesh(devices, axis_names<span class="op">=</span>(<span class="st">&#39;i&#39;</span>,))</span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a>    sharding <span class="op">=</span> jax.sharding.NamedSharding(</span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a>        mesh, jax.sharding.PartitionSpec(<span class="st">&#39;i&#39;</span>)</span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    x_sharded <span class="op">=</span> jax.device_put(x, sharding)</span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;Explicit sharding: </span><span class="sc">{</span>x_sharded<span class="sc">.</span>sharding<span class="sc">}</span><span class="ss">&quot;</span>)</span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-70"><a href="#cb7-70" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb7-71"><a href="#cb7-71" aria-hidden="true" tabindex="-1"></a>    main()</span></code></pre></div>
+<p>A <code>psum</code> várt eredménye négy eszköz esetén minden eszközön
+<code>[6.0, 6.0, 6.0, 6.0]</code>, a <code>pmean</code> várt eredménye
+<code>[1.5, 1.5, 1.5, 1.5]</code>. Az <code>all_gather</code> kimenete
+<code>(4, 4)</code> alakú, minden sor <code>[0, 1, 2, 3]</code>.</p>
+<h3 data-number="27.3.8" id="gpu-s-cuda-baseline"><span
+class="header-section-number">27.3.8</span> GPU-s CUDA-baseline</h3>
+<p>A GPU-s baseline egyetlen A100-as redukció, amely ugyanannak a
+numerikus összegnek a kiszámítását mutatja. A kernel nem optimalizált; a
+cél nem a teljesítmény, hanem a várt numerikus érték ellenőrzése. A
+<code>gpu058</code> alfejezetben szereplő redukcióoptimalizálást itt nem
+ismételjük.</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ — egyszerű redukciós baseline a laborhoz</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítási ellenőrzésű minta; nem futtatott mérés a kéziratban.</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                        </span><span class="op">\</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: </span><span class="sc">%s</span><span class="st"> (</span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">                </span><span class="op">\</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span>cudaGetErrorString<span class="op">(</span>err<span class="op">),</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span><span class="dv">1</span><span class="op">);</span><span class="pp">                                                   </span><span class="op">\</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> reduce_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> x<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> tid <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> tid<span class="op">;</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> x<span class="op">[</span>i<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> s <span class="op">=</span> <span class="dv">1</span><span class="op">;</span> s <span class="op">&lt;</span> blockDim<span class="op">.</span>x<span class="op">;</span> s <span class="op">*=</span> <span class="dv">2</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tid <span class="op">%</span> <span class="op">(</span><span class="dv">2</span> <span class="op">*</span> s<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>blockIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> n <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> h_x<span class="op">[]</span> <span class="op">=</span> <span class="op">{</span><span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">3.0</span><span class="bu">f</span><span class="op">};</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_x <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> h_out <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_x<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_out<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_x<span class="op">,</span> h_x<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d_out<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>    reduce_kernel<span class="op">&lt;&lt;&lt;</span><span class="dv">1</span><span class="op">,</span> threads<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaMemcpy<span class="op">(&amp;</span>h_out<span class="op">,</span> d_out<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;CUDA baseline sum: </span><span class="sc">%f\n</span><span class="st">&quot;</span><span class="op">,</span> h_out<span class="op">);</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_x<span class="op">));</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>    CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_out<span class="op">));</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel launch alakja a fenti mintában
+<code>&lt;&lt;&lt;grid, block, shared_bytes, stream&gt;&gt;&gt;</code> =
+<code>&lt;&lt;&lt;1, 256, 0, 0&gt;&gt;&gt;</code>. A blockméret 256, a
+shared memória mérete 256 <code>float</code>, azaz 1 KiB, a stream 0. A
+precízió mindkét laborrészben FP32.</p>
+<h3 data-number="27.3.9" id="build--futtatási-és-mérési-napló"><span
+class="header-section-number">27.3.9</span> Build-, futtatási és mérési
+napló</h3>
+<p>A labor környezetét a tényleges futtatás előtt rögzíteni kell. Az
+alábbi táblázat a formátumot mutatja; a mért értékeket a laboratóriumi
+futás után kell beírni.</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tétel</th>
+<th>Várt érték</th>
+<th>Mért érték (ellenőrzött labor)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>JAX/TPU <code>psum</code> n=4</td>
+<td><code>[6.0, 6.0, 6.0, 6.0]</code></td>
+<td>nem futtatott ellenőrzött mérés</td>
+</tr>
+<tr class="even">
+<td>JAX/TPU <code>pmean</code> n=4</td>
+<td><code>[1.5, 1.5, 1.5, 1.5]</code></td>
+<td>nem futtatott ellenőrzött mérés</td>
+</tr>
+<tr class="odd">
+<td>JAX/TPU <code>all_gather</code> n=4</td>
+<td>shape <code>(4, 4)</code>, sorok <code>[0,1,2,3]</code></td>
+<td>nem futtatott ellenőrzött mérés</td>
+</tr>
+<tr class="even">
+<td>CUDA baseline sum n=4</td>
+<td><code>6.0</code></td>
+<td>nem futtatott ellenőrzött mérés</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Környezet elsődleges TPU-részhez (ellenőrzendő):</strong>
+Cloud TPU v4-8, JAX/jaxlib 0.4.x, XLA a TPU backenddel,
+<code>JAX_PLATFORMS=tpu</code>, TPU-illesztő a szolgáltató szerint. A
+pontos verziót a laborban a <code>pip show jax jaxlib</code> és a
+<code>jax.default_backend()</code> kimenetével kell rögzíteni.</p>
+<p><strong>Környezet a CUDA-baseline-hoz (ellenőrzendő):</strong> NVIDIA
+A100 40 GB, CUDA 12.2, NVIDIA driver 535.86, compute capability 8.0
+(<code>-arch=sm_80</code>), operációs rendszer és háttérterhelés
+rögzítve.</p>
+<p><strong>Buildparancs a CUDA-részhez:</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> reduce_baseline reduce_baseline.cu</span></code></pre></div>
+<p><strong>Futtatás:</strong></p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co"># JAX/TPU</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="va">JAX_PLATFORMS</span><span class="op">=</span>tpu <span class="ex">python</span> tpu_psum.py</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="co"># CUDA baseline</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./reduce_baseline</span></span></code></pre></div>
+<p><strong>Mérési eljárás:</strong> legalább 10 ismétlés warm-up után;
+az átlag mellett a szórást vagy percentilist is közölni kell. A
+TPU-részt akkor lehet mérni, ha valós TPU-hozzáférés rendelkezésre áll.
+A CPU-s JAX-futtatás (<code>JAX_PLATFORMS=cpu</code>) segíthet a
+numerikus várt érték ellenőrzésében, de az nem TPU-mérés.</p>
+<p>A mérési naplóban külön kell választani a numerikus eredményt és az
+időeredményt. A fenti táblázat numerikus várt/mért értéket mutat; az
+idő- és energiaeredményeket külön naplóban kell rögzíteni, ha a labor
+célja a kollektívák teljesítménye.</p>
+<h3 data-number="27.3.10" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">27.3.10</span> Tipikus hibák és
+megelőzésük</h3>
+<p>A TPU-programokban a kollektívák és a sharding hibái gyakran csak
+fordítási időben vagy az első futásnál jelentkeznek. A leggyakoribb
+esetek:</p>
+<ol type="1">
+<li><strong>Az axis_name nem egyezik.</strong> A
+<code>jax.lax.psum(v, axis_name='i')</code> hívásnál az <code>i</code>
+tengelynek definiálva kell lennie a
+<code>jax.pmap(..., axis_name='i')</code> hívásban. Hiba:
+<code>ValueError: axis_name 'i' not in pmapped function</code>.</li>
+<li><strong>Az eszközszám és az adatdimenzió eltér.</strong> Ha a
+<code>pmap</code> a 0. tengelyt osztja el, a 0. dimenzió méretének
+oszthatónak kell lennie az eszközszámmal. Hiba:
+<code>ValueError: pmap got ... leading axis size ... but device count is ...</code>.</li>
+<li><strong>A sharding spec nem illik a mesh-re.</strong> Ha a
+<code>PartitionSpec</code> olyan tengelyt nevez meg, amely nem létezik a
+<code>Mesh</code>-ben, a JAX fordítási hibát ad. Ellenőrizni kell a
+<code>Mesh.axis_names</code> listát.</li>
+<li><strong>A hostra másolás a tanító ciklusban.</strong> A
+<code>jax.device_get</code> minden lépésben blokkol és PCIe/host
+másolást végez; a tanítás sebessége drasztikusan csökken. Csak
+logoláskor vagy checkpointnál hívjuk.</li>
+<li><strong>A kollektíva tengelyén a kimenet replikált, de a következő
+művelet shardot vár.</strong> Például <code>psum</code> után a kimenet
+replikált, de a következő lépés <code>PartitionSpec('data')</code>
+bemenetet vár. Ilyenkor egy <code>AllGather</code> vagy
+<code>ReduceScatter</code> hiányzik, vagy a sharding-specet kell
+javítani.</li>
+<li><strong>Lebegőpontos nemdeterminizmus.</strong> Az all-reduce során
+az összeadás sorrendje az eszközök és a szegmentálás szerint változhat.
+Az FP32-es <code>psum</code> bitre pontosan általában nem
+determinisztikus. Ha reprodukálhatóság kell, a <code>gpu123</code>
+alfejezetben tárgyalt módon rögzített redukciót vagy magasabb precíziót
+kell használni.</li>
+<li><strong>OOM a HBM-ben.</strong> A túl nagy batch vagy túl nagy
+replikált tenzorok a TPU HBM-jét kimerítik. Az XLA ilyenkor
+<code>RESOURCE_EXHAUSTED</code> jellegű hibát ad. A megoldás a batch
+csökkentése, a sharding módosítása vagy a modellpárhuzamosság
+bevezetése.</li>
+<li><strong>A TPU-n nem futó kódot valós mérésként feltüntetni.</strong>
+Ez nem programozási hiba, hanem méréstechnikai hiba. A laborban mindig
+jelölni kell, ha a kód csak fordítási ellenőrzésen esett át. A fenti
+táblázat ezt a szabályt követi.</li>
+</ol>
+<h3 data-number="27.3.11" id="összefoglalás"><span
+class="header-section-number">27.3.11</span> Összefoglalás</h3>
+<p>A TPU programozási modellje a sharding és a kollektívák kettősére
+épül. A sharding megmondja, hogy az adat melyik eszközön van; a
+kollektíva leírja, hogy az eszközök hogyan cserélnek információt. A JAX
+a <code>pmap</code>-pel egyszerű esetben implicit shardingot ad, az
+explicit <code>Mesh</code> és <code>PartitionSpec</code> pedig teljes
+irányítást biztosít. A <code>psum</code>, <code>pmean</code>,
+<code>all_gather</code>, <code>reduce_scatter</code>,
+<code>all_to_all</code> és <code>collective_permute</code> műveletek az
+XLA HLO-gráfban jelennek meg, és a TPU ICI-hálózatán futnak. A host CPU
+csak irányít, az adatcsere az eszközök között zajlik. A host-device
+kapcsolatban az aszinkronitás miatt mindig szinkronizálni kell, mielőtt
+mérünk vagy a hostra másolunk.</p>
+<h3 data-number="27.3.12" id="önellenőrző-kérdés"><span
+class="header-section-number">27.3.12</span> Önellenőrző kérdés</h3>
+<p>Adott nyolc TPU-eszköz, egy <code>(8,)</code> alakú FP32 vektor
+<code>[1, 1, 1, 1, 1, 1, 1, 1]</code>, és egy <code>jax.pmap</code> a
+<code>axis_name='i'</code> tengellyel. Mi lesz a
+<code>jax.lax.psum(x, axis_name='i')</code> eredménye minden eszközön,
+és mi lesz a <code>jax.lax.pmean</code> eredménye? Milyen XLA HLO
+művelet keletkezik a <code>psum</code> hívásból, és miért nem a host CPU
+végzi az adatcserét?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu103.html">← 27.2 XLA és a gráffordítás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu105.html">27.4 TPU vs. GPU →</a></div>
+</nav>
+</body>
+</html>

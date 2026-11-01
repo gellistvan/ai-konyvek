@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>18.2 Halo-csere és többblokkos stencil – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch17">18 Stencil, PDE és iteratív megoldók</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu066.html">← 18.1 Stencil-alapok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu068.html">18.3 PDE és iteratív megoldók →</a></div>
+</nav>
+<h2 data-number="18.2" id="gpu067"><span
+class="header-section-number">18.2</span> Halo-csere és többblokkos
+stencil</h2>
+<p>A halo-csere akkor válik elsődleges helyességi és
+teljesítménykérdéssé, amikor a stencil rácsát több blokk között osztjuk
+szét. A <code>gpu066</code> egységben a stencil-számítás alapjait, a
+rádiuszt és a shared memory tile gondolatát már bevezettük. Most azt
+vizsgáljuk, hogyan kezeljük a blokkhatárokon átnyúló függőségeket: mit
+kell betölteni a szomszédos blokkokból, hogyan biztosítja a globális
+memória az adatcserét, és milyen szinkronizációs szabályok mellett marad
+helyes a megoldás.</p>
+<h3 data-number="18.2.1" id="a-blokkok-közötti-halo-fogalma"><span
+class="header-section-number">18.2.1</span> 1. A blokkok közötti halo
+fogalma</h3>
+<p>Egy 2D, ötpontos Jacobi-stencil esetén az <code>(i,j)</code> cella új
+értéke:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi></mrow><mrow><mi>t</mi><mo>+</mo><mn>1</mn></mrow></msubsup><mo>=</mo><mfrac><mn>1</mn><mn>4</mn></mfrac><mrow><mo stretchy="true" form="prefix">(</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>−</mo><mn>1</mn><mo>,</mo><mi>j</mi></mrow><mi>t</mi></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>+</mo><mn>1</mn><mo>,</mo><mi>j</mi></mrow><mi>t</mi></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi><mo>−</mo><mn>1</mn></mrow><mi>t</mi></msubsup><mo>+</mo><msubsup><mi>u</mi><mrow><mi>i</mi><mo>,</mo><mi>j</mi><mo>+</mo><mn>1</mn></mrow><mi>t</mi></msubsup><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+u^{t+1}_{i,j} =
+\frac{1}{4}\left(
+u^t_{i-1,j}+u^t_{i+1,j}+u^t_{i,j-1}+u^t_{i,j+1}
+\right),
+</annotation></semantics></math></p>
+<p>ha Dirichlet-peremmel a tartományon kívüli pontok értékét nullának
+tekintjük. A stencil rádiusza itt <code>R=1</code>, mert minden irányban
+egy cella távolságig van szükség a szomszédokra.</p>
+<p>Ha a rácsot blokkonként feldolgozott csempékre bontjuk, akkor egy
+<code>T×T</code> belső méretű csempének a széle számításához a csempén
+kívüli, <code>R</code> szélességű gyűrű is kell. Ezt a gyűrűt nevezzük
+halonak vagy szellemcellának. A blokk által számított belső tartományt
+<em>interior</em>, a betöltött, de nem frissített szomszédos gyűrűt
+<em>halo</em> néven különböztetjük meg.</p>
+<p>Egy <code>T×T</code> csempéhez <code>H=R=1</code> esetén a teljes
+betöltött tartomány:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>T</mi><mo>+</mo><mn>2</mn><mi>R</mi><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup><mo>=</mo><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>T</mi><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">
+(T+2R)^2 = (T+2)^2
+</annotation></semantics></math></p>
+<p>cella, míg a belső, frissítendő tartomány <code>T^2</code>. A halo
+celláinak száma:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mrow><mi mathvariant="normal">h</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi></mrow></msub><mo>=</mo><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>T</mi><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup><mo>−</mo><msup><mi>T</mi><mn>2</mn></msup><mo>=</mo><mn>4</mn><mi>T</mi><mo>+</mo><mn>4</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+N_{\mathrm{halo}} = (T+2)^2 - T^2 = 4T+4.
+</annotation></semantics></math></p>
+<p>A halo-arány tehát:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><msub><mi>N</mi><mrow><mi mathvariant="normal">h</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">o</mi></mrow></msub><msub><mi>N</mi><mrow><mi mathvariant="normal">b</mi><mi mathvariant="normal">e</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">ö</mi><mi mathvariant="normal">l</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">ö</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">t</mi></mrow></msub></mfrac><mo>=</mo><mfrac><mrow><mn>4</mn><mi>T</mi><mo>+</mo><mn>4</mn></mrow><msup><mrow><mo stretchy="true" form="prefix">(</mo><mi>T</mi><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+\frac{N_{\mathrm{halo}}}{N_{\mathrm{betöltött}}}
+= \frac{4T+4}{(T+2)^2}.
+</annotation></semantics></math></p>
+<p>Ez az arány a csempeméret növelésével csökken, tehát a nagyobb csempe
+kisebb relatív halo-forgalmat jelent. Ugyanakkor a csempe mérete nem
+nőhet korlátlanul, mert a shared memory és a regiszterkészlet
+korlátos.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: right;">Csempeméret <code>T</code></th>
+<th style="text-align: right;">Betöltött cella <code>(T+2)^2</code></th>
+<th style="text-align: right;">Halo-cella</th>
+<th style="text-align: right;">Halo-arány</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">36</td>
+<td style="text-align: right;">36,0%</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">324</td>
+<td style="text-align: right;">68</td>
+<td style="text-align: right;">21,0%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">1156</td>
+<td style="text-align: right;">132</td>
+<td style="text-align: right;">11,4%</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4356</td>
+<td style="text-align: right;">260</td>
+<td style="text-align: right;">6,0%</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban a halo-arány a blokk által a globális memóriából
+beolvasott adatmennyiség azon része, amely nem belső számítási munka.
+Ezért a csempeméret megválasztása nemcsak occupancy-kérdés, hanem
+memóriaforgalmi kérdés is.</p>
+<h3 data-number="18.2.2" id="implicit-és-explicit-halo-kezelés"><span
+class="header-section-number">18.2.2</span> 2. Implicit és explicit
+halo-kezelés</h3>
+<p>A GPU-n a blokkok közötti halo-kezelésnek két gyakorlati alakja
+van.</p>
+<h3 data-number="18.2.3"
+id="implicit-halo-globális-memórián-keresztül"><span
+class="header-section-number">18.2.3</span> Implicit halo globális
+memórián keresztül</h3>
+<p>A legegyszerűbb, és egyetlen GPU-n gyakran a legjobb módszer az, hogy
+nincsenek külön szellemtömbök. A teljes <code>u</code> és
+<code>u_{\mathrm{next}}</code> tömb a rács fizikai celláit tárolja
+<code>nx×ny</code> méretben. Minden blokk a saját tile-jához tartozó
+belső cellákat számítja, de a szükséges szomszédokat közvetlenül a
+globális memóriában lévő aktuális <code>u</code> tömbből olvassa be a
+shared memory tile-ba.</p>
+<p>Ebben a modellben a halo-csere nem külön másolási lépés, hanem maga a
+globális memóriából való beolvasás. A szomszédos blokkok által előző
+iterációban kiírt értékeket a következő kernelindítás olvassa. Az
+iterációk közötti kernelindítás határa egyben globális szinkronizációs
+pont is: a kernel újraindulása előtt minden blokk befejezte az előző
+iteráció írását.</p>
+<p>Ez a minta együtt jár a dupla puffereléssel:</p>
+<pre class="text"><code>for k in 0..K-1:
+    stencil_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(u, u_next)
+    swap(u, u_next)</code></pre>
+<p>A <code>swap</code> itt pointercserét jelent, nem adatmozgatást. A
+dupla pufferelés azért fontos, mert ha ugyanabba a tömbbe írnánk,
+amelyből olvasunk, akkor az egyik blokk már felülírhatná azt az értéket,
+amelyet egy másik blokk még nem olvasott be. A kernelindítások közötti
+implicit globális szinkronizáció ezt a versenyhelyzetet kiküszöböli.</p>
+<h3 data-number="18.2.4" id="explicit-halo-csere-szellemtömbökkel"><span
+class="header-section-number">18.2.4</span> Explicit halo-csere
+szellemtömbökkel</h3>
+<p>Bizonyos tervezési mintákban – például perzisztens blokkoknál,
+multi-GPU-s felosztásnál, vagy erősen particionált subdomain-tárolásnál
+– a csempéknek saját, külön tárolt szellemtartományuk van. Ekkor a belső
+cellák kiszámítása után egy külön lépésben kell a szomszédos csempék
+szélső celláit a megfelelő szellemtartományba másolni. Ezt nevezzük
+explicit halo-cserének.</p>
+<p>A két modell közötti döntés egyszerűen megfogalmazható:</p>
+<ul>
+<li>egyetlen GPU, iterációnként induló kernel → implicit halo;</li>
+<li>perzisztens blokk, saját subdomain-tárolás, multi-GPU vagy
+specifikus overlap-terv → explicit halo.</li>
+</ul>
+<h3 data-number="18.2.5"
+id="globális-memória-és-szinkronizáció-szabályai"><span
+class="header-section-number">18.2.5</span> 3. Globális memória és
+szinkronizáció szabályai</h3>
+<p>A blokkok közötti adatcsere a globális memórián keresztül történik. A
+globális memória láthatósága a kernelhatárokon garantált: ha egy
+kernelben az egyik blokk kiír egy értéket, akkor a következő kernel már
+láthatja azt.</p>
+<p>Ebből következik, hogy az implicit halo-minta esetén nem kell
+semmilyen blokkok közötti <code>__syncthreads()</code> hívás. A
+<code>__syncthreads()</code> csak egy blokk szálait szinkronizálja. Nem
+globális barrier, és blokkok közötti láthatóságot nem ad. Ha valaki
+például azt feltételezi, hogy a 0. blokk által kiírt szomszédos cella az
+1. blokkban egy <code>__syncthreads()</code> után látható, az hibás: a
+blokkok ütemezése nem garantált, és a hardver nem ad ilyen
+szinkronizációt.</p>
+<p>A kernelhatárok által adott globális szinkronizáció elegendő, de van
+egy ára: minden iterációban lezárul és újraindul egy kernel. Ez több
+ezer rövid stencil-lépés esetén számottevő launch overhead lehet.
+Ilyenkor megoldás lehet:</p>
+<ul>
+<li>grid-stride loop és néhány iteráció egy kernelben, de ekkor a halo
+nem frissülhet az egyes belső lépések között, ezért csak olyan stencil
+esetén használható, ahol a régebbi halo érték is elfogadható, vagy</li>
+<li>cooperative groups grid-szinkronizáció, amely bizonyos
+architektúrákon és feltételekkel kernelhatáron belül is ad globális
+szinkronizációt. Ezt a <code>gpu032</code> egység tárgyalja; itt elég
+annyi, hogy ez haladó eszköz, és alapfeladatban a kernelhatár-alapú
+megoldás a megbízható kiindulópont.</li>
+</ul>
+<h3 data-number="18.2.6"
+id="teljes-példa-2d-jacobi-shared-memory-tile-vel-és-implicit-haloval"><span
+class="header-section-number">18.2.6</span> 4. Teljes példa: 2D Jacobi
+shared memory tile-vel és implicit haloval</h3>
+<p>Az alábbi CUDA C++ példa azt a javasolt mintát valósítja meg, amikor
+a halo a globális <code>u</code> tömbből kerül a shared memory tile-ba.
+A kernel 32×32 belső cellát számít blokkonként, és minden blokk egy
+<code>34×34</code> shared memory tile-t tölt fel.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17)
+// halo_stencil.cu
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CUDA_CHECK(call)                                                    \
+  do {                                                                      \
+    cudaError_t err = (call);                                               \
+    if (err != cudaSuccess) {                                               \
+      std::fprintf(stderr, &quot;CUDA error %s:%d: %s\n&quot;,                       \
+                   __FILE__, __LINE__, cudaGetErrorString(err));            \
+      std::exit(EXIT_FAILURE);                                              \
+    }                                                                       \
+  } while (0)
+
+using real = double;
+
+constexpr int R = 1;
+constexpr int TILE_X = 32;
+constexpr int TILE_Y = 32;
+
+// Tiled kernel: a halo-t a globális u tömbből tölti be.
+__global__ void jacobi2d_tiled(const real* __restrict__ u,
+                               real* __restrict__ un,
+                               int nx, int ny)
+{
+  __shared__ real s[TILE_Y + 2 * R][TILE_X + 2 * R];
+
+  const int tx0 = blockIdx.x * TILE_X;
+  const int ty0 = blockIdx.y * TILE_Y;
+
+  const int tile_w = TILE_X + 2 * R;
+  const int tile_h = TILE_Y + 2 * R;
+
+  // A tile-nek és a halo-nak megfelelő cellák betöltése.
+  for (int idx = threadIdx.y * blockDim.x + threadIdx.x;
+       idx &lt; tile_w * tile_h;
+       idx += blockDim.x * blockDim.y) {
+
+    const int shx = idx % tile_w;
+    const int shy = idx / tile_w;
+    const int gx  = tx0 + shx - R;
+    const int gy  = ty0 + shy - R;
+
+    const bool inside_x = (gx &gt;= 0 &amp;&amp; gx &lt; nx);
+    const bool inside_y = (gy &gt;= 0 &amp;&amp; gy &lt; ny);
+
+    s[shy][shx] = (inside_x &amp;&amp; inside_y) ? u[gy * nx + gx] : real(0);
+  }
+
+  __syncthreads();
+
+  const int i = ty0 + threadIdx.y;
+  const int j = tx0 + threadIdx.x;
+
+  if (i &lt; ny &amp;&amp; j &lt; nx) {
+    const int sx = threadIdx.x + R;
+    const int sy = threadIdx.y + R;
+
+    const real left  = s[sy][sx - 1];
+    const real right = s[sy][sx + 1];
+    const real down  = s[sy - 1][sx];
+    const real up    = s[sy + 1][sx];
+
+    un[i * nx + j] = real(0.25) * (left + right + down + up);
+  }
+}
+
+// Referenciakernel: ugyanaz a stencil közvetlen globális memóriaolvasással.
+__global__ void jacobi2d_ref(const real* __restrict__ u,
+                             real* __restrict__ un,
+                             int nx, int ny)
+{
+  const int i = blockIdx.y * blockDim.y + threadIdx.y;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (i &gt;= ny || j &gt;= nx) return;
+
+  const real left  = (j &gt; 0)       ? u[i * nx + j - 1] : real(0);
+  const real right = (j + 1 &lt; nx)  ? u[i * nx + j + 1] : real(0);
+  const real down  = (i &gt; 0)       ? u[(i - 1) * nx + j] : real(0);
+  const real up    = (i + 1 &lt; ny)  ? u[(i + 1) * nx + j] : real(0);
+
+  un[i * nx + j] = real(0.25) * (left + right + down + up);
+}
+
+real* run_tiled(real* u, real* un, int nx, int ny, int iterations)
+{
+  dim3 block(TILE_X, TILE_Y);
+  dim3 grid((nx + TILE_X - 1) / TILE_X,
+            (ny + TILE_Y - 1) / TILE_Y);
+
+  for (int k = 0; k &lt; iterations; ++k) {
+    jacobi2d_tiled&lt;&lt;&lt;grid, block&gt;&gt;&gt;(u, un, nx, ny);
+    CUDA_CHECK(cudaGetLastError());
+    std::swap(u, un);
+  }
+
+  return u;
+}
+
+real* run_ref(real* u, real* un, int nx, int ny, int iterations)
+{
+  dim3 block(32, 32);
+  dim3 grid((nx + 31) / 32, (ny + 31) / 32);
+
+  for (int k = 0; k &lt; iterations; ++k) {
+    jacobi2d_ref&lt;&lt;&lt;grid, block&gt;&gt;&gt;(u, un, nx, ny);
+    CUDA_CHECK(cudaGetLastError());
+    std::swap(u, un);
+  }
+
+  return u;
+}
+
+int main(int argc, char** argv)
+{
+  const int nx         = (argc &gt; 1) ? std::atoi(argv[1]) : 2048;
+  const int ny         = (argc &gt; 2) ? std::atoi(argv[2]) : 2048;
+  const int iterations = (argc &gt; 3) ? std::atoi(argv[3]) : 20;
+
+  const size_t n = static_cast&lt;size_t&gt;(nx) * ny;
+  const size_t nbytes = n * sizeof(real);
+
+  std::vector&lt;real&gt; h_u(n), h_zero(n, real(0)), h_tiled(n), h_ref(n);
+
+  for (int i = 0; i &lt; ny; ++i) {
+    for (int j = 0; j &lt; nx; ++j) {
+      const real x = static_cast&lt;real&gt;(j);
+      const real y = static_cast&lt;real&gt;(i);
+      h_u[i * nx + j] =
+          std::sin(real(0.02) * x) * std::cos(real(0.012) * y) +
+          std::exp(-((x - nx / real(2)) * (x - nx / real(2)) +
+                     (y - ny / real(2)) * (y - ny / real(2))) /
+                   real(2000.0));
+    }
+  }
+
+  real *d_u = nullptr, *d_un = nullptr;
+  real *d_ref_u = nullptr, *d_ref_un = nullptr;
+
+  CUDA_CHECK(cudaMalloc(&amp;d_u, nbytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_un, nbytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_ref_u, nbytes));
+  CUDA_CHECK(cudaMalloc(&amp;d_ref_un, nbytes));
+
+  CUDA_CHECK(cudaMemcpy(d_u, h_u.data(), nbytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_ref_u, h_u.data(), nbytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_un, h_zero.data(), nbytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_ref_un, h_zero.data(), nbytes, cudaMemcpyHostToDevice));
+
+  // Warm-up: a mérés előtti első indítás ne torzítsa az időt.
+  {
+    dim3 block(TILE_X, TILE_Y);
+    dim3 grid((nx + TILE_X - 1) / TILE_X,
+              (ny + TILE_Y - 1) / TILE_Y);
+    jacobi2d_tiled&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_u, d_un, nx, ny);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+
+  cudaEvent_t start, stop;
+  CUDA_CHECK(cudaEventCreate(&amp;start));
+  CUDA_CHECK(cudaEventCreate(&amp;stop));
+
+  CUDA_CHECK(cudaEventRecord(start, 0));
+  real* final_tiled = run_tiled(d_u, d_un, nx, ny, iterations);
+  CUDA_CHECK(cudaEventRecord(stop, 0));
+  CUDA_CHECK(cudaEventSynchronize(stop));
+
+  float ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&amp;ms, start, stop));
+  const double seconds = static_cast&lt;double&gt;(ms) / 1000.0;
+
+  dim3 block(TILE_X, TILE_Y);
+  dim3 grid((nx + TILE_X - 1) / TILE_X,
+            (ny + TILE_Y - 1) / TILE_Y);
+
+  const size_t loaded_cells =
+      static_cast&lt;size_t&gt;(grid.x) * grid.y *
+      (TILE_X + 2 * R) * (TILE_Y + 2 * R) * iterations;
+
+  const size_t written_cells = n * static_cast&lt;size_t&gt;(iterations);
+
+  const double moved_bytes =
+      static_cast&lt;double&gt;(loaded_cells + written_cells) * sizeof(real);
+
+  const double effective_bw_gbs =
+      moved_bytes / (seconds * 1e9);
+
+  real* final_ref = run_ref(d_ref_u, d_ref_un, nx, ny, iterations);
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  CUDA_CHECK(cudaMemcpy(h_tiled.data(), final_tiled,
+                        nbytes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_ref.data(), final_ref,
+                        nbytes, cudaMemcpyDeviceToHost));
+
+  double max_abs_diff = 0.0;
+  for (size_t idx = 0; idx &lt; n; ++idx) {
+    max_abs_diff = std::max(max_abs_diff,
+                            std::abs(h_tiled[idx] - h_ref[idx]));
+  }
+
+  std::printf(&quot;nx=%d ny=%d iterations=%d tile=%dx%d\n&quot;,
+              nx, ny, iterations, TILE_X, TILE_Y);
+  std::printf(&quot;kernel time = %.3f ms\n&quot;, ms);
+  std::printf(&quot;effective bandwidth = %.2f GB/s\n&quot;,
+              effective_bw_gbs);
+  std::printf(&quot;max abs diff vs reference = %.17g\n&quot;, max_abs_diff);
+
+  CUDA_CHECK(cudaFree(d_u));
+  CUDA_CHECK(cudaFree(d_un));
+  CUDA_CHECK(cudaFree(d_ref_u));
+  CUDA_CHECK(cudaFree(d_ref_un));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+
+  return 0;
+}</code></pre>
+<p>A kódban a <code>run_tiled</code> minden iterációban újraindítja a
+kernelt, majd pointert cserél. A <code>final_tiled</code> pointer ezért
+az utolsó iteráció eredményét mutatja. A referenciakernel ugyanazon a
+topológián dolgozik, de nem használ shared memory tile-t; így a két
+futás numerikusan összehasonlítható.</p>
+<p>A sávszélességszámítás itt a tényleges globális adatmozgást
+közelíti:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mi mathvariant="normal">G</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">/</mi><mi mathvariant="normal">s</mi></mrow><mo>=</mo><mfrac><mrow><mrow><mo stretchy="true" form="prefix">[</mo><msub><mi>G</mi><mi>x</mi></msub><msub><mi>G</mi><mi>y</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>x</mi></msub><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>y</mi></msub><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mi>K</mi><mo>+</mo><msub><mi>n</mi><mi>x</mi></msub><msub><mi>n</mi><mi>y</mi></msub><mi>K</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>⋅</mo><mn>8</mn></mrow><mrow><mi>t</mi><mo>⋅</mo><msup><mn>10</mn><mn>9</mn></msup></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+\mathrm{GB/s} =
+\frac{
+\left[
+G_x G_y (T_x+2)(T_y+2)K + n_x n_y K
+\right] \cdot 8
+}{t \cdot 10^9},
+</annotation></semantics></math></p>
+<p>ahol <code>K</code> az iterációk száma, <code>G_x,G_y</code> a
+rácsdimenzió, <code>T_x,T_y</code> a tile belső mérete, <code>t</code>
+pedig a mért futásidő másodpercben. Ez nem a hardver névleges
+csúcssávszélessége, hanem az algoritmus globális memóriaforgalmára
+számított effektív érték.</p>
+<h3 data-number="18.2.7"
+id="explicit-halo-csere-egy-egyszerű-1d-modellen"><span
+class="header-section-number">18.2.7</span> 5. Explicit halo-csere egy
+egyszerű 1D modellen</h3>
+<p>Az explicit halo-csere oktatására az 1D eset a legáttekinthetőbb.
+Tegyük fel, hogy a fizikai tartományt <code>T</code> darab, egyenként
+<code>W</code> belső cellát tartalmazó csempére osztjuk. Minden csempe
+globális memóriában <code>S = W + 2H</code> hosszú szeletet foglal el,
+ahol <code>H</code> a halo szélessége. Egy csempe helyi indexei:</p>
+<pre class="text"><code>[0, H-1]               bal halo
+[H, H+W-1]             belső cellák
+[H+W, H+W+H-1]         jobb halo</code></pre>
+<p>A belső kernel kiszámítja a <code>H</code> és <code>H+W-1</code>
+közötti frissített értékeket. Ezután a halo-kernel a bal szélső belső
+cellákat a szomszéd jobb halojába, a jobb szélső belső cellákat pedig a
+szomszéd bal halojába másolja.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17) -- explicit 1D halo-másoló vázlat
+constexpr int H = 1;
+
+__global__ void halo1d_explicit(const real* __restrict__ src,
+                                real* __restrict__ dst,
+                                int tiles, int stride, int width)
+{
+  const int t = blockIdx.x;
+  const int h = threadIdx.x;
+
+  if (t &gt;= tiles || h &gt;= H) return;
+
+  // Bal halo: a t-1-edik csempe utolsó H belső cellájából.
+  if (t &gt; 0) {
+    dst[t * stride + h] =
+        src[(t - 1) * stride + width + h];
+  }
+
+  // Jobb halo: a t+1-edik csempe első H belső cellájából.
+  if (t &lt; tiles - 1) {
+    dst[t * stride + H + width + h] =
+        src[(t + 1) * stride + H + h];
+  }
+}</code></pre>
+<p>Ez a vázlat egy blokkot indít csempénként, és blokkon belül
+<code>H</code> szálat használ. Nagy <code>H</code> vagy sok csempe
+esetén ez gyenge kihasználtságú lehet, de a helyességi gondolatot jól
+mutatja. Termelési kódban érdemes a másolást egyetlen kernelben, az
+összes halocella sorszámát egy 1D indexre leképezve megszervezni, vagy
+2D esetben <code>cudaMemcpy2DAsync</code> hívásokkal a téglalap alakú
+szegélyeket másolni.</p>
+<p>2D esetben az explicit halo-csere négy lépésből áll: felső, alsó, bal
+és jobb szegély másolása. Sorirányú szegélyekhez a
+<code>cudaMemcpy2DAsync</code> alkalmas, mert egyetlen hívásban másol
+<code>W×H</code> méretű sorcsíkot device pointerek között. A hívás
+sémája:</p>
+<pre class="cuda"><code>CUDA_CHECK(cudaMemcpy2DAsync(
+    dst_ptr, dst_pitch,
+    src_ptr, src_pitch,
+    width * sizeof(real),
+    height,
+    cudaMemcpyDeviceToDevice,
+    stream));</code></pre>
+<p>Ilyenkor a <code>src_ptr</code> a szomszédos csempe belső szegélyére,
+a <code>dst_ptr</code> a célcsempe megfelelő halosávjára mutat, a
+<code>pitch</code> pedig a tényleges byte-beli sortávolság. Ez a
+megoldás aszinkron streamen is futtatható, és nem igényel külön
+kernelkódot a másoláshoz.</p>
+<h3 data-number="18.2.8" id="skálázás-és-a-halo-költsége"><span
+class="header-section-number">18.2.8</span> 6. Skálázás és a halo
+költsége</h3>
+<p>A halo-kezelés költsége a csempék felületével arányos, a hasznos
+számítás a csempék térfogatával. Ezért a blokkszám növelésével a
+halo-forgalom relatív súlya nő.</p>
+<p>Erős skálázás esetén a rács mérete rögzített, a blokkok számát
+növeljük. Ekkor a csempék belső mérete csökken, így a halo-arány nő.
+Például egy <code>512×512</code> belső rács esetén:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: right;">Blokkrács</th>
+<th style="text-align: right;">Tile <code>T</code></th>
+<th style="text-align: right;">Halo-arány</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">4×4</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">3,1%</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">8×8</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">6,0%</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">16×16</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">11,4%</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">32×32</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">21,0%</td>
+</tr>
+</tbody>
+</table>
+<p>A gyakorlatban a <code>T=16</code> már nagyon nagy halo-arányt
+jelent, ezért ilyen felbontásnál a blokkszámot nem érdemes túlzásba
+vinni. Emellett az occupancy is romolhat, ha a kis tile mellett
+ugyanakkora shared memory fenntartása felesleges.</p>
+<p>Gyenge skálázás esetén a csempeméretet rögzítjük, és a rács
+növelésével arányosan növeljük a blokkok számát. Ekkor a halo-arány
+közel állandó, és a megoldás jól skálázható, amíg a GPU el nem éri a
+blokkok és szálak ütemezési korlátait. A gyakorlati optimumot úgy
+érdemes keresni, hogy a <code>T</code> értékét például 16, 32, 64 és 96
+között futtatott mérésekkel vizsgáljuk, miközben rögzítjük az
+occupancyt, a shared memory méretét és a regiszterhasználatot.</p>
+<h3 data-number="18.2.9" id="tipikus-hibák-és-javításuk"><span
+class="header-section-number">18.2.9</span> 7. Tipikus hibák és
+javításuk</h3>
+<h3 data-number="18.2.10"
+id="hiányzó-__syncthreads-a-tile-betöltése-után"><span
+class="header-section-number">18.2.10</span> Hiányzó
+<code>__syncthreads()</code> a tile betöltése után</h3>
+<p>Ha a shared memory tile-t feltöltő szálak és a stencilt számító
+szálak nem szinkronizálnak, akkor az egyik szál még a régi vagy
+részlegesen kiírt <code>s</code> értéket olvashatja. Helyes megoldás: a
+betöltési ciklus után mindig <code>__syncthreads()</code>.</p>
+<h3 data-number="18.2.11" id="in-place-frissítés"><span
+class="header-section-number">18.2.11</span> In-place frissítés</h3>
+<p>Ha a kernel ugyanabba a tömbbe ír, amelyből a szomszédos blokkok
+olvasnak, akkor a kiírás sorrendje nem szabályozott. Ez időben változó,
+nehezen reprodukálható eredményt ad. Helyes megoldás: dupla pufferelés,
+azaz <code>u</code> és <code>u_next</code> váltogatása.</p>
+<h3 data-number="18.2.12"
+id="blokkok-közötti-__syncthreads-feltételezése"><span
+class="header-section-number">18.2.12</span> Blokkok közötti
+<code>__syncthreads()</code> feltételezése</h3>
+<p>A <code>__syncthreads()</code> nem globális barrier. Ha a kód azt
+feltételezi, hogy az összes blokkhalo már frissült, akkor hibás. Helyes
+megoldás: a halo-cserét kernelhatárra bízni, vagy coop groups
+grid-szinkronizációt használni szigorú architekturális feltételek
+mellett.</p>
+<h3 data-number="18.2.13" id="nem-inicializált-halocellák"><span
+class="header-section-number">18.2.13</span> Nem inicializált
+halocellák</h3>
+<p>A shared memory tile szélein a tartományon kívüli cellákba véletlen
+érték kerülhet, ha azokat nem állítjuk be. A példakódban a feltételen
+kívül eső cellák értéke <code>0</code>, ami Dirichlet-peremet valósít
+meg. Neumann-perem esetén a belső szomszédból, periodikus perem esetén a
+szemközti oldalról kell tölteni.</p>
+<h3 data-number="18.2.14" id="túl-nagy-csempeméret"><span
+class="header-section-number">18.2.14</span> Túl nagy csempeméret</h3>
+<p>A nagy <code>T</code> csökkenti a relatív halo-forgalmat, de növeli a
+shared memory foglalást, és csökkentheti az occupancyt. A 32×32 tile
+FP64 esetén <code>(32+2)^2×8 ≈ 9,2 KiB</code> shared memóriát foglal,
+ami több blokk egyidejű futtatását általában lehetővé teszi. A 96×96
+tile már <code>98^2×8 ≈ 75,4 KiB</code>, ami SM-enként csak néhány
+blokkot enged, így a latency hiding romolhat.</p>
+<h3 data-number="18.2.15" id="nem-ellenőrzött-kernelhiba"><span
+class="header-section-number">18.2.15</span> Nem ellenőrzött
+kernelhiba</h3>
+<p>A CUDA kernelindítás aszinkron, ezért a hiba sokszor nem azonnal
+jelentkezik. A kódban minden indítás után <code>cudaGetLastError</code>,
+a futtatás után pedig <code>cudaDeviceSynchronize</code> szükséges. Az
+out-of-bounds hibákat a <code>compute-sanitizer --tool memcheck</code>
+mutatja meg.</p>
+<h3 data-number="18.2.16"
+id="labor-halo-csere-2d-jacobi-stencilben"><span
+class="header-section-number">18.2.16</span> 8. Labor: halo-csere 2D
+Jacobi-stencilben</h3>
+<h3 data-number="18.2.17" id="fordítás-és-futtatás"><span
+class="header-section-number">18.2.17</span> Fordítás és futtatás</h3>
+<p>A forrás neve legyen <code>halo_stencil.cu</code>. A buildparancsot a
+céleszköz compute capabilityjéhez kell igazítani:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Pontegye be a labor GPU compute capabilityjét.</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-lineinfo</span> <span class="dt">\</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>     <span class="at">-o</span> halo_stencil halo_stencil.cu</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Kis ráccsal, gyors helyességi ellenőrzés:</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">compute-sanitizer</span> <span class="at">--tool</span> memcheck ./halo_stencil 256 256 2</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Nagyobb ráccsal, mérés:</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="ex">./halo_stencil</span> 4096 4096 20</span></code></pre></div>
+<h3 data-number="18.2.18" id="rögzítendő-gpu-konfiguráció"><span
+class="header-section-number">18.2.18</span> Rögzítendő
+GPU-konfiguráció</h3>
+<p>Minden mérés előtt rögzíteni kell a környezetet:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">--query-gpu</span><span class="op">=</span>name,driver_version,clocks.sm,power.limit <span class="at">--format</span><span class="op">=</span>csv</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">--version</span></span></code></pre></div>
+<p>Példa naplósablon, nem mért adat:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Elem</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU modell</td>
+<td>a labor GPU azonosítója</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>a kártya tényleges CC-értéke</td>
+</tr>
+<tr class="odd">
+<td>Driver</td>
+<td>a telepített driver verziója</td>
+</tr>
+<tr class="even">
+<td>CUDA toolkit</td>
+<td>a <code>nvcc --version</code> által mutatott verzió</td>
+</tr>
+<tr class="odd">
+<td>Operációs rendszer</td>
+<td>a labor OS-e</td>
+</tr>
+<tr class="even">
+<td>Power limit</td>
+<td><code>nvidia-smi</code> alapján</td>
+</tr>
+<tr class="odd">
+<td>ECC / MIG / háttérterhelés</td>
+<td>kapcsolt állapot</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="18.2.19" id="elvárt-eredmény"><span
+class="header-section-number">18.2.19</span> Elvárt eredmény</h3>
+<p>A tiled kernel és a referenciakernel ugyanazt az aritmetikai
+műveletsort végzi, azonos FP64 pontossággal, ezért a
+<code>max_abs_diff</code> elvárt értéke <code>0</code> vagy a fordító
+optimalizációjából adódóan néhány ULP alatti eltérés. Az itt bemutatott
+FP64 implementációnál a tíz- vagy húszlépéses Jacobi-iteráció után a
+hiba jellemzően <code>0,0</code> vagy közel az.</p>
+<h3 data-number="18.2.20" id="mért-eredmény"><span
+class="header-section-number">18.2.20</span> Mért eredmény</h3>
+<p>A mérési naplóban ezeket az oszlopokat kell rögzíteni, és a mért
+értékeket elkülöníteni az elvárttól:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metrika</th>
+<th>Elvárt</th>
+<th>Mért</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Kernelidő</td>
+<td>a hardver függvénye</td>
+<td><code>[mérendő]</code> ms</td>
+</tr>
+<tr class="even">
+<td>Effektív sávszélesség</td>
+<td>számított</td>
+<td><code>[mérendő]</code> GB/s</td>
+</tr>
+<tr class="odd">
+<td><code>max_abs_diff</code></td>
+<td><code>0</code></td>
+<td><code>[mérendő]</code></td>
+</tr>
+<tr class="even">
+<td>Occupancy</td>
+<td>a tile és a kernel erőforrásai alapján számítandó</td>
+<td><code>[mérendő]</code></td>
+</tr>
+</tbody>
+</table>
+<p>A mérésnél legalább 5–10 ismétlést kell futtatni, és az átlag mellett
+a szórást vagy percentilist is közölni kell. A bemutatott kód egyetlen
+időmérést végez; valódi benchmarkban a warm-up utáni ismétléseket külső
+ciklusból kell gyűjteni.</p>
+<h3 data-number="18.2.21" id="opencl-és-jax-kiegészítés"><span
+class="header-section-number">18.2.21</span> OpenCL és JAX
+kiegészítés</h3>
+<p>Ugyanez a minta OpenCL C-ben a <code>__local</code> memóriával
+valósítható meg. A kernelváza:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode opencl"><code class="sourceCode opencl"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// OpenCL C (koncepcionális vázlat, fordítási ellenőrzéshez)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> <span class="dt">void</span> jacobi2d_halo<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">double</span><span class="op">*</span> u<span class="op">,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>                            <span class="kw">__global</span> <span class="dt">double</span><span class="op">*</span> un<span class="op">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>                            <span class="dt">int</span> nx<span class="op">,</span> <span class="dt">int</span> ny<span class="op">)</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">__local</span> <span class="dt">double</span> s<span class="op">[</span><span class="dv">34</span><span class="op">][</span><span class="dv">34</span><span class="op">];</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> tx0 <span class="op">=</span> get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">*</span> <span class="dv">32</span><span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> ty0 <span class="op">=</span> get_group_id<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">*</span> <span class="dv">32</span><span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> i <span class="op">=</span> ty0 <span class="op">+</span> get_local_id<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">int</span> j <span class="op">=</span> tx0 <span class="op">+</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>  <span class="co">// ... s feltöltése get_local_size(0), get_local_size(1) alapján ...</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>  barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>  <span class="kw">if</span> <span class="op">(</span>i <span class="op">&lt;</span> ny <span class="op">&amp;&amp;</span> j <span class="op">&lt;</span> nx<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    un<span class="op">[</span>i <span class="op">*</span> nx <span class="op">+</span> j<span class="op">]</span> <span class="op">=</span> <span class="fl">0.25</span> <span class="op">*</span> <span class="op">(</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>get_local_id<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">+</span> <span class="dv">1</span><span class="op">][</span>get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">+</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>get_local_id<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">+</span> <span class="dv">1</span><span class="op">][</span>get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">+</span> <span class="dv">2</span><span class="op">]</span> <span class="op">+</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>get_local_id<span class="op">(</span><span class="dv">1</span><span class="op">)][</span>get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">+</span> <span class="dv">1</span><span class="op">]</span> <span class="op">+</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>        s<span class="op">[</span>get_local_id<span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">+</span> <span class="dv">2</span><span class="op">][</span>get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">+</span> <span class="dv">1</span><span class="op">]);</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>  <span class="op">}</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>JAX-ban a blokkhalo kérdését a keretrendszer és a fordító kezeli. A
+funkcionális implementáció például <code>jnp.roll</code> és maszk
+segítségével adható meg:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># JAX (koncepcionális, GPU/TPU-vázlat)</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> jacobi_step(u):</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    left <span class="op">=</span> jnp.roll(u, <span class="dv">1</span>, axis<span class="op">=</span><span class="dv">1</span>).at[:, <span class="dv">0</span>].<span class="bu">set</span>(<span class="fl">0.0</span>)</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    right <span class="op">=</span> jnp.roll(u, <span class="op">-</span><span class="dv">1</span>, axis<span class="op">=</span><span class="dv">1</span>).at[:, <span class="op">-</span><span class="dv">1</span>].<span class="bu">set</span>(<span class="fl">0.0</span>)</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    down <span class="op">=</span> jnp.roll(u, <span class="dv">1</span>, axis<span class="op">=</span><span class="dv">0</span>).at[<span class="dv">0</span>, :].<span class="bu">set</span>(<span class="fl">0.0</span>)</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    up <span class="op">=</span> jnp.roll(u, <span class="op">-</span><span class="dv">1</span>, axis<span class="op">=</span><span class="dv">0</span>).at[<span class="op">-</span><span class="dv">1</span>, :].<span class="bu">set</span>(<span class="fl">0.0</span>)</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="fl">0.25</span> <span class="op">*</span> (left <span class="op">+</span> right <span class="op">+</span> down <span class="op">+</span> up)</span></code></pre></div>
+<p>A JAX ebben a vázlatban a sharding és a halo kommunikációját a
+háttérben végzi; az explicit blokkszintű irányítás nem jelenik meg. A
+méréshez ezért külön kell rögzíteni a JAX verzióját, a háttér eszközt
+(GPU/TPU), valamint a sharding tervet. A TPU-ra vonatkozó szabályokat a
+<code>gpu106</code>–<code>gpu109</code> egységek tárgyalják.</p>
+<h3 data-number="18.2.22" id="önellenőrző-kérdések"><span
+class="header-section-number">18.2.22</span> 9. Önellenőrző
+kérdések</h3>
+<ol type="1">
+<li>Miért nem oldja meg a <code>__syncthreads()</code> a blokkok közötti
+halo-függőséget?</li>
+<li>Egy <code>64×64</code> belső méretű tile esetén mennyi a halo-arány
+<code>R=1</code> mellett, és miért javul a sávszélesség-kihasználás a
+<code>32×32</code> tile-hoz képest?</li>
+<li>Milyen hiba lép fel, ha a Jacobi-stencilt ugyanabba a globális
+tömbbe írjuk, amelyből olvasunk? Miért ad rossz vagy nem
+determinisztikus eredményt?</li>
+<li>Mi a különbség az implicit és az explicit halo-csere között, és
+mikor érdemes explicit másolást használni?</li>
+</ol>
+<p>A <code>gpu068</code> egység ezekre a fogalmakra építve tárgyalja
+majd a PDE-megoldókat és az iteratív módszerek GPU-s szerkezetét. A
+halo-kezelés itt bemutatott double buffering és kernelhatáros
+szinkronizációs mintája lesz az alapja a későbbi fejlettebb átfedési és
+pipeline-technikáknak is.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu066.html">← 18.1 Stencil-alapok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu068.html">18.3 PDE és iteratív megoldók →</a></div>
+</nav>
+</body>
+</html>

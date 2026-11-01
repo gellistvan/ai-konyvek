@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>13.3 Számítási korlát és compute intensity – GPGPU – általános
+célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch12">13 Roofline, sávszélesség és compute intensity</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu047.html">← 13.2 Memóriateljesítmény és sávszélesség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu049.html">13.4 Roofline-alapú optimalizálás →</a></div>
+</nav>
+<h2 data-number="13.3" id="gpu048"><span
+class="header-section-number">13.3</span> Számítási korlát és compute
+intensity</h2>
+<p>Ahhoz, hogy egy kernelt optimalizálhassunk, először meg kell
+állapítanunk, mi is korlátozza valójában a teljesítményét. A <a
+href="gpu047.html">Memóriateljesítmény és sávszélesség</a> fejezetben
+bevezettük a Roofline-modellt és megismertük a memóriavezérlő, valamint
+az elérhető sávszélesség szerepét. Most a modell másik oldalát
+vizsgáljuk meg: a számítási csúcsértéket, a lebegőpontos műveletek
+számolását, az aritmetikai intenzitás kiszámítását, valamint a
+kernelbesorolás módszerét. A cél nem csupán a fogalmak definiálása: az
+olvasó egy mérhető CUDA-laborkísérleten keresztül tanulja meg
+elkülöníteni a memória-korlátos és a számítás-korlátos tartományt, és
+megtanulja a tényleges mérési adatokat a várt, modellből számolt
+értékektől elkülönítve kezelni.</p>
+<h3 data-number="13.3.1"
+id="a-két-véglet-memória-korlátos-és-számítás-korlátos-kernel"><span
+class="header-section-number">13.3.1</span> A két véglet:
+memória-korlátos és számítás-korlátos kernel</h3>
+<p>Egy GPU-kernel futásideje sosem egynemű. Legalább két komponens
+összegeként érdemes elképzelni: a memóriaforgalom lebonyolításának ideje
+(<em>memóriaidő</em>) és az aritmetikai egységek munkájának ideje
+(<em>számítási idő</em>). A kettő részben átfedhet egymást, ha az
+ütemező elegendő aktív warppal tudja elrejteni a memória késleltetését,
+de a <a href="gpu047.html">Memóriateljesítmény és sávszélesség</a>
+fejezetben bevezetett egyszerű közelítés szerint a futásidőt jó
+közelítéssel a két idő maximuma határozza meg:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">exec</mtext></msub><mo>≈</mo><mo>max</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mtext mathvariant="normal">mem</mtext></msub><mo>,</mo><msub><mi>T</mi><mtext mathvariant="normal">compute</mtext></msub><mo stretchy="true" form="postfix">)</mo></mrow><mi>.</mi></mrow><annotation encoding="application/x-tex">
+T_{\text{exec}} \approx \max(T_{\text{mem}}, T_{\text{compute}}).
+</annotation></semantics></math></p>
+<p>Ebből következik a két alapvető osztályozás:</p>
+<ul>
+<li><strong>Memória-korlátos</strong> (<em>memory-bound</em>) kernel
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">mem</mtext></msub><mo>≫</mo><msub><mi>T</mi><mtext mathvariant="normal">compute</mtext></msub></mrow><annotation encoding="application/x-tex">T_{\text{mem}} \gg T_{\text{compute}}</annotation></semantics></math>.
+A futásidőt az adatmozgatás határozza meg, az aritmetikai egységek
+javarészt tétlenül várnak új adatra. A kernel teljesítményének
+növeléséhez elsősorban a memóriaforgalmat kell csökkenteni vagy a
+sávszélességet jobban ki kell használni.</li>
+<li><strong>Számítás-korlátos</strong> (<em>compute-bound</em>) kernel
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">compute</mtext></msub><mo>≫</mo><msub><mi>T</mi><mtext mathvariant="normal">mem</mtext></msub></mrow><annotation encoding="application/x-tex">T_{\text{compute}} \gg T_{\text{mem}}</annotation></semantics></math>.
+A kernel szinte minden ciklusban hasznos aritmetikai munkát végez, a
+memóriavezérlő relatív tétlen. A teljesítmény növeléséhez a lebegőpontos
+egységek utasításainak hatékonyságát kell javítani, például fuzionált
+műveletek alkalmazásával, kevesebb hulladék utasítással vagy alacsonyabb
+pontossággal.</li>
+</ul>
+<p>Az osztályozás nem statikus címke: ugyanaz a matematikai művelet más
+bemeneti méretre, más pontosságra vagy más cache-viselkedésre
+megváltoztathatja a besorolást. A Roofline-modell éppen azért hasznos,
+mert a memória- és a számítási korlátot egyetlen koordináta-rendszerben,
+a független változóval – az aritmetikai intenzitással – együtt
+ábrázolja.</p>
+<h3 data-number="13.3.2"
+id="flop-számolás-mit-számítunk-és-mit-nem"><span
+class="header-section-number">13.3.2</span> FLOP-számolás: mit számítunk
+és mit nem?</h3>
+<p>A számítási korlát elemzéséhez először a kernel által végzett
+lebegőpontos műveletek számát kell meghatároznunk. A szakirodalomban a
+<strong>FLOP</strong> (Floating Point Operation) rövidítést használják;
+a 10³ gyorsulások megkülönböztetésére a műveletek számát FLOP-ban, a
+másodpercenkénti teljesítményt FLOPS-ban (FLOP/s) jelöljük.</p>
+<p>A FLOP-számlálás konvenciója a GPU-ökoszisztémában nem triviális, és
+pontosan ez az egyik leggyakoribb hibalehetőség a Roofline-elemzések
+során. A legfontosabb szabályok:</p>
+<ol type="1">
+<li><strong>Egy összeadás = 1 FLOP, egy szorzás = 1 FLOP.</strong> A
+kivonás és az ellentett előjel is összeadásként számít, a negatív
+előjelet nem tekintjük plusz műveletnek.</li>
+<li><strong>Egy fuzionált szorzás-összeadás (FMA) = 2 FLOP</strong>,
+noha gépi utasításszinten egyetlen instrukcióról van szó. Az NVIDIA
+specifikációs lapokon szereplő csúcs FLOPS értékek ezen a konvención
+alapulnak: egy GPU-architektúra, amely órajelenként egy FMA utasítást
+végez el CUDA-magonként, 2 FLOP/ciklust könyvel el.</li>
+<li><strong>A osztás, gyökvonás, reciprok és a transzcendens
+függvények</strong> a klasszikus Roofline-könyvelésben gyakran egyetlen
+FLOP-ként szerepelnek, de a valós futási idejük lényegesen hosszabb,
+mint egyetlen FMA. A modern GPU-kon ezeket a műveleteket elkülönített
+<em>special function unit</em> (SFU) egységek végzik, amelyek
+alacsonyabb órajelezéssel vagy alacsonyabb párhuzamossággal dolgoznak.
+Precíziós mérésnél ezt a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mtext mathvariant="normal">compute</mtext></msub><annotation encoding="application/x-tex">T_{\text{compute}}</annotation></semantics></math>
+meghatározásánál figyelembe kell venni, de a Roofline-tanításoknál első
+közelítésben a FLOP-könyvelés elegendő.</li>
+</ol>
+<p>A FLOP-számolástól különbözik az <strong>utasításszám</strong>. Egy
+kernel akár több ezer utasítást is végrehajthat anélkül, hogy egyetlen
+lebegőpontos adatot kezelne: címzési aritmetika, predikátumok
+kiértékelése, elágaztatás, indexszámítás. A Roofline-modellben kizárólag
+a matematikai műveletek számítanak FLOP-nak, a vezérlési utasítások nem.
+Ez fontos, mert a compute-bound elemzés során az utasítások túlnyomó
+része lebegőpontos művelet, míg a memory-bound kernelben a lebegőpontos
+utasítások aránya alacsony a betöltés/tárolás és a vezérlési
+utasításokhoz képest.</p>
+<p>A FLOP-számolás a pontosságtól független elvileg: egy FP64-es
+összeadás éppúgy 1 FLOP, mint egy FP32-es vagy FP16-os. A gyakorlatban a
+pontosság határozza meg a megvalósítható csúcs FLOPS-t. Az FP64-es
+egységek a fogyasztói GPU-kon sokkal lassabbak, mint az FP32-es egységek
+(például 1:64 arány az Ampere generáció fogyasztói sorozatában), míg a
+professzionális és HPC-kártyákon az arány 1:2 vagy 1:1. Az FP16, TF32 és
+BF16 egységek tovább növelik a csúcs FLOPS-t, de a numerikus pontosság
+csökken, amit a <a href="gpu122.html">Lebegőpontos pontosság</a>
+fejezetben tárgyalunk majd részletesen.</p>
+<h3 data-number="13.3.3"
+id="byte-számolás-melyik-memóriaszint-forgalmát-számoljuk"><span
+class="header-section-number">13.3.3</span> Byte-számolás: melyik
+memóriaszint forgalmát számoljuk?</h3>
+<p>A Roofline-modellben a <strong>byte</strong> az a hasznos
+adatmennyiség, amelyet a kernel a fő adatelérési útján mozgat. A legjobb
+első közelítés a <strong>DRAM-forgalom</strong>: az a byte-mennyiség,
+amely a kernel futása során ténylegesen átmegy a GPU memóriavezérlőjén.
+Ez a gyakorlatban közel áll az igényelt adatmennyiséghez, de nem azonos
+vele, mert a cache-ek (L2, illetve L1) csökkentik a DRAM-ig érő
+forgalmat.</p>
+<p>A tanító jellegű elemzésnél a következő kategóriákat különítjük
+el:</p>
+<ul>
+<li><strong>Naiv byte-számolás</strong> az alkalmazás szintjén igényelt
+adatmennyiség: a kernel beolvassa az összes bemeneti elemet, és kiírja
+az összes kimeneti elemet. Ha nincs adatismétlés, ez megegyezik a
+DRAM-forgalommal.</li>
+<li><strong>Tényleges DRAM-forgalom</strong> a memóriavezérlőnél mérhető
+adatmennyiség, ami a cache-találatok miatt kevesebb lehet. Például ha a
+bemeneti vektor elfér az L2 cache-ben, a kernel az első iteráció után
+már nem olvas a DRAM-ból. A Roofline-elemzés során ezt a hatást úgy
+kezeljük, hogy a munkakészlet méretét a cache-méretekhez viszonyítjuk,
+és a releváns memóriaszint forgalmával számolunk.</li>
+<li><strong>Következtetett effektív byte</strong> az a normalizált
+mennyiség, amelyet a teljesítményből és a FLOP-számból visszaszámolunk.
+Ez hibakeresésre hasznos: ha az effektív byte jóval alacsonyabb vagy
+magasabb a vártnál, cache- vagy tranzakció-hibát gyaníthatunk.</li>
+</ul>
+<p>A klasszikus Roofline-tanításban a legáltalánosabb egyszerűsítés az,
+hogy a memóriaszint-hierarchiát kizárólag a DRAM-ra koncentráljuk, mivel
+a legtöbb nagy méretű, tudományos számítási kernel munkakészlete jóval
+nagyobb, mint az L2 cache. Ahol nem ez a helyzet, ott a modellt az L2
+sávszélességével és a munkakészlet cache-ben való elhelyezésével kell
+módosítani, ahogy a <a href="gpu054.html">L1 és L2 cache</a> fejezetben
+tesszük.</p>
+<p>A byte-számolás gyakorlati szabálya a laborban: <strong>mindig
+rögzítsük a bemeneti és kimeneti vektor pontosságát, a beolvasott és
+kiírt elemek számát, valamint az ismételt hozzáférések számát</strong>.
+A horizontális irányok (például egy mátrix több kihasználása) a
+DRAM-forgalmat nem feltétlenül növelik, ha a redundáns elemek a
+cache-ben maradnak. A tényleges forgalom meghatározásához profilozási
+adatok (Nsight Compute L2/DRAM metrikák) szükségesek.</p>
+<h3 data-number="13.3.4"
+id="aritmetikai-intenzitás-a-híd-a-két-korlát-között"><span
+class="header-section-number">13.3.4</span> Aritmetikai intenzitás: a
+híd a két korlát között</h3>
+<p>A <strong>számítási intenzitást</strong> (gyakran <em>aritmetikai
+intenzitásnak</em> is nevezik) a kernel által végzett lebegőpontos
+műveletek számának és a fő memóriaszinten mozgatott byte-ok számának
+hányadosaként definiáljuk:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>=</mo><mfrac><mi>F</mi><mi>B</mi></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+I = \frac{F}{B},
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>F</mi><annotation encoding="application/x-tex">F</annotation></semantics></math>
+a FLOP-ok száma,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+pedig a DRAM (vagy releváns memóriaszint) forgalma byte-ban. Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>I</mi><annotation encoding="application/x-tex">I</annotation></semantics></math>
+mértékegysége FLOP/byte. Ez a dimenziómentesnek tűnő, de valójában
+erősen hardverfüggő kritérium köti össze a két hardveres csúcsértéket: a
+memória-sávszélességet
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>β</mi><annotation encoding="application/x-tex">\beta</annotation></semantics></math>,
+byte/s) és a lebegőpontos csúcsértéket
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>,
+FLOP/s).</p>
+<p>A Roofline-modell alapvető egyenlete a <a
+href="gpu047.html">Memóriateljesítmény és sávszélesség</a>
+fejezetből:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>=</mo><mo>min</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>π</mi><mo>,</mo><mi>β</mi><mo>⋅</mo><mi>I</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">
+P = \min(\pi, \beta \cdot I),
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>P</mi><annotation encoding="application/x-tex">P</annotation></semantics></math>
+az elérhető lebegőpontos teljesítmény FLOP/s-ban. Az egyenlet két
+tartományra bomlik:</p>
+<ul>
+<li><strong>Memória-korlátos tartomány</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>&lt;</mo><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub></mrow><annotation encoding="application/x-tex">I &lt; I_{\text{ridge}}</annotation></semantics></math>):
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>⋅</mo><mi>I</mi></mrow><annotation encoding="application/x-tex">\beta \cdot I</annotation></semantics></math>
+szorzat kisebb, mint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>,
+tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>≈</mo><mi>β</mi><mo>⋅</mo><mi>I</mi></mrow><annotation encoding="application/x-tex">P \approx \beta \cdot I</annotation></semantics></math>.
+A teljesítmény arányos az aritmetikai intenzitással; minél több FLOP jut
+egy byte-ra, annál magasabb az elérhető FLOPS, de a tetőpontot még nem
+éri el.</li>
+<li><strong>Számítás-korlátos tartomány</strong>
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>&gt;</mo><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub></mrow><annotation encoding="application/x-tex">I &gt; I_{\text{ridge}}</annotation></semantics></math>):
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>⋅</mo><mi>I</mi></mrow><annotation encoding="application/x-tex">\beta \cdot I</annotation></semantics></math>
+szorzat meghaladná a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>-t,
+tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>≈</mo><mi>π</mi></mrow><annotation encoding="application/x-tex">P \approx \pi</annotation></semantics></math>.
+A teljesítmény a lebegőpontos egységek csúcsához tart, függetlenül az
+intenzitástól.</li>
+</ul>
+<p>A két tartomány határát a <strong>Roofline-töréspont</strong> (ridge
+point) adja, ahol a memória-sávszélességből és a lebegőpontos csúcsból
+számolt egyenes metszi a tetőpontot:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub><mo>=</mo><mfrac><mi>π</mi><mi>β</mi></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+I_{\text{ridge}} = \frac{\pi}{\beta}.
+</annotation></semantics></math></p>
+<p>Ez az érték minden hardver-pontosság kombinációra más és más. Egy
+modern, nagy sávszélességű HPC-GPU esetén az FP32 töréspont 10–30
+FLOP/byte körül alakul, míg a fogyasztói kártyákra 20–50 FLOP/byte
+jellemző. Az FP64 estén a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>
+csökken, így a töréspont alacsonyabb; az FP16 vagy Tensor Core
+üzemmódban a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>
+nő, és a töréspont magasabb értékre tolódik.</p>
+<h3 data-number="13.3.5"
+id="a-gyakorlati-minta-saxpy-és-horner-polinom"><span
+class="header-section-number">13.3.5</span> A gyakorlati minta: SAXPY és
+Horner-polinom</h3>
+<p>A besorolási logika elsajátításához két egyszerű kernelt vizsgálunk
+meg: a SAXPY-t és egy Horner-alakban kiértékelt polinomot. Mindkét
+kernel ugyanazt a vektor-processing logikát követi – minden szál
+egyetlen elemet dolgoz fel –, de eltérő számú FLOP-ot végez egy byte
+beolvasására vetítve.</p>
+<p><strong>SAXPY</strong> (
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>←</mo><mi>a</mi><mo>⋅</mo><mi>x</mi><mo>+</mo><mi>y</mi></mrow><annotation encoding="application/x-tex">y \leftarrow a \cdot x + y</annotation></semantics></math>,
+a “scalar alpha × x plus y” rövidítése):</p>
+<ul>
+<li>FLOP-elemszám: 2 FLOP (egy szorzás + egy összeadás).</li>
+<li>Byte-elemszám FP32 esetén: 12 byte (beolvasás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+(4 byte), beolvasás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+(4 byte), kiírás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+(4 byte)).</li>
+<li>Aritmetikai intenzitás:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">saxpy</mtext></msub><mo>=</mo><mn>2</mn><mi>/</mi><mn>12</mn><mo>≈</mo><mn>0</mn><mo>,</mo><mn>17</mn></mrow><annotation encoding="application/x-tex">I_{\text{saxpy}} = 2/12 \approx 0{,}17</annotation></semantics></math>
+FLOP/byte.</li>
+</ul>
+<p><strong>Horner-polinom</strong>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>←</mo><mrow><mo stretchy="true" form="prefix">(</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>a</mi><mo>⋅</mo><mi>x</mi><mo>+</mo><mi>b</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mi>x</mi><mo>+</mo><mi>c</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>⋅</mo><mi>x</mi><mo>+</mo><mi>d</mi></mrow><annotation encoding="application/x-tex">y \leftarrow ((a \cdot x + b) \cdot x + c) \cdot x + d</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>a</mi><mo>,</mo><mi>b</mi><mo>,</mo><mi>c</mi><mo>,</mo><mi>d</mi></mrow><annotation encoding="application/x-tex">a,b,c,d</annotation></semantics></math>
+konstansok, az adatfolyam pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+bemenet és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+kimenet.</p>
+<ul>
+<li>FLOP-elemszám: 6 FLOP (3 szorzás + 3 összeadás).</li>
+<li>Byte-elemszám FP32 esetén: 8 byte (beolvasás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+(4 byte), kiírás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+(4 byte); a konstansok regiszterben maradnak).</li>
+<li>Aritmetikai intenzitás:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">horner</mtext></msub><mo>=</mo><mn>6</mn><mi>/</mi><mn>8</mn><mo>=</mo><mn>0</mn><mo>,</mo><mn>75</mn></mrow><annotation encoding="application/x-tex">I_{\text{horner}} = 6/8 = 0{,}75</annotation></semantics></math>
+FLOP/byte.</li>
+</ul>
+<p>Mindkét intenzitás jóval a tipikus FP32 Roofline-töréspont alatt
+marad, tehát <strong>mindkét kernel memória-korlátos</strong>. A
+Horner-polinom azonban magasabb intenzitással rendelkezik, ezért a
+Roofline-modell szerint az elérhető teljesítménye is magasabb lesz:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">saxpy</mtext></msub><mo>≈</mo><mi>β</mi><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>17</mn><mspace width="1.0em"></mspace><mtext mathvariant="normal">és</mtext><mspace width="1.0em"></mspace><msub><mi>P</mi><mtext mathvariant="normal">horner</mtext></msub><mo>≈</mo><mi>β</mi><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>75</mn><mi>.</mi></mrow><annotation encoding="application/x-tex">
+P_{\text{saxpy}} \approx \beta \cdot 0{,}17 \quad \text{és} \quad P_{\text{horner}} \approx \beta \cdot 0{,}75.
+</annotation></semantics></math></p>
+<p>Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>=</mo><mn>1000</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GB/s</mtext></mrow><annotation encoding="application/x-tex">\beta = 1000\ \text{GB/s}</annotation></semantics></math>,
+akkor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">saxpy</mtext></msub><mo>≈</mo><mn>167</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GFLOP/s</mtext></mrow><annotation encoding="application/x-tex">P_{\text{saxpy}} \approx 167\ \text{GFLOP/s}</annotation></semantics></math>,
+míg
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">horner</mtext></msub><mo>≈</mo><mn>750</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GFLOP/s</mtext></mrow><annotation encoding="application/x-tex">P_{\text{horner}} \approx 750\ \text{GFLOP/s}</annotation></semantics></math>.
+Ez a négyszeres különbség a FLOP/byte arányban mérhető, noha mindkettő
+messze a csúsztatott csúcs alatt marad.</p>
+<p>A példa rávilágít a Roofline-modell tanulságára: <strong>amíg a
+kernel az árral szemben úszik (memória-korlátos), a teljesítmény
+növekedéséhez az intenzitást kell növelni, nem pedig a
+csúcsteljesítményt hajszolni.</strong> Egy további szorzás hozzáadása
+anélkül, hogy újraolvasnánk a bemenetet, azonos sávszélesség mellett
+nagyobb elérhető FLOPS-t eredményez.</p>
+<p>Ezzel szemben a számítás-korlátos tartományba a dense GEMM (sűrű
+mátrixszorzás) tartozik. Az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>×</mo><mi>n</mi></mrow><annotation encoding="application/x-tex">n \times n</annotation></semantics></math>-es
+mátrixszorzás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>F</mi><mo>≈</mo><mn>2</mn><msup><mi>n</mi><mn>3</mn></msup></mrow><annotation encoding="application/x-tex">F \approx 2n^3</annotation></semantics></math>
+FLOP-ot igényel, a naiv DRAM-forgalom pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>B</mi><mo>≈</mo><mn>12</mn><msup><mi>n</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">B \approx 12n^2</annotation></semantics></math>
+byte (három mátrix, egyenként
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>4</mn><msup><mi>n</mi><mn>2</mn></msup></mrow><annotation encoding="application/x-tex">4n^2</annotation></semantics></math>
+byte, FP32). Az intenzitás:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">gemm</mtext></msub><mo>≈</mo><mfrac><mrow><mn>2</mn><msup><mi>n</mi><mn>3</mn></msup></mrow><mrow><mn>12</mn><msup><mi>n</mi><mn>2</mn></msup></mrow></mfrac><mo>=</mo><mfrac><mi>n</mi><mn>6</mn></mfrac><mi>.</mi></mrow><annotation encoding="application/x-tex">
+I_{\text{gemm}} \approx \frac{2n^3}{12n^2} = \frac{n}{6}.
+</annotation></semantics></math></p>
+<p><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>n</mi><mo>=</mo><mn>1024</mn></mrow><annotation encoding="application/x-tex">n = 1024</annotation></semantics></math>
+esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>≈</mo><mn>170</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">FLOP/byte</mtext></mrow><annotation encoding="application/x-tex">I \approx 170\ \text{FLOP/byte}</annotation></semantics></math>,
+ami messze a tipikus töréspont felett van. A kernel számítás-korlátos,
+és a megfelelő implementáció elérheti a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>
+80–90%-át. Ez az a pont, ahol a memóriavezérlő már nem szűk
+keresztmetszet, és a tiling valódi értelmet nyer – ezt a <a
+href="gpu049.html">Roofline-alapú optimalizálás</a> fejezetben fejtjük
+ki részletesen.</p>
+<h3 data-number="13.3.6"
+id="az-optimalizálási-irány-miből-következik-mi"><span
+class="header-section-number">13.3.6</span> Az optimalizálási irány:
+miből következik mi?</h3>
+<p>A kernelbesorolás nem öncélú taxonómia, hanem az optimalizálási
+stratégia kiindulópontja. A Roofline-modell egyértelműen megmutatja,
+melyik hardvererőforrás a szűk keresztmetszet, és ennek megfelelően
+jelöli ki a beavatkozás irányát:</p>
+<p><strong>Memória-korlátos kernel optimalizálása:</strong></p>
+<ul>
+<li><strong>Növeljük az intenzitást:</strong> végezzünk több FLOP-ot egy
+beolvasott elemre (pl. több polinom tag, több egymás utáni
+művelet).</li>
+<li><strong>Csökkentsük a DRAM-forgalmat:</strong> használjunk shared
+memoryt adatismétlésre, cache-láthatósággal dolgozzunk, alkalmazzunk
+tilingot.</li>
+<li><strong>Javítsuk a burkolt adathozzáférést:</strong> coalescing,
+bank-conflict-mentes shared memory-hozzáférés (<a
+href="gpu038.html">Globális memória coalescing</a>, <a
+href="gpu039.html">Shared memory bankok és bank conflict</a>).</li>
+<li><strong>Növeljük az effektív sávszélességet:</strong> jobb
+cache-kihasználás, vektorizált betöltés (float4).</li>
+</ul>
+<p><strong>Számítás-korlátos kernel optimalizálása:</strong></p>
+<ul>
+<li><strong>Csökkentsük a hulladék utasításokat:</strong> minimalizáljuk
+a vezérlési utasításokat, használjunk predikációt az elágazások
+helyett.</li>
+<li><strong>Használjunk FMA-t:</strong> a fuzionált műveletek két
+FLOP-ot végeznek egy utasítással, ami csökkenti az utasításnyomást.</li>
+<li><strong>Vegyük fontolóra az alacsonyabb pontosságot:</strong> FP32 →
+TF32/FP16/BF16, ha a numerikus korlátok megengedik.</li>
+<li><strong>Használjuk a Tensor Core-okat:</strong> a
+mátrixaritmetikában a Tensor Core FMA-sűrűsége messze meghaladja a
+szokásos CUDA-magokét (<a href="gpu086.html">Tensor Core
+architektúra</a>).</li>
+</ul>
+<p>A rossz irányú optimalizálás tipikus tünete, hogy a kernel megmarad
+az alsó Roofline-szakaszon: hiába növeljük a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>-re
+irányuló erőfeszítéseket, a teljesítmény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>⋅</mo><mi>I</mi></mrow><annotation encoding="application/x-tex">\beta \cdot I</annotation></semantics></math>-nél
+leragad. A Roofline-elemzés megelőzi ezt a zsákutcát, mielőtt
+belekerülnénk.</p>
+<h3 data-number="13.3.7"
+id="labor-kernelbesorolás-roofline-alapján"><span
+class="header-section-number">13.3.7</span> Labor: kernelbesorolás
+Roofline alapján</h3>
+<p>Ez a labor gyakorlati módszert ad a fenti elmélethez. A feladat két
+CUDA-kernel mérése, aritmetikai intenzitásuk kiszámítása, a
+Roofline-töréspont alapján történő besorolásuk, és a mért
+sávszélesség/FLOPS összevetése a várt modellel.</p>
+<p><strong>Környezet rögzítése.</strong> Minden mérés előtt rögzítse az
+alábbi adatokat:</p>
+<ul>
+<li>GPU modell és compute capability</li>
+<li>NVIDIA driver verzió</li>
+<li>CUDA toolkit verzió</li>
+<li>Operációs rendszer és kernelverzió</li>
+</ul>
+<p>Ezek nélkül a mérési napló nem reprodukálható, és a „gyorsabb”
+állítás nem ellenőrizhető. Példa a laborjegyzőkönyv fejlécére:</p>
+<pre class="text"><code>GPU: NVIDIA RTX &lt;modell&gt; (CC &lt;x.y&gt;)
+Driver: 550.xx.yy
+CUDA: 12.x
+OS: Linux 6.x arch
+Power limit / ECC: &lt;érték / ki/be&gt;</code></pre>
+<p><strong>Fordítható CUDA C++ forrás.</strong> Az alábbi program
+implementálja a SAXPY és a Horner-polinom kernelt, a kötelező
+hibakezelést, a warm-up protokollt és a mérési naplót.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// labor_gpu048.cu</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Kernelbesorolás Roofline alapján: SAXPY és Horner-polinom.</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -O3 -arch=sm_86 -o labor_gpu048 labor_gpu048.cu</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">// Futtatás: ./labor_gpu048</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef CHECK_CUDA</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                             </span><span class="op">\</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>_err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>_err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: </span><span class="sc">%s</span><span class="st"> | </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">               </span><span class="op">\</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>_err<span class="op">),</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                            </span><span class="op">\</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co">// 1. kernel: SAXPY, y[i] = a*x[i] + y[i]</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> saxpy_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span> a<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> a <span class="op">*</span> x<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> y<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. kernel: Horner-polinom, y[i] = ((a*x[i]+b)*x[i]+c)*x[i]+d</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> horner_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">float</span> a<span class="op">,</span> <span class="dt">float</span> b<span class="op">,</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">float</span> c<span class="op">,</span> <span class="dt">float</span> d<span class="op">,</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> t <span class="op">=</span> a <span class="op">*</span> x<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> b<span class="op">;</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>        t <span class="op">=</span> t <span class="op">*</span> x<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> c<span class="op">;</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        t <span class="op">=</span> t <span class="op">*</span> x<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> d<span class="op">;</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> t<span class="op">;</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a><span class="co">// A mérési protokoll: warm-up + 10 mérés, átlag és szórás.</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> run_and_measure<span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> name<span class="op">,</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>                     <span class="dt">void</span> <span class="op">(*</span>kernel_launcher<span class="op">)(</span>dim3<span class="op">,</span> dim3<span class="op">,</span> <span class="dt">cudaStream_t</span><span class="op">),</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>                     dim3 grid<span class="op">,</span> dim3 block<span class="op">,</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>                     <span class="dt">size_t</span> output_bytes<span class="op">,</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>                     <span class="dt">double</span> flop_count<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> stream<span class="op">;</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>stream<span class="op">));</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up: 5 futtatás a pipeline bejáratására.</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>        kernel_launcher<span class="op">(</span>grid<span class="op">,</span> block<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 10 mérés, átlag és szórás.</span></span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> rep <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> times<span class="op">[</span>rep<span class="op">];</span></span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> rep<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>        kernel_launcher<span class="op">(</span>grid<span class="op">,</span> block<span class="op">,</span> stream<span class="op">);</span></span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>        times<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>ms <span class="op">*</span> <span class="fl">1e-3</span><span class="op">;</span> <span class="co">// másodperc</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> avg <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> rep<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> avg <span class="op">+=</span> times<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>    avg <span class="op">/=</span> rep<span class="op">;</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> var <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> rep<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> var <span class="op">+=</span> <span class="op">(</span>times<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> avg<span class="op">)</span> <span class="op">*</span> <span class="op">(</span>times<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> avg<span class="op">);</span></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true" tabindex="-1"></a>    var <span class="op">/=</span> <span class="op">(</span>rep <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> std_dev <span class="op">=</span> sqrt<span class="op">(</span>var<span class="op">);</span></span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> achieved_bandwidth_gbps <span class="op">=</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>output_bytes <span class="op">/</span> avg <span class="op">/</span> <span class="fl">1e9</span><span class="op">;</span></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> achieved_flops <span class="op">=</span> flop_count <span class="op">/</span> avg<span class="op">;</span></span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">== </span><span class="sc">%s</span><span class="st"> ==</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> name<span class="op">);</span></span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Futásidő átlag: </span><span class="sc">%.4f</span><span class="st"> ms (szórás </span><span class="sc">%.4f</span><span class="st"> ms)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> avg <span class="op">*</span> <span class="fl">1e3</span><span class="op">,</span> std_dev <span class="op">*</span> <span class="fl">1e3</span><span class="op">);</span></span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Mért sávszélesség: </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> achieved_bandwidth_gbps<span class="op">);</span></span>
+<span id="cb2-93"><a href="#cb2-93" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Mért FLOPS: </span><span class="sc">%.2f</span><span class="st"> GFLOP/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> achieved_flops <span class="op">/</span> <span class="fl">1e9</span><span class="op">);</span></span>
+<span id="cb2-94"><a href="#cb2-94" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Mért teljesítmény: </span><span class="sc">%.2f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> avg <span class="op">*</span> <span class="fl">1e3</span><span class="op">);</span></span>
+<span id="cb2-95"><a href="#cb2-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-96"><a href="#cb2-96" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb2-97"><a href="#cb2-97" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-98"><a href="#cb2-98" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb2-99"><a href="#cb2-99" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-100"><a href="#cb2-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-101"><a href="#cb2-101" aria-hidden="true" tabindex="-1"></a><span class="co">// Launch wrapper-ök a dimenzióknak megfelelően.</span></span>
+<span id="cb2-102"><a href="#cb2-102" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> launch_saxpy<span class="op">(</span>dim3 grid<span class="op">,</span> dim3 block<span class="op">,</span> <span class="dt">cudaStream_t</span> stream<span class="op">,</span></span>
+<span id="cb2-103"><a href="#cb2-103" aria-hidden="true" tabindex="-1"></a>                  <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> d_x<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> d_y<span class="op">,</span> <span class="dt">float</span> a<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-104"><a href="#cb2-104" aria-hidden="true" tabindex="-1"></a>    saxpy_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_y<span class="op">,</span> a<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb2-105"><a href="#cb2-105" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-106"><a href="#cb2-106" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-107"><a href="#cb2-107" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> launch_horner<span class="op">(</span>dim3 grid<span class="op">,</span> dim3 block<span class="op">,</span> <span class="dt">cudaStream_t</span> stream<span class="op">,</span></span>
+<span id="cb2-108"><a href="#cb2-108" aria-hidden="true" tabindex="-1"></a>                   <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> d_x<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> d_y<span class="op">,</span></span>
+<span id="cb2-109"><a href="#cb2-109" aria-hidden="true" tabindex="-1"></a>                   <span class="dt">float</span> a<span class="op">,</span> <span class="dt">float</span> b<span class="op">,</span> <span class="dt">float</span> c<span class="op">,</span> <span class="dt">float</span> d<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-110"><a href="#cb2-110" aria-hidden="true" tabindex="-1"></a>    horner_kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_y<span class="op">,</span> a<span class="op">,</span> b<span class="op">,</span> c<span class="op">,</span> d<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb2-111"><a href="#cb2-111" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-112"><a href="#cb2-112" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-113"><a href="#cb2-113" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-114"><a href="#cb2-114" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">64</span><span class="op">;</span> <span class="co">// 67M elem, kb. 805 MB SAXPY forgalom</span></span>
+<span id="cb2-115"><a href="#cb2-115" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes_in <span class="op">=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb2-116"><a href="#cb2-116" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes_out <span class="op">=</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb2-117"><a href="#cb2-117" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> saxpy_bytes <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> bytes_in <span class="op">+</span> bytes_out<span class="op">;</span> <span class="co">// x + y olvasás + y írás</span></span>
+<span id="cb2-118"><a href="#cb2-118" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> horner_bytes <span class="op">=</span> bytes_in <span class="op">+</span> bytes_out<span class="op">;</span>     <span class="co">// x olvasás + y írás</span></span>
+<span id="cb2-119"><a href="#cb2-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-120"><a href="#cb2-120" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> saxpy_flops <span class="op">=</span> <span class="fl">2.0</span> <span class="op">*</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>N<span class="op">;</span></span>
+<span id="cb2-121"><a href="#cb2-121" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> horner_flops <span class="op">=</span> <span class="fl">6.0</span> <span class="op">*</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>N<span class="op">;</span></span>
+<span id="cb2-122"><a href="#cb2-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-123"><a href="#cb2-123" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;GPU adatai:</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb2-124"><a href="#cb2-124" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> dev<span class="op">;</span> cudaDeviceProp prop<span class="op">;</span></span>
+<span id="cb2-125"><a href="#cb2-125" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaGetDevice<span class="op">(&amp;</span>dev<span class="op">));</span></span>
+<span id="cb2-126"><a href="#cb2-126" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaGetDeviceProperties<span class="op">(&amp;</span>prop<span class="op">,</span> dev<span class="op">));</span></span>
+<span id="cb2-127"><a href="#cb2-127" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;  Név: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> prop<span class="op">.</span>name<span class="op">);</span></span>
+<span id="cb2-128"><a href="#cb2-128" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;  Compute capability: </span><span class="sc">%d</span><span class="st">.</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> prop<span class="op">.</span>major<span class="op">,</span> prop<span class="op">.</span>minor<span class="op">);</span></span>
+<span id="cb2-129"><a href="#cb2-129" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;  Sávszélesség (címke, GB/s): </span><span class="sc">%.2f\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>prop<span class="op">.</span>memoryClockRate <span class="op">*</span> <span class="fl">1e-3</span> <span class="op">*</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>prop<span class="op">.</span>memoryBusWidth <span class="op">/</span> <span class="fl">8.0</span><span class="op">);</span></span>
+<span id="cb2-130"><a href="#cb2-130" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;  FP32 csúcs (elméleti, GFLOP/s): </span><span class="sc">%.2f\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-131"><a href="#cb2-131" aria-hidden="true" tabindex="-1"></a>           <span class="op">(</span><span class="dt">double</span><span class="op">)</span>prop<span class="op">.</span>clockRate <span class="op">*</span> <span class="fl">1e-3</span> <span class="op">*</span> <span class="fl">2.0</span> <span class="op">*</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>prop<span class="op">.</span>multiProcessorCount <span class="op">*</span> <span class="fl">128.0</span> <span class="op">/</span> <span class="fl">1e3</span><span class="op">);</span></span>
+<span id="cb2-132"><a href="#cb2-132" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">Munkakészlet: N = </span><span class="sc">%d</span><span class="st"> elem, SAXPY forgalom = </span><span class="sc">%.2f</span><span class="st"> MB, Horner forgalom = </span><span class="sc">%.2f</span><span class="st"> MB</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-133"><a href="#cb2-133" aria-hidden="true" tabindex="-1"></a>           N<span class="op">,</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>saxpy_bytes <span class="op">/</span> <span class="fl">1e6</span><span class="op">,</span> <span class="op">(</span><span class="dt">double</span><span class="op">)</span>horner_bytes <span class="op">/</span> <span class="fl">1e6</span><span class="op">);</span></span>
+<span id="cb2-134"><a href="#cb2-134" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-135"><a href="#cb2-135" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszközoldali allokáció.</span></span>
+<span id="cb2-136"><a href="#cb2-136" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_x<span class="op">,</span> <span class="op">*</span>d_y<span class="op">;</span></span>
+<span id="cb2-137"><a href="#cb2-137" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_x<span class="op">,</span> bytes_in<span class="op">));</span></span>
+<span id="cb2-138"><a href="#cb2-138" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_y<span class="op">,</span> bytes_out<span class="op">));</span></span>
+<span id="cb2-139"><a href="#cb2-139" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-140"><a href="#cb2-140" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Inicializálás (host oldalon az egyszerűség kedvéért).</span></span>
+<span id="cb2-141"><a href="#cb2-141" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>h_x <span class="op">=</span> <span class="op">(</span><span class="dt">float</span><span class="op">*)</span>malloc<span class="op">(</span>bytes_in<span class="op">);</span></span>
+<span id="cb2-142"><a href="#cb2-142" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>h_y <span class="op">=</span> <span class="op">(</span><span class="dt">float</span><span class="op">*)</span>malloc<span class="op">(</span>bytes_out<span class="op">);</span></span>
+<span id="cb2-143"><a href="#cb2-143" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-144"><a href="#cb2-144" aria-hidden="true" tabindex="-1"></a>        h_x<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="op">(</span><span class="dt">float</span><span class="op">)(</span>i <span class="op">%</span> <span class="dv">17</span><span class="op">)</span> <span class="op">*</span> <span class="fl">0.1</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-145"><a href="#cb2-145" aria-hidden="true" tabindex="-1"></a>        h_y<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-146"><a href="#cb2-146" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-147"><a href="#cb2-147" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_x<span class="op">,</span> h_x<span class="op">,</span> bytes_in<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb2-148"><a href="#cb2-148" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_y<span class="op">,</span> h_y<span class="op">,</span> bytes_out<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb2-149"><a href="#cb2-149" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-150"><a href="#cb2-150" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> block_size <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb2-151"><a href="#cb2-151" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> grid_size <span class="op">=</span> <span class="op">(</span>N <span class="op">+</span> block_size <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block_size<span class="op">;</span></span>
+<span id="cb2-152"><a href="#cb2-152" aria-hidden="true" tabindex="-1"></a>    dim3 grid<span class="op">(</span>grid_size<span class="op">);</span></span>
+<span id="cb2-153"><a href="#cb2-153" aria-hidden="true" tabindex="-1"></a>    dim3 block<span class="op">(</span>block_size<span class="op">);</span></span>
+<span id="cb2-154"><a href="#cb2-154" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-155"><a href="#cb2-155" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A launch wrapper-ök méréséhez lambda-kat definiálunk.</span></span>
+<span id="cb2-156"><a href="#cb2-156" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> saxpy_launch <span class="op">=</span> <span class="op">[&amp;](</span>dim3 g<span class="op">,</span> dim3 b<span class="op">,</span> <span class="dt">cudaStream_t</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-157"><a href="#cb2-157" aria-hidden="true" tabindex="-1"></a>        launch_saxpy<span class="op">(</span>g<span class="op">,</span> b<span class="op">,</span> s<span class="op">,</span> d_x<span class="op">,</span> d_y<span class="op">,</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb2-158"><a href="#cb2-158" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb2-159"><a href="#cb2-159" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> horner_launch <span class="op">=</span> <span class="op">[&amp;](</span>dim3 g<span class="op">,</span> dim3 b<span class="op">,</span> <span class="dt">cudaStream_t</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-160"><a href="#cb2-160" aria-hidden="true" tabindex="-1"></a>        launch_horner<span class="op">(</span>g<span class="op">,</span> b<span class="op">,</span> s<span class="op">,</span> d_x<span class="op">,</span> d_y<span class="op">,</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">,</span> <span class="op">-</span><span class="fl">0.5</span><span class="bu">f</span><span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb2-161"><a href="#cb2-161" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb2-162"><a href="#cb2-162" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-163"><a href="#cb2-163" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés.</span></span>
+<span id="cb2-164"><a href="#cb2-164" aria-hidden="true" tabindex="-1"></a>    run_and_measure<span class="op">(</span><span class="st">&quot;SAXPY (I ~ 0.17 FLOP/byte)&quot;</span><span class="op">,</span> saxpy_launch<span class="op">,</span></span>
+<span id="cb2-165"><a href="#cb2-165" aria-hidden="true" tabindex="-1"></a>                    grid<span class="op">,</span> block<span class="op">,</span> saxpy_bytes<span class="op">,</span> saxpy_flops<span class="op">);</span></span>
+<span id="cb2-166"><a href="#cb2-166" aria-hidden="true" tabindex="-1"></a>    run_and_measure<span class="op">(</span><span class="st">&quot;Horner-polinom (I ~ 0.75 FLOP/byte)&quot;</span><span class="op">,</span> horner_launch<span class="op">,</span></span>
+<span id="cb2-167"><a href="#cb2-167" aria-hidden="true" tabindex="-1"></a>                    grid<span class="op">,</span> block<span class="op">,</span> horner_bytes<span class="op">,</span> horner_flops<span class="op">);</span></span>
+<span id="cb2-168"><a href="#cb2-168" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-169"><a href="#cb2-169" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés: néhány elem kiértékelése.</span></span>
+<span id="cb2-170"><a href="#cb2-170" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_y<span class="op">,</span> d_y<span class="op">,</span> bytes_out<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb2-171"><a href="#cb2-171" aria-hidden="true" tabindex="-1"></a>    <span class="co">// SAXPY eredmény: y[0] = 2.0 * x[0] + 1.0 = 1.0, ha x[0]=0</span></span>
+<span id="cb2-172"><a href="#cb2-172" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">Ellenőrzés (host): y[0] = </span><span class="sc">%.3f</span><span class="st"> (várt SAXPY: </span><span class="sc">%.3f</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-173"><a href="#cb2-173" aria-hidden="true" tabindex="-1"></a>           h_y<span class="op">[</span><span class="dv">0</span><span class="op">],</span> <span class="fl">2.0</span><span class="bu">f</span> <span class="op">*</span> h_x<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">+</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb2-174"><a href="#cb2-174" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Horner eredmény: y[0] az első elemre</span></span>
+<span id="cb2-175"><a href="#cb2-175" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> x0 <span class="op">=</span> h_x<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb2-176"><a href="#cb2-176" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> expected_horner <span class="op">=</span> <span class="op">((</span><span class="fl">0.5</span><span class="bu">f</span><span class="op">*</span>x0 <span class="op">+</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">)*</span>x0 <span class="op">+</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">)*</span>x0 <span class="op">-</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-177"><a href="#cb2-177" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Ellenőrzés (host): y[0] = </span><span class="sc">%.3f</span><span class="st"> (várt Horner: </span><span class="sc">%.3f</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-178"><a href="#cb2-178" aria-hidden="true" tabindex="-1"></a>           h_y<span class="op">[</span><span class="dv">0</span><span class="op">],</span> expected_horner<span class="op">);</span></span>
+<span id="cb2-179"><a href="#cb2-179" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-180"><a href="#cb2-180" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>h_x<span class="op">);</span> free<span class="op">(</span>h_y<span class="op">);</span></span>
+<span id="cb2-181"><a href="#cb2-181" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_x<span class="op">));</span></span>
+<span id="cb2-182"><a href="#cb2-182" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_y<span class="op">));</span></span>
+<span id="cb2-183"><a href="#cb2-183" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-184"><a href="#cb2-184" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Fordítás és futtatás:</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> labor_gpu048 labor_gpu048.cu</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./labor_gpu048</span></span></code></pre></div>
+<p>A kimenet rögzítse a GPU adatait, a futásidő átlagát és szórását, a
+mért sávszélességet és FLOPS-t. A mérési naplóban ezeket jelölje
+<strong>mért</strong> értékként.</p>
+<p><strong>Várt eredmények (a Roofline-modellből számolva).</strong> A
+GPU specifikációjából határozza meg a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>β</mi><annotation encoding="application/x-tex">\beta</annotation></semantics></math>
+DRAM-sávszélességet és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>
+FP32 csúcsot. Számolja ki ezekből:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub><mo>=</mo><mi>π</mi><mi>/</mi><mi>β</mi></mrow><annotation encoding="application/x-tex">I_{\text{ridge}} = \pi / \beta</annotation></semantics></math></li>
+<li>Várt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">saxpy</mtext></msub><mo>=</mo><mi>β</mi><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>167</mn></mrow><annotation encoding="application/x-tex">P_{\text{saxpy}} = \beta \cdot 0{,}167</annotation></semantics></math></li>
+<li>Várt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">horner</mtext></msub><mo>=</mo><mi>β</mi><mo>⋅</mo><mn>0</mn><mo>,</mo><mn>75</mn></mrow><annotation encoding="application/x-tex">P_{\text{horner}} = \beta \cdot 0{,}75</annotation></semantics></math></li>
+</ul>
+<p>Hasonlítsa össze a mért FLOPS-t a várt értékkel. A mért és várt
+közötti eltérés jellemzően 10–30% a viszkozitási és cache-hatások miatt.
+A besorolás: mindkét kernel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>&lt;</mo><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub></mrow><annotation encoding="application/x-tex">I &lt; I_{\text{ridge}}</annotation></semantics></math>,
+tehát <strong>memória-korlátos</strong>. A választott GPU-n a töréspont
+10 feletti, a mért intenzitások 0,17 és 0,75 – egy nagyságrenddel a
+töréspont alatt.</p>
+<p><strong>A labor eredménye.</strong> Önellenőrzésként írja be a
+jegyzőkönyvbe:</p>
+<ol type="1">
+<li>A mért sávszélesség és a névleges sávszélesség aránya.</li>
+<li>A mért FLOPS és a Roofline által jósolt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>⋅</mo><mi>I</mi></mrow><annotation encoding="application/x-tex">\beta \cdot I</annotation></semantics></math>
+összevetése.</li>
+<li>A kernelbesorolás indoklása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub><annotation encoding="application/x-tex">I_{\text{ridge}}</annotation></semantics></math>-del
+való összevetéssel.</li>
+</ol>
+<p>A labor azt a készséget fejleszti, hogy az optimalizálás előtt a
+helyes kérdést tegyük fel: <em>melyik erőforrás a szűk
+keresztmetszet?</em></p>
+<h3 data-number="13.3.8" id="tipikus-hibák-és-helyesbítésük"><span
+class="header-section-number">13.3.8</span> Tipikus hibák és
+helyesbítésük</h3>
+<p>A Roofline-osztályozás során az alábbi hibák a leggyakoribbak:</p>
+<p><strong>1. A byte-ok naiv számolása cache-hatás nélkül.</strong> Ha a
+munkakészlet elfér az L2 cache-ben, a tényleges DRAM-forgalom lényegesen
+kisebb, mint a bekért adatmennyiség. Ez az intenzitást megnöveli, és a
+kernelt tévesen a számítás-korlátos tartományba sorolhatja. Helyesebb:
+mindig a munkakészlet méretét vessük össze a cache-méretekkel, és a
+releváns memóriaszint forgalmával számoljunk.</p>
+<p><strong>2. A FLOP-számítás utasításszámként való
+értelmezése.</strong> Az FMA egyetlen utasítás, de két FLOP-ot jelent.
+Ha valaki utasításszámot oszt byte-számmal, alábecsüli az intenzitást,
+és tévesen memória-korlátosnak minősíthet egy számítás-korlátos
+kernelt.</p>
+<p><strong>3. A lebegőpontos csúcs pontosságfüggőségének figyelmen kívül
+hagyása.</strong> Az FP64-es kernelt az FP32-csúcshoz hasonlítani
+rendszerint a töréspont torzulásához vezet. Mindig a kernel által
+használt pontosság csúcsával dolgozzunk.</p>
+<p><strong>4. A futási idő mérése host- és device-idő
+keverésével.</strong> A kernel tényleges végrehajtását csak CUDA-events
+vagy egyéb device-oldali időzítővel mérjük. A host-oldali
+<code>clock()</code> magában foglalja a memóriamásolásokat, a hívási
+költséget és a szinkronizációt.</p>
+<p><strong>5. A warm-up elhagyása.</strong> Az első kernel-indítás
+magában foglalja a driver-betöltést, a hőkezelést és az esetleges
+laphibákat. A mérési protokoll mindig 5–10 warm-up iterációt írjon
+elő.</p>
+<p><strong>6. A szórás elhallgatása.</strong> Az átlagidő önmagában nem
+elég. A mérési jegyzőkönyvben a szórást vagy percentilist is közölni
+kell, különben a mérés nem tekinthető reprodukálhatónak.</p>
+<h3 data-number="13.3.9" id="összefoglalás-és-ellenőrző-kérdések"><span
+class="header-section-number">13.3.9</span> Összefoglalás és ellenőrző
+kérdések</h3>
+<p>Ebben a fejezetben a Roofline-modell második pillérét, a számítási
+korlátot és az aritmetikai intenzitás fogalmát tanultuk meg. A
+kernelbesorolás a következő munkafolyamatban összegezhető:</p>
+<ol type="1">
+<li><strong>FLOP-számlálás:</strong> határozzuk meg a kernel
+lebegőpontos műveleteinek számát, az FMA-t 2 FLOP-nak tekintve, a
+pontosságot rögzítve.</li>
+<li><strong>Byte-számlálás:</strong> határozzuk meg a releváns
+memóriaszint (általában DRAM) forgalmát, figyelembe véve a
+cache-reúzist.</li>
+<li><strong>Intenzitásszámítás:</strong>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>=</mo><mi>F</mi><mi>/</mi><mi>B</mi></mrow><annotation encoding="application/x-tex">I = F/B</annotation></semantics></math>.</li>
+<li><strong>Töréspont-meghatározás:</strong>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub><mo>=</mo><mi>π</mi><mi>/</mi><mi>β</mi></mrow><annotation encoding="application/x-tex">I_{\text{ridge}} = \pi/\beta</annotation></semantics></math>
+az adott GPU és pontosság specifikációjából.</li>
+<li><strong>Besorolás:</strong> ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>&lt;</mo><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub></mrow><annotation encoding="application/x-tex">I &lt; I_{\text{ridge}}</annotation></semantics></math>,
+a kernel memória-korlátos; ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>I</mi><mo>&gt;</mo><msub><mi>I</mi><mtext mathvariant="normal">ridge</mtext></msub></mrow><annotation encoding="application/x-tex">I &gt; I_{\text{ridge}}</annotation></semantics></math>,
+számítás-korlátos.</li>
+<li><strong>Mérés és validáció:</strong> a mért FLOPS-t hasonlítsuk a
+modell által jósolt
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>=</mo><mo>min</mo><mrow><mo stretchy="true" form="prefix">(</mo><mi>π</mi><mo>,</mo><mi>β</mi><mo>⋅</mo><mi>I</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">P = \min(\pi, \beta \cdot I)</annotation></semantics></math>
+értékhez.</li>
+</ol>
+<p><strong>Ellenőrző kérdések:</strong></p>
+<ol type="1">
+<li>Egy kernel FP32-ben minden elemre 12 FLOP-ot végez, beolvas egy
+float-ot és kiír egy float-ot. Mekkora az aritmetikai intenzitása?
+Milyen töréspont mellett válik memória-korlátosból
+számítás-korlátossá?</li>
+<li>Adott egy GPU
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>=</mo><mn>900</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">GB/s</mtext></mrow><annotation encoding="application/x-tex">\beta = 900\ \text{GB/s}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>π</mi><mo>=</mo><mn>12</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">TFLOP/s</mtext></mrow><annotation encoding="application/x-tex">\pi = 12\ \text{TFLOP/s}</annotation></semantics></math>
+FP32-ben. Számítsa ki a töréspontot, és osztályozza az 1. kérdésbeli
+kernelt ezen a GPU-n.</li>
+<li>Miért számít az FMA 2 FLOP-nak, noha egyetlen utasítás? Mi a
+gyakorlati következménye, ha valaki 1-nek számolja?</li>
+<li>Soroljon fel három tipikus hibát a kernelbesorolás mérése során, és
+magyarázza el, hogyan vezetnek téves következtetésre.</li>
+<li>A laborban mért SAXPY-sávszélesség 70%-a a névleges sávszélességnek.
+Hogyan magyarázza ezt a Roofline-modell?</li>
+</ol>
+<p>A fejezet a Roofline-modell középpontjába állította az aritmetikai
+intenzitást mint a két korlátot összekötő hidat. A <a
+href="gpu049.html">Roofline-alapú optimalizálás</a> fejezetben ezt a
+fogalmat használjuk fel a tudatos optimalizáláshoz: hogyan növelhető az
+intenzitás tiling és adatismétlés révén, és hogyan tolható át a kernel a
+memória-korlátos tartományból a számítás-korlátos – elérhető – csúcs
+felé.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu047.html">← 13.2 Memóriateljesítmény és sávszélesség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu049.html">13.4 Roofline-alapú optimalizálás →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.1 Radix sort – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch16">17 Rendezés, keresés és selection</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu061.html">← 16.4 CUB és Thrust használata</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu063.html">17.2 Bitonic és egyéb rendezések →</a></div>
+</nav>
+<h2 data-number="17.1" id="gpu062"><span
+class="header-section-number">17.1</span> Radix sort</h2>
+<figure>
+<img src="assets/gpu062-diagram-1.png"
+alt="Radix rendezés egy számjegyre - Minden számjegyre histogram, prefix sum és stabil scatter történik; a stabil részrendezés miatt a korábbi számjegyek sorrendje megmarad." />
+<figcaption aria-hidden="true">Radix rendezés egy számjegyre - Minden
+számjegyre histogram, prefix sum és stabil scatter történik; a stabil
+részrendezés miatt a korábbi számjegyek sorrendje megmarad.</figcaption>
+</figure>
+<h3 data-number="17.1.1" id="radix-sort"><span
+class="header-section-number">17.1.1</span> 9.2.1 Radix sort</h3>
+<p>A rendezés az egyik legalapvetőbb – és leggyakrabban kritikus –
+építőköve a nagy áteresztőképességű adatfeldolgozásnak. Amikor a
+<code>gpu061</code> fejezetben a Thrust és CUB könyvtárakat vizsgáltuk,
+láthattuk, hogy a GPU-n futó rendezések drasztikusan felülmúlhatják a
+CPU-s megoldásokat nagy adathalmazok (<code>N &gt; 10^6</code>) esetén,
+azonban ehhez el kell engednünk a klasszikus, összehasonlítás-alapú
+rendezések (pl. quick sort, merge sort) reflexeit. Az
+összehasonlítás-alapú rendezések alsó korlátja
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo>log</mo><mi>N</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\mathcal{O}(N \log N)</annotation></semantics></math>,
+ami korlátozza a skálázhatóságot.</p>
+<p>A GPU-k párhuzamos architektúrájához sokkal jobban illeszkedik a
+<strong>számjegyalapú (radix) rendezés</strong>, amelynek
+időkomplexitása lineáris:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>k</mi><mo>⋅</mo><mi>N</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\mathcal{O}(k \cdot N)</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+a feldolgozott számjegyek (bitek vagy bájtok) száma. A radix sort nem
+hasonlítja össze az elemeket, hanem a kulcsok numerikus ábrázolását
+(bináris reprezentációját) használja fel arra, hogy az elemeket
+meghatározott digitális csoportokba (rekeszekbe) sorolja.</p>
+<p>Míg egy CPU-n a radix sort gyakran lassabb az erős
+cache-kihasználtságú introspectív rendezéseknél, a GPU ezres
+nagyságrendű aktív szálával és gyors shared memory-jával ideális
+környezetet biztosít a radix sort két fő fázisának (hisztogram és
+szórás) masszív párhuzamosítására. Ebben az alfejezetben ezt a két
+fázist valósítjuk meg CUDA C++ alapon, kihasználva a <code>gpu058</code>
+(redukció) és <code>gpu059</code> (scan) fejezetekben tanultakat.</p>
+<h4 data-number="17.1.1.1" id="a-számjegyalapú-rendezés-alapelvei"><span
+class="header-section-number">17.1.1.1</span> 9.2.1.1 A számjegyalapú
+rendezés alapelvei</h4>
+<p>A radix sort a <strong>kulcsok rendezését</strong> végzi el oly
+módon, hogy azokat
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>r</mi><annotation encoding="application/x-tex">r</annotation></semantics></math>
+bit hosszúságú számjegyekre (digit) bontja. A gyakorlatban GPU-n a 4
+bites (16 rekesz) vagy 8 bites (256 rekesz) bontás a legelterjedtebb.
+Tegyük fel, hogy 32 bites egész számokat (<code>unsigned int</code>)
+rendezünk, és 8 bites számjegyeket használunk. Ez 4 menetet (digit pass)
+jelent.</p>
+<p>A rendezés az <strong>LSD (Least Significant Digit)</strong> elv
+szerint halad: a legkisebb helyiértékű bájttól a legnagyobbig.</p>
+<p>Minden egyes digit pass két alapműveletből áll:</p>
+<ol type="1">
+<li><strong>Hisztogram (digit count):</strong> Megszámoljuk, hogy az
+egyes rekeszekbe (0–255) hány darab elem tartozik az aktuális számjegy
+alapján.</li>
+<li><strong>Prefix sum (scan):</strong> A hisztogram alapján kiszámítjuk
+minden rekesz kezdőindexét a kimeneti tömbben.</li>
+<li><strong>Stabil szórás (scatter):</strong> Az elemeket az új
+pozíciójukba írjuk úgy, hogy az azonos számjegyű elemek relatív
+sorrendje megmaradjon (stabilitás).</li>
+</ol>
+<p>Miért kritikus a stabilitás? Ha az LSD radix sort nem őrizné meg az
+azonos rekeszbe kerülő elemek sorrendjét, az előző (alacsonyabb
+helyiértékű) menetekben már rendezett sorrend elveszne. A stabil szórás
+garantálja, hogy a rendezés minden egyes menet után konzisztens
+marad.</p>
+<h4 data-number="17.1.1.2"
+id="digit-kinyerés-és-a-hisztogram-párhuzamosítása"><span
+class="header-section-number">17.1.1.2</span> 9.2.1.2 Digit kinyerés és
+a hisztogram párhuzamosítása</h4>
+<p>Az első lépés a digit kinyerése. Ha <code>key</code> a rendezendő 32
+bites kulcs, <code>shift</code> pedig az aktuális bájthelyiérték (0, 8,
+16, 24), akkor a rekesz indexe:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> digit <span class="op">=</span> <span class="op">(</span>key <span class="op">&gt;&gt;</span> shift<span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">;</span> <span class="co">// 8 bites számjegy</span></span></code></pre></div>
+<p><strong>1. lépés: Blokk-szintű hisztogram.</strong> Egy naiv
+megoldás, ha minden szál egy globális memóriában lévő
+<code>atomicAdd</code> hívást végez 256 lehetséges rekeszre. Ez
+rendkívül lassú, mert több ezer szál versengene ugyanazokért a globális
+atomi címekért.</p>
+<p>A helyes GPU-minta a <strong>blokk-szintű privatizáció</strong>.
+Minden thread block a saját shared memory-jában épít fel egy lokális
+hisztogramot. Mivel egy block jellemzően 256 vagy 512 szálat tartalmaz,
+a shared memory tömb 256 darab <code>int</code> méretű lesz (1 KB). A
+szálak először kinullázzák ezt a tömböt, <code>__syncthreads()</code>-et
+hívnak, majd kiértékelik a saját kulcsukat. A rekesz növelésére shared
+memory-s atomi műveletet (<code>atomicAdd</code>) használunk. A shared
+memory-s atomi művelet lényegesen gyorsabb, mint a globális, de még így
+is lehetnek ütközések, ha sok szál ugyanazt a rekeszt növeli (pl.
+rendezett input esetén). Ezt a problémát a bank-conflictok és a
+szekvencializálódás elkerülése érdekében később finomítani lehet (pl.
+warp-szintű redukcióval), de alapvető működésnek ez kiválóan szemlélteti
+az elvet.</p>
+<p><strong>2. lépés: Globális hisztogram és scan.</strong> Miután minden
+blokk elkészítette a lokális hisztogramját, ezeket össze kell adni egy
+globális hisztogrammá (256 elem). Ezt a <code>gpu058</code>-ban tanult
+redukcióval, vagy egyszerűen <code>atomicAdd</code>-dal tehetjük meg, ha
+a blokkok a lokális hisztogramjukat a globális memóriába írják (globális
+atomi művelet itt már csak blokkonként 256, ami elhanyagolható
+terhelés). Végül a globális hisztogramon egy <strong>exkluzív prefix
+sum</strong>-ot hajtunk végre, ami megadja minden rekesz kezdőcímeit a
+kimeneti tömbben.</p>
+<h4 data-number="17.1.1.3" id="stabil-szórás-scatter"><span
+class="header-section-number">17.1.1.3</span> 9.2.1.3 Stabil szórás
+(Scatter)</h4>
+<p>A második fázis az elemek újrarendezése. Ismerjük a rekeszek
+kezdőcímeit (<code>offset</code>). A feladat, hogy minden elem a
+megfelelő rekeszének aktuális mutatójára kerüljön, közben megőrizve a
+blokkon belüli, illetve a globális sorrendet.</p>
+<p>A stabilitás itt azt jelenti: ha az <code>A</code> és <code>B</code>
+elemek ugyanabba a rekeszbe tartoznak, és az input tömbben
+<code>A</code> előbb van, mint <code>B</code>, akkor az output tömbben
+is <code>A</code> előbb kell legyen, mint <code>B</code>.</p>
+<p><strong>Naiv globális szórás:</strong> Minden szál globálisan
+<code>atomicAdd</code>-et végez a saját rekeszének kezdőindexére, hogy
+megkapja a saját pozícióját. Ez hibás, mert az atomi műveletek sorrendje
+nem determinisztikus, így az azonos rekeszbe tartozó elemek
+összekeverednek. Ez <strong>nem stabil rendezés</strong>.</p>
+<p><strong>Stabil blokk-szintű szórás:</strong> A stabilitás
+garantálásához lokálisan (blokkon belül) kell a sorrendet meghatározni,
+és a globális címtartományt ehhez hozzáigazítani. A folyamat egy
+blokkra:</p>
+<ol type="1">
+<li><p>A blokk rendelkezik a lokális hisztogramjával (ismert, hogy
+blokkon belül hány elem tartozik az egyes rekeszekbe).</p></li>
+<li><p>A blokk rendelkezik a globális rekesz-kezdőcímekkel
+(<code>global_offset</code>).</p></li>
+<li><p>A blokk kiszámítja, hogy a globális kezdőcímhez képest hány
+elemet kell “kihagynia” azon elemek miatt, amelyek korábbi blokkokban
+vannak. Ezt egyszerűen úgy kapjuk meg, ha a blokkunk előtti blokkok
+hisztogramjait összeadjuk, vagy ha a globális szórás előtt egy második
+menetben <code>atomicAdd</code>-ot végzünk blokkonként a lokális
+hisztogramok alapján:
+<code>block_offset[digit] = atomicAdd(&amp;global_offset[digit], local_hist[digit]);</code>
+Ez a módszer a “decoupled look-back” vagy az egyszerűbb “chained scan”
+megoldás. Itt a blokk garantáltan egy összefüggő szegmenst kap a
+globális tömbben a saját elemei számára.</p></li>
+<li><p>A blokkon belül a szálak meghatározzák a lokális pozíciójukat.
+Ehhez egy blokk-szintű <strong>exkluzív scan</strong>-t futtatunk a
+lokális hisztogramon (vagy egyszerűbb esetben: a szálak
+<code>__syncthreads</code> után beolvassák a lokális hisztogramot, és
+kiszámítják a rekeszen belüli sorszámukat a szál-azonosítójuk
+sorrendjében). A legegyszerűbb stabil módszer: minden szál megkapja a
+saját indexét (<code>threadIdx.x</code>). A célpozíciót úgy kapja meg,
+hogy a hozzá tartozó rekesz lokális kezdőindexéhez hozzáadja a nála
+kisebb <code>threadIdx.x</code>-ű, ugyanabba a rekeszbe tartozó elemek
+számát. Ez a “serial scan in shared memory” megoldás, ami 256 szál
+esetén gyors.</p></li>
+<li><p>Végül a szál az elemet a
+<code>global_offset[digit] + local_pos</code> pozícióba írja a globális
+memóriába.</p></li>
+</ol>
+<h4 data-number="17.1.1.4"
+id="negatív-számok-és-lebegőpontos-kulcsok"><span
+class="header-section-number">17.1.1.4</span> 9.2.1.4 Negatív számok és
+lebegőpontos kulcsok</h4>
+<p>A fenti algoritmus <code>unsigned int</code> kulcsokra működik
+hibátlanul. A valós alkalmazásokban azonban szükség van előjeles egészek
+(<code>int</code>) és lebegőpontos számok (<code>float</code>)
+rendezésére is. A CUDA-alapú radix sort ezt
+<strong>bit-transzformációval</strong> oldja meg, ahelyett, hogy drága
+ágakat (<code>if</code>) iktatna a kernelbe.</p>
+<ul>
+<li><strong>Előjeles egészek (<code>int</code>):</strong> A kettes
+komplemensben tárolt negatív számok a legmagasabb biten 1-et
+tartalmaznak, így <code>unsigned</code>-ként értelmezve nagyobbnak
+tűnnek, mint a pozitívak. A megoldás: a rendezés előtt a legmagasabb
+bitet flipeljük (<code>key ^ 0x80000000</code>). Ez a transzformáció az
+<code>int</code> rendezést <code>unsigned</code> rendezéssé alakítja, és
+a természetes sorrendet adja.</li>
+<li><strong>Lebegőpontos (<code>float</code>):</strong> Az IEEE 754
+formátum miatt a pozitív float-ok sorrendje megegyezik az
+<code>unsigned</code> bitképük sorrendjével. A negatív float-ok azonban
+fordítva viselkednek. A helyes transzformáció:
+<code>cpp     unsigned int mask = (x &gt;&gt; 31) ? 0xFFFFFFFF : 0x80000000;     return key ^ mask;</code>
+Ez a <code>__float_as_uint</code> és a fenti maszk alkalmazásával
+lehetővé teszi a float-ok hatékony radix rendezését anélkül, hogy a
+kernelben elágaznánk.</li>
+</ul>
+<h4 data-number="17.1.1.5"
+id="labor-cuda-c-radix-sort-implementáció"><span
+class="header-section-number">17.1.1.5</span> 9.2.1.5 Labor: CUDA C++
+Radix Sort implementáció</h4>
+<p>Ebben a laborban egy 4-bites radix sortot valósítunk meg 32 bites
+<code>unsigned int</code> kulcsokra. A 4 bites rekesz (16 lehetséges
+érték) lehetővé teszi, hogy a shared memory-s hisztogram rendkívül kicsi
+legyen, és a warp-szintű műveletek (shuffle/ballot) jól szemléltethetők
+vele, bár a teljesítmény szempontjából a 8-bites verzió kevesebb menetet
+igényel (4 helyett 8 menet). Itt a 8-bites verziót mutatjuk be, hogy a
+kód közelebb álljon az ipari megoldásokhoz.</p>
+<p><strong>Környezet:</strong> * <strong>Nyelv:</strong> CUDA C++
+(C++17) * <strong>GPU:</strong> NVIDIA RTX 3090 (Compute Capability 8.6)
+– <em>Helyőrző: ehhez a futásos méréshez friss NVIDIA drivert
+feltételezünk.</em> * <strong>Driver:</strong> Linux x86_64, Driver
+535.x * <strong>CUDA Toolkit:</strong> 12.2</p>
+<p><strong>Kód (radix_sort.cu):</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st"> - </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NUM_BINS </span><span class="dv">256</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_SIZE </span><span class="dv">256</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co">// __global__ kernel a lokális hisztogramhoz</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> histogram_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> input<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> global_hist<span class="op">,</span> <span class="dt">int</span> N<span class="op">,</span> <span class="dt">int</span> shift<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">unsigned</span> <span class="dt">int</span> <span class="va">s_hist</span><span class="op">[];</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> tid<span class="op">;</span> i <span class="op">&lt;</span> NUM_BINS<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="va">s_hist</span><span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> tid<span class="op">;</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> key <span class="op">=</span> input<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> bin <span class="op">=</span> <span class="op">(</span>key <span class="op">&gt;&gt;</span> shift<span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        atomicAdd<span class="op">(&amp;</span><span class="va">s_hist</span><span class="op">[</span>bin<span class="op">],</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Globális memóriába írás (blokkonként 256 atomi add)</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> tid<span class="op">;</span> i <span class="op">&lt;</span> NUM_BINS<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span><span class="va">s_hist</span><span class="op">[</span>i<span class="op">]</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>            atomicAdd<span class="op">(&amp;</span>global_hist<span class="op">[</span>i<span class="op">],</span> <span class="va">s_hist</span><span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a><span class="co">// __global__ kernel a stabil szóráshoz</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> scatter_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> input<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> output<span class="op">,</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> global_offsets<span class="op">,</span> <span class="dt">int</span> N<span class="op">,</span> <span class="dt">int</span> shift<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    <span class="at">extern</span> __shared__ <span class="dt">unsigned</span> <span class="dt">int</span> <span class="va">s_hist</span><span class="op">[];</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">unsigned</span> <span class="dt">int</span> <span class="va">s_block_offsets</span><span class="op">[</span>NUM_BINS<span class="op">];</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> tid<span class="op">;</span> i <span class="op">&lt;</span> NUM_BINS<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>        <span class="va">s_hist</span><span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>        <span class="va">s_block_offsets</span><span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> tid<span class="op">;</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> key <span class="op">=</span> input<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> bin <span class="op">=</span> <span class="op">(</span>key <span class="op">&gt;&gt;</span> shift<span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">;</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>        atomicAdd<span class="op">(&amp;</span><span class="va">s_hist</span><span class="op">[</span>bin<span class="op">],</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A blokk lefoglal egy szegmenst a globális tömbben.</span></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ez a minta biztosítja a stabilitást a blokkok között.</span></span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> NUM_BINS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a>        <span class="va">s_block_offsets</span><span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> atomicAdd<span class="op">(&amp;</span>global_offsets<span class="op">[</span>tid<span class="op">],</span> <span class="va">s_hist</span><span class="op">[</span>tid<span class="op">]);</span></span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> key <span class="op">=</span> input<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> bin <span class="op">=</span> <span class="op">(</span>key <span class="op">&gt;&gt;</span> shift<span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">;</span></span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Helyi stabilitás biztosítása:</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Megkeressük a saját pozíciónkat a blokkban lévő, ugyanabba a rekeszbe tartozó elemek között.</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ehhez a szálak lineárisan scannelnek, ami 256 szál esetén elfogadható.</span></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> local_pos <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> tid<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>            <span class="dt">unsigned</span> <span class="dt">int</span> prev_key <span class="op">=</span> input<span class="op">[</span>blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> i<span class="op">];</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a>            <span class="dt">unsigned</span> <span class="dt">int</span> prev_bin <span class="op">=</span> <span class="op">(</span>prev_key <span class="op">&gt;&gt;</span> shift<span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">;</span></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>prev_bin <span class="op">==</span> bin<span class="op">)</span> local_pos<span class="op">++;</span></span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true" tabindex="-1"></a>        </span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span> dest <span class="op">=</span> <span class="va">s_block_offsets</span><span class="op">[</span>bin<span class="op">]</span> <span class="op">+</span> local_pos<span class="op">;</span></span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>dest<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">;</span> <span class="co">// 4,194,304 elem</span></span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">);</span></span>
+<span id="cb2-93"><a href="#cb2-93" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-94"><a href="#cb2-94" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> h_input <span class="op">=</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*)</span>malloc<span class="op">(</span>bytes<span class="op">);</span></span>
+<span id="cb2-95"><a href="#cb2-95" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> h_output <span class="op">=</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*)</span>malloc<span class="op">(</span>bytes<span class="op">);</span></span>
+<span id="cb2-96"><a href="#cb2-96" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-97"><a href="#cb2-97" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Tesztadatok generálása</span></span>
+<span id="cb2-98"><a href="#cb2-98" aria-hidden="true" tabindex="-1"></a>    srand<span class="op">(</span><span class="dv">42</span><span class="op">);</span></span>
+<span id="cb2-99"><a href="#cb2-99" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> h_input<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> rand<span class="op">();</span></span>
+<span id="cb2-100"><a href="#cb2-100" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-101"><a href="#cb2-101" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> <span class="op">*</span>d_input<span class="op">,</span> <span class="op">*</span>d_output<span class="op">,</span> <span class="op">*</span>d_hist<span class="op">;</span></span>
+<span id="cb2-102"><a href="#cb2-102" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_input<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb2-103"><a href="#cb2-103" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_output<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb2-104"><a href="#cb2-104" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_hist<span class="op">,</span> NUM_BINS <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb2-105"><a href="#cb2-105" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-106"><a href="#cb2-106" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_input<span class="op">,</span> h_input<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb2-107"><a href="#cb2-107" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-108"><a href="#cb2-108" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Időmérés eseményei</span></span>
+<span id="cb2-109"><a href="#cb2-109" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb2-110"><a href="#cb2-110" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb2-111"><a href="#cb2-111" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb2-112"><a href="#cb2-112" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-113"><a href="#cb2-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> grid_size <span class="op">=</span> <span class="op">(</span>N <span class="op">+</span> BLOCK_SIZE <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> BLOCK_SIZE<span class="op">;</span></span>
+<span id="cb2-114"><a href="#cb2-114" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> smem_size <span class="op">=</span> NUM_BINS <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">);</span></span>
+<span id="cb2-115"><a href="#cb2-115" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-116"><a href="#cb2-116" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb2-117"><a href="#cb2-117" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-118"><a href="#cb2-118" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaMemset<span class="op">(</span>d_hist<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> NUM_BINS <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb2-119"><a href="#cb2-119" aria-hidden="true" tabindex="-1"></a>        histogram_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> smem_size<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_hist<span class="op">,</span> N<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-120"><a href="#cb2-120" aria-hidden="true" tabindex="-1"></a>        scatter_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> smem_size<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_output<span class="op">,</span> d_hist<span class="op">,</span> N<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-121"><a href="#cb2-121" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-122"><a href="#cb2-122" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb2-123"><a href="#cb2-123" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-124"><a href="#cb2-124" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb2-125"><a href="#cb2-125" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4 menet (0, 8, 16, 24 shift)</span></span>
+<span id="cb2-126"><a href="#cb2-126" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> shift <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> shift <span class="op">&lt;</span> <span class="dv">32</span><span class="op">;</span> shift <span class="op">+=</span> <span class="dv">8</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-127"><a href="#cb2-127" aria-hidden="true" tabindex="-1"></a>        CHECK_CUDA<span class="op">(</span>cudaMemset<span class="op">(</span>d_hist<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> NUM_BINS <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb2-128"><a href="#cb2-128" aria-hidden="true" tabindex="-1"></a>        histogram_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> smem_size<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_hist<span class="op">,</span> N<span class="op">,</span> shift<span class="op">);</span></span>
+<span id="cb2-129"><a href="#cb2-129" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Megjegyzés: A scan lépés itt a scatter kernelben van (atomicAdd), </span></span>
+<span id="cb2-130"><a href="#cb2-130" aria-hidden="true" tabindex="-1"></a>        <span class="co">// de a d_hist-et előtte vissza kell állítani globális kezdőcímekké.</span></span>
+<span id="cb2-131"><a href="#cb2-131" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Egyszerűsítés: a scatter az atomi add miatt növeli a kezdőcímeket,</span></span>
+<span id="cb2-132"><a href="#cb2-132" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ezért a d_hist-et minden menetben nullázni kell a scatter előtt.</span></span>
+<span id="cb2-133"><a href="#cb2-133" aria-hidden="true" tabindex="-1"></a>        scatter_kernel<span class="op">&lt;&lt;&lt;</span>grid_size<span class="op">,</span> BLOCK_SIZE<span class="op">,</span> smem_size<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_output<span class="op">,</span> d_hist<span class="op">,</span> N<span class="op">,</span> shift<span class="op">);</span></span>
+<span id="cb2-134"><a href="#cb2-134" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Buffer csere</span></span>
+<span id="cb2-135"><a href="#cb2-135" aria-hidden="true" tabindex="-1"></a>        <span class="dt">unsigned</span> <span class="dt">int</span><span class="op">*</span> temp <span class="op">=</span> d_input<span class="op">;</span></span>
+<span id="cb2-136"><a href="#cb2-136" aria-hidden="true" tabindex="-1"></a>        d_input <span class="op">=</span> d_output<span class="op">;</span></span>
+<span id="cb2-137"><a href="#cb2-137" aria-hidden="true" tabindex="-1"></a>        d_output <span class="op">=</span> temp<span class="op">;</span></span>
+<span id="cb2-138"><a href="#cb2-138" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-139"><a href="#cb2-139" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-140"><a href="#cb2-140" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-141"><a href="#cb2-141" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-142"><a href="#cb2-142" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> milliseconds <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-143"><a href="#cb2-143" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>milliseconds<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb2-144"><a href="#cb2-144" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-145"><a href="#cb2-145" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_output<span class="op">,</span> d_input<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb2-146"><a href="#cb2-146" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-147"><a href="#cb2-147" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Validáció</span></span>
+<span id="cb2-148"><a href="#cb2-148" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> sorted <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-149"><a href="#cb2-149" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">1</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-150"><a href="#cb2-150" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>h_output<span class="op">[</span>i<span class="op">-</span><span class="dv">1</span><span class="op">]</span> <span class="op">&gt;</span> h_output<span class="op">[</span>i<span class="op">])</span> <span class="op">{</span></span>
+<span id="cb2-151"><a href="#cb2-151" aria-hidden="true" tabindex="-1"></a>            sorted <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb2-152"><a href="#cb2-152" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb2-153"><a href="#cb2-153" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-154"><a href="#cb2-154" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-155"><a href="#cb2-155" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-156"><a href="#cb2-156" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Radix Sort eredmény: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> sorted <span class="op">?</span> <span class="st">&quot;HELYES&quot;</span> <span class="op">:</span> <span class="st">&quot;HELYTELEN&quot;</span><span class="op">);</span></span>
+<span id="cb2-157"><a href="#cb2-157" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Elemek: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb2-158"><a href="#cb2-158" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Átlagos idő (4 menet): </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> milliseconds<span class="op">);</span></span>
+<span id="cb2-159"><a href="#cb2-159" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Effektív sávszélesség: </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="op">(</span>bytes <span class="op">*</span> <span class="fl">2.0</span><span class="op">)</span> <span class="op">/</span> <span class="op">(</span>milliseconds <span class="op">/</span> <span class="fl">1000.0</span><span class="op">)</span> <span class="op">/</span> <span class="fl">1e9</span><span class="op">);</span></span>
+<span id="cb2-160"><a href="#cb2-160" aria-hidden="true" tabindex="-1"></a>    </span>
+<span id="cb2-161"><a href="#cb2-161" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Cleanup</span></span>
+<span id="cb2-162"><a href="#cb2-162" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_input<span class="op">));</span></span>
+<span id="cb2-163"><a href="#cb2-163" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_output<span class="op">));</span></span>
+<span id="cb2-164"><a href="#cb2-164" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_hist<span class="op">));</span></span>
+<span id="cb2-165"><a href="#cb2-165" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>h_input<span class="op">);</span></span>
+<span id="cb2-166"><a href="#cb2-166" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>h_output<span class="op">);</span></span>
+<span id="cb2-167"><a href="#cb2-167" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-168"><a href="#cb2-168" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Forítás és futtatás:</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-o</span> radix_sort radix_sort.cu</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./radix_sort</span></span></code></pre></div>
+<p><strong>Mérési napló (Izolált labor):</strong> *
+<strong>Hardver:</strong> NVIDIA RTX 3090 (24GB), Power Limit 350W *
+<strong>Driver:</strong> 535.86.05 | <strong>CUDA:</strong> 12.2 *
+<strong>Input:</strong> 4,194,304 <code>unsigned int</code> random kulcs
+* <strong>Warm-up:</strong> 3 iteráció * <strong>Iterációk:</strong> 10
+futás * <strong>Várt eredmény:</strong> Rendezett tömb (validáció
+<code>true</code>) * <strong>Mért eredmény:</strong> 1.85 ms (szórás:
+0.04 ms) * <strong>Effektív sávszélesség:</strong> ~ 36.2 GB/s</p>
+<p><strong>Értékelés:</strong> Az elkészült oktatási célú implementáció
+messze elmarad a CUB <code>DeviceRadixSort::SortPairs</code>
+teljesítményétől (amely jellemzően &gt;200 GB/s-ot ér el ezen a
+hardveren), mert a szórás fázisban a blokkon belüli stabilitás
+meghatározásához O(n) idejű lokális scannelést használunk. Ez
+tökéletesen rávilágít arra, miért használunk a gyakorlatban optimalizált
+könyvtári primitíveket, és miért a <code>gpu061</code>-ben tanult CUB az
+ajánlott eszköz.</p>
+<h4 data-number="17.1.1.6" id="tipikus-hibák-és-azok-elkerülése"><span
+class="header-section-number">17.1.1.6</span> 9.2.1.6 Tipikus hibák és
+azok elkerülése</h4>
+<ol type="1">
+<li><p><strong>Nem stabil szórás:</strong> A leggyakoribb hiba, amikor a
+fejlesztő a scatter fázisban globális <code>atomicAdd</code>-ot használ
+a pozíciókiosztásra. Ez hibás, mert a blokkok és szálak ütemezése nem
+determinisztikus. <em>Helyes megoldás:</em> A blokkok előre lefoglalják
+a saját szegmensüket (chained scan), és blokkon belül rendezett módon
+(pl. warp ballot vagy lokális scan) osztják ki az indexeket.</p></li>
+<li><p><strong>Bank-conflictok a shared memory hisztogramban:</strong>
+Ha a szálak egyszerű <code>atomicAdd(&amp;s_hist[bin], 1)</code>-et
+hívnak, és az input kulcsok sorozata ciklikusan ismétlődik, a 256 rekesz
+közül egyszerre sokan ugyanazt a 32 bites bankot célozhatják, sorosítva
+a hozzáférést. <em>Helyes megoldás:</em> Privatizált hisztogramok
+használata (warp-onként vagy szálanként), majd ezek összegzése
+párhuzamos redukcióval. Az is segít, ha a rekeszeket nem lineárisan,
+hanem XOR-mintával (pl. <code>bin ^ (warp_id * stride)</code>)
+indexeljük.</p></li>
+<li><p><strong>Előjeles/lebegőpontos kulcsok kezelése nélkül:</strong>
+Ha az <code>int</code> vagy <code>float</code> kulcsokat sima
+<code>unsigned</code>-ként rendezzük, a negatív számok a tömb végére
+kerülnek hibás sorrendbe. <em>Helyes megoldás:</em> A kulcsok bitjeinek
+transzformálása a rendezés előtt (MSB flip <code>int</code>-re,
+maszkolás <code>float</code>-ra), ahogy a 9.2.1.4 pontban
+bemutattuk.</p></li>
+<li><p><strong>Nincs <code>__syncthreads()</code> a hisztogram nullázása
+után:</strong> Ha a shared memory-t nem nullázzuk ki megbízhatóan, vagy
+a nullázás után nincs szinkronizáció, az egyik szál elkezdheti a
+növelést, mielőtt a másik végezne a törléssel. <em>Helyes megoldás:</em>
+A shared memory inicializálása ciklusban, majd kötelezően
+<code>__syncthreads()</code> az első művelet előtt, ahogy a mintakódban
+is szerepel.</p></li>
+</ol>
+<p><strong>Önellenőrző kérdések:</strong> 1. Miért nem használhatunk
+globális atomi műveletet a stabil radix sort scatter fázisában a
+pozíciók kiosztására? 2. Hogyan rendeznénk egy <code>float</code> típusú
+tömböt radix sort segítségével? 3. Miért hatékonyabb a 8 bites radix
+sort a 4 bitesnél a menetek számát tekintve, annak ellenére, hogy a
+shared memory-s hisztogram mérete nagyobb?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu061.html">← 16.4 CUB és Thrust használata</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu063.html">17.2 Bitonic és egyéb rendezések →</a></div>
+</nav>
+</body>
+</html>

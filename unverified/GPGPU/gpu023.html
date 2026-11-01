@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>7.2 Shared memory és élettartam – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch06">7 Memóriaterek: global, shared, local, constant és texture</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu022.html">← 7.1 Global memory és allokáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu024.html">7.3 Local, constant és texture memória →</a></div>
+</nav>
+<h2 data-number="7.2" id="gpu023"><span
+class="header-section-number">7.2</span> Shared memory és
+élettartam</h2>
+<p>A shared memory a CUDA memóriahierarchia egyik legnagyobb
+teljesítményt befolyásoló eleme. Míg a global memória a grid összes
+threadje számára elérhető, de nagy késleltetésű, a shared memory
+egyetlen blokk threadjei között osztozik, és a regiszterekhez hasonló
+nagyságrendű, néhány órajelciklusos hozzáférést biztosít. A gyakorlatban
+a shared memory a blokk szintű együttműködés alapja: a thread-ek ide
+gyűjtik be a global memóriából az adott számítási lépéshez szükséges
+adatokat, itt cserélnek részeredményeket, és innen olvassák vissza
+azokat a szomszédos thread-ek által előállított értékeket, amelyekre a
+következő lépésben szükség van. Ebben az alfejezetben a
+<code>__shared__</code> deklaráció formáit, a dinamikus allokációt, a
+szinkronizáció szerepét és a shared memory bankokból fakadó bank
+conflict jelenséget tárgyaljuk, majd egy mátrixszorzó tiling kernelen
+keresztül mutatjuk be a gyakorlati használatot.</p>
+<h3 data-number="7.2.1"
+id="shared__-és-a-shared-memory-élettartama"><span
+class="header-section-number">7.2.1</span> <code>__shared__</code> és a
+shared memory élettartama</h3>
+<p>A shared memory-t a kernelben a <code>__shared__</code> kulcsszóval
+deklaráljuk. A legegyszerűbb forma a statikus méretű tömb:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+__shared__ float tile[32][32];</code></pre>
+<p>Ez a deklaráció minden blokk számára létrehoz egy 32×32 elemű
+lebegőpontos tömböt. A memóriaterület a blokk indulásakor jön létre, és
+a blokk befejeződéséig létezik; a blokk threadjei közösen használják, de
+a blokkok között nincs megosztás. A shared memory fizikailag az SM-en
+belüli gyors memória, általában 64–256 KiB közötti méretű, a GPU
+generációjától és a konfigurációtól függően (például A100 esetén 164
+KiB, de ez ellenőrizendő). A blokk maximális shared memory igényét a
+kernel fordításakor és a launch konfigurációban is meg kell adni,
+illetve a hardver korlátozza.</p>
+<p>A statikus deklaráció mellett létezik dinamikus shared memory is. Ezt
+a kernelben <code>extern __shared__</code> előtaggal jelezzük, a
+tényleges méretet pedig a kernel indításakor a launch konfiguráció
+harmadik paraméterében adjuk meg bájtokban:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+extern __shared__ float s[]; // méretét a launch adja meg
+
+__global__ void kernelDinamikus(float* out, int n) {
+    int tid = threadIdx.x;
+    if (tid &lt; n) {
+        s[tid] = tid * 0.5f;
+        __syncthreads();
+        out[tid] = s[tid] * 2.0f;
+    }
+}</code></pre>
+<p>A kernel indítása:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+size_t sharedBytes = n * sizeof(float);
+kernelDinamikus&lt;&lt;&lt;gridDim, blockDim, sharedBytes, 0&gt;&gt;&gt;(d_out, n);</code></pre>
+<p>Itt a <code>sharedBytes</code> értékét a <code>n</code> elemű float
+tömbhöz igazítjuk. Ha több dinamikus shared tömböt szeretnénk, akkor
+egyetlen <code>extern __shared__</code> tömböt kell deklarálni, és azon
+belül kell pointer-aritmetikával elhelyezni a résztömböket. Például:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+extern __shared__ float s[];
+float* a = s;                 // első rész
+float* b = &amp;s[n];             // második rész</code></pre>
+<p>A dinamikus allokáció előnye, hogy a kernel fordításakor nem kell
+ismerni a pontos méretet, így ugyanaz a bináris többféle blokkmérettel
+is futtatható, feltéve, hogy a shared memória igénye a hardveres
+korláton belül marad. A dinamikus shared memória méretét a
+<code>cudaFuncSetAttribute</code> függvénnyel is megadhatjuk, ha a
+kernel pointerét és a
+<code>cudaFuncAttributeMaxDynamicSharedMemorySize</code> attribútumot
+használjuk, de a launch paraméteres megoldás egyszerűbb és
+elterjedtebb.</p>
+<p>A shared memory láthatósága kizárólag a blokk threadjeire terjed ki.
+A blokkon belül minden thread ugyanazt a memóriaterületet éri el, de az
+írások és olvasások sorrendjét szinkronizálni kell. A shared memory nem
+őrzi meg az értékeket a blokk befejezése után; a következő blokk
+ugyanarra a fizikai területre írhat, ezért a blokkok közötti
+kommunikációra nem használható.</p>
+<h3 data-number="7.2.2"
+id="szinkronizáció-__syncthreads-és-a-veszélyes-feltételes-használat"><span
+class="header-section-number">7.2.2</span> Szinkronizáció:
+<code>__syncthreads()</code> és a veszélyes feltételes használat</h3>
+<p>A shared memory akkor hasznos, ha a thread-ek adatot cserélnek: az
+egyik thread ír, egy másik olvas. Mivel a thread-ek ütemezése nem
+garantált sorrendű, a szinkronizáció elengedhetetlen. A
+<code>__syncthreads()</code> barriere a blokk összes threadjét bevárja:
+minden thread csak akkor lép tovább, ha minden thread elérte ugyanezt a
+hívást. Ez biztosítja, hogy a barrier előtti írások minden thread
+számára láthatóvá válnak a barrier után.</p>
+<p>A tiling kernel tipikus sémája:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+__shared__ float As[TILE][TILE + 1];
+__shared__ float Bs[TILE][TILE + 1];
+
+int tx = threadIdx.x, ty = threadIdx.y;
+// global indexek
+int row = blockIdx.y * TILE + ty;
+int col = blockIdx.x * TILE + tx;
+
+float sum = 0.0f;
+
+for (int t = 0; t &lt; (N + TILE - 1) / TILE; ++t) {
+    // betöltés a global memóriából a shared tömbökbe
+    As[ty][tx] = (row &lt; N &amp;&amp; t * TILE + tx &lt; N) ? A[row * N + t * TILE + tx] : 0.0f;
+    Bs[ty][tx] = (t * TILE + ty &lt; N &amp;&amp; col &lt; N) ? B[(t * TILE + ty) * N + col] : 0.0f;
+
+    __syncthreads(); // minden thread befejezte a betöltést
+
+    // számítás a shared memóriából
+    for (int k = 0; k &lt; TILE; ++k) {
+        sum += As[ty][k] * Bs[k][tx];
+    }
+
+    __syncthreads(); // a következő csempe betöltése előtt mindenki befejezte az olvasást
+}
+
+if (row &lt; N &amp;&amp; col &lt; N) {
+    C[row * N + col] = sum;
+}</code></pre>
+<p>A két <code>__syncthreads()</code> nélkülözhetetlen. Az első
+biztosítja, hogy a teljes csempe betöltése megtörtént, mielőtt bármely
+thread elkezdené a szorzást. A második megakadályozza, hogy egy gyors
+thread a következő iterációban felülírja a shared memóriát, mielőtt a
+lassabb thread-ek befejezték volna az aktuális csempe olvasását. A
+barrier hiánya versenyhelyzetet okoz, ami hibás eredményhez vezet, és a
+hiba nemdeterminisztikusan jelentkezhet.</p>
+<p>Gyakori hiba a <code>__syncthreads()</code> feltételes ágon belüli
+elhelyezése. A következő kód hibás:</p>
+<pre class="cuda"><code>// HIBÁS: a __syncthreads() csak egyes thread-ekre fut le
+if (tx &lt; 16) {
+    // valamilyen részleges munka
+    __syncthreads();
+}</code></pre>
+<p>Mivel a barriernek a blokk összes threadjére ki kell terjednie, a
+feltétel miatt egyes thread-ek soha nem érik el a hívást, a többi pedig
+örökre várakozik – ez holtpontot okoz. A helyes minta az, hogy a
+<code>__syncthreads()</code> hívás a feltételen kívül, a vezérlési
+folyamattól függetlenül szerepeljen. Ha a feltételes munka után minden
+threadnek szinkronizálnia kell, a szinkronizációt a feltétel után kell
+elhelyezni, ügyelve arra, hogy minden thread elérje.</p>
+<h3 data-number="7.2.3" id="bankok-és-bank-conflict"><span
+class="header-section-number">7.2.3</span> Bankok és bank conflict</h3>
+<p>A shared memory hardveres szervezése 32 bankra oszlik (a warp
+méretének megfelelően). Minden bank egy-egy 32 bites szót tárol, és a
+bankok ciklikusan oszlanak meg a memóriacímek között: a 0. cím a 0.
+bankba, az 1. cím az 1. bankba, …, a 31. cím a 31. bankba, a 32. cím
+újra a 0. bankba tartozik, és így tovább. Ha egy warp 32 threadje
+ugyanabban az órajelciklusban ugyanahhoz a bankhoz szeretne hozzáférni,
+de különböző címekre, akkor bank conflict lép fel, és a hozzáférést a
+hardver több lépésben sorosítja. Ez csökkenti a tényleges
+sávszélességet.</p>
+<p>A legegyszerűbb esetben, ha a warp threadjei egyenletesen, stride = 1
+módon érik el a memóriát (például <code>s[threadIdx.x]</code>), minden
+thread más bankba kerül, és nincs conflict. Ha stride = 2, akkor két
+thread osztozik ugyanazon a bankon, így 2-way conflict keletkezik. A
+legrosszabb eset a stride = 32, amikor mind a 32 thread ugyanabba a
+bankba ír vagy olvas, ami 32-way conflictet, azaz teljes sorosítást
+eredményez.</p>
+<p>A bank conflict elkerülésére a leggyakoribb technika a padding, azaz
+a tömb dimenzióinak eggyel való megnövelése. A fenti mátrixszorzó
+példában <code>As[ty][tx]</code> indexelésnél a <code>tx</code> 0..31, a
+<code>ty</code> 0..31, így az <code>As[ty][tx]</code> címek a
+<code>ty * (TILE + 1) + tx</code> képletet követik. Ha a második
+dimenzió <code>TILE + 1</code> (azaz 33), akkor a szomszédos sorok
+kezdőcímei 33-mal térnek el, ami nem osztható 32-vel, így az azonos
+<code>tx</code> indexű elemek különböző bankokba kerülnek. Ezáltal a
+betöltési és olvasási lépések során nincs bank conflict. Ha viszont a
+tömb mérete <code>TILE</code> (azaz 32) lenne, akkor a sorok kezdőcímei
+32-vel térnének el, és minden sor ugyanabba a bankba esne, ami 32-way
+conflictet okozna.</p>
+<p>A bank conflict mérésére a CUDA eszköztárban a
+<code>cuda-memcheck --tool synccheck</code> nem alkalmas, de a Nsight
+Compute profilozó a
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code> és
+hasonló metrikákkal mutatja a shared memória bank conflictjeit. A
+fejezet laborjában ezt a mérést is elvégezzük, de a jelen leírásban csak
+a teljesítménykülönbséget vizsgáljuk.</p>
+<h3 data-number="7.2.4"
+id="gyakorlati-minta-shared-memory-tiling-mátrixszorzással"><span
+class="header-section-number">7.2.4</span> Gyakorlati minta: shared
+memory tiling mátrixszorzással</h3>
+<p>A tiling célja, hogy a global memória ismételt olvasását csökkentsük
+azáltal, hogy az adatokat egyszer betöltjük a gyors shared memóriába, és
+onnan többször felhasználjuk. A mátrixszorzás klasszikus példa: a naiv
+kernel minden kimeneti elemhez a bemeneti mátrixok teljes sorát és
+oszlopát olvassa, ami nagy global memória forgalmat generál. A tilinges
+változat viszont egy TILE×TILE méretű csempét betölt a shared memóriába,
+és a csempén belüli szorzatösszegeket a shared memóriából számolja, így
+minden betöltött elemet TILE-szor használ fel.</p>
+<p>A labor meghatározása szerint a feladat a shared memory tiling
+implementálása. Az alábbiakban bemutatjuk a naiv baseline kernelt, a
+tilinges kernelt, a launch paramétereket és a mérési környezetet. A
+kódok a CUDA C++ (C++17) nyelvet használják, és a hibakezelést a
+<code>cudaGetLastError()</code> és <code>cudaDeviceSynchronize()</code>
+hívásokkal végezzük.</p>
+<p><strong>Naiv kernel (baseline):</strong></p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+__global__ void matmul_naive(const float* A, const float* B, float* C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row &lt; N &amp;&amp; col &lt; N) {
+        float sum = 0.0f;
+        for (int k = 0; k &lt; N; ++k) {
+            sum += A[row * N + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}</code></pre>
+<p><strong>Tilinges kernel:</strong></p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+#define TILE 32
+
+__global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
+    __shared__ float As[TILE][TILE + 1]; // padding a bank conflict ellen
+    __shared__ float Bs[TILE][TILE + 1];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE + ty;
+    int col = blockIdx.x * TILE + tx;
+
+    float sum = 0.0f;
+    int numTiles = (N + TILE - 1) / TILE;
+
+    for (int t = 0; t &lt; numTiles; ++t) {
+        // Betöltés a global memóriából, határellenőrzéssel
+        int aRow = row;
+        int aCol = t * TILE + tx;
+        int bRow = t * TILE + ty;
+        int bCol = col;
+
+        if (aRow &lt; N &amp;&amp; aCol &lt; N)
+            As[ty][tx] = A[aRow * N + aCol];
+        else
+            As[ty][tx] = 0.0f;
+
+        if (bRow &lt; N &amp;&amp; bCol &lt; N)
+            Bs[ty][tx] = B[bRow * N + bCol];
+        else
+            Bs[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        // Számítás a shared memóriából
+        for (int k = 0; k &lt; TILE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row &lt; N &amp;&amp; col &lt; N) {
+        C[row * N + col] = sum;
+    }
+}</code></pre>
+<p>A launch konfiguráció a következő:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), nvcc 12.4 (ellenőrizendő)
+int N = 2048;
+int TILE = 32;
+dim3 block(TILE, TILE);              // 32 x 32 = 1024 thread
+dim3 grid((N + TILE - 1) / TILE, (N + TILE - 1) / TILE); // 64 x 64 blokk
+matmul_tiled&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_A, d_B, d_C, N);
+// shared memória mérete statikus, így a harmadik paraméter 0</code></pre>
+<p>A kernelben a shared memória mérete
+<code>2 * TILE * (TILE + 1) * sizeof(float) = 2 * 32 * 33 * 4 = 8448</code>
+bájt, ami jóval a limit alatt van. A blokk mérete 1024 thread, ami
+maximális a legtöbb architektúrán, de a regiszterhasználat miatt az
+occupancyt ellenőrizni kell.</p>
+<h3 data-number="7.2.5"
+id="labor-shared-memory-tiling-implementálása-és-mérése"><span
+class="header-section-number">7.2.5</span> Labor: shared memory tiling
+implementálása és mérése</h3>
+<p>A labor célja a naiv és a tilinges mátrixszorzó kernel
+összehasonlítása, valamint a shared memory hatásának számszerűsítése. A
+mérési környezet az alábbi helyőrző paraméterekkel rendelkezik, mivel a
+labor izolált környezetben fut, és a megadott hardveradatok nem valós
+rendszerre vonatkoznak:</p>
+<ul>
+<li>GPU: NVIDIA A100 (placeholder, izolált labor)</li>
+<li>Driver: 550.54.15 (placeholder, ellenőrizendő)</li>
+<li>CUDA verzió: 12.4 (ellenőrizendő)</li>
+<li>Compute capability: 8.0</li>
+<li>Operációs rendszer: Ubuntu 22.04 (placeholder)</li>
+<li>Fordító: nvcc 12.4 (ellenőrizendő)</li>
+<li>Optimalizálás: <code>-O3 -arch=sm_80</code></li>
+<li>Bemeneti méret: N = 2048, TILE = 32, float32 (FP32)</li>
+<li>Mérési módszer: warm-up 5 iteráció, majd 10 mérés, átlag és
+szórás</li>
+</ul>
+<p>Build parancs:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> matmul_shared matmul_shared.cu</span></code></pre></div>
+<p>Futtatási parancs:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./matmul_shared</span></span></code></pre></div>
+<p>A mérési napló (a számok helyőrzők, nem valós mérésből származnak; a
+labor szerződés szerinti formátumot illusztrálják):</p>
+<table>
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 30%" />
+<col style="width: 19%" />
+<col style="width: 39%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>kernel</th>
+<th>futásidő átlag (ms)</th>
+<th>szórás (ms)</th>
+<th>memória átbocsátás (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>matmul_naive</td>
+<td>12.30</td>
+<td>0.15</td>
+<td>120</td>
+</tr>
+<tr class="even">
+<td>matmul_tiled</td>
+<td>4.50</td>
+<td>0.08</td>
+<td>330</td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>várt eredmény</strong> az, hogy a tilinges kernel
+jelentősen gyorsabb a naivnál, mert a global memória tranzakciók száma
+körülbelül TILE-szorosára csökken. A naiv kernel minden kimeneti elemhez
+N darab global memória olvasást végez, ami N^3 = 2048^3 ≈ 8,59 milliárd
+float olvasást jelent a teljes mátrixra. A tilinges kernel ezzel szemben
+minden bemeneti elemet TILE-szor (32-szer) tölt be, ami a global memória
+forgalmat durván N^3 / TILE nagyságrendűre csökkenti, így a tilinges
+változat elméletileg akár 32-szer kisebb global memória forgalmat
+bonyolíthat. A gyakorlati gyorsulás ennél kisebb, mert a shared memória
+hozzáférések is időt vesznek igénybe, és a szinkronizáció is overheadet
+jelent. A mérési naplóban szereplő 2,7×-es gyorsulás (12,30 → 4,50 ms)
+reális lehet egy A100-as GPU-n, de a pontos érték erősen függ a memória
+órajeltől, az occupancytől és a bank conflict mértékétől. Fontos, hogy a
+fenti táblázat adatai nem ellenőrzöttek, ezért a labor tényleges
+futtatása során a saját környezetben kell mérni, és a naplót
+rögzíteni.</p>
+<p>A <strong>mért eredmény</strong> a labor során keletkező tényleges
+adat. A fenti táblázatban szereplő számok nem valós mérésből származnak,
+hanem a helyőrző adatok a labor dokumentációjának formátumát mutatják. A
+valós méréshez a kernelt le kell fordítani, izolált laborban futtatni,
+és a <code>cudaDeviceSynchronize()</code> utáni futási időket rögzíteni.
+A mérés előtt a GPU-t fel kell melegíteni (warm-up), hogy az órajel és a
+memória állapota stabilizálódjon. A kapott átlag és szórás alapján lehet
+megítélni a teljesítményt.</p>
+<p>A labor során érdemes a Nsight Compute profilozót is futtatni a
+shared memória bank conflictjeinek ellenőrzésére. A paddinggel ellátott
+kernelnél a bank conflict metrikának nullához közelinek kell lennie, míg
+a padding nélküli változatnál magas 32-way conflictet látunk. A labor
+átadandó eredménye tartalmazza a forráskódot, a build parancsot, a
+futtatási környezet rögzítését, a mérési naplót, valamint a várt és mért
+eredmények összehasonlítását.</p>
+<h3 data-number="7.2.6" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">7.2.6</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A shared memory használata során több gyakori hiba léphet fel. Az
+alábbiakban összefoglaljuk ezeket, és megadjuk a helyes megoldást.</p>
+<ol type="1">
+<li><p><strong>Hiányzó <code>__syncthreads()</code> a tiling
+ciklusban.</strong> Ha a betöltés után nincs szinkronizáció, egyes
+thread-ek még a régi shared memória tartalommal számolnak, mert a többi
+thread még nem fejezte be az írást. Ez hibás eredményhez vezet. A helyes
+minta: minden shared memória írás után, mielőtt bármely thread olvasná
+az adatot, <code>__syncthreads()</code> szükséges, és minden olvasás
+után, mielőtt a következő iterációban felülírnánk, szintén.</p></li>
+<li><p><strong>Feltételes <code>__syncthreads()</code>
+használata.</strong> A korábban említett módon a barrier nem lehet
+feltételhez kötve, mert egyes thread-ek kihagyják, a többiek örökre
+várnak. A helyes megoldás az, hogy a szinkronizációt a feltételes
+blokkon kívülre helyezzük, és ügyelünk arra, hogy minden thread
+ténylegesen elérje.</p></li>
+<li><p><strong>Túl nagy shared memória igény a launch
+konfigurációban.</strong> Ha a kernel statikus vagy dinamikus shared
+memória igénye meghaladja a hardveres limitet, a kernel indítása
+<code>cudaErrorSharedMemoryTooSmall</code> hibával tér vissza. A helyes
+megoldás a shared memória méretének csökkentése, például kisebb csempe
+(TILE) választásával, vagy a dinamikus shared memória méretének a
+rendelkezésre álló kapacitáshoz igazítása.</p></li>
+<li><p><strong>Bank conflict figyelmen kívül hagyása.</strong> A shared
+memória tömbök méretének 32-vel oszthatónak választása (például
+<code>[TILE][TILE]</code>, ahol TILE = 32) 32-way bank conflictet okoz,
+mert minden sor ugyanabba a bankba esik. A helyes megoldás a padding,
+azaz a második dimenzió <code>TILE + 1</code>-re állítása, így a sorok
+kezdőcímei eltolódnak, és a hozzáférések conflictmentessé
+válnak.</p></li>
+<li><p><strong>A shared memória inicializálásának elmulasztása.</strong>
+A shared memória tartalma a blokk indulásakor definiálatlan. Ha a kernel
+a betöltés előtt olvassa, szemét értéket kap. A helyes megoldás az, hogy
+a használat előtt minden szükséges elemet explicit módon betöltünk,
+például a global memóriából, vagy nullázunk.</p></li>
+<li><p><strong>A dinamikus shared memória pointerének hibás kezelése
+több tömb esetén.</strong> Ha több dinamikus tömböt szeretnénk, egyetlen
+<code>extern __shared__</code> deklarációt kell használni, és azon belül
+pointer-aritmetikával kell elhelyezni a részeket. A pointereket a kernel
+elején, a <code>__syncthreads()</code> előtt kell beállítani. A
+helytelen pointer-számítás gyakori hiba.</p></li>
+</ol>
+<p>Ezek a hibák mind a shared memory alapvető tulajdonságaiból fakadnak,
+és a fenti megoldásokkal elkerülhetők. A fejezet laborja során a
+paddinggel ellátott tiling kernel implementálása és a
+<code>__syncthreads()</code> helyes elhelyezése a fő ellenőrzési
+pont.</p>
+<h3 data-number="7.2.7" id="önellenőrző-kérdések"><span
+class="header-section-number">7.2.7</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a statikus és a dinamikus shared memory között?
+Hogyan adjuk meg a dinamikus shared memory méretét a kernel
+indításakor?</li>
+<li>Miért szükséges a <code>__syncthreads()</code> a tiling ciklus
+betöltési és számítási fázisa között? Mi történik, ha elhagyjuk?</li>
+<li>Magyarázza el, mi a bank conflict, és miért okoz
+teljesítményromlást? Hogyan kerülhető el egy 32×32-es shared tömb
+esetén?</li>
+<li>A fenti tilinges mátrixszorzó kernelben miért használunk
+<code>TILE + 1</code> oszlopot a shared tömbökben a <code>TILE</code>
+helyett?</li>
+<li>Hogyan ellenőrizhető a shared memória bank conflictjeinek száma a
+Nsight Compute profilozóval?</li>
+</ol>
+<p>A következő alfejezet (<a href="gpu024.html">Local, constant és
+texture memória</a>) a local, constant és texture memóriatereket
+tárgyalja, és épít az itt bevezetett shared memory fogalmakra, különösen
+a memóriahierarchia kiválasztási szempontjaira. A shared memory a gyors,
+blokkszintű együttműködés alapja, és a későbbi fejezetekben (tiling,
+redukció, stencil) újra előkerül.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu022.html">← 7.1 Global memory és allokáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu024.html">7.3 Local, constant és texture memória →</a></div>
+</nav>
+</body>
+</html>

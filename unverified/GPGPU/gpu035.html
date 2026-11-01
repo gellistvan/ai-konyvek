@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.2 cuda-gdb és kernel-debugging – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch09">10 Hibakezelés, debugging és compute-sanitizer</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu034.html">← 10.1 CUDA-hibakódok és ellenőrzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu036.html">10.3 Compute-sanitizer: memcheck és racecheck →</a></div>
+</nav>
+<h2 data-number="10.2" id="gpu035"><span
+class="header-section-number">10.2</span> cuda-gdb és
+kernel-debugging</h2>
+<p>A GPU-oldali hibakeresés akkor válik szükségessé, amikor a kernel nem
+a várt eredményt adja, vagy a futás közben leáll. A host-oldali
+hibakód-ellenőrzés – amit a <a href="gpu034.html">CUDA-hibakódok és
+ellenőrzés</a> egységben tárgyaltunk – megmondja, hogy a kernel indítása
+vagy a memóriaművelet sikertelen volt-e, de nem ad betekintést abba,
+hogy a kernel <em>belsejében</em> mi történt. A kernel futtatása közben
+a szálak egymástól függetlenül, párhuzamosan hajtódnak végre; a hiba oka
+gyakran az indexszámításban, a memória-hozzáférésben vagy a warpok
+közötti divergens viselkedésben rejlik. Ilyen esetekben a fejlesztőnek
+bele kell látnia az eszköz futási állapotába.</p>
+<p>Erre a célra szolgál a CUDA-GDB, az NVIDIA GPU-oldali debugger
+eszköze, amely a GDB-re épül, és lehetővé teszi a kernel töréspontjainak
+elhelyezését, a változók és regiszterek vizsgálatát, valamint a szálak
+és lane-ek kiválasztását. Ez az egység bemutatja a cuda-gdb alapjait, a
+debug build fogalmát, a kernel-töréspontok és lane-ek kezelését, végül
+egy labor keretében a warp-állapot vizsgálatát gyakoroltatja.</p>
+<hr />
+<h3 data-number="10.2.1"
+id="miért-van-szükség-gpu-oldali-debuggerre"><span
+class="header-section-number">10.2.1</span> 1. Miért van szükség
+GPU-oldali debuggerre?</h3>
+<p>A hagyományos CPU-debugger egy processz futási állapotát vizsgálja: a
+stack, a regiszterek, a memória és a programszámláló egyetlen
+végrehajtási szálhoz tartoznak. A GPU-n azonban több ezer szál fut
+párhuzamosan, és ezeket a hardver 32 elemű warpokba csoportosítja.
+Egyetlen kernelindítás során több száz, akár több ezer warp is aktív
+lehet. A hiba gyakran csak egy adott szálra vagy egy adott indexre
+vonatkozik, például:</p>
+<ul>
+<li>túlindexelés a határellenőrzés hiánya miatt (out-of-bounds),</li>
+<li>helytelen globális indexszámítás (hibás
+<code>blockIdx</code>/<code>threadIdx</code> kombináció),</li>
+<li>versenyhelyzet, amikor több szál ugyanazt a memóriacímet írja,</li>
+<li>a warpok divergens végrehajtása, amikor a feltételes utasítások
+miatt a szálak különböző kódszakaszokat hajtanak végre.</li>
+</ul>
+<p>A cuda-gdb segítségével ezeket a hibákat pontosan lehet lokalizálni,
+mert a debugger a kernel töréspontján megáll, és lekérdezhető az adott
+szál vagy lane állapota.</p>
+<h3 data-number="10.2.2" id="a-cuda-gdb-alapjai"><span
+class="header-section-number">10.2.2</span> 2. A cuda-gdb alapjai</h3>
+<p>A cuda-gdb parancssori felülete a GDB-t terjeszti ki CUDA-specifikus
+parancsokkal. Elindítása ugyanúgy történik, mint a GDB esetében:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cuda-gdb</span> ./prog</span></code></pre></div>
+<p>A debuggerben elérhető fő parancsok a következők:</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Parancs</th>
+<th>Jelentés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>break fájl:sor</code></td>
+<td>Töréspont elhelyezése a megadott forrássorban, akár kernelben
+is</td>
+</tr>
+<tr class="even">
+<td><code>run [args]</code></td>
+<td>A program futtatása a debugger alatt</td>
+</tr>
+<tr class="odd">
+<td><code>continue</code></td>
+<td>Futás a következő töréspontig</td>
+</tr>
+<tr class="even">
+<td><code>next</code></td>
+<td>Következő forrássor végrehajtása (kernelben is)</td>
+</tr>
+<tr class="odd">
+<td><code>step</code></td>
+<td>Belépés a hívott függvénybe</td>
+</tr>
+<tr class="even">
+<td><code>info cuda kernels</code></td>
+<td>A futtatott CUDA-kernelek listája</td>
+</tr>
+<tr class="odd">
+<td><code>info cuda threads</code></td>
+<td>Az aktív szálak és blokkok listája az aktuális kernelben</td>
+</tr>
+<tr class="even">
+<td><code>cuda kernel N</code></td>
+<td>Az N-edik kernel kiválasztása</td>
+</tr>
+<tr class="odd">
+<td><code>cuda thread (x,y,z)</code></td>
+<td>Az aktuális szál kiválasztása a megadott
+<code>threadIdx</code>-szel</td>
+</tr>
+<tr class="even">
+<td><code>cuda block (x,y,z)</code></td>
+<td>Az aktuális blokk kiválasztása</td>
+</tr>
+<tr class="odd">
+<td><code>cuda lane L</code></td>
+<td>Az aktuális lane kiválasztása a warp-on belül</td>
+</tr>
+<tr class="even">
+<td><code>print kifejezés</code></td>
+<td>Az adott szálra vonatkozó változó vagy regiszter kiértékelése</td>
+</tr>
+<tr class="odd">
+<td><code>info registers</code></td>
+<td>A regiszterek tartalmának megjelenítése</td>
+</tr>
+<tr class="even">
+<td><code>info locals</code></td>
+<td>A lokális változók megjelenítése</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>cuda thread</code> parancsban a thread index háromdimenziós.
+Például:</p>
+<pre><code>(cuda-gdb) cuda thread (3, 0, 0)</code></pre>
+<p>Ezután a <code>print</code> és a memória-hozzáférési parancsok erre a
+szálra vonatkoznak. A lane kiválasztása különösen fontos, mert a warp 32
+lane-je együtt hajtódik végre, és a debuggerben egy adott lane
+regiszterállapotát külön is meg lehet vizsgálni.</p>
+<h3 data-number="10.2.3" id="debug-build-és-optimalizáció"><span
+class="header-section-number">10.2.3</span> 3. Debug build és
+optimalizáció</h3>
+<p>Ahhoz, hogy a cuda-gdb értelmes eszköz legyen, a kódot debug módban
+kell fordítani. Az NVCC a következő kapcsolókat biztosítja:</p>
+<ul>
+<li><code>-G</code>: device-side debug info bekapcsolása. Ez a kernel
+kódjába debug szimbólumokat helyez, és lehetővé teszi a töréspontok
+elhelyezését a kernelben.</li>
+<li><code>-g</code>: host-side debug info.</li>
+<li><code>-O0</code>: optimalizáció kikapcsolása. Ez biztosítja, hogy a
+változók nem kerülnek kioptimalizálásra, és a forrássorok közvetlenül
+leképezhetők a gépi kódra.</li>
+</ul>
+<p>Példa debug buildre:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-G</span> <span class="at">-g</span> <span class="at">-O0</span> <span class="at">-o</span> faulty_add faulty_add.cu</span></code></pre></div>
+<p>Fontos tudni, hogy a <code>-G</code> kapcsoló erősen csökkenti a
+futási teljesítményt, és megváltoztathatja a regiszterhasználatot, a
+shared memory layoutot és az occupancyt is. Ezért a debug buildben mért
+futásidő nem reprezentálja a release build teljesítményét. Emiatt a
+teljesítményméréseket mindig optimalizált, <code>-O3</code> vagy
+<code>-O2</code> kapcsolóval készült release buildben kell végezni; a
+debug build csak a helyességi hibák feltárására szolgál.</p>
+<p>Lehetséges köztes megoldás a <code>-lineinfo</code> kapcsoló, amely a
+release buildben is elérhetővé teszi a forrássor-információkat, így a
+töréspontokat a rendszer az optimalizált kódban is be tudja tenni. A
+<code>-lineinfo</code> azonban nem ad teljes debug szimbólumokat, ezért
+a változók és regiszterek vizsgálata korlátozott; a kernelben megállni
+ugyan lehetséges, de a lokális változók esetleg már nem elérhetők.</p>
+<p>A gyakorlatban a következő munkafolyamat javasolt:</p>
+<ol type="1">
+<li>Fejlesztés közben debug build <code>-G -g -O0</code> kapcsolóval,
+amíg a kernel hibás.</li>
+<li>A hiba megtalálása után a kernel átfordítása release módba
+(<code>-O3</code>), és a teljesítmény mérése.</li>
+</ol>
+<h3 data-number="10.2.4" id="kernel-töréspont-elhelyezése"><span
+class="header-section-number">10.2.4</span> 4. Kernel-töréspont
+elhelyezése</h3>
+<p>A töréspontot kernelben ugyanúgy lehet elhelyezni, mint host kódban.
+Például:</p>
+<pre><code>(cuda-gdb) break faulty_add.cu:7</code></pre>
+<p>Itt a <code>faulty_add.cu:7</code> azt jelenti, hogy a kernel hetedik
+sorában szeretnénk megállni. A debugger a kernel indításakor érvényesíti
+a töréspontot, és amikor az adott sort bármelyik szál eléri, a program
+megáll. Alapértelmezés szerint a töréspont az összes szálra vonatkozik;
+ha egy töréspontot egy adott blokkhoz vagy szálhoz szeretnénk kötni, a
+GDB feltételes töréspontjait használhatjuk, például:</p>
+<pre><code>(cuda-gdb) break faulty_add.cu:7 if threadIdx.x == 5</code></pre>
+<p>Ez a feltételes töréspont csak akkor aktiválódik, ha a
+<code>threadIdx.x</code> értéke 5-öt vesz fel. Ez nagyon hasznos, mert a
+kernelben egyszerre több ezer szál fut, és ha minden szál megáll a
+töréspontnál, a debugger túlterheltté válik.</p>
+<p>A töréspont elérése után a <code>info cuda kernels</code> parancs
+megmutatja a futtatott kernel nevét és a grid konfigurációját.
+Például:</p>
+<pre><code>(cuda-gdb) info cuda kernels
+Kernel 0: faulty_add, grid=(1,1,1), block=(32,1,1), device=0</code></pre>
+<p>A <code>info cuda threads</code> parancs listázza az aktuális
+kernelben aktív szálakat. A kimenetben láthatók a blokk- és szálindexek,
+valamint a lane-azonosítók.</p>
+<h3 data-number="10.2.5" id="lane-és-warp-fogalma-a-debuggerben"><span
+class="header-section-number">10.2.5</span> 5. Lane és warp fogalma a
+debuggerben</h3>
+<p>A GPU a szálakat 32 elemű csoportokba, úgynevezett warpokba szervezi.
+A warp minden lane-je ugyanazt az utasítást hajtja végre egyszerre, de
+eltérő adatokon. A cuda-gdb lehetőséget ad arra, hogy egy adott lane-t
+kiválasszunk, és megvizsgáljuk annak regisztereit, lokális változóit.
+Ezt a következő parancspárral tehetjük meg:</p>
+<pre><code>(cuda-gdb) cuda lane 3
+(cuda-gdb) print tid
+$1 = 3</code></pre>
+<p>A <code>cuda lane 3</code> parancs hatására a debugger az aktuális
+warp harmadik lane-jét jelöli ki. Ezután a <code>print</code> parancs a
+<code>tid</code> változót a lane-3 szempontjából értékeli ki. Ha a
+<code>tid</code> értéke különbözik a lane-azonosítótól, az arra utal,
+hogy a <code>threadIdx.x</code> és a lane-azonosító közötti leképezés
+nem triviális, például 2D-s blokk esetén.</p>
+<p>A lane-ek közötti különbség akkor válik fontossá, amikor a warp
+divergens végrehajtást hajt végre. Tekintsük a következő
+kernelrészletet:</p>
+<pre class="cuda"><code>if (threadIdx.x &lt; 16) {
+    total += shared[threadIdx.x];
+} else {
+    total += shared[threadIdx.x - 16];
+}</code></pre>
+<p>Ebben az esetben a warp első 16 lane-je az <code>if</code> ágba lép,
+a másik 16 lane az <code>else</code> ágba. A hardver a két ágat sorban
+hajtja végre, és közben a nem aktív lane-eket letiltja. A debuggerben
+megvizsgálhatjuk, hogy egy adott töréspontnál mely lane-ek aktívak. Ezt
+a <code>info cuda threads</code> parancs kimenete mutatja meg, ahol az
+aktív lane-ek külön jelölve vannak.</p>
+<p>A divergens viselkedés vizsgálatához hasznos a <code>cuda lane</code>
+parancs, mert így kiválaszthatunk egy inaktív lane-t is, és
+ellenőrizhetjük, hogy annak állapota a másik ágnak megfelelően
+alakult-e. Az inaktív lane-ek regiszterei megőrzik az utolsó közös
+utasítás előtti értékeket, így a <code>print</code> parancs megmutatja,
+hogy az adott szál éppen melyik ágon fog továbbhaladni, amikor ismét
+aktívvá válik.</p>
+<h3 data-number="10.2.6"
+id="warp-állapot-vizsgálata-a-gyakorlatban"><span
+class="header-section-number">10.2.6</span> 6. Warp-állapot vizsgálata a
+gyakorlatban</h3>
+<p>A warp-állapot vizsgálata a következő lépésekből áll:</p>
+<ol type="1">
+<li><strong>Töréspont elhelyezése</strong> a kernel kritikus
+sorában.</li>
+<li><strong>Futtatás</strong> a debugger alatt.</li>
+<li>A <code>info cuda kernels</code> paranccsal azonosítjuk a
+kernelt.</li>
+<li>A <code>info cuda threads</code> paranccsal megjelenítjük a
+szálakat.</li>
+<li>Egy konkrét szál vagy lane kiválasztása.</li>
+<li>A <code>print</code> és <code>info registers</code> segítségével
+kiértékeljük az állapotot.</li>
+</ol>
+<p>Példaként vegyünk egy egyszerű vektorösszeadó kernelt, amelyben
+szándékos hibaként nincs határellenőrzés, és a kernel rossz indexet
+olvashat. A kód a következő:</p>
+<pre class="cuda"><code>#include &lt;cstdio&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CHECK(call)                                                        \
+    do {                                                           \
+        cudaError_t err = call;                                    \
+        if (err != cudaSuccess) {                                  \
+            std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;,       \
+                         __FILE__, __LINE__, cudaGetErrorString(err)); \
+            std::exit(1);                                           \
+        }                                                           \
+    } while (0)
+
+__global__ void faulty_add(int *out, const int *in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Hiba: ha i == 0, akkor in[i - 1] érvénytelen.
+    int j = (threadIdx.x == 0 &amp;&amp; blockIdx.x == 0) ? i - 1 : i;
+    if (i &lt; n) {
+        out[i] = in[j] + 1;
+    }
+}
+
+int main() {
+    const int n = 32;
+    int *d_out, *d_in;
+    CHECK(cudaMalloc(&amp;d_out, n * sizeof(int)));
+    CHECK(cudaMalloc(&amp;d_in, n * sizeof(int)));
+    int h_in[n];
+    for (int i = 0; i &lt; n; ++i) h_in[i] = i;
+    CHECK(cudaMemcpy(d_in, h_in, n * sizeof(int), cudaMemcpyHostToDevice));
+
+    faulty_add&lt;&lt;&lt;1, 32&gt;&gt;&gt;(d_out, d_in, n);
+    CHECK(cudaDeviceSynchronize());
+
+    int h_out[n];
+    CHECK(cudaMemcpy(h_out, d_out, n * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int i = 0; i &lt; n; ++i) {
+        if (h_out[i] != h_in[i] + 1) {
+            std::printf(&quot;Mismatch at %d: got %d, expected %d\n&quot;,
+                        i, h_out[i], h_in[i] + 1);
+        }
+    }
+    CHECK(cudaFree(d_out));
+    CHECK(cudaFree(d_in));
+    return 0;
+}</code></pre>
+<p>A kódot debug módban fordítjuk:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-G</span> <span class="at">-g</span> <span class="at">-O0</span> <span class="at">-o</span> faulty_add faulty_add.cu</span></code></pre></div>
+<p>Indítsuk el a debuggerben:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cuda-gdb</span> ./faulty_add</span></code></pre></div>
+<p>Állítsunk be egy töréspontot a kernel hetedik sorában (ahol az
+indexszámítás történik):</p>
+<pre><code>(cuda-gdb) break faulty_add.cu:7
+(cuda-gdb) run</code></pre>
+<p>A program megáll, amikor a kernel eléri a töréspontot. A
+<code>info cuda kernels</code> parancs kimenete:</p>
+<pre><code>(cuda-gdb) info cuda kernels
+Kernel 0: faulty_add, grid=(1,1,1), block=(32,1,1), device=0</code></pre>
+<p>Most nézzük meg az aktív szálakat:</p>
+<pre><code>(cuda-gdb) info cuda threads
+BlockIdx (0,0,0) ThreadIdx (0,0,0) LANE 0
+BlockIdx (0,0,0) ThreadIdx (1,0,0) LANE 1
+...
+BlockIdx (0,0,0) ThreadIdx (31,0,0) LANE 31</code></pre>
+<p>Válasszuk ki a nulladik szálat:</p>
+<pre><code>(cuda-gdb) cuda thread (0,0,0)
+(cuda-gdb) print i
+$1 = 0</code></pre>
+<p>A hiba az <code>in[j]</code> elérésben van, mert
+<code>j = i - 1 = -1</code>. A debuggerben a <code>print j</code>
+megmutatja:</p>
+<pre><code>(cuda-gdb) print j
+$2 = -1</code></pre>
+<p>Ha a szálak közül másokat is megvizsgálunk, például az első
+szálat:</p>
+<pre><code>(cuda-gdb) cuda thread (1,0,0)
+(cuda-gdb) print j
+$3 = 1</code></pre>
+<p>A hiba tehát csak a nulladik szálra jellemző, és a debugger
+segítségével pontosan beazonosítható.</p>
+<h3 data-number="10.2.7"
+id="labor-breakpoint-és-warp-állapot-vizsgálata"><span
+class="header-section-number">10.2.7</span> 7. Labor: breakpoint és
+warp-állapot vizsgálata</h3>
+<p>Ebben a laborban a cuda-gdb segítségével egy hibás kernel debugolását
+végezzük el. A cél a kernel-töréspont elhelyezése, a szálak és lane-ek
+kiválasztása, valamint a regiszterek vizsgálata egy konkrét hibás
+indexnél.</p>
+<p><strong>Környezeti adatok rögzítése</strong> (példaértékek, a valós
+laborban ezeket a saját környezetedben ellenőrizd):</p>
+<ul>
+<li>GPU: NVIDIA GeForce RTX 4070 (példa)</li>
+<li>Compute capability: 8.9</li>
+<li>Driver: 550.54.14 (ellenőrizendő)</li>
+<li>CUDA Toolkit: 12.4</li>
+<li>Fordító: NVCC 12.4</li>
+<li>OS: Ubuntu 22.04</li>
+<li>Debugger: cuda-gdb 12.4</li>
+</ul>
+<p>A mérési naplóban rögzítsd a fenti értékeket, valamint a kernel
+pontos forrását, a build parancsot, a debugger parancsait és a kapott
+kimeneteket.</p>
+<p><strong>Feladat:</strong> A fenti <code>faulty_add</code> kernelben a
+nulladik szál hibás indexet használ. A debuggerrel kell megtalálnunk a
+hibát.</p>
+<p><strong>Lépések:</strong></p>
+<ol type="1">
+<li><p>Fordítsd le a kódot debug módban:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-G</span> <span class="at">-g</span> <span class="at">-O0</span> <span class="at">-o</span> faulty_add faulty_add.cu</span></code></pre></div></li>
+<li><p>Indítsd el a cuda-gdb-t:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cuda-gdb</span> ./faulty_add</span></code></pre></div></li>
+<li><p>Helyezz el töréspontot a kernel kritikus sorában:</p>
+<pre><code>(cuda-gdb) break faulty_add.cu:7</code></pre></li>
+<li><p>Futtasd a programot:</p>
+<pre><code>(cuda-gdb) run</code></pre></li>
+<li><p>Vizsgáld meg a kernel és a szálak listáját:</p>
+<pre><code>(cuda-gdb) info cuda kernels
+(cuda-gdb) info cuda threads</code></pre></li>
+<li><p>Válaszd ki a nulladik szálat, és írasd ki a <code>i</code> és
+<code>j</code> értékét:</p>
+<pre><code>(cuda-gdb) cuda thread (0,0,0)
+(cuda-gdb) print i
+(cuda-gdb) print j</code></pre></li>
+<li><p>Válaszd ki az első szálat, és hasonlítsd össze:</p>
+<pre><code>(cuda-gdb) cuda thread (1,0,0)
+(cuda-gdb) print i
+(cuda-gdb) print j</code></pre></li>
+<li><p>Válaszd ki a lane-3-at (ha a szál-index 3), és nézd meg a
+<code>j</code> értékét:</p>
+<pre><code>(cuda-gdb) cuda lane 3
+(cuda-gdb) print j</code></pre></li>
+</ol>
+<p><strong>Várt eredmény:</strong> A nulladik szálra <code>i = 0</code>,
+<code>j = -1</code>, ami nyilvánvalóan érvénytelen index. Az első szálra
+<code>i = 1</code>, <code>j = 1</code>, ami helyes. A lane-3 esetén
+<code>j = 3</code>. A hiba oka a feltételben a
+<code>threadIdx.x == 0 &amp;&amp; blockIdx.x == 0</code> esetben az
+<code>i - 1</code> kifejezés, amely negatív értéket ad.</p>
+<p><strong>Mért eredmény (példa):</strong> A fenti parancsok valós
+kimenete a következő lehet (a saját környezetedben ettől eltérhet, ezért
+a pontos értékeket rögzíteni kell):</p>
+<pre><code>Breakpoint 1, faulty_add&lt;&lt;&lt;(1,1,1),(32,1,1)&gt;&gt;&gt; (...) at faulty_add.cu:7
+7       int i = blockIdx.x * blockDim.x + threadIdx.x;
+(cuda-gdb) cuda thread (0,0,0)
+[Current CUDA Thread: (0,0,0) (Lane 0)]
+(cuda-gdb) print i
+$1 = 0
+(cuda-gdb) print j
+$2 = -1</code></pre>
+<p>A mért és a várt értékek egyeznek, tehát a diagnózis helyes.</p>
+<p><strong>Megjegyzés:</strong> A labor nem méri a teljesítményt; a
+debug build futási ideje nem releváns. A kernel kimenete a
+<code>cudaDeviceSynchronize</code> és a <code>memcpy</code> után már
+hibás lesz, de a laborban a debuggerrel a hibát a futás közben
+azonosítottuk.</p>
+<h3 data-number="10.2.8" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">10.2.8</span> 8. Tipikus hibák és helyes
+megoldások</h3>
+<p>A cuda-gdb-vel gyakran találkozó hibák:</p>
+<ol type="1">
+<li><p><strong>Out-of-bounds indexelés</strong>: A debuggerben a
+<code>print i</code> vagy <code>print j</code> megmutatja a tényleges
+indexet; ha az kívül esik a memóriaterületen, a hiba forrása azonnal
+látható. A megoldás a határellenőrzés bevezetése, vagy az indexszámítás
+javítása.</p></li>
+<li><p><strong>Hibás grid/block konfiguráció</strong>: A
+<code>info cuda kernels</code> kimenete megmutatja a grid- és
+blockdimenziókat. Ha a kernel csak a tömb egy részét fedi le, vagy túl
+sok szál indul, a debuggerben könnyű észrevenni.</p></li>
+<li><p><strong>Race condition</strong>: Amikor több szál ugyanazt a
+memóriacímet írja, a végeredmény nem determinisztikus. A cuda-gdb nem
+képes automatikusan észlelni a versenyhelyzetet, de a <code>print</code>
+és a <code>info cuda threads</code> segítségével nyomon követhető, hogy
+mely szálak írnak ugyanarra a címre. A következő egységben tárgyalt
+compute-sanitizer pedig hatékonyan detektálja ezeket.</p></li>
+<li><p><strong>Divergens warp viselkedés</strong>: Ha a kernel
+feltételes ugrást tartalmaz, a debuggerben az
+<code>info cuda threads</code> megmutatja, mely szálak aktívak az adott
+ponton. A hiba gyakran abból ered, hogy a fejlesztő nem veszi
+figyelembe, hogy a warp mindkét ágat sorban hajtja végre, ami nem
+szándékos eredményhez vezet.</p></li>
+</ol>
+<p>A fenti hibák mindegyike a debugger segítségével gyorsan
+azonosítható, ha a töréspontot jól választjuk meg. A legfontosabb
+tanács: <strong>ne az egész kernelre helyezzünk töréspontot, hanem a
+kritikus indexszámításra vagy a memória-hozzáférésre</strong>.</p>
+<h3 data-number="10.2.9"
+id="korlátok-és-átvezetés-a-következő-egységre"><span
+class="header-section-number">10.2.9</span> 9. Korlátok és átvezetés a
+következő egységre</h3>
+<p>A cuda-gdb hatékony, de nem csodaszer. Néhány korlát:</p>
+<ul>
+<li>A debug build jelentősen megváltoztatja a kernel viselkedését:
+nagyobb regiszterhasználat, alacsonyabb occupancy, eltérő optimalizáció.
+Ezért a debugban észlelt jelenségek nem feltétlenül jelennek meg release
+buildben, és fordítva.</li>
+<li>A hardveres töréspontok száma korlátozott; nagyon sok töréspont
+esetén a debugger szoftveres megoldásra vált, ami lassú lehet.</li>
+<li>A lane-ek közötti interakciók, például a shuffle műveletek
+vizsgálata bonyolult, mert a debugger a kiválasztott lane-t mutatja, de
+a warp többi tagjának állapotát nehezebb nyomon követni.</li>
+<li>A shared memory és a regiszterek értékei a debug megállásakor
+módosulhatnak, ezért a kapott értékeket óvatosan kell kezelni.</li>
+</ul>
+<p>A cuda-gdb azonban az elsőszámú eszköz a kernel futás közbeni
+hibáinak feltárására. Amikor a hibát sikerült reprodukálni, a következő
+lépés gyakran a memóriahibák és a versenyhelyzetek automatikus keresése.
+Ezt a compute-sanitizer eszköz végzi el, amelyet a következő egységben
+(<a href="gpu036.html">Compute-sanitizer: memcheck és racecheck</a>)
+mutatunk be. A debuggerrel szerzett tapasztalat – a szálak, lane-ek és
+warpok állapotának értelmezése – közvetlenül hasznosul a
+memória-ellenőrző eszköz kimenetének megértéséhez is.</p>
+<hr />
+<h3 data-number="10.2.10" id="önellenőrző-kérdések"><span
+class="header-section-number">10.2.10</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a <code>-G</code> és a <code>-lineinfo</code>
+kapcsoló között a CUDA-fordítóban?</li>
+<li>Hogyan választasz ki egy adott lane-t a cuda-gdb-ben, és miért
+fontos ez a divergens warpok vizsgálatakor?</li>
+<li>Miért nem szabad a debug buildben mért futási időt
+teljesítménymutaszként használni?</li>
+</ol>
+<p>A kérdésekre adott válaszok segítenek ellenőrizni, hogy a
+kernel-debugging alapfogalmait elsajátítottad-e. A következő egységben a
+compute-sanitizer memória- és versenyhelyzet-ellenőrző képességeire
+térünk át.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu034.html">← 10.1 CUDA-hibakódok és ellenőrzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu036.html">10.3 Compute-sanitizer: memcheck és racecheck →</a></div>
+</nav>
+</body>
+</html>

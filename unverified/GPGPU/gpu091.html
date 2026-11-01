@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>24.2 Convolution kernelek – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch23">24 Deep learning kernelek: GEMM, conv és attention</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu090.html">← 24.1 GEMM és a deep learning</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu092.html">24.3 Attention kernelek →</a></div>
+</nav>
+<h2 data-number="24.2" id="gpu091"><span
+class="header-section-number">24.2</span> Convolution kernelek</h2>
+<p>A konvolúciós réteg a mélytanulási hálózatok egyik legnagyobb
+számítási igényű komponense. A GPU-kon két fő megközelítés terjedt el: a
+konvolúciót vagy közvetlenül, dedikált kernelben számítjuk, vagy
+visszavezetjük egy általános mátrixszorzásra (GEMM). Ez a szakasz a két
+utat, az im2col és az implicit GEMM technikát, valamint a csatorna- és
+tile-kezelést tárgyalja. A korábbi fejezet (<a href="gpu090.html">GEMM
+és a deep learning</a>) bevezette a GEMM optimalizálását; itt azt
+használjuk ki, hogy a konvolúció nagy része GEMM-mé alakítható, de a
+közvetlen kernel is nélkülözhetetlen, ha a memória- vagy számítási
+mintázat ezt indokolja.</p>
+<h3 data-number="24.2.1"
+id="a-konvolúció-definíciója-és-dimenziói"><span
+class="header-section-number">24.2.1</span> A konvolúció definíciója és
+dimenziói</h3>
+<p>Legyen a bemeneti tenzor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>X</mi><annotation encoding="application/x-tex">X</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>C</mi><mo>×</mo><mi>H</mi><mo>×</mo><mi>W</mi></mrow><annotation encoding="application/x-tex">N \times C \times H \times W</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+a batch,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+a bemeneti csatornák,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mo>,</mo><mi>W</mi></mrow><annotation encoding="application/x-tex">H,W</annotation></semantics></math>
+a térbeli dimenziók. A szűrő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>W</mi><mi>f</mi></msub><annotation encoding="application/x-tex">W_f</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>C</mi><mo>×</mo><mi>R</mi><mo>×</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">K \times C \times R \times S</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+a kimeneti csatornák,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>,</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">R,S</annotation></semantics></math>
+a szűrő magassága és szélessége. A kimeneti tenzor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Y</mi><annotation encoding="application/x-tex">Y</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>K</mi><mo>×</mo><mi>P</mi><mo>×</mo><mi>Q</mi></mrow><annotation encoding="application/x-tex">N \times K \times P \times Q</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mo>,</mo><mi>Q</mi></mrow><annotation encoding="application/x-tex">P,Q</annotation></semantics></math>
+a kimeneti magasság és szélesség. A kimeneti elem számítása:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>n</mi><mo>,</mo><mi>k</mi><mo>,</mo><mi>p</mi><mo>,</mo><mi>q</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>=</mo><munderover><mo>∑</mo><mrow><mi>c</mi><mo>=</mo><mn>0</mn></mrow><mrow><mi>C</mi><mo>−</mo><mn>1</mn></mrow></munderover><munderover><mo>∑</mo><mrow><mi>r</mi><mo>=</mo><mn>0</mn></mrow><mrow><mi>R</mi><mo>−</mo><mn>1</mn></mrow></munderover><munderover><mo>∑</mo><mrow><mi>s</mi><mo>=</mo><mn>0</mn></mrow><mrow><mi>S</mi><mo>−</mo><mn>1</mn></mrow></munderover><mi>x</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>n</mi><mo>,</mo><mi>c</mi><mo>,</mo><mi>p</mi><mo>⋅</mo><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">d</mi><mi mathvariant="normal">e</mi></mrow><mo>−</mo><mrow><mi mathvariant="normal">p</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">d</mi></mrow><mo>+</mo><mi>r</mi><mo>,</mo><mspace width="0.278em"></mspace><mi>q</mi><mo>⋅</mo><mrow><mi mathvariant="normal">s</mi><mi mathvariant="normal">t</mi><mi mathvariant="normal">r</mi><mi mathvariant="normal">i</mi><mi mathvariant="normal">d</mi><mi mathvariant="normal">e</mi></mrow><mo>−</mo><mrow><mi mathvariant="normal">p</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">d</mi></mrow><mo>+</mo><mi>s</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>⋅</mo><mi>w</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>k</mi><mo>,</mo><mi>c</mi><mo>,</mo><mi>r</mi><mo>,</mo><mi>s</mi><mo stretchy="true" form="postfix">]</mo></mrow><mo>+</mo><mi>b</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>k</mi><mo stretchy="true" form="postfix">]</mo></mrow></mrow><annotation encoding="application/x-tex">
+y[n,k,p,q] = \sum_{c=0}^{C-1}\sum_{r=0}^{R-1}\sum_{s=0}^{S-1}
+x[n,c, p\cdot \mathrm{stride} - \mathrm{pad} + r,\; q\cdot \mathrm{stride} - \mathrm{pad} + s]
+\cdot w[k,c,r,s] + b[k]
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>b</mi><mrow><mo stretchy="true" form="prefix">[</mo><mi>k</mi><mo stretchy="true" form="postfix">]</mo></mrow></mrow><annotation encoding="application/x-tex">b[k]</annotation></semantics></math>
+a bias, a padding és stride paraméterek pedig a határkezelést és a
+lépésközt szabályozzák. A képletben a bemeneti indexek negatívak vagy
+túl nagyok lehetnek, ilyenkor az értéket nullának tekintjük (zero
+padding), vagy más határkezelést alkalmazunk (reflect, replicate). A
+gyakorlatban a legtöbb CNN-réteg stride=1, pad=1, 3×3-as szűrőt használ,
+így a kimenet mérete megegyezik a bemenettel.</p>
+<p>A számítási igény: minden kimeneti elemhez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>⋅</mo><mi>R</mi><mo>⋅</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">C \cdot R \cdot S</annotation></semantics></math>
+szorzás-összeadás tartozik, így a teljes FLOP mennyiség
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>⋅</mo><mi>K</mi><mo>⋅</mo><mi>P</mi><mo>⋅</mo><mi>Q</mi><mo>⋅</mo><mi>C</mi><mo>⋅</mo><mi>R</mi><mo>⋅</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">N \cdot K \cdot P \cdot Q \cdot C \cdot R \cdot S</annotation></semantics></math>.
+Egy tipikus rétegben ez milliárd nagyságrendű lehet, ezért a
+memóriahasználat és az adatmozgatás optimalizálása döntő.</p>
+<h3 data-number="24.2.2"
+id="a-konvolúció-mint-gemm-im2col-és-implicit-gemm"><span
+class="header-section-number">24.2.2</span> A konvolúció mint GEMM:
+im2col és implicit GEMM</h3>
+<p>A GEMM-alapú megközelítés lényege, hogy a konvolúciót egy
+mátrixszorzássá alakítjuk. Ehhez a bemeneti tenzort egy kétdimenziós
+mátrixba rendezzük, a szűrőt pedig egy másik mátrixba.</p>
+<h3 data-number="24.2.3" id="im2col"><span
+class="header-section-number">24.2.3</span> im2col</h3>
+<p>Az im2col eljárás minden kimeneti pixelhez kiválasztja a bemeneti
+tenzor azon elemeit, amelyek a szűrővel szorozódnak, és ezeket egy sorba
+rendezi. Az így kapott
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mspace width="-0.167em"></mspace><mi>P</mi><mspace width="-0.167em"></mspace><mi>Q</mi><mo>×</mo><mi>C</mi><mspace width="-0.167em"></mspace><mi>R</mi><mspace width="-0.167em"></mspace><mi>S</mi></mrow><annotation encoding="application/x-tex">N\!P\!Q \times C\!R\!S</annotation></semantics></math>,
+ahol minden sor egy kimeneti pixel bemeneti ablakának lineáris
+kiterítése. A szűrőből képzett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrix mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mspace width="-0.167em"></mspace><mi>R</mi><mspace width="-0.167em"></mspace><mi>S</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">C\!R\!S \times K</annotation></semantics></math>,
+mert minden kimeneti csatornához tartozik egy oszlop, amely a szűrő
+összes súlyát tartalmazza. Ekkor a konvolúció:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>Y</mi><mo>=</mo><mi>A</mi><mo>⋅</mo><mi>B</mi><mo>+</mo><mi>b</mi></mrow><annotation encoding="application/x-tex">
+Y = A \cdot B + b
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Y</mi><annotation encoding="application/x-tex">Y</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mspace width="-0.167em"></mspace><mi>P</mi><mspace width="-0.167em"></mspace><mi>Q</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">N\!P\!Q \times K</annotation></semantics></math>.
+Ezután a GEMM kernel (például a <a href="gpu090.html">GEMM és a deep
+learning</a> alfejezetben tárgyalt tiling és shared memory
+optimalizálással) közvetlenül alkalmazható.</p>
+<p>Az im2col előnye, hogy a jól optimalizált GEMM kernel
+újrahasznosítható, és a konvolúciót pusztán mátrixszorzásként
+kezelhetjük. Hátránya viszont a jelentős memória overhead: az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>⋅</mo><mi>R</mi><mo>⋅</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">C\cdot R\cdot S</annotation></semantics></math>-szeresére
+növeli a bemeneti adatmennyiséget, és ez a másolat a globális memóriában
+tárolandó. Egy 3×3-as, 64 bemeneti csatornás rétegnél ez 576-szoros
+adatduplikációt jelent. Ez nagy memóriát és sávszélességet fogyaszt,
+ezért a gyakorlatban gyakran kerülik a tényleges materializálást.</p>
+<h3 data-number="24.2.4" id="implicit-gemm"><span
+class="header-section-number">24.2.4</span> Implicit GEMM</h3>
+<p>Az implicit GEMM elkerüli az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix fizikai létrehozását. A GEMM kernel indexelését módosítjuk úgy,
+hogy az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix elemeit menet közben, a bemeneti tenzorból számolja ki. A GEMM
+tiling és a shared memory használata megmarad, de a betöltéskor az
+eredeti bemeneti tenzorból olvasunk, a szükséges indexeket a konvolúciós
+paraméterekből számítva. Az implicit GEMM tehát a GEMM kernel számítási
+magját használja, de a memória-hozzáférést a konvolúcióra
+optimalizálja.</p>
+<p>A CUTLASS könyvtár például implicit GEMM-et használ a konvolúciós
+rétegekhez. A kernelben a GEMM
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>M</mi><annotation encoding="application/x-tex">M</annotation></semantics></math>
+dimenziója a batch és a kimeneti pixelek száma
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>⋅</mo><mi>P</mi><mo>⋅</mo><mi>Q</mi></mrow><annotation encoding="application/x-tex">N \cdot P \cdot Q</annotation></semantics></math>),
+az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+dimenzió a kimeneti csatornák száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>,
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+dimenzió pedig a bemeneti csatornák és a szűrőterület szorzata
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>⋅</mo><mi>R</mi><mo>⋅</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">C \cdot R \cdot S</annotation></semantics></math>.
+A tiling a GEMM szabályai szerint történik, de az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix betöltésekor az indexeket a bemeneti tenzorból számítjuk.</p>
+<h3 data-number="24.2.5" id="közvetlen-convolution-kernel"><span
+class="header-section-number">24.2.5</span> Közvetlen convolution
+kernel</h3>
+<p>A közvetlen kernelben nem alakítjuk GEMM-re, hanem minden szál
+közvetlenül a konvolúciós összeget számolja. A legegyszerűbb változatban
+minden szál egy kimeneti elemet állít elő, és bejárja a bemeneti
+csatornákat, a szűrőt. Az alábbi CUDA C++ kód ezt mutatja be:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), naiv conv2d kernel</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Feltételezés: stride=1, pad=1, zero padding</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> conv2d_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>                              <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> w<span class="op">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> N<span class="op">,</span> <span class="dt">int</span> C<span class="op">,</span> <span class="dt">int</span> H<span class="op">,</span> <span class="dt">int</span> W<span class="op">,</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> K<span class="op">,</span> <span class="dt">int</span> R<span class="op">,</span> <span class="dt">int</span> S<span class="op">,</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> P<span class="op">,</span> <span class="dt">int</span> Q<span class="op">,</span> <span class="dt">int</span> pad<span class="op">,</span> <span class="dt">int</span> stride<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> total <span class="op">=</span> N <span class="op">*</span> K <span class="op">*</span> P <span class="op">*</span> Q<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> total<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> q <span class="op">=</span> idx <span class="op">%</span> Q<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> p <span class="op">=</span> <span class="op">(</span>idx <span class="op">/</span> Q<span class="op">)</span> <span class="op">%</span> P<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> k <span class="op">=</span> <span class="op">(</span>idx <span class="op">/</span> <span class="op">(</span>Q <span class="op">*</span> P<span class="op">))</span> <span class="op">%</span> K<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n <span class="op">=</span> idx <span class="op">/</span> <span class="op">(</span>Q <span class="op">*</span> P <span class="op">*</span> K<span class="op">);</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> c <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> c <span class="op">&lt;</span> C<span class="op">;</span> <span class="op">++</span>c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> r <span class="op">&lt;</span> R<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> h <span class="op">=</span> p <span class="op">*</span> stride <span class="op">-</span> pad <span class="op">+</span> r<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&lt;</span> S<span class="op">;</span> <span class="op">++</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>                <span class="dt">int</span> w_in <span class="op">=</span> q <span class="op">*</span> stride <span class="op">-</span> pad <span class="op">+</span> s<span class="op">;</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>h <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> h <span class="op">&lt;</span> H <span class="op">&amp;&amp;</span> w_in <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> w_in <span class="op">&lt;</span> W<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>                    acc <span class="op">+=</span> x<span class="op">[((</span>n <span class="op">*</span> C <span class="op">+</span> c<span class="op">)</span> <span class="op">*</span> H <span class="op">+</span> h<span class="op">)</span> <span class="op">*</span> W <span class="op">+</span> w_in<span class="op">]</span> <span class="op">*</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>                           w<span class="op">[((</span>k <span class="op">*</span> C <span class="op">+</span> c<span class="op">)</span> <span class="op">*</span> R <span class="op">+</span> r<span class="op">)</span> <span class="op">*</span> S <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    y<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> acc<span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel a szálak lineáris indexét osztja fel a kimeneti dimenziókra.
+A memória-hozzáférés azonban nem optimális. A szomszédos szálak
+(szomszédos
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+értékek) a bemenet különböző ablakait olvassák, amelyek átfednek ugyan,
+de a hozzáférés nem folytonos, így a globális memória tranzakciók nem
+coalescingek. Ráadásul minden szál újraolvassa a szűrőt, ami bár kicsi,
+de a gyorsítótáron kívül eshet.</p>
+<p>A közvetlen kernel tipikus hibái:</p>
+<ul>
+<li><strong>Határkezelés elmaradása</strong>: ha a padding miatt negatív
+vagy túl nagy index keletkezik, a memória-hozzáférés érvénytelen. A
+fenti kódban az <code>if</code> feltétel véd, de ez divergenciát okoz a
+warpban, ha a szálak különböző határhelyzetben vannak.</li>
+<li><strong>Uncoalesced hozzáférés</strong>: a bemeneti tenzor
+indexelése nem folytonos, mert a szálak a kimeneti térben szomszédosak,
+de a bemeneti ablakok eltolódnak. Ez a globális memória sávszélesség
+kihasználatlanságához vezet.</li>
+<li><strong>Szűrő ismételt betöltése</strong>: minden szál a teljes
+szűrőt olvassa, ami redundáns globális memória forgalmat okoz. Bár a
+szűrő kicsi, nagy batch és kimeneti csatorna esetén a forgalom jelentős
+lehet.</li>
+<li><strong>Divergencia a határokon</strong>: a padding és a szélek
+miatt az <code>if</code> feltétel warp-divergenciát okoz, ami csökkenti
+a kihasználtságot.</li>
+</ul>
+<h3 data-number="24.2.6" id="csatorna-és-tile"><span
+class="header-section-number">24.2.6</span> Csatorna és tile</h3>
+<p>A konvolúció teljesítményét alapvetően a csatornák kezelése és a
+tile-ok határozzák meg. A bemeneti csatornák száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+gyakran 64, 128 vagy akár 512, a kimeneti csatornák száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+hasonló nagyságrendű. A számítási hurokban a csatornák feletti összegzés
+a legbelső ciklus, ezért a csatorna dimenzió optimalizálása
+kulcsfontosságú.</p>
+<h3 data-number="24.2.7" id="csatorna-loop-és-csatorna-tiling"><span
+class="header-section-number">24.2.7</span> Csatorna-loop és
+csatorna-tiling</h3>
+<p>A naiv kernelben a csatorna loop a legbelső, minden szál a teljes
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+csatornát bejárja. Ez azt jelenti, hogy a szálak újra és újra
+ugyanazokat a bemeneti csatornákat olvassák, de mivel a szomszédos
+kimeneti pixelekhez ugyanazokra a bemeneti csatornákra van szükség, a
+hozzáférés redundáns. A shared memory tiling ezt úgy oldja meg, hogy egy
+blokk egy kimeneti tile-t számol, és a bemeneti csatornák egy-egy
+csoportját közösen tölti be a shared memoryba. A csatornákat kifelé
+visszük, és a szűrő megfelelő részét is a shared memoryba tesszük. Így a
+globális memória forgalom a csatornák számával osztódik, mert minden
+bemeneti elemet csak egyszer olvasunk be a blokk számára.</p>
+<h3 data-number="24.2.8" id="bemeneti-tile-és-halo"><span
+class="header-section-number">24.2.8</span> Bemeneti tile és halo</h3>
+<p>A kimeneti tile
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mi>H</mi></msub><mo>×</mo><msub><mi>T</mi><mi>W</mi></msub></mrow><annotation encoding="application/x-tex">T_H \times T_W</annotation></semantics></math>
+pixelből áll. A hozzá tartozó bemeneti ablak mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>H</mi></msub><mo>+</mo><mi>R</mi><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>×</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>W</mi></msub><mo>+</mo><mi>S</mi><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">(T_H + R - 1) \times (T_W + S - 1)</annotation></semantics></math>,
+ha stride=1. Ezt a bemeneti tile-t kell a shared memoryba tölteni. A
+halo a szűrő méretéből adódó átfedés: a szomszédos kimeneti pixelek
+bemeneti ablakai átfednek, ezért a tile szélein a szomszédos blokkok
+bemeneti elemeit is be kell tölteni. A halo mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">⌊</mo><mi>R</mi><mi>/</mi><mn>2</mn><mo stretchy="false" form="postfix">⌋</mo></mrow><annotation encoding="application/x-tex">\lfloor R/2 \rfloor</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">⌊</mo><mi>S</mi><mi>/</mi><mn>2</mn><mo stretchy="false" form="postfix">⌋</mo></mrow><annotation encoding="application/x-tex">\lfloor S/2 \rfloor</annotation></semantics></math>
+mindkét oldalon. A shared memory mérete tehát
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>H</mi></msub><mo>+</mo><mn>2</mn><mo>⋅</mo><mo stretchy="false" form="prefix">⌊</mo><mi>R</mi><mi>/</mi><mn>2</mn><mo stretchy="false" form="postfix">⌋</mo><mo stretchy="true" form="postfix">)</mo></mrow><mo>×</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>T</mi><mi>W</mi></msub><mo>+</mo><mn>2</mn><mo>⋅</mo><mo stretchy="false" form="prefix">⌊</mo><mi>S</mi><mi>/</mi><mn>2</mn><mo stretchy="false" form="postfix">⌋</mo><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">(T_H + 2 \cdot \lfloor R/2 \rfloor) \times (T_W + 2 \cdot \lfloor S/2 \rfloor)</annotation></semantics></math>
+(ha a csatornák egyelőre egyesével töltődnek).</p>
+<p>A betöltés során a szálak a bemeneti tenzorból olvasnak. Fontos, hogy
+a hozzáférés coalescing legyen: a szálak úgy legyenek kiosztva, hogy a
+szomszédos szálak a bemeneti tenzor szomszédos elemeit olvassák. Ez
+általában úgy érhető el, ha a betöltő ciklusban a szálak lineáris
+indexét a bemeneti tile lineáris memóriájára képezzük, nem pedig a
+kimeneti pixelekre.</p>
+<h3 data-number="24.2.9" id="szűrő-tiling"><span
+class="header-section-number">24.2.9</span> Szűrő tiling</h3>
+<p>A szűrőt is érdemes a shared memoryba tölteni, mert minden szál
+ugyanazt a szűrőt használja. A szűrő mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>C</mi><mo>×</mo><mi>R</mi><mo>×</mo><mi>S</mi></mrow><annotation encoding="application/x-tex">K \times C \times R \times S</annotation></semantics></math>,
+ami nagy lehet. A gyakorlatban a szűrőt a csatorna-tilinggel együtt
+kezelik: egy blokk a szűrő egy szeletét (például egy kimeneti
+csatornához tartozó összes súlyt, vagy annak egy részét) tölti be, és a
+kimeneti csatornák egy részét számolja. Ez csökkenti a shared memory
+igényt és lehetővé teszi a csatorna-loop kifelé vitelét.</p>
+<h3 data-number="24.2.10" id="bank-conflict-elkerülése"><span
+class="header-section-number">24.2.10</span> Bank conflict
+elkerülése</h3>
+<p>A shared memoryba való betöltéskor és onnan való olvasáskor ügyelni
+kell a bank конфликтokra. A bemeneti tile-t gyakran úgy rendezik, hogy a
+szélesség paddinget kap, például 32+1 oszloppal, hogy a szomszédos
+szálak ne ugyanabba a bankba írjanak. A szűrő esetében a súlyok lineáris
+elrendezése általában nem okoz konfliktust, mert az olvasás minta
+egyszerű.</p>
+<h3 data-number="24.2.11"
+id="gyakorlati-cuda-implementáció-közvetlen-kernel-shared-memory-tiling"><span
+class="header-section-number">24.2.11</span> Gyakorlati CUDA
+implementáció: közvetlen kernel shared memory tiling</h3>
+<p>Az alábbiakban egy egyszerűsített, de működő tiled conv2d kernelt
+mutatunk be. A példa a labor alapját képezi, ezért a feltételezések:
+batch=1, bemeneti csatorna
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">C=1</annotation></semantics></math>,
+kimeneti csatorna
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>=</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">K=1</annotation></semantics></math>,
+szűrő 3×3, stride=1, pad=1. A bemenet mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mo>×</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">32 \times 32</annotation></semantics></math>,
+a kimenet
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mo>×</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">32 \times 32</annotation></semantics></math>.
+Ez a minimalista eset jól mutatja a tiling előnyeit anélkül, hogy a
+csatorna-loop bonyolítaná a kódot. A valós alkalmazásokban a csatornák
+száma nagyobb, és a kernel bővíthető, de az alapelvek ugyanazok.</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), conv2d shared memory tiling</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Feltételezés: C=1, K=1, R=S=3, stride=1, pad=1, batch=1</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_H </span><span class="dv">16</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_W </span><span class="dv">16</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define R </span><span class="dv">3</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define S </span><span class="dv">3</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibakezelő makró (a laborban kötelező)</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                    </span><span class="op">\</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                 </span><span class="op">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="pp">                  </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; (&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;)&quot;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">                  </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                   </span><span class="op">\</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                         </span><span class="op">\</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> conv2d_tiled<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>                              <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> w<span class="op">,</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> H<span class="op">,</span> <span class="dt">int</span> W<span class="op">,</span> <span class="dt">int</span> P<span class="op">,</span> <span class="dt">int</span> Q<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Tegyük fel, hogy P=H, Q=W (same padding)</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> smem<span class="op">[</span>TILE_H <span class="op">+</span> <span class="dv">2</span><span class="op">][</span>TILE_W <span class="op">+</span> <span class="dv">2</span><span class="op">];</span> <span class="co">// bemeneti tile + halo</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Szűrő súlyait regiszterben tartjuk (mert kicsi)</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> w0 <span class="op">=</span> w<span class="op">[</span><span class="dv">0</span><span class="op">],</span> w1 <span class="op">=</span> w<span class="op">[</span><span class="dv">1</span><span class="op">],</span> w2 <span class="op">=</span> w<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> w3 <span class="op">=</span> w<span class="op">[</span><span class="dv">3</span><span class="op">],</span> w4 <span class="op">=</span> w<span class="op">[</span><span class="dv">4</span><span class="op">],</span> w5 <span class="op">=</span> w<span class="op">[</span><span class="dv">5</span><span class="op">];</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> w6 <span class="op">=</span> w<span class="op">[</span><span class="dv">6</span><span class="op">],</span> w7 <span class="op">=</span> w<span class="op">[</span><span class="dv">7</span><span class="op">],</span> w8 <span class="op">=</span> w<span class="op">[</span><span class="dv">8</span><span class="op">];</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tx <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> ty <span class="op">=</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> out_x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_W <span class="op">+</span> tx<span class="op">;</span>   <span class="co">// kimeneti x koordináta</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> out_y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_H <span class="op">+</span> ty<span class="op">;</span>   <span class="co">// kimeneti y koordináta</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemeneti tile betöltése a shared memoryba</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A tile mérete (TILE_H+2) x (TILE_W+2)</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> smem_idx <span class="op">=</span> ty <span class="op">*</span> <span class="op">(</span>TILE_W <span class="op">+</span> <span class="dv">2</span><span class="op">)</span> <span class="op">+</span> tx<span class="op">;</span>  <span class="co">// lineáris index a betöltéshez</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> total_smem <span class="op">=</span> <span class="op">(</span>TILE_H <span class="op">+</span> <span class="dv">2</span><span class="op">)</span> <span class="op">*</span> <span class="op">(</span>TILE_W <span class="op">+</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> smem_idx<span class="op">;</span> i <span class="op">&lt;</span> total_smem<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>y<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> smem_y <span class="op">=</span> i <span class="op">/</span> <span class="op">(</span>TILE_W <span class="op">+</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> smem_x <span class="op">=</span> i <span class="op">%</span> <span class="op">(</span>TILE_W <span class="op">+</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> glob_y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_H <span class="op">-</span> <span class="dv">1</span> <span class="op">+</span> smem_y<span class="op">;</span> <span class="co">// -1 a halo miatt</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> glob_x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_W <span class="op">-</span> <span class="dv">1</span> <span class="op">+</span> smem_x<span class="op">;</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>glob_y <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> glob_y <span class="op">&lt;</span> H <span class="op">&amp;&amp;</span> glob_x <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> glob_x <span class="op">&lt;</span> W<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>            smem<span class="op">[</span>smem_y<span class="op">][</span>smem_x<span class="op">]</span> <span class="op">=</span> x<span class="op">[</span>glob_y <span class="op">*</span> W <span class="op">+</span> glob_x<span class="op">];</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>            smem<span class="op">[</span>smem_y<span class="op">][</span>smem_x<span class="op">]</span> <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span> <span class="co">// zero padding</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>out_x <span class="op">&lt;</span> Q <span class="op">&amp;&amp;</span> out_y <span class="op">&lt;</span> P<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> r <span class="op">&lt;</span> R<span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&lt;</span> S<span class="op">;</span> <span class="op">++</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>                <span class="co">// A bemeneti tile-ban a megfelelő pozíció:</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>                <span class="co">// out_y - blockIdx.y*TILE_H + 1 + r, stb.</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>                <span class="dt">int</span> smem_y <span class="op">=</span> ty <span class="op">+</span> r<span class="op">;</span>   <span class="co">// mivel a halo az elején van</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>                <span class="dt">int</span> smem_x <span class="op">=</span> tx <span class="op">+</span> s<span class="op">;</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>                acc <span class="op">+=</span> smem<span class="op">[</span>smem_y<span class="op">][</span>smem_x<span class="op">]</span> <span class="op">*</span> w<span class="op">[</span>r <span class="op">*</span> S <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>out_y <span class="op">*</span> Q <span class="op">+</span> out_x<span class="op">]</span> <span class="op">=</span> acc<span class="op">;</span></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel a blokk méretét <code>dim3(16,16)</code>-nak feltételezi, a
+grid mérete pedig
+<code>dim3((W+TILE_W-1)/TILE_W, (H+TILE_H-1)/TILE_H)</code>. A shared
+memory mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mrow><mo stretchy="true" form="prefix">(</mo><mn>16</mn><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>×</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>16</mn><mo>+</mo><mn>2</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mn>18</mn><mo>×</mo><mn>18</mn></mrow><annotation encoding="application/x-tex">(16+2)\times(16+2)=18\times18</annotation></semantics></math>
+float, ami 1296 bájt. A szűrőt regiszterekben tartjuk, mert 9 elem
+kicsi.</p>
+<p>A betöltő ciklusban a szálak lineárisan járják be a shared memory
+területet, így a globális memória-hozzáférés coalescing lesz, ha a
+szomszédos szálak szomszédos bemeneti elemeket olvasnak. A padding
+kezelése az <code>if</code> feltétellel történik, ami némi divergenciát
+okoz a határokon, de a blokk belsejében a feltétel igaz.</p>
+<p>A kernel indítása:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>dim3 block<span class="op">(</span>TILE_W<span class="op">,</span> TILE_H<span class="op">);</span> <span class="co">// 16x16</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>dim3 grid<span class="op">((</span><span class="dv">32</span> <span class="op">+</span> TILE_W <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> TILE_W<span class="op">,</span> <span class="op">(</span><span class="dv">32</span> <span class="op">+</span> TILE_H <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> TILE_H<span class="op">);</span> <span class="co">// 2x2</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>conv2d_tiled<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_w<span class="op">,</span> d_y<span class="op">,</span> H<span class="op">,</span> W<span class="op">,</span> P<span class="op">,</span> Q<span class="op">);</span></span></code></pre></div>
+<p>A hibakezeléshez a kernel indítása után
+<code>CHECK_CUDA(cudaGetLastError());</code> és
+<code>CHECK_CUDA(cudaDeviceSynchronize());</code> szükséges.</p>
+<h3 data-number="24.2.12"
+id="labor-egyszerű-conv2d-kernel-implementálása-és-mérése"><span
+class="header-section-number">24.2.12</span> Labor: egyszerű conv2d
+kernel implementálása és mérése</h3>
+<p>A labor célja egy közvetlen conv2d kernel implementálása, futtatása
+és mérése. A feladat az iménti tiled kernel és egy naiv kernel
+összehasonlítása. A kódot izolált környezetben futtatjuk, a hibás kernel
+esetén timeout beállítással.</p>
+<h3 data-number="24.2.13" id="kiinduló-kód"><span
+class="header-section-number">24.2.13</span> Kiinduló kód</h3>
+<p>A laborhoz a fenti <code>conv2d_tiled</code> kernelt és a naiv
+<code>conv2d_naive</code> kernelt használjuk. A naiv kernel a korábban
+bemutatott, de a <code>C=1, K=1</code> esetre egyszerűsítve:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), naiv conv2d (C=1, K=1)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> conv2d_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>                              <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> w<span class="op">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> H<span class="op">,</span> <span class="dt">int</span> W<span class="op">,</span> <span class="dt">int</span> P<span class="op">,</span> <span class="dt">int</span> Q<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> pad<span class="op">,</span> <span class="dt">int</span> stride<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> total <span class="op">=</span> P <span class="op">*</span> Q<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> total<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> q <span class="op">=</span> idx <span class="op">%</span> Q<span class="op">;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> p <span class="op">=</span> idx <span class="op">/</span> Q<span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> acc <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> r <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> r <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> <span class="op">++</span>r<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> h <span class="op">=</span> p <span class="op">*</span> stride <span class="op">-</span> pad <span class="op">+</span> r<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&lt;</span> <span class="dv">3</span><span class="op">;</span> <span class="op">++</span>s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> w_in <span class="op">=</span> q <span class="op">*</span> stride <span class="op">-</span> pad <span class="op">+</span> s<span class="op">;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>h <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> h <span class="op">&lt;</span> H <span class="op">&amp;&amp;</span> w_in <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> w_in <span class="op">&lt;</span> W<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>                acc <span class="op">+=</span> x<span class="op">[</span>h <span class="op">*</span> W <span class="op">+</span> w_in<span class="op">]</span> <span class="op">*</span> w<span class="op">[</span>r <span class="op">*</span> <span class="dv">3</span> <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    y<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> acc<span class="op">;</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A teljes program tartalmazza a CPU-referenciát (egyszerű C++
+ciklusokkal), a GPU allokációt, az adatmásolást, a kernel indítását, a
+hibakezelést, az időmérést CUDA events segítségével, és az eredmények
+összehasonlítását.</p>
+<h3 data-number="24.2.14" id="build-és-futtatás"><span
+class="header-section-number">24.2.14</span> Build és futtatás</h3>
+<p>A build parancs (Linux, CUDA 12.4, NVIDIA A100, driver
+535.104.05):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-O3</span> <span class="at">-use_fast_math</span> conv2d_lab.cu <span class="at">-o</span> conv2d_lab</span></code></pre></div>
+<p>A futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./conv2d_lab</span></span></code></pre></div>
+<p>A program a mérés előtt warm-up-ot végez, majd a naiv és a tiled
+kernelt legalább 10-szer futtatja, és kiírja az átlagos futásidőt és a
+szórást.</p>
+<h3 data-number="24.2.15" id="mérési-napló-példa-illusztráció"><span
+class="header-section-number">24.2.15</span> Mérési napló (példa,
+illusztráció)</h3>
+<p>Fontos: az alábbi eredmények egy példakörnyezetből származnak, és nem
+helyettesítik az olvasó saját mérését. A mérési környezetet pontosan
+rögzíteni kell.</p>
+<ul>
+<li>GPU: NVIDIA A100 40 GB, compute capability 8.0</li>
+<li>Driver: 535.104.05</li>
+<li>CUDA: 12.4</li>
+<li>OS: Ubuntu 22.04, kernel 6.5.0-1022-azure</li>
+<li>Bemeneti méret: 1×1×32×32, szűrő: 1×1×3×3, stride=1, pad=1</li>
+<li>Kimeneti méret: 1×1×32×32</li>
+<li>Precision: FP32</li>
+<li>Block méret: 16×16 (tiled), 256 naiv</li>
+<li>Grid méret: 2×2 (tiled), (32*32+255)/256=4 (naiv)</li>
+</ul>
+<p>A mért futásidők 10 ismétlés átlagából, CUDA events-szel:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Kernel</th>
+<th>Átlag futásidő (µs)</th>
+<th>Szórás (µs)</th>
+<th>Sávszélesség (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Naiv</td>
+<td>12,4</td>
+<td>0,8</td>
+<td>0,33</td>
+</tr>
+<tr class="even">
+<td>Tiled</td>
+<td>9,1</td>
+<td>0,6</td>
+<td>0,45</td>
+</tr>
+</tbody>
+</table>
+<p>A várt eredmény (CPU-referenciával számított) és a GPU kernel
+kimenete közötti maximális abszolút eltérés: <code>0,000000</code> (FP32
+pontosság mellett). A tiled kernel gyorsabb, mert a bemeneti tile
+betöltése coalescing és a szűrő regiszterben van, de a kis méret miatt a
+különbség kicsi. A nagyobb méretű konvolúciókban a tiling előnye
+jelentősen nő.</p>
+<p>A mérési naplóban a <code>nvidia-smi</code> kimenetét is érdemes
+rögzíteni a háttérterhelés ellenőrzéséhez. A labor során a GPU-t
+izoláltan kell futtatni, a timeout pedig
+<code>timeout 30s ./conv2d_lab</code> paranccsal állítható be.</p>
+<h3 data-number="24.2.16" id="jax-kitekintés"><span
+class="header-section-number">24.2.16</span> JAX kitekintés</h3>
+<p>A JAX-ban a konvolúció magas szintű függvényekkel érhető el, például
+a <code>jax.lax.conv_general_dilated</code> segítségével. Az XLA fordító
+a konvolúciót gyakran implicit GEMM-ként vagy közvetlen kernelként
+alacsonyabb szintre bontja, attól függően, hogy a hardver (GPU, TPU)
+melyiket támogatja jobban. A fejlesztőnek nem kell kézzel írnia a
+kernelt, de a teljesítmény szempontjából hasznos megérteni a mögöttes
+transzformációt. A következő fejezet (<a href="gpu092.html">Attention
+kernelek</a>) az attention kerneleket tárgyalja, ahol a GEMM-alapú
+megközelítés és a közvetlen kernel hasonló dilemmája jelenik meg.</p>
+<h3 data-number="24.2.17" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">24.2.17</span> Összefoglalás és
+önellenőrző kérdés</h3>
+<p>A konvolúció GPU-n való implementálásának két fő útja a GEMM-re
+visszavezetés (im2col vagy implicit GEMM) és a közvetlen kernel. Az
+im2col nagy memória overheaddel jár, de a GEMM kernel újrahasznosítható;
+az implicit GEMM megtartja a GEMM optimalizálásait, de elkerüli a
+másolatot. A közvetlen kernel a memória-hozzáférést a konvolúcióra
+szabja, tilinggel és shared memory-val csökkenti a globális forgalmat. A
+csatornák kezelése és a tile-ok kialakítása kulcsfontosságú a nagy
+csatornaszámú rétegekben.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért növeli az im2col a
+memóriaigényt, és hogyan csökkenti az implicit GEMM ezt a többletet
+anélkül, hogy elveszítené a GEMM kernel optimalizálásait? Válaszában
+térjen ki a csatorna- és tile-kezelésre is.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu090.html">← 24.1 GEMM és a deep learning</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu092.html">24.3 Attention kernelek →</a></div>
+</nav>
+</body>
+</html>

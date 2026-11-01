@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>28.2 Vmap, pmap és sharding – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – TPU, OpenCL és más modellek</a> › <a href="index.html#gpuch27">28 JAX és TPU programozás</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu106.html">← 28.1 JAX alapok és a funkcionális modell</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu108.html">28.3 TPU-n futó JAX →</a></div>
+</nav>
+<h2 data-number="28.2" id="gpu107"><span
+class="header-section-number">28.2</span> Vmap, pmap és sharding</h2>
+<p>A JAX programozási modell egyik legfontosabb erőssége, hogy a
+transzformációk – <code>jit</code>, <code>grad</code>,
+<code>vmap</code>, <code>pmap</code> – kompozícióként épülnek egymásra.
+Az előző alfejezetben megismertük a <code>jit</code>-et és a
+funkcionális modellt. Most a batch-vektorizálás és a többeszközös
+párhuzamosítás két alapvető eszközét tárgyaljuk. A <code>vmap</code>
+egyetlen eszközön, egyetlen kernelhíváson belül párhuzamosítja a
+mintafeldolgozást, míg a <code>pmap</code> és az újabb
+<code>shard_map</code> a számítást több gyorsítóra teríti ki. A TPU-k és
+a modern GPU-k nagy teljesítményét csak akkor tudjuk kiaknázni, ha a
+batch-dimenzió mentén is párhuzamosítunk, és a kollektív műveletek
+segítségével az eszközök közötti adatcserét is explicit módon
+vezéreljük.</p>
+<h3 data-number="28.2.1" id="vmap-automatikus-batch-vektorizálás"><span
+class="header-section-number">28.2.1</span> 1. vmap: automatikus
+batch-vektorizálás</h3>
+<p>A <code>vmap</code> transzformáció egy függvényt úgy alakít át, hogy
+az a batch dimenzió mentén vektorizáltan fusson. Ennek megértéséhez
+vegyünk egy egyszerű függvényt, amely egyetlen mintát dolgoz fel:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> single_sample_loss(x, y, w):</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="fl">0.5</span> <span class="op">*</span> jnp.<span class="bu">sum</span>((jnp.dot(x, w) <span class="op">-</span> y) <span class="op">**</span> <span class="dv">2</span>)</span></code></pre></div>
+<p>Itt <code>x</code> hossza <code>D</code>, <code>w</code> mérete
+<code>D×K</code>, a kimenet skalár. Ha egy <code>B</code> méretű
+mini-batch-et szeretnénk feldolgozni, a naiv Python-ciklus minden
+mintára meghívja a függvényt, ami a JAX-ban nyomkövetési (trace) szinten
+is lassú, és nem használja ki a gyorsító párhuzamosságát. A
+<code>vmap</code> pontosan ezt oldja meg: a függvényt a batch dimenzió
+mentén „térképezi le”.</p>
+<p>A leggyakoribb alak:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>batched_loss <span class="op">=</span> jax.vmap(single_sample_loss, in_axes<span class="op">=</span>(<span class="dv">0</span>, <span class="dv">0</span>, <span class="va">None</span>))</span></code></pre></div>
+<p>Az <code>in_axes</code> paraméter megadja, hogy az egyes argumentumok
+melyik dimenziója legyen a batch. Itt az <code>x</code> és
+<code>y</code> első dimenziója batch, a <code>w</code> súly minden
+mintára ugyanaz, ezért <code>None</code>. Az eredmény <code>(B,)</code>
+alakú, ahol <code>B</code> a batch méret.</p>
+<p>A <code>vmap</code> nem csak a bemenetekre, hanem a kimenetre is hat:
+az <code>out_axes</code> paraméterrel megadhatjuk, hogy a kimenet melyik
+dimenzióját tekintsük batch-nek. Ha a függvény több kimenetet ad, az
+<code>out_axes</code> megfelelő tuple.</p>
+<p>A batching trace működése: a JAX a függvényt szimbolikusan kiértékeli
+egyetlen „batched” dummy argumentummal, és minden primitív műveletet
+megvizsgál. A <code>jnp.dot</code>, <code>jnp.sum</code> stb. batching
+szempontból átírható; például az <code>x @ w</code> mátrixszorzás
+<code>(B,D) @ (D,K)</code> alakú lesz. Ha a művelet nem ismeri a batch
+dimenziót, a JAX hibaüzenetet ad, és ilyenkor explicit
+<code>vmap</code>-kompatibilis implementációt kell írni.</p>
+<p>Példaként vegyünk egy képosztályozó előfeldolgozást, amely egyetlen
+képből átlagot és varianciát számol:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> image_stats(img):</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.mean(img), jnp.var(img)</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>batch_stats <span class="op">=</span> jax.vmap(image_stats, in_axes<span class="op">=</span><span class="dv">0</span>, out_axes<span class="op">=</span><span class="dv">0</span>)</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>imgs <span class="op">=</span> jnp.ones((<span class="dv">32</span>, <span class="dv">224</span>, <span class="dv">224</span>, <span class="dv">3</span>))</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>means, <span class="bu">vars</span> <span class="op">=</span> batch_stats(imgs)</span></code></pre></div>
+<p>A <code>vmap</code> hatására a <code>jnp.mean</code> és
+<code>jnp.var</code> minden képre külön-külön fut le, de a JAX a teljes
+batch-re optimalizált kernel(eke)t generál. Ez a transzformáció tehát
+nem egyszerűen ciklust ír át, hanem a függvényt nyomköveti, és a
+primitíveket eleve „batch-elve” hajtja végre.</p>
+<p>A <code>vmap</code> legfontosabb előnyei: - Nincs szükség kézi
+<code>reshape</code>/<code>transpose</code>-ra a legtöbb esetben. - A
+<code>jit</code>-tel együtt használható:
+<code>jax.jit(jax.vmap(f))</code> vagy <code>jax.vmap(jax.jit(f))</code>
+is működik. - A TPU-n a <code>vmap</code> által generált batch dimenzió
+jól illeszkedik a TPU vektor egységeihez, így az adatpárhuzamos számítás
+hatékony.</p>
+<p>Hátrányok: - A <code>vmap</code> csak eszközön belüli (device-local)
+párhuzamosítást ad; több eszközre nem terjed ki. - Nem kezeli az
+eszközök közötti kommunikációt; ehhez a <code>pmap</code> vagy a
+sharding szükséges.</p>
+<h3 data-number="28.2.2" id="pmap-többeszközös-párhuzamosítás"><span
+class="header-section-number">28.2.2</span> 2. pmap: többeszközös
+párhuzamosítás</h3>
+<p>A <code>pmap</code> a <code>vmap</code>-hez hasonló, de a batch
+dimenziót az elérhető eszközökre osztja. A függvény minden eszközön
+ugyanazt a kódot futtatja a bemenetek különböző szegmensein. A
+<code>pmap</code> bevezet egy implicit <code>device</code> dimenziót az
+argumentumok első tengelyére.</p>
+<p>Példa:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>devices <span class="op">=</span> jax.devices()        <span class="co"># pl. 8 TPU/GPU</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>batch_per_device <span class="op">=</span> <span class="dv">32</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>D, K <span class="op">=</span> <span class="dv">256</span>, <span class="dv">16</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jnp.ones((<span class="bu">len</span>(devices) <span class="op">*</span> batch_per_device, D))</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>y <span class="op">=</span> jnp.ones((<span class="bu">len</span>(devices) <span class="op">*</span> batch_per_device, K))</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> loss(x, y, w):</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.mean(<span class="fl">0.5</span> <span class="op">*</span> jnp.<span class="bu">sum</span>((jnp.dot(x, w) <span class="op">-</span> y) <span class="op">**</span> <span class="dv">2</span>, axis<span class="op">=</span><span class="dv">1</span>))</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>pmap_loss <span class="op">=</span> jax.pmap(loss, in_axes<span class="op">=</span>(<span class="dv">0</span>, <span class="dv">0</span>, <span class="va">None</span>))</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>losses <span class="op">=</span> pmap_loss(x, y, w)  <span class="co"># shape (num_devices,)</span></span></code></pre></div>
+<p>A bemenet első dimenziója
+<code>len(devices) * batch_per_device</code> kell legyen, mert a
+<code>pmap</code> ezt osztja szét. A kimenet <code>(num_devices,)</code>
+alakú: minden eszköz a saját batch-részére számolt veszteséget adja
+vissza.</p>
+<p>A <code>pmap</code> lényege, hogy a <code>axis_name</code>
+paraméterrel egy nevet adunk a device dimenziónak, és ezt a nevet a
+kollektív műveletek használják:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> average_loss(x, y, w):</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    local_loss <span class="op">=</span> jnp.mean(<span class="fl">0.5</span> <span class="op">*</span> jnp.<span class="bu">sum</span>((jnp.dot(x, w) <span class="op">-</span> y) <span class="op">**</span> <span class="dv">2</span>, axis<span class="op">=</span><span class="dv">1</span>))</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jax.lax.pmean(local_loss, axis_name<span class="op">=</span><span class="st">&#39;devices&#39;</span>)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>pmap_avg <span class="op">=</span> jax.pmap(average_loss, in_axes<span class="op">=</span>(<span class="dv">0</span>, <span class="dv">0</span>, <span class="va">None</span>), axis_name<span class="op">=</span><span class="st">&#39;devices&#39;</span>)</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>avg <span class="op">=</span> pmap_avg(x, y, w)  <span class="co"># minden eszközön ugyanaz a skalár</span></span></code></pre></div>
+<p>A <code>pmean</code>, <code>psum</code>, <code>all_gather</code>,
+<code>all_to_all</code> a <code>jax.lax</code> modulban találhatók, és a
+JAX a XLA kollektív hívásokra fordítja őket (AllReduce, AllGather
+stb.).</p>
+<p>A <code>pmap</code> korlátai: - Az implicit device dimenzió gyakran
+okoz átalakítási hibát, mert a felhasználó elfelejti, hogy a kimenet
+több eszközre szóródik. - Az eszközök száma hardverfüggő, ami a kódot
+kevésbé hordozhatóvá teszi. - A <code>pmap</code> nem illeszkedik jól a
+JAX újabb sharding modelljéhez; a JAX fejlesztői a
+<code>shard_map</code>-ot javasolják az újabb projektekhez. - A
+<code>pmap</code> és a <code>jit</code> keverése korlátozott.</p>
+<p>Mindazonáltal a <code>pmap</code> oktatási szempontból hasznos, mert
+expliciten megmutatja az eszközök közötti dimenziót és a kollektív
+műveletek szerepét.</p>
+<h3 data-number="28.2.3" id="sharding-és-mesh"><span
+class="header-section-number">28.2.3</span> 3. Sharding és mesh</h3>
+<p>A JAX újabb programozási modellje a shardingot tekinti elsődlegesnek.
+A sharding azt írja le, hogyan helyezzük el a tömb dimenzióit az
+eszközökből álló rácson (mesh). A mesh egy logikai elrendezés, amelyben
+minden tengelynek nevet adunk, például
+<code>('data', 'model')</code>.</p>
+<p>Példa: 4 eszközt 2×2-es mesh-be szervezünk:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.experimental.mesh_utils <span class="im">as</span> mesh_utils</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> Mesh, NamedSharding, PartitionSpec <span class="im">as</span> P</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>devices <span class="op">=</span> jax.devices()  <span class="co"># pl. 4 TPU v5e chip, 4 szál</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>mesh <span class="op">=</span> Mesh(mesh_utils.create_device_mesh((<span class="dv">2</span>, <span class="dv">2</span>)), (<span class="st">&#39;data&#39;</span>, <span class="st">&#39;model&#39;</span>))</span></code></pre></div>
+<p>A <code>create_device_mesh((2,2))</code> feltételezi a hardver
+topológiáját; ha a fizikai hálózat nem 2D, a XLA szoftveresen is kezeli,
+de a teljesítmény változhat. A TPU-k esetében a mesh dimenziói gyakran
+igazodnak a logikai topológiához (pl. 2D torus), így a kommunikáció
+hatékonyabb lehet.</p>
+<p>Egy tömb shardingját a <code>PartitionSpec</code> adja meg. A
+specifikáció a tömb dimenzióit a mesh tengelynevekre képezi. Például egy
+<code>(B, L, D)</code> alakú aktivációt úgy shardingolhatunk, hogy a
+<code>B</code> a <code>data</code> tengelyre, az <code>L</code> a
+<code>model</code> tengelyre kerül:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>spec <span class="op">=</span> P(<span class="st">&#39;data&#39;</span>, <span class="st">&#39;model&#39;</span>, <span class="va">None</span>)</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>sharding <span class="op">=</span> NamedSharding(mesh, spec)</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jax.device_put(jnp.ones((B, L, D)), sharding)</span></code></pre></div>
+<p>A <code>None</code> azt jelenti, hogy a dimenzió replikált (nem
+osztott). A <code>NamedSharding</code> expliciten megnevezi a mesh
+tengelyeket; a JAX ebből tudja, hogy a tömb melyik eszközön milyen
+szeletet tart.</p>
+<p>A <code>shard_map</code> transzformáció lehetővé teszi, hogy egy
+függvényt egy adott shardinggal futtassunk, és az érvelési specifikációk
+automatikusan meghatározzák a kommunikációt. A <code>shard_map</code>
+explicit shardingot ad a függvény bemeneteire és kimeneteire:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> shard_map</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="at">@shard_map</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> layer(x, w):</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="co"># x sharded a &#39;data&#39; tengely mentén, w sharded a &#39;model&#39; tengely mentén</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> jnp.dot(x, w)  <span class="co"># helyben fut, ha a sharding kompatibilis</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jax.lax.psum(y, axis_name<span class="op">=</span><span class="st">&#39;model&#39;</span>)  <span class="co"># AllReduce a model tengely mentén</span></span></code></pre></div>
+<p>A függvényen belül a <code>jax.lax</code> collectives a mesh
+tengelynevekre hivatkoznak. A <code>shard_map</code> kiszámítja a
+szükséges kommunikációt a bemenetek és a kimenetek shardingjai alapján.
+Ez a megközelítés explicit, de rugalmas: pontosan megadjuk, melyik
+tengely mentén osztjuk az adatot, és a JAX automatikusan beszúrja a
+szükséges AllReduce, AllGather vagy AllToAll hívásokat.</p>
+<p>A <code>mesh</code> kontextusban, ha <code>jit</code>-tel együtt
+használjuk, a JAX automatikusan alkalmazhatja a shardingot. A
+<code>shard_map</code> egy explicit, alacsonyabb szintű eszköz, ahol a
+felhasználó irányítja a shardingot. A <code>with mesh:</code> blokk
+használata biztosítja, hogy a kollektív műveletek tudják, melyik mesh-re
+hivatkoznak.</p>
+<h3 data-number="28.2.4" id="kollektív-műveletek"><span
+class="header-section-number">28.2.4</span> 4. Kollektív műveletek</h3>
+<p>A <code>jax.lax</code> kollektív primitívek a XLA collectives-re
+épülnek. A leggyakoribbak:</p>
+<ul>
+<li><code>psum(x, axis_name)</code>: az <code>axis_name</code> által
+meghatározott eszközökön összegzi az <code>x</code> értékét, és az
+eredményt minden résztvevőnek visszaadja (AllReduce SUM). Ez a
+leggyakoribb a gradiens-átlagoláshoz.</li>
+<li><code>pmean(x, axis_name)</code>: átlag az adott tengely eszközein
+(AllReduce MEAN, gyakran psum utáni osztással).</li>
+<li><code>all_gather(x, axis_name)</code>: az <code>x</code> tömböt az
+eszközök között konkatenálja az adott tengely mentén. Például ha minden
+eszköz egy <code>(N,)</code> vektort tart, az <code>all_gather</code>
+eredménye <code>(num_devices*N,)</code>.</li>
+<li><code>all_to_all(x, axis_name, split_axis, concat_axis)</code>: az
+eszközök közötti általános csere, hasznos például
+figyelem-mechanizmusokban, ahol a fejek szétosztása történik.</li>
+<li><code>ppermute(x, axis_name, perm)</code>: egyéni permutáció az
+eszközök között, ritkábban használt.</li>
+</ul>
+<p>Ezeket a műveleteket mindig a megfelelő mesh vagy pmap kontextusban
+kell hívni; másképp hibaüzenetet kapunk, hogy az <code>axis_name</code>
+nincs definiálva. A <code>psum</code> és <code>pmean</code> a tipikus
+adatpárhuzamos tanításnál az eszközök közötti veszteség- vagy
+gradiens-átlagolást végzi. Az <code>all_gather</code> akkor kell, amikor
+egy eszközön lévő részeredményt minden eszközre szét kell szórni,
+például a modell kimenetének összegyűjtéséhez.</p>
+<h3 data-number="28.2.5" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">28.2.5</span> 5. Tipikus hibák és helyes
+megoldások</h3>
+<ol type="1">
+<li><p><strong><code>vmap</code> <code>in_axes</code> elhagyása több
+argumentum esetén.</strong> Ha az egyik argumentum skalár/paraméter,
+akkor <code>None</code> kell. Ha az <code>in_axes</code> nem tuple,
+hanem egyetlen int, az csak az első argumentumra vonatkozik. Például
+<code>jax.vmap(f, in_axes=0)</code> csak az első argumentumot tekinti
+batch-nek; a többi méretét fixen hagyja.</p></li>
+<li><p><strong><code>pmap</code> esetén a bemenő tömb méretének
+elfelejtése.</strong> A bemenet első dimenziója pontosan
+<code>num_devices</code>-szeres kell legyen, különben a
+<code>pmap</code> hibát dob. Ha a tényleges batch nem osztható, pad-elni
+kell. A hiba tipikus üzenete: <code>shard_count</code>
+mismatch.</p></li>
+<li><p><strong><code>pmap</code> kimenetének félreértelmezése.</strong>
+A <code>pmap</code> kimenete <code>(num_devices, ...)</code>. A további
+feldolgozáshoz gyakran <code>jax.device_get</code>-re vagy
+<code>jax.lax.all_gather</code>-re van szükség. Ha a kimenetet egyetlen
+tömbre akarjuk, akkor
+<code>jnp.concatenate(jax.device_get(output))</code> vagy
+<code>jax.pmap</code>-en belül <code>all_gather</code>
+használandó.</p></li>
+<li><p><strong><code>shard_map</code> és <code>Mesh</code> tengelynevek
+ütközése.</strong> Ugyanazt a nevet több tengelyre is használjuk, vagy a
+<code>PartitionSpec</code> rossz sorrendben hivatkozik a mesh
+tengelyekre. Például a <code>P('model', 'data')</code> más elosztást ad,
+mint a <code>P('data', 'model')</code>.</p></li>
+<li><p><strong>Collectives használata mesh kontextuson kívül.</strong> A
+<code>psum</code> csak akkor működik, ha van aktív mesh vagy pmap
+<code>axis_name</code>. A hibát a JAX
+<code>Error: axis_name 'data' not found</code> üzenettel jelzi. A
+megoldás: a <code>with mesh:</code> blokkba kell helyezni a hívást, vagy
+a <code>shard_map</code> belsejében kell lennie.</p></li>
+<li><p><strong>Eszközök hiánya.</strong> Ha csak CPU van, a
+<code>jax.devices()</code> csak CPU-t ad. A <code>pmap</code> ilyenkor
+több CPU szálat használ, ami nem ugyanaz, mint a GPU/TPU párhuzamosság.
+A kód hordozhatósága érdekében érdemes ellenőrizni a
+<code>jax.local_device_count()</code>-ot, és a felhasználót
+tájékoztatni, ha nincs elég eszköz.</p></li>
+<li><p><strong>A <code>shard_map</code>-ben a
+<code>in_specs</code>/<code>out_specs</code> hiánya.</strong> Ez ahhoz
+vezethet, hogy a függvény a bemenet tényleges shardingját nem veszi
+figyelembe, és a teljesítmény gyenge lesz. Bár a <code>shard_map</code>
+a bemeneti shardingból következtet, explicit specifikáció megadása segít
+a JAX-nak az optimalizálásban és a hibák elkerülésében.</p></li>
+<li><p><strong>A <code>vmap</code> és a <code>pmap</code> helytelen
+kompozíciója.</strong> Például <code>jax.pmap(jax.vmap(f))</code>
+helyett gyakran elég a <code>pmap</code> önmagában is, mert a
+<code>pmap</code> implicit módon batch-el az eszközök között és az
+eszközön belül is. A felesleges vmap növeli a regiszternyomást és a
+trace költségét.</p></li>
+</ol>
+<h3 data-number="28.2.6" id="labor-vmap-és-shard_map-példa"><span
+class="header-section-number">28.2.6</span> 6. Labor: vmap és shard_map
+példa</h3>
+<p><strong>Cél:</strong> Egy egyszerű kétrétegű MLP-t futtatunk
+batch-ben, és összehasonlítjuk a naiv Python ciklus, a <code>vmap</code>
+és a <code>shard_map</code> teljesítményét. A cél bemutatni a
+vektorizálás és a sharding gyakorlati előnyeit.</p>
+<p><strong>Környezet:</strong> NVIDIA A100-SXM4-40GB, 2 db, NVLink,
+driver 535.104.05, CUDA 12.4, JAX 0.4.26, jaxlib 0.4.26+cuda12.cudnn89,
+Python 3.11. A mérés izolált konténerben, háttérterhelés nélkül.</p>
+<p><strong>Kód (JAX):</strong></p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> statistics</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> functools <span class="im">import</span> partial</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax.sharding <span class="im">import</span> Mesh, NamedSharding, PartitionSpec <span class="im">as</span> P, shard_map</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.experimental.mesh_utils <span class="im">as</span> mesh_utils</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Paraméterek</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>B <span class="op">=</span> <span class="dv">4096</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>D <span class="op">=</span> <span class="dv">256</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>H <span class="op">=</span> <span class="dv">512</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>K <span class="op">=</span> <span class="dv">16</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> jax.random.PRNGKey(<span class="dv">0</span>)</span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jax.random.normal(key, (B, D))</span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>y <span class="op">=</span> jax.random.normal(key, (B, K))</span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>w1 <span class="op">=</span> jax.random.normal(key, (D, H))</span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>b1 <span class="op">=</span> jax.random.normal(key, (H,))</span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>w2 <span class="op">=</span> jax.random.normal(key, (H, K))</span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>b2 <span class="op">=</span> jax.random.normal(key, (K,))</span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Rétegfüggvény</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> mlp(x, params):</span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    w1, b1, w2, b2 <span class="op">=</span> params</span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    z <span class="op">=</span> jnp.tanh(jnp.dot(x, w1) <span class="op">+</span> b1)</span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> jnp.dot(z, w2) <span class="op">+</span> b2</span>
+<span id="cb9-28"><a href="#cb9-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="cb9-29"><a href="#cb9-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-30"><a href="#cb9-30" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Naiv Python ciklus, JAX jit nélkül</span></span>
+<span id="cb9-31"><a href="#cb9-31" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> naive_loop(x, params):</span>
+<span id="cb9-32"><a href="#cb9-32" aria-hidden="true" tabindex="-1"></a>    outputs <span class="op">=</span> []</span>
+<span id="cb9-33"><a href="#cb9-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(x.shape[<span class="dv">0</span>]):</span>
+<span id="cb9-34"><a href="#cb9-34" aria-hidden="true" tabindex="-1"></a>        outputs.append(mlp(x[i], params))</span>
+<span id="cb9-35"><a href="#cb9-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.stack(outputs)</span>
+<span id="cb9-36"><a href="#cb9-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. vmap + jit</span></span>
+<span id="cb9-38"><a href="#cb9-38" aria-hidden="true" tabindex="-1"></a>batched_mlp <span class="op">=</span> jax.jit(jax.vmap(mlp, in_axes<span class="op">=</span>(<span class="dv">0</span>, <span class="va">None</span>)))</span>
+<span id="cb9-39"><a href="#cb9-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-40"><a href="#cb9-40" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. shard_map: a batch dimenziót a &#39;dp&#39; tengelyre osztjuk</span></span>
+<span id="cb9-41"><a href="#cb9-41" aria-hidden="true" tabindex="-1"></a>devices <span class="op">=</span> jax.local_devices()</span>
+<span id="cb9-42"><a href="#cb9-42" aria-hidden="true" tabindex="-1"></a>mesh <span class="op">=</span> Mesh(mesh_utils.create_device_mesh((<span class="bu">len</span>(devices),)), (<span class="st">&#39;dp&#39;</span>,))</span>
+<span id="cb9-43"><a href="#cb9-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-44"><a href="#cb9-44" aria-hidden="true" tabindex="-1"></a><span class="co"># A bemeneti sharding: batch dimenzió a dp tengelyre</span></span>
+<span id="cb9-45"><a href="#cb9-45" aria-hidden="true" tabindex="-1"></a>in_sharding <span class="op">=</span> NamedSharding(mesh, P(<span class="st">&#39;dp&#39;</span>))</span>
+<span id="cb9-46"><a href="#cb9-46" aria-hidden="true" tabindex="-1"></a>x_sharded <span class="op">=</span> jax.device_put(x, in_sharding)</span>
+<span id="cb9-47"><a href="#cb9-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-48"><a href="#cb9-48" aria-hidden="true" tabindex="-1"></a><span class="co"># Paraméterek replikálva</span></span>
+<span id="cb9-49"><a href="#cb9-49" aria-hidden="true" tabindex="-1"></a>params_sharded <span class="op">=</span> [jax.device_put(p, NamedSharding(mesh, P())) <span class="cf">for</span> p <span class="kw">in</span> (w1, b1, w2, b2)]</span>
+<span id="cb9-50"><a href="#cb9-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-51"><a href="#cb9-51" aria-hidden="true" tabindex="-1"></a><span class="at">@shard_map</span></span>
+<span id="cb9-52"><a href="#cb9-52" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> layer(x, params):</span>
+<span id="cb9-53"><a href="#cb9-53" aria-hidden="true" tabindex="-1"></a>    w1, b1, w2, b2 <span class="op">=</span> params</span>
+<span id="cb9-54"><a href="#cb9-54" aria-hidden="true" tabindex="-1"></a>    z <span class="op">=</span> jnp.tanh(jnp.dot(x, w1) <span class="op">+</span> b1)</span>
+<span id="cb9-55"><a href="#cb9-55" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> jnp.dot(z, w2) <span class="op">+</span> b2</span>
+<span id="cb9-56"><a href="#cb9-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> out</span>
+<span id="cb9-57"><a href="#cb9-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-58"><a href="#cb9-58" aria-hidden="true" tabindex="-1"></a><span class="co"># Melegítés</span></span>
+<span id="cb9-59"><a href="#cb9-59" aria-hidden="true" tabindex="-1"></a>_ <span class="op">=</span> naive_loop(x[:<span class="dv">32</span>], (w1, b1, w2, b2))</span>
+<span id="cb9-60"><a href="#cb9-60" aria-hidden="true" tabindex="-1"></a>_ <span class="op">=</span> batched_mlp(x, (w1, b1, w2, b2))</span>
+<span id="cb9-61"><a href="#cb9-61" aria-hidden="true" tabindex="-1"></a>_ <span class="op">=</span> layer(x_sharded, params_sharded)</span>
+<span id="cb9-62"><a href="#cb9-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-63"><a href="#cb9-63" aria-hidden="true" tabindex="-1"></a><span class="co"># Mérés</span></span>
+<span id="cb9-64"><a href="#cb9-64" aria-hidden="true" tabindex="-1"></a>reps <span class="op">=</span> <span class="dv">10</span></span>
+<span id="cb9-65"><a href="#cb9-65" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> name, f, args <span class="kw">in</span> [</span>
+<span id="cb9-66"><a href="#cb9-66" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;naive_loop (B=128)&quot;</span>, naive_loop, (x[:<span class="dv">128</span>], (w1, b1, w2, b2))),</span>
+<span id="cb9-67"><a href="#cb9-67" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;vmap_jit&quot;</span>, batched_mlp, (x, (w1, b1, w2, b2))),</span>
+<span id="cb9-68"><a href="#cb9-68" aria-hidden="true" tabindex="-1"></a>    (<span class="st">&quot;shard_map&quot;</span>, layer, (x_sharded, params_sharded)),</span>
+<span id="cb9-69"><a href="#cb9-69" aria-hidden="true" tabindex="-1"></a>]:</span>
+<span id="cb9-70"><a href="#cb9-70" aria-hidden="true" tabindex="-1"></a>    times <span class="op">=</span> []</span>
+<span id="cb9-71"><a href="#cb9-71" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _ <span class="kw">in</span> <span class="bu">range</span>(reps):</span>
+<span id="cb9-72"><a href="#cb9-72" aria-hidden="true" tabindex="-1"></a>        t0 <span class="op">=</span> time.perf_counter()</span>
+<span id="cb9-73"><a href="#cb9-73" aria-hidden="true" tabindex="-1"></a>        result <span class="op">=</span> f(<span class="op">*</span>args)</span>
+<span id="cb9-74"><a href="#cb9-74" aria-hidden="true" tabindex="-1"></a>        result.block_until_ready()</span>
+<span id="cb9-75"><a href="#cb9-75" aria-hidden="true" tabindex="-1"></a>        times.append(time.perf_counter() <span class="op">-</span> t0)</span>
+<span id="cb9-76"><a href="#cb9-76" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(<span class="ss">f&quot;</span><span class="sc">{</span>name<span class="sc">}</span><span class="ss">: átlag </span><span class="sc">{</span>statistics<span class="sc">.</span>mean(times)<span class="sc">:.4f}</span><span class="ss"> s, szórás </span><span class="sc">{</span>statistics<span class="sc">.</span>stdev(times)<span class="sc">:.4f}</span><span class="ss"> s&quot;</span>)</span></code></pre></div>
+<p><strong>Mérési napló (helyőrző):</strong></p>
+<p>A következő táblázatban a számok illusztrációk; a tényleges mérést a
+fenti környezetben kell elvégezni, és a naplóban a pontos értékeket
+rögzíteni. A „várt” oszlop az elméleti skálázási várakozást írja le.</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Módszer</th>
+<th>Mért átlag (ms)</th>
+<th>Mért szórás (ms)</th>
+<th>Várt viselkedés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>naive_loop (B=128)</td>
+<td>1550</td>
+<td>180</td>
+<td>Python ciklus, nincs trace, O(B) iteráció; nagyon lassú</td>
+</tr>
+<tr class="even">
+<td>vmap+jit (B=4096)</td>
+<td>2.4</td>
+<td>0.15</td>
+<td>Batch trace, 1 GPU; nagyságrenddel gyorsabb a naivnál</td>
+</tr>
+<tr class="odd">
+<td>shard_map (B=4096, 2 GPU)</td>
+<td>1.3</td>
+<td>0.1</td>
+<td>Batch sharded 2 GPU-ra; további gyorsulás a párhuzamosításból</td>
+</tr>
+</tbody>
+</table>
+<p>A mért értékeket a futás után külön kell rögzíteni. A várt eredmény
+az, hogy a <code>vmap</code> a naiv ciklushoz képest több nagyságrenddel
+gyorsabb, mert a JAX a teljes batch-re optimalizált XLA-kernelt generál.
+A <code>shard_map</code> két GPU-n a batch-dimenzió mentén további
+gyorsulást ad, feltéve, hogy a batch méret elég nagy ahhoz, hogy a
+kommunikáció (ha van) elhanyagolható legyen a számításhoz képest. A
+pontos arány a hardver terhelésétől, a memória sávszélességétől és a JAX
+verziójától függ.</p>
+<p><strong>Ellenőrzés:</strong> A kódnak hiba nélkül kell futnia; a
+<code>block_until_ready()</code> biztosítja a szinkronizációt a mérés
+előtt. A benchmarknak tartalmaznia kell a warm-upot, a többszöri futást
+(legalább 10 ismétlés) és a szórást vagy percentilist.</p>
+<h3 data-number="28.2.7" id="összefoglalás"><span
+class="header-section-number">28.2.7</span> 7. Összefoglalás</h3>
+<p>A <code>vmap</code> a batch-vektorizálás alapvető eszköze, amely
+egyetlen eszközön belül használja ki a párhuzamosítást. A
+<code>pmap</code> a régi, de oktatási szempontból fontos eszköz a
+többeszközös párhuzamosításhoz, kollektív műveletekkel. Az újabb
+<code>shard_map</code> és a <code>Mesh</code>/<code>PartitionSpec</code>
+modell explicit shardingot kínál, és jobban illeszkedik a modern TPU- és
+multi-GPU-rendszerekhez. A kollektív műveletek nélkülözhetetlenek a
+modell- és adatpárhuzamosításhoz. A következő alfejezet (<a
+href="gpu108.html">TPU-n futó JAX</a>) részletesen bemutatja, hogyan
+futtathatunk JAX-kódot TPU-n, milyen specifikus korlátok és
+teljesítményjellemzők vannak, és hogyan profilozhatjuk a
+TPU-végrehajtást.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu106.html">← 28.1 JAX alapok és a funkcionális modell</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu108.html">28.3 TPU-n futó JAX →</a></div>
+</nav>
+</body>
+</html>

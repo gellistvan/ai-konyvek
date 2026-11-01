@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.2 NCCL és kollektív műveletek – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu098.html">← 26.1 Több GPU és peer access</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu100.html">26.3 NVLink, NVSwitch és GPUDirect →</a></div>
+</nav>
+<h2 data-number="26.2" id="gpu099"><span
+class="header-section-number">26.2</span> NCCL és kollektív
+műveletek</h2>
+<p>A <a href="gpu098.html">Több GPU és peer access</a> egység a több GPU
+közötti közvetlen adatmozgatás, a peer-to-peer hozzáférés és a GPU–GPU
+másolás alapjait mutatta be. Ebben az egységben egy réteggel feljebb
+lépünk: olyan műveleteket vizsgálunk, amelyekben sok GPU közösen,
+egyetlen kommunikációs lépésben cserél vagy redukál adatot. Ezek a
+kollektív műveletek alkotják a multi-GPU tanítás, a szimuláció, a gráf-
+és lineáris algebrai algoritmusok gerincét. A fejezet középpontjában az
+all-reduce, a gyűrű- és faalgoritmusok, valamint az NCCL gyakorlati
+használata áll.</p>
+<p><strong>Mi a kollektív kommunikáció?</strong></p>
+<p>A kollektív kommunikáció olyan adatcsere, amelyben egy egész
+processzcsoport vagy rank-halmaz vesz részt, és a művelet szemantikája
+nem egyetlen pont-pont kapcsolatra, hanem a csoport egészére vonatkozik.
+A leggyakoribb műveletek a következők.</p>
+<ul>
+<li><strong>All-reduce:</strong> minden rank egy saját puffert ad meg, a
+rendszer a megadott redukciós műveletet (például összeg, maximum,
+minimum) alkalmazza az összes rank adatára, és az eredményt minden rank
+megkapja. A multi-GPU tanításban a gradiensátlagolás tipikusan
+all-reduce.</li>
+<li><strong>Broadcast:</strong> egy kiválasztott gyökérrank adatát az
+összes többi rank megkapja.</li>
+<li><strong>Reduce:</strong> hasonló az all-reduce-hoz, de az eredmény
+csak egyetlen kijelölt rankra kerül.</li>
+<li><strong>All-gather:</strong> minden rank elküldi a saját adatát, és
+minden rank összegyűjti az összes rank adatát.</li>
+<li><strong>Reduce-scatter:</strong> az all-reduce első felét valósítja
+meg: a redukált eredményt darabokra vágva szétszórja a rankok
+között.</li>
+<li><strong>All-to-all:</strong> minden rank minden másik ranknak
+különböző adatdarabot küld.</li>
+</ul>
+<p>A fejezet elsősorban az all-reduce-ra koncentrál, mert ez a
+legfontosabb és egyben a leginkább optimalizálható kollektív művelet a
+GPU-s számításban.</p>
+<p><strong>Miért nem elég a naiv megoldás?</strong></p>
+<p>Egy naiv all-reduce megvalósítható úgy, hogy minden rank elküldi az
+adatát egy központi ranknak, az elvégzi a redukciót, majd a végeredményt
+broadcastolja. Ez a séma egyszerű, de a központi rank hálózati
+sávszélessége szűk keresztmetszetté válik: a bejövő forgalom a rankok
+számával arányosan nő, a kimenő forgalom szintén. Nagy méretű
+üzeneteknél a központi rank CPU- vagy GPU-kártyája egyszerűen nem tud
+annyi adatot fogadni és küldeni, amennyit a többi rank képes lenne
+előállítani. Ráadásul a modern multi-GPU csomópontokban a GPU-k közötti
+hálózat gyakran nem egyetlen közös busz, hanem hierarchikus: NVLink,
+NVSwitch, PCIe, InfiniBand. Egy jó kollektív algoritmus figyelembe veszi
+ezt a topológiát, és a hálózat linkeit egyenletesen terheli.</p>
+<p><strong>Gyűrű all-reduce</strong></p>
+<p>A gyűrű all-reduce az egyik legfontosabb algoritmus nagy üzenetekhez.
+Tegyük fel, hogy P rank van, és minden rank S bájt méretű adatot
+szeretne összegezni. A gyűrű algoritmus logikai gyűrűt alkot a
+rankokból: minden ranknak van egy bal és egy jobb szomszédja. Az adatot
+P darabra, chunkra vágjuk, minden chunk mérete körülbelül S/P.</p>
+<p>Az all-reduce két fázisból áll.</p>
+<ol type="1">
+<li><strong>Reduce-scatter:</strong> P−1 lépésben minden rank az
+aktuálisan birtokolt egyik chunkot elküldi a jobb szomszédjának, és a
+bal szomszédtól kapott chunkot hozzáadja a saját megfelelő részéhez.
+Minden lépés után továbbadja a kapott, részben redukált adatot. A P−1
+lépés végére minden rank egy-egy chunk teljes, az összes rankra
+kiterjedő redukált értékét birtokolja.</li>
+<li><strong>All-gather:</strong> újabb P−1 lépésben a teljesen redukált
+chunkokat körbeküldik a gyűrűn, így a végére minden rank minden chunkot
+megkap, vagyis a teljes redukált eredményt.</li>
+</ol>
+<p>A gyűrű all-reduce minden lépésben minden linket egyszerre használ,
+így a hálózati sávszélesség kihasználása jó. A per rank elküldött
+adatmennyiség:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>⋅</mo><mfrac><mrow><mi>P</mi><mo>−</mo><mn>1</mn></mrow><mi>P</mi></mfrac><mo>⋅</mo><mi>S</mi><mo>,</mo></mrow><annotation encoding="application/x-tex">
+2 \cdot \frac{P-1}{P} \cdot S,
+</annotation></semantics></math></p>
+<p>ami nagy P esetén közelítőleg 2S. Az ideális futásidő modellje:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mtext mathvariant="normal">ring</mtext></msub><mo>=</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mi>P</mi><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mi>L</mi><mo>+</mo><mn>2</mn><mrow><mo stretchy="true" form="prefix">(</mo><mi>P</mi><mo>−</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mfrac><mi>S</mi><mrow><mi>P</mi><mi>B</mi></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">
+T_{\text{ring}} = 2(P-1)L + 2(P-1)\frac{S}{P B},
+</annotation></semantics></math></p>
+<p>ahol L a lépésenkénti latencia, B a link sávszélessége. Jól látható,
+hogy a gyűrű előnye nagy S esetén mutatkozik meg, mert a sávszélességi
+tag a chunkmérettel csökken, a latencia viszont O(P), ezért kis
+üzenetekre nem feltétlenül optimális.</p>
+<p><strong>Fa all-reduce</strong></p>
+<p>A fa all-reduce a latenciára optimalizál. Itt a rankok egy bináris
+fát alkotnak. A redukció fázisban minden levél elküldi a saját adatát a
+szülőjének, a szülő összeadja a gyermekeitől kapott értékeket a
+sajátjával, majd továbbküldi a saját szülőjének. Így a gyökér log2(P)
+lépés után megkapja a teljes redukált eredményt. Ezután a broadcast
+fázisban a gyökér visszaszórja az eredményt a fa mentén, szintén log2(P)
+lépésben.</p>
+<p>A fa latenciája jobb, mint a gyűrűé: O(log P) lépés. Azonban a
+gyökérhez közelebbi linkeken nagyobb adatforgalom halad át, mert a
+gyökér felé haladva az üzenetek nem csökkennek chunkokra. Kis
+üzeneteknél a latencia dominál, ezért a fa jól működik. Nagy üzeneteknél
+viszont a gyökér linkje szűk keresztmetszet lesz, és a fa rosszabb
+sávszélesség-kihasználást ad, mint a gyűrű.</p>
+<p>A gyakorlatban az NCCL általában automatikusan választ a gyűrű, a fa
+és más algoritmusok (például NVLS, CollNet) között, a méret, a rankok
+száma és a detektált topológia alapján. A felhasználónak csak
+diagnosztikai célból érdemes környezeti változókkal felülbírálni,
+például az <code>NCCL_ALGO=Ring</code> vagy <code>NCCL_ALGO=Tree</code>
+beállítással.</p>
+<p><strong>NCCL a gyakorlatban</strong></p>
+<p>Az NVIDIA Collective Communications Library (NCCL) a fenti kollektív
+műveletek GPU-optimalizált implementációját adja. Az NCCL nem igényel
+MPI-t, de az MPI-vel jól együttműködik: tipikusan az MPI biztosítja a
+processzek indítását, a rank azonosítást és a vezérlést, az NCCL pedig a
+GPU-k közötti kollektív adatmozgatást végzi. Az NCCL a CUDA
+stream-szemantikát követi: minden művelet egy CUDA streamen fut,
+aszinkron módon, ezért a hívás után a stream szinkronizálásával lehet
+megvárni a befejezést.</p>
+<p>A legfontosabb NCCL API-elemek:</p>
+<ul>
+<li><code>ncclComm_t</code>: egy kommunikátor, amely egy rank-halmazt
+fog össze.</li>
+<li><code>ncclGetUniqueId</code>: egyedi azonosítót generál, amelyet
+minden ranknak meg kell kapnia.</li>
+<li><code>ncclCommInitRank</code>: létrehoz egy kommunikátort; minden
+rank megadja a saját rankjét és a rankok számát.</li>
+<li><code>ncclAllReduce</code>: végrehajtja az all-reduce műveletet a
+megadott streamen.</li>
+<li><code>ncclCommDestroy</code>: felszabadítja a kommunikátort.</li>
+</ul>
+<p>A kommunikátor inicializálásához az egyik rank generálja az
+azonosítót, majd azt broadcastolni kell a többi ranknak. Ez a lépés
+történhet MPI-vel, de megoldható más out-of-band csatornán is.</p>
+<p><strong>NCCL all-reduce labor</strong></p>
+<p>A következő labor egy minimalis NCCL all-reduce példát mutat be,
+amely négy GPU-t használ. A kód minden rankon feltölti a bemeneti
+puffert <code>rank + 1</code> értékekkel, végrehajt egy all-reduce
+összeget, majd ellenőrzi, hogy minden elem a várt értéket tartalmazza.
+Az all-reduce előtt és után CUDA eventekkel mérjük a futásidőt, és
+kiszámítjuk a sávszélességi mutatókat.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), NCCL 2.x, MPI</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: lásd a kód utáni parancsot.</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mpi.h&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;nccl.h&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>MPI_Abort<span class="op">(</span>MPI_COMM_WORLD<span class="op">,</span><span class="pp"> </span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>err<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NCCL_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">ncclResult_t</span><span class="pp"> </span>res<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>res<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>ncclSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;NCCL error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span>ncclGetErrorString<span class="op">(</span>res<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>MPI_Abort<span class="op">(</span>MPI_COMM_WORLD<span class="op">,</span><span class="pp"> </span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>res<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> fill_value<span class="op">(</span><span class="dt">float</span><span class="op">*</span> x<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">,</span> <span class="dt">float</span> v<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> i <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>blockIdx<span class="op">.</span>x<span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> x<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> v<span class="op">;</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span><span class="op">**</span> argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    MPI_Init<span class="op">(&amp;</span>argc<span class="op">,</span> <span class="op">&amp;</span>argv<span class="op">);</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> world_rank <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> world_size <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    MPI_Comm_rank<span class="op">(</span>MPI_COMM_WORLD<span class="op">,</span> <span class="op">&amp;</span>world_rank<span class="op">);</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    MPI_Comm_size<span class="op">(</span>MPI_COMM_WORLD<span class="op">,</span> <span class="op">&amp;</span>world_size<span class="op">);</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> device_count <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetDeviceCount<span class="op">(&amp;</span>device_count<span class="op">));</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>device_count <span class="op">&lt;</span> world_size<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>world_rank <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;Kevesebb GPU (</span><span class="sc">%d</span><span class="st">) van, mint processz (</span><span class="sc">%d</span><span class="st">)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>                         device_count<span class="op">,</span> world_size<span class="op">);</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>        MPI_Abort<span class="op">(</span>MPI_COMM_WORLD<span class="op">,</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A laborban a local_rankot a környezetből kell venni</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    <span class="co">// (például OMPI_COMM_WORLD_LOCAL_RANK), itt egyszerűsítünk.</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> local_rank <span class="op">=</span> world_rank <span class="op">%</span> device_count<span class="op">;</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>local_rank<span class="op">));</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> N <span class="op">=</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">?</span> <span class="bu">std::</span>atoll<span class="op">(</span>argv<span class="op">[</span><span class="dv">1</span><span class="op">])</span> <span class="op">:</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">);</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> sendbuff <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> recvbuff <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>sendbuff<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>recvbuff<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> local_value <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>world_rank <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> blocks <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;((</span>N <span class="op">+</span> threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threads<span class="op">);</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>    fill_value<span class="op">&lt;&lt;&lt;</span>blocks<span class="op">,</span> threads<span class="op">&gt;&gt;&gt;(</span>sendbuff<span class="op">,</span> N<span class="op">,</span> local_value<span class="op">);</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>    ncclUniqueId id<span class="op">;</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>world_rank <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> NCCL_CHECK<span class="op">(</span>ncclGetUniqueId<span class="op">(&amp;</span>id<span class="op">));</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>    MPI_Bcast<span class="op">(&amp;</span>id<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>ncclUniqueId<span class="op">),</span> MPI_BYTE<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> MPI_COMM_WORLD<span class="op">);</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ncclComm_t</span> comm<span class="op">;</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>    NCCL_CHECK<span class="op">(</span>ncclCommInitRank<span class="op">(&amp;</span>comm<span class="op">,</span> world_size<span class="op">,</span> id<span class="op">,</span> world_rank<span class="op">));</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> stream<span class="op">;</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>stream<span class="op">));</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up. A laborban legalább 5-10 ismétlést és szórást kell rögzíteni.</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>    NCCL_CHECK<span class="op">(</span>ncclAllReduce<span class="op">(</span>sendbuff<span class="op">,</span> recvbuff<span class="op">,</span> N<span class="op">,</span> ncclFloat<span class="op">,</span> ncclSum<span class="op">,</span> comm<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>    NCCL_CHECK<span class="op">(</span>ncclAllReduce<span class="op">(</span>sendbuff<span class="op">,</span> recvbuff<span class="op">,</span> N<span class="op">,</span> ncclFloat<span class="op">,</span> ncclSum<span class="op">,</span> comm<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> elapsed_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>elapsed_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_recv <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">*&gt;(</span><span class="bu">std::</span>malloc<span class="op">(</span>N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-92"><a href="#cb1-92" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_recv<span class="op">,</span> recvbuff<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb1-93"><a href="#cb1-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-94"><a href="#cb1-94" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> expected <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>world_size <span class="op">*</span> <span class="op">(</span>world_size <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> <span class="dv">2</span><span class="op">);</span></span>
+<span id="cb1-95"><a href="#cb1-95" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> max_abs_diff <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb1-96"><a href="#cb1-96" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-97"><a href="#cb1-97" aria-hidden="true" tabindex="-1"></a>        <span class="at">const</span> <span class="dt">double</span> diff <span class="op">=</span> <span class="bu">std::</span>fabs<span class="op">(</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>h_recv<span class="op">[</span>i<span class="op">])</span> <span class="op">-</span> expected<span class="op">);</span></span>
+<span id="cb1-98"><a href="#cb1-98" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>diff <span class="op">&gt;</span> max_abs_diff<span class="op">)</span> max_abs_diff <span class="op">=</span> diff<span class="op">;</span></span>
+<span id="cb1-99"><a href="#cb1-99" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-100"><a href="#cb1-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-101"><a href="#cb1-101" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> bytes <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>N<span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-102"><a href="#cb1-102" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> t_s <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>elapsed_ms<span class="op">)</span> <span class="op">*</span> <span class="fl">1e-3</span><span class="op">;</span></span>
+<span id="cb1-103"><a href="#cb1-103" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> busy_bw <span class="op">=</span> <span class="fl">2.0</span> <span class="op">*</span> <span class="op">(</span>world_size <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> bytes <span class="op">/</span> t_s <span class="op">/</span> <span class="fl">1e9</span><span class="op">;</span> <span class="co">// GB/s</span></span>
+<span id="cb1-104"><a href="#cb1-104" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">double</span> algo_bw <span class="op">=</span> <span class="fl">2.0</span> <span class="op">*</span> bytes <span class="op">/</span> t_s <span class="op">/</span> <span class="fl">1e9</span><span class="op">;</span>                    <span class="co">// GB/s</span></span>
+<span id="cb1-105"><a href="#cb1-105" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>world_rank <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-106"><a href="#cb1-106" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;N=</span><span class="sc">%zu</span><span class="st"> P=</span><span class="sc">%d</span><span class="st"> elapsed=</span><span class="sc">%.3f</span><span class="st"> ms busy_bw=</span><span class="sc">%.3f</span><span class="st"> GB/s algo_bw=</span><span class="sc">%.3f</span><span class="st"> GB/s max_abs_diff=</span><span class="sc">%.9g\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb1-107"><a href="#cb1-107" aria-hidden="true" tabindex="-1"></a>                    N<span class="op">,</span> world_size<span class="op">,</span> elapsed_ms<span class="op">,</span> busy_bw<span class="op">,</span> algo_bw<span class="op">,</span> max_abs_diff<span class="op">);</span></span>
+<span id="cb1-108"><a href="#cb1-108" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-109"><a href="#cb1-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-110"><a href="#cb1-110" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>free<span class="op">(</span>h_recv<span class="op">);</span></span>
+<span id="cb1-111"><a href="#cb1-111" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb1-112"><a href="#cb1-112" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-113"><a href="#cb1-113" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb1-114"><a href="#cb1-114" aria-hidden="true" tabindex="-1"></a>    NCCL_CHECK<span class="op">(</span>ncclCommDestroy<span class="op">(</span>comm<span class="op">));</span></span>
+<span id="cb1-115"><a href="#cb1-115" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>recvbuff<span class="op">));</span></span>
+<span id="cb1-116"><a href="#cb1-116" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>sendbuff<span class="op">));</span></span>
+<span id="cb1-117"><a href="#cb1-117" aria-hidden="true" tabindex="-1"></a>    MPI_Finalize<span class="op">();</span></span>
+<span id="cb1-118"><a href="#cb1-118" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-119"><a href="#cb1-119" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kódban <code>sendbuff</code> és <code>recvbuff</code> külön
+pufferek; a laborban ez biztonságos, és elkerüli a nem in-place
+műveletből adódó hibákat. A várt eredmény
+<code>world_size * (world_size + 1) / 2</code>, mivel a bemenet a
+rankokon <code>1, 2, 3, 4</code>, összegük <code>10</code>. Mivel ezek
+egész számok pontosan ábrázolhatók FP32-ben, a hibának nullának kell
+lennie.</p>
+<p>A fordítás tipikus parancsa:</p>
+<pre><code>nvcc -ccbin mpic++ -std=c++17 -I${CUDA_HOME}/include -I${NCCL_HOME}/include \
+     nccl_allreduce.cu -o nccl_allreduce \
+     -L${CUDA_HOME}/lib64 -lcudart -L${NCCL_HOME}/lib -lnccl</code></pre>
+<p>Futtatás:</p>
+<pre><code>mpirun -np 4 --map-by ppr:1:node ./nccl_allreduce 16777216</code></pre>
+<p>A <code>--map-by</code> beállítás csak példa; a tényleges
+processz-GPU hozzárendelést a klaszter ütemezője és a
+<code>CUDA_VISIBLE_DEVICES</code> együtt határozza meg.</p>
+<p><strong>Mérési napló és az eredmények elkülönítése</strong></p>
+<p>A könyv módszertana szerint a mérési környezetet és a mért
+eredményeket rögzíteni kell. Az alábbi táblázat egy
+<strong>példa</strong> laborprotokollt mutat. A „mért” oszlopban a saját
+laborban mért értékek kerülnek; itt csak a szerkezet látható. A „várt”
+oszlop a gyűrű modellből számított becslést tartalmazza, nem mérési
+eredmény.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Környezet</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>4× NVIDIA A100 40 GB (példa)</td>
+</tr>
+<tr class="even">
+<td>Driver</td>
+<td>535.154.05 (példa)</td>
+</tr>
+<tr class="odd">
+<td>CUDA</td>
+<td>12.2 (példa)</td>
+</tr>
+<tr class="even">
+<td>NCCL</td>
+<td>2.19.3 (példa)</td>
+</tr>
+<tr class="odd">
+<td>MPI</td>
+<td>OpenMPI 4.1.5 (példa)</td>
+</tr>
+<tr class="even">
+<td>Interconnect</td>
+<td>NVLink/NVSwitch (példa)</td>
+</tr>
+<tr class="odd">
+<td><code>NCCL_ALGO</code></td>
+<td>gyári (Ring)</td>
+</tr>
+<tr class="even">
+<td><code>NCCL_PROTO</code></td>
+<td>gyári</td>
+</tr>
+</tbody>
+</table>
+<p>A laborban a következő két bemenetméreten érdemes mérni:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>N</th>
+<th>Ismétlések</th>
+<th>Mért futásidő (ms)</th>
+<th>Mért <code>busy_bw</code> (GB/s)</th>
+<th>Mért <code>algo_bw</code> (GB/s)</th>
+<th>Várt <code>algo_bw</code> (GB/s)</th>
+<th>Várt max. absz. hiba</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1&lt;&lt;22</td>
+<td>10</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>a gyűrű modellből becsülve</td>
+<td>0</td>
+</tr>
+<tr class="even">
+<td>1&lt;&lt;24</td>
+<td>10</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>[laborban]</td>
+<td>a gyűrű modellből becsülve</td>
+<td>0</td>
+</tr>
+</tbody>
+</table>
+<p>A várt <code>algo_bw</code> a <code>T_ring</code> modellből
+számítható: <code>algo_bw = 2S / T_ring</code>. A gyűrűnél ez körülbelül
+<code>P/(2(P-1)) * B_eff</code>, ahol <code>B_eff</code> a linken mért
+tényleges sávszélesség. A laborban ezt a becslést a saját hardverre kell
+kalibrálni; a táblázatban szereplő számok nem helyettesítik a mérést. A
+mért <code>busy_bw</code> a forgalmazott bájtok alapján számítandó:
+<code>busy_bw = 2(P-1)S / time</code>, ami nem azonos az
+<code>algo_bw</code>-vel.</p>
+<p><strong>Tipikus hibák és megoldások</strong></p>
+<p>A kollektív kommunikációban a hibák gyakran nem azonnali crash-t,
+hanem holtpontot vagy nem determinisztikus hibát okoznak.</p>
+<ol type="1">
+<li><p><strong>Nem minden rank hívja meg a kollektív műveletet.</strong>
+Az all-reduce egy csoportos művelet; ha egyetlen rank kihagyja, a többi
+rank várakozni fog a beérkező adatra, és a program lefagy. A megoldás:
+minden kollektív hívásnak ugyanabban a sorrendben kell megjelennie
+minden rankon, akár hibakezelés után is.</p></li>
+<li><p><strong>A <code>ncclCommInitRank</code> rank argumentuma nem
+egyezik az MPI rank-kel.</strong> Ha a rank nem konzisztens, a
+kommunikátor hibásan jön létre, és az adatcsere szemantikája sérül. A
+laborban mindig ugyanazt a ranket használjuk az MPI-ben és az
+NCCL-ben.</p></li>
+<li><p><strong>A stream szinkronizálás hiánya.</strong> Az
+<code>ncclAllReduce</code> aszinkron, ezért ha közvetlenül utána a
+<code>recvbuff</code>-ot olvassuk <code>cudaStreamSynchronize</code>
+nélkül, versenyhelyzetet kapunk. A példa ezért hív szinkronizálást a
+<code>cudaEventElapsedTime</code> előtt.</p></li>
+<li><p><strong>Hibás GPU-kiválasztás több folyamatnál.</strong> Ha
+minden MPI-folyamat ugyanazt a GPU-t látja, az NCCL nem tud peer-to-peer
+hozzáférést kialakítani, és a teljesítmény drasztikusan romlik, vagy
+hibába ütközünk. A <code>cudaSetDevice(local_rank)</code> hívásnak a
+megfelelő rankre kell mutatnia.</p></li>
+<li><p><strong>A <code>ncclUniqueId</code> broadcastolásának
+hiánya.</strong> Ha az azonosítót nem juttatjuk el minden rankhoz, a
+<code>ncclCommInitRank</code> hibát ad vagy eltérő kommunikátorokat hoz
+létre. A <code>MPI_Bcast</code> a <code>sizeof(ncclUniqueId)</code>
+méretet használja, mert a típus opak.</p></li>
+<li><p><strong>A <code>sendbuff</code> és <code>recvbuff</code>
+átfedését feltételező in-place művelet.</strong> Az NCCL all-reduce
+támogatja az in-place használatot, ha a két pointer azonos, de ezt
+ellenőrizni kell a használt NCCL-verzióban. A biztonság kedvéért a labor
+külön puffereket használ.</p></li>
+</ol>
+<p><strong>Önellenőrző kérdés</strong></p>
+<p>Példa: Hány linket terhel a gyűrű all-reduce P=4 rank, S=1 MiB üzenet
+esetén, és mennyi a per rank elküldött adatmennyiség? Válasz: a gyűrű
+mind a 4 linket használja párhuzamosan; a per rank elküldött adat
+<code>2 · (3/4) · 1 MiB = 1,5 MiB</code>, mert az all-reduce két fázisa
+3-3 lépésből áll, és minden lépésben S/P = 256 KiB chunkot
+mozgatunk.</p>
+<p>Az NCCL és a kollektív műveletek fogalma itt megalapozza a következő
+egységet, amely az NVLink, NVSwitch és GPUDirect részleteit, valamint a
+multi-GPU topológia teljesítményre gyakorolt hatását tárgyalja. A <a
+href="gpu100.html">NVLink, NVSwitch és GPUDirect</a> egységben az itt
+bevezetett kommunikátor-modellre és a gyűrű/tree választás szempontjaira
+építünk.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu098.html">← 26.1 Több GPU és peer access</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu100.html">26.3 NVLink, NVSwitch és GPUDirect →</a></div>
+</nav>
+</body>
+</html>

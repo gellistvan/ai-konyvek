@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>11.2 Shared memory bankok és bank conflict – GPGPU – általános
+célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch10">11 Coalescing, bank conflicts és vectorizált hozzáférés</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu038.html">← 11.1 Globális memória coalescing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu040.html">11.3 Vektorizált betöltés és tárolás →</a></div>
+</nav>
+<h2 data-number="11.2" id="gpu039"><span
+class="header-section-number">11.2</span> Shared memory bankok és bank
+conflict</h2>
+<p>A shared memory a GPU-blokkon belüli adatcsere leggyorsabb
+programozható felülete. A globális memória nagy késleltetését és a
+regiszterek szűkösségét úgy hidalja át, hogy a blokk összes szála
+számára közös, kis méretű, nagy sávszélességű tárolót biztosít. A
+hatékony használat azonban nem merül ki abban, hogy adatot másolunk
+bele: a hardver a shared memóriát <strong>bankokra</strong> osztja, és
+ha a hozzáférések ütköznek, a kért párhuzamosság elveszik. Ez az
+alfejezet a bankok működését, az ütközések felismerését és elkerülését
+tárgyalja, majd egy teljes labor keretében bank conflict mentes
+transzponálást valósít meg.</p>
+<figure>
+<img src="assets/gpu039-diagram-1.png"
+alt="Shared memory bank conflict - A bank címét a szóindex modulo a bankok száma adja; ha egy warp több szálának címe ugyanarra a bankra esik, a hozzáférés sorosítódik." />
+<figcaption aria-hidden="true">Shared memory bank conflict - A bank
+címét a szóindex modulo a bankok száma adja; ha egy warp több szálának
+címe ugyanarra a bankra esik, a hozzáférés sorosítódik.</figcaption>
+</figure>
+<h3 data-number="11.2.1" id="a-shared-memory-bank-szervezése"><span
+class="header-section-number">11.2.1</span> A shared memory bank
+szervezése</h3>
+<p>A modern NVIDIA GPU-kon a shared memory fizikailag <strong>32
+bankból</strong> áll (a pontos szám a compute capability függvénye; a
+jelenleg elterjedt architektúrákon – Volta, Turing, Ampere, Hopper – 32
+bank van, de ezt a CUDA Programming Guide aktuális verziójában mindig
+ellenőrizni kell). Minden bank egy-egy <strong>32 bites szót</strong>
+tud kiszolgálni egyetlen memóriaórajel alatt. A bankok címzése a
+következő: ha egy 32 bites szó a shared memóriában az <code>s</code>
+bájtcímen kezdődik, akkor a hozzá tartozó bank indexe:</p>
+<pre class="text"><code>bank = (s / 4) % 32</code></pre>
+<p>Azaz a 4 bájtos szavak sorban, ciklikusan oszlanak el a 32 bank
+között. Egyetlen warp (32 szál) egyszerre egy utasítást hajt végre; ha
+mind a 32 szál különböző bankból olvas vagy ír, a memóriaművelet
+egyetlen tranzakcióban végrehajtható. Ha azonban két vagy több szál
+ugyanabba a bankba, de <strong>különböző címre</strong> hivatkozik, a
+hardver a hozzáféréseket sorba kényszeríti: ez a <strong>bank
+conflict</strong>.</p>
+<p>A bankok közötti konfliktus tehát nem a shared memória teljes
+sávszélességét csökkenti, hanem a párhuzamos memória-hozzáférések
+sorosítását okozza. Egy 32 szálból álló warp esetén, ha mind a 32 szál
+ugyanabba a bankba ír különböző címekre, a művelet 32
+memóriatranzakcióra esik szét. Ez a teljesítményromlás a gyakorlatban
+ugyanolyan súlyos lehet, mint a nem koaleszkált globális
+memória-hozzáférés, ezért a bank conflict elemzése a kerneloptimalizálás
+egyik alapvető lépése.</p>
+<h3 data-number="11.2.2" id="bank-conflict-definíció-és-példák"><span
+class="header-section-number">11.2.2</span> Bank conflict definíció és
+példák</h3>
+<p>A bank conflict pontos definíciója a következő: <strong>egy warp két
+vagy több aktív szála ugyanabba a bankba, de különböző szóra hivatkozik
+ugyanabban a memóriautasításban</strong>. Ha a címek azonosak, az eset
+broadcast, amit később tárgyalunk. A konfliktus mértékét a legnagyobb
+számú, azonos bankba eső különböző cím határozza meg. Például ha 8 szál
+ugyanabba a bankba de különböző címre mutat, akkor az a hozzáférés
+8-utas konfliktus, és a hardver 8 tranzakcióra bontja.</p>
+<p>Tekintsünk egy egyszerű esetet, amikor egy <code>float</code> tömböt
+(<code>32 bites szavak</code>) olvasunk a shared memóriából. A
+legegyszerűbb hozzáférési minta a <strong>szekvenciális</strong>: a
+<code>tid</code> azonosítójú szál a <code>s_data[tid]</code> elemet
+olvassa. Ekkor:</p>
+<ul>
+<li><code>tid = 0</code> → bank 0</li>
+<li><code>tid = 1</code> → bank 1</li>
+<li>…</li>
+<li><code>tid = 31</code> → bank 31</li>
+</ul>
+<p>Minden szál más bankot használ, nincs konfliktus. Ez az ideális
+eset.</p>
+<p>Most változtassuk meg a lépésközt <strong>stride 2</strong>-re: a
+szál <code>s_data[2 * tid]</code>-et olvas. Ekkor:</p>
+<ul>
+<li><code>tid = 0</code> → bank 0</li>
+<li><code>tid = 1</code> → bank 2</li>
+<li><code>tid = 2</code> → bank 4</li>
+<li>…</li>
+<li><code>tid = 15</code> → bank 30</li>
+<li><code>tid = 16</code> → bank 0 (mert 32 % 32 = 0)</li>
+<li><code>tid = 17</code> → bank 2</li>
+<li>stb.</li>
+</ul>
+<p>Itt a 0. és a 16. szál ugyanabba a bankba (0. bank) mutat, de
+különböző elemekre. Hasonlóan az 1. és 17. szál a 2. bankba, és így
+tovább. Ez <strong>2-utas bank conflict</strong>, mert minden bankot két
+szál osztozik. A memóriaművelet kétszer annyi időt vesz igénybe, mint a
+stride 1 eset.</p>
+<p>A stride 32 a legrosszabb eset: ha a szál
+<code>s_data[32 * tid]</code>-et olvas, mind a 32 szál a 0. bankba mutat
+(hiszen <code>32 * tid / 4 % 32 = 0</code> minden <code>tid</code>-re),
+és mivel az elemek különbözőek, <strong>32-utas konfliktus</strong>
+alakul ki. Ez 32 memóriatranzakciót jelent egyetlen warp számára, ami a
+shared memória sávszélességének drasztikus csökkenését okozza.</p>
+<p>Fontos megjegyezni, hogy a bank indexelés <strong>a szó
+méretéhez</strong> kötődik. Ha <code>double</code> (64 bit) elemeket
+tárolunk, akkor minden <code>double</code> két egymást követő bankot
+foglal el. Ebben az esetben a <code>tid</code> szerinti szekvenciális
+olvasás <code>s_data[tid]</code> (ahol <code>s_data</code>
+<code>double*</code>) azt jelenti, hogy a 0. szál a 0. és 1. bankot, az
+1. szál a 2. és 3. bankot, stb. használja. Ez nem okoz konfliktust, mert
+a szálak különböző bankpárokhoz férnek hozzá. Ha azonban a hozzáférési
+minta eltolódik, a konfliktusok bonyolultabbá válnak, ezért 64 bites
+típusoknál különösen figyelni kell a bank indexek párosítására.</p>
+<h3 data-number="11.2.3" id="broadcast-és-multicast"><span
+class="header-section-number">11.2.3</span> Broadcast és multicast</h3>
+<p>Amikor egy warp minden aktív szála <strong>ugyanazt a 32 bites
+szót</strong> olvassa a shared memóriából, a hardver nem sorosítja a
+hozzáférést, hanem <strong>broadcast</strong> módban egyszerre
+kiszolgálja mind a 32 szálat. Ez egyetlen memóriatranzakció, nincs bank
+conflict. Ez az eset akkor áll elő, ha például minden szál
+<code>s_data[0]</code>-t olvas.</p>
+<p>A <strong>multicast</strong> kifejezést gyakran használják arra az
+esetre, amikor egy memóriautasítás egy bankon belül több szál számára
+szolgál ki ugyanazt a címet, de a szálak egy része másik bankot is elér.
+A hardver a modern architektúrákon képes bizonyos mértékű multicast
+optimalizálásra, de az általános szabály: ha egy bankon belül a címek
+azonosak, az nem konfliktus; ha különbözőek, akkor konfliktus. A
+gyakorlatban a broadcast fontos optimalizálási lehetőség, például
+konstansok vagy közös adatok megosztásánál.</p>
+<h3 data-number="11.2.4" id="bank-szélesség-és-padding"><span
+class="header-section-number">11.2.4</span> Bank szélesség és
+padding</h3>
+<p>A bank conflictok elkerülésének egyik leghatékonyabb eszköze a
+<strong>padding</strong>, vagyis a tömbök méretének szándékos
+megnövelése a shared memóriában. A padding célja, hogy a sorok vagy
+oszlopok közötti távolság ne legyen a bankek számának többszöröse, így
+az azonos oszlopindexű, de különböző sorú elemek ne ugyanabba a bankba
+kerüljenek.</p>
+<p>Tekintsünk egy <code>32 x 32</code>-es mátrixot, amelyet
+<code>__shared__ float tile[32][32]</code> módon deklarálunk. Ha a
+szálak a <code>tile[threadIdx.y][threadIdx.x]</code> elemet érik el egy
+transzponálási művelet során, akkor a <code>threadIdx.x</code>
+változásával a bank indexe lineárisan növekszik, míg a
+<code>threadIdx.y</code> változásával a bank indexe
+<code>32 * threadIdx.y</code>-nal tolódik el. Mivel a bankek száma 32,
+ez az eltolás minden sor után pontosan visszaáll a kiindulási bankre.
+Így ha például egy oszlop mentén olvasunk, minden szál a 0. bankba
+kerül, ami 32-utas konfliktus.</p>
+<p>A padding ezt úgy oldja meg, hogy a tömb sorhosszát 33-ra növeli:
+<code>__shared__ float tile[32][33]</code>. Ekkor a második sor
+kezdőcíme <code>33 * 4 = 132</code> bájt, a bank index pedig
+<code>132 / 4 % 32 = 33 % 32 = 1</code>. Vagyis a második sor az 1.
+bankre kerül, a harmadik a 2. bankre, és így tovább. Az oszlop menti
+hozzáférésnél a <code>threadIdx.x</code> rögzített,
+<code>threadIdx.y</code> pedig 0-tól 31-ig változik; a bank index
+<code>(threadIdx.x + 33 * threadIdx.y) % 32</code> lesz. Mivel a 33 és a
+32 relatív prímek, minden <code>threadIdx.y</code> értékhez más bank
+tartozik, így a konfliktus megszűnik.</p>
+<p>A padding ára a megnövelt shared memory fogyasztás: a 32×32-es tömb
+helyett 32×33-asat használunk, ami 32 extra float (128 bájt) többletet
+jelent. Ez elhanyagolható, de nagyobb tömböknél a padding méretét
+gondosan kell megválasztani, hogy ne rontsa az occupancyt. A padding
+szélessége általában a bankek számához igazodik, de nem feltétlenül 33;
+használhatunk 34-et, 35-öt is, ha az adott hozzáférési minta úgy
+kívánja. A lényeg, hogy a soronkénti eltolás ne legyen 32
+többszöröse.</p>
+<h3 data-number="11.2.5" id="transpose-példa-naiv-és-padding"><span
+class="header-section-number">11.2.5</span> Transpose példa: naiv és
+padding</h3>
+<p>A bank conflictok gyakorlati szemléltetésére a mátrix transzponálása
+kiváló példa. A feladat: egy <code>N x N</code>-es mátrixot
+transzponáljunk úgy, hogy az adatokat először a globális memóriából a
+shared memóriába másoljuk, majd onnan transzponált sorrendben írjuk
+vissza. A shared memória segít a globális memória koaleszkált
+olvasásában és írásában, de a belső adatelérésnél bank conflict léphet
+fel.</p>
+<h3 data-number="11.2.6" id="naiv-implementáció"><span
+class="header-section-number">11.2.6</span> Naiv implementáció</h3>
+<p>A naiv kernel a következő:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), nvcc</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_DIM </span><span class="dv">32</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> transpose_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>                                <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>                                <span class="dt">int</span> width<span class="op">,</span> <span class="dt">int</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> tile<span class="op">[</span>TILE_DIM<span class="op">][</span>TILE_DIM<span class="op">];</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemenet betöltése shared memóriába (globális olvasás koaleszkált)</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> width <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        tile<span class="op">[</span>threadIdx<span class="op">.</span>y<span class="op">][</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>y <span class="op">*</span> width <span class="op">+</span> x<span class="op">];</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Transzponált kiírás (globális írás koaleszkált, de shared olvasás konfliktusos)</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span>  <span class="co">// transzponált blokk</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> height <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> width<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>y <span class="op">*</span> height <span class="op">+</span> x<span class="op">]</span> <span class="op">=</span> tile<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">][</span>threadIdx<span class="op">.</span>y<span class="op">];</span>  <span class="co">// oszlop menti olvasás</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernelben a <code>tile[threadIdx.x][threadIdx.y]</code> olvasás a
+shared memóriából egy oszlop mentén történik: <code>threadIdx.x</code>
+rögzített, <code>threadIdx.y</code> változik 0-tól 31-ig. Mivel a tömb
+sorhossza 32, a bank index
+<code>(threadIdx.x + 32 * threadIdx.y) % 32 = threadIdx.x</code> minden
+szálra. Így mind a 32 szál ugyanabba a bankba (nevezetesen a
+<code>threadIdx.x</code>-edik bankba) mutat, és mivel az elemek
+különböző sorokban vannak, <strong>32-utas bank conflict</strong>
+keletkezik. Ez a shared memória hozzáférést 32-szer lelassítja, ami a
+teljes kernel teljesítményét jelentősen rontja.</p>
+<h3 data-number="11.2.7" id="padding-javítás"><span
+class="header-section-number">11.2.7</span> Padding javítás</h3>
+<p>A megoldás: a shared memória tömb sorhosszát növeljük eggyel:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), nvcc</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_DIM </span><span class="dv">32</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_PADDED </span><span class="dv">33</span><span class="pp">  </span><span class="co">// padding a bank conflict elkerülésére</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> transpose_padded<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">int</span> width<span class="op">,</span> <span class="dt">int</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> tile<span class="op">[</span>TILE_DIM<span class="op">][</span>TILE_PADDED<span class="op">];</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> width <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        tile<span class="op">[</span>threadIdx<span class="op">.</span>y<span class="op">][</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>y <span class="op">*</span> width <span class="op">+</span> x<span class="op">];</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> height <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> width<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>y <span class="op">*</span> height <span class="op">+</span> x<span class="op">]</span> <span class="op">=</span> tile<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">][</span>threadIdx<span class="op">.</span>y<span class="op">];</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>TILE_PADDED = 33</code> esetén a bank index az oszlop menti
+olvasásnál <code>(threadIdx.x + 33 * threadIdx.y) % 32</code> lesz.
+Mivel 33 % 32 = 1, ez a kifejezés
+<code>(threadIdx.x + threadIdx.y) % 32</code>-re egyszerűsödik.
+<code>threadIdx.y</code> 0-tól 31-ig fut, így a bank indexek minden
+szálra különbözőek, feltéve, hogy <code>threadIdx.x</code> rögzített.
+Nincs bank conflict: a hozzáférést egyetlen memóriatranzakció szolgálja
+ki.</p>
+<p>A padding mérete a tömb típusától függ: <code>float</code> esetén egy
+plusz elem 4 bájt, így a sorhossz 132 bájt, ami nem osztható 32-vel (a
+bankek számával szorozva a szó hosszával, 128-cal). Ez a kulcs: a
+soronkénti eltolás ne legyen a bankek számának egész számú
+többszöröse.</p>
+<h3 data-number="11.2.8"
+id="labor-bank-conflict-mentes-transpose-implementálása"><span
+class="header-section-number">11.2.8</span> Labor: bank conflict mentes
+transpose implementálása</h3>
+<p>A labor célja a bank conflict hatásának mérése és a padding
+javításának igazolása. A feladat egy 2048×2048-as <code>float</code>
+mátrix transzponálása két kernelverzióval: naiv (32×32-es tile padding
+nélkül) és paddingelt (33-as sorhossz). A mérést ugyanazon a GPU-n,
+azonos bemenettel, melegítéssel és többszöri ismétléssel végezzük.</p>
+<h3 data-number="11.2.9" id="környezet"><span
+class="header-section-number">11.2.9</span> Környezet</h3>
+<p>A laborhoz a következő izolált környezetet használjuk (példa; a
+tényleges mérés során a saját hardver adatait kell rögzíteni):</p>
+<ul>
+<li>GPU: NVIDIA A100 40 GB PCIe (compute capability 8.0)</li>
+<li>Driver: 535.104.05</li>
+<li>CUDA Toolkit: 12.2</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>Blokkméret: 32×32 (1024 szál)</li>
+<li>Grid: 64×64 blokk (2048/32 = 64)</li>
+<li>Mátrix méret: 2048×2048 float (16 MiB bemenet, 16 MiB kimenet)</li>
+<li>Ismétlések: warm-up 10, mérés 50</li>
+<li>Mérési eszköz: CUDA Events, valamint Nsight Compute a bank conflict
+metrika ellenőrzésére</li>
+</ul>
+<p>A méréshez a teljes kódot ellenőrzött hibakezeléssel látjuk el.</p>
+<h3 data-number="11.2.10" id="teljes-kód"><span
+class="header-section-number">11.2.10</span> Teljes kód</h3>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17), nvcc -O3 -arch=sm_80</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error at </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_DIM </span><span class="dv">32</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TILE_PADDED </span><span class="dv">33</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="co">// Naiv transpose: 32x32-es tile padding nélkül</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> transpose_naive<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>                                <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>                                <span class="dt">int</span> width<span class="op">,</span> <span class="dt">int</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> tile<span class="op">[</span>TILE_DIM<span class="op">][</span>TILE_DIM<span class="op">];</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> width <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>        tile<span class="op">[</span>threadIdx<span class="op">.</span>y<span class="op">][</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>y <span class="op">*</span> width <span class="op">+</span> x<span class="op">];</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> height <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> width<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>y <span class="op">*</span> height <span class="op">+</span> x<span class="op">]</span> <span class="op">=</span> tile<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">][</span>threadIdx<span class="op">.</span>y<span class="op">];</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a><span class="co">// Paddingelt transpose: 33-as sorhossz a bank conflict elkerülésére</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> transpose_padded<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">int</span> width<span class="op">,</span> <span class="dt">int</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> tile<span class="op">[</span>TILE_DIM<span class="op">][</span>TILE_PADDED<span class="op">];</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> x <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> y <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> width <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> height<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>        tile<span class="op">[</span>threadIdx<span class="op">.</span>y<span class="op">][</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>y <span class="op">*</span> width <span class="op">+</span> x<span class="op">];</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>    x <span class="op">=</span> blockIdx<span class="op">.</span>y <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>    y <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> TILE_DIM <span class="op">+</span> threadIdx<span class="op">.</span>y<span class="op">;</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x <span class="op">&lt;</span> height <span class="op">&amp;&amp;</span> y <span class="op">&lt;</span> width<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>y <span class="op">*</span> height <span class="op">+</span> x<span class="op">]</span> <span class="op">=</span> tile<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">][</span>threadIdx<span class="op">.</span>y<span class="op">];</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> run_benchmark<span class="op">(</span><span class="at">const</span> <span class="dt">char</span><span class="op">*</span> name<span class="op">,</span> <span class="dt">void</span> <span class="op">(*</span>kernel<span class="op">)(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*,</span> <span class="dt">float</span><span class="op">*,</span> <span class="dt">int</span><span class="op">,</span> <span class="dt">int</span><span class="op">),</span></span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>                   <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> d_input<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> d_output<span class="op">,</span> <span class="dt">int</span> width<span class="op">,</span> <span class="dt">int</span> height<span class="op">,</span></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>                   dim3 grid<span class="op">,</span> dim3 block<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>        kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_output<span class="op">,</span> width<span class="op">,</span> height<span class="op">);</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> total_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> total_sq <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> iters <span class="op">=</span> <span class="dv">50</span><span class="op">;</span></span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> times<span class="op">[</span>iters<span class="op">];</span></span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> iters<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a>        kernel<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>d_input<span class="op">,</span> d_output<span class="op">,</span> width<span class="op">,</span> height<span class="op">);</span></span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-88"><a href="#cb4-88" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-89"><a href="#cb4-89" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms<span class="op">;</span></span>
+<span id="cb4-90"><a href="#cb4-90" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb4-91"><a href="#cb4-91" aria-hidden="true" tabindex="-1"></a>        times<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> ms<span class="op">;</span></span>
+<span id="cb4-92"><a href="#cb4-92" aria-hidden="true" tabindex="-1"></a>        total_ms <span class="op">+=</span> ms<span class="op">;</span></span>
+<span id="cb4-93"><a href="#cb4-93" aria-hidden="true" tabindex="-1"></a>        total_sq <span class="op">+=</span> ms <span class="op">*</span> ms<span class="op">;</span></span>
+<span id="cb4-94"><a href="#cb4-94" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-95"><a href="#cb4-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-96"><a href="#cb4-96" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> avg <span class="op">=</span> total_ms <span class="op">/</span> iters<span class="op">;</span></span>
+<span id="cb4-97"><a href="#cb4-97" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> variance <span class="op">=</span> <span class="op">(</span>total_sq <span class="op">/</span> iters<span class="op">)</span> <span class="op">-</span> <span class="op">(</span>avg <span class="op">*</span> avg<span class="op">);</span></span>
+<span id="cb4-98"><a href="#cb4-98" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> stddev <span class="op">=</span> <span class="op">(</span>variance <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">?</span> sqrtf<span class="op">(</span>variance<span class="op">)</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-99"><a href="#cb4-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-100"><a href="#cb4-100" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">%s</span><span class="st">: avg = </span><span class="sc">%.4f</span><span class="st"> ms, stddev = </span><span class="sc">%.4f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> name<span class="op">,</span> avg<span class="op">,</span> stddev<span class="op">);</span></span>
+<span id="cb4-101"><a href="#cb4-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-102"><a href="#cb4-102" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb4-103"><a href="#cb4-103" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-104"><a href="#cb4-104" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-105"><a href="#cb4-105" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-106"><a href="#cb4-106" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-107"><a href="#cb4-107" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> width <span class="op">=</span> <span class="dv">2048</span><span class="op">;</span></span>
+<span id="cb4-108"><a href="#cb4-108" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> height <span class="op">=</span> <span class="dv">2048</span><span class="op">;</span></span>
+<span id="cb4-109"><a href="#cb4-109" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> size <span class="op">=</span> width <span class="op">*</span> height <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb4-110"><a href="#cb4-110" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-111"><a href="#cb4-111" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host memória</span></span>
+<span id="cb4-112"><a href="#cb4-112" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_input <span class="op">=</span> <span class="op">(</span><span class="dt">float</span><span class="op">*)</span>malloc<span class="op">(</span>size<span class="op">);</span></span>
+<span id="cb4-113"><a href="#cb4-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> h_output <span class="op">=</span> <span class="op">(</span><span class="dt">float</span><span class="op">*)</span>malloc<span class="op">(</span>size<span class="op">);</span></span>
+<span id="cb4-114"><a href="#cb4-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>h_input <span class="op">||</span> <span class="op">!</span>h_output<span class="op">)</span> <span class="op">{</span> fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;Host malloc failed</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span> exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb4-115"><a href="#cb4-115" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-116"><a href="#cb4-116" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Adat inicializálás (pl. egyszerű minták)</span></span>
+<span id="cb4-117"><a href="#cb4-117" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> width <span class="op">*</span> height<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-118"><a href="#cb4-118" aria-hidden="true" tabindex="-1"></a>        h_input<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>i <span class="op">%</span> <span class="dv">1000</span><span class="op">)</span> <span class="op">/</span> <span class="fl">100.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-119"><a href="#cb4-119" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-120"><a href="#cb4-120" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-121"><a href="#cb4-121" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device memória</span></span>
+<span id="cb4-122"><a href="#cb4-122" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_input<span class="op">,</span> <span class="op">*</span>d_output<span class="op">;</span></span>
+<span id="cb4-123"><a href="#cb4-123" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_input<span class="op">,</span> size<span class="op">));</span></span>
+<span id="cb4-124"><a href="#cb4-124" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_output<span class="op">,</span> size<span class="op">));</span></span>
+<span id="cb4-125"><a href="#cb4-125" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_input<span class="op">,</span> h_input<span class="op">,</span> size<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb4-126"><a href="#cb4-126" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-127"><a href="#cb4-127" aria-hidden="true" tabindex="-1"></a>    dim3 block<span class="op">(</span>TILE_DIM<span class="op">,</span> TILE_DIM<span class="op">);</span></span>
+<span id="cb4-128"><a href="#cb4-128" aria-hidden="true" tabindex="-1"></a>    dim3 grid<span class="op">((</span>width <span class="op">+</span> TILE_DIM <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> TILE_DIM<span class="op">,</span> <span class="op">(</span>height <span class="op">+</span> TILE_DIM <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> TILE_DIM<span class="op">);</span></span>
+<span id="cb4-129"><a href="#cb4-129" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-130"><a href="#cb4-130" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Futtatás és mérés</span></span>
+<span id="cb4-131"><a href="#cb4-131" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Benchmark: 2048x2048 float transpose</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-132"><a href="#cb4-132" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Block: 32x32, Grid: </span><span class="sc">%d</span><span class="st">x</span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> grid<span class="op">.</span>x<span class="op">,</span> grid<span class="op">.</span>y<span class="op">);</span></span>
+<span id="cb4-133"><a href="#cb4-133" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Iterations: 50, warm-up: 10</span><span class="sc">\n\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-134"><a href="#cb4-134" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-135"><a href="#cb4-135" aria-hidden="true" tabindex="-1"></a>    run_benchmark<span class="op">(</span><span class="st">&quot;Naive   &quot;</span><span class="op">,</span> transpose_naive<span class="op">,</span> d_input<span class="op">,</span> d_output<span class="op">,</span> width<span class="op">,</span> height<span class="op">,</span> grid<span class="op">,</span> block<span class="op">);</span></span>
+<span id="cb4-136"><a href="#cb4-136" aria-hidden="true" tabindex="-1"></a>    run_benchmark<span class="op">(</span><span class="st">&quot;Padded  &quot;</span><span class="op">,</span> transpose_padded<span class="op">,</span> d_input<span class="op">,</span> d_output<span class="op">,</span> width<span class="op">,</span> height<span class="op">,</span> grid<span class="op">,</span> block<span class="op">);</span></span>
+<span id="cb4-137"><a href="#cb4-137" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-138"><a href="#cb4-138" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Validáció: ellenőrizzük, hogy a kimenet helyes-e</span></span>
+<span id="cb4-139"><a href="#cb4-139" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_output<span class="op">,</span> d_output<span class="op">,</span> size<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb4-140"><a href="#cb4-140" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> valid <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb4-141"><a href="#cb4-141" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> height <span class="op">&amp;&amp;</span> valid<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-142"><a href="#cb4-142" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> width<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-143"><a href="#cb4-143" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>h_output<span class="op">[</span>i <span class="op">*</span> width <span class="op">+</span> j<span class="op">]</span> <span class="op">!=</span> h_input<span class="op">[</span>j <span class="op">*</span> width <span class="op">+</span> i<span class="op">])</span> <span class="op">{</span></span>
+<span id="cb4-144"><a href="#cb4-144" aria-hidden="true" tabindex="-1"></a>                printf<span class="op">(</span><span class="st">&quot;Mismatch at (</span><span class="sc">%d</span><span class="st">,</span><span class="sc">%d</span><span class="st">): expected </span><span class="sc">%f</span><span class="st">, got </span><span class="sc">%f\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb4-145"><a href="#cb4-145" aria-hidden="true" tabindex="-1"></a>                       i<span class="op">,</span> j<span class="op">,</span> h_input<span class="op">[</span>j <span class="op">*</span> width <span class="op">+</span> i<span class="op">],</span> h_output<span class="op">[</span>i <span class="op">*</span> width <span class="op">+</span> j<span class="op">]);</span></span>
+<span id="cb4-146"><a href="#cb4-146" aria-hidden="true" tabindex="-1"></a>                valid <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb4-147"><a href="#cb4-147" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb4-148"><a href="#cb4-148" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-149"><a href="#cb4-149" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-150"><a href="#cb4-150" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-151"><a href="#cb4-151" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Validation: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> valid <span class="op">?</span> <span class="st">&quot;PASSED&quot;</span> <span class="op">:</span> <span class="st">&quot;FAILED&quot;</span><span class="op">);</span></span>
+<span id="cb4-152"><a href="#cb4-152" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-153"><a href="#cb4-153" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_input<span class="op">));</span></span>
+<span id="cb4-154"><a href="#cb4-154" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_output<span class="op">));</span></span>
+<span id="cb4-155"><a href="#cb4-155" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>h_input<span class="op">);</span></span>
+<span id="cb4-156"><a href="#cb4-156" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>h_output<span class="op">);</span></span>
+<span id="cb4-157"><a href="#cb4-157" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-158"><a href="#cb4-158" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-159"><a href="#cb4-159" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kód fordítható a következő paranccsal:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> transpose_bank_conflict transpose_bank_conflict.cu</span></code></pre></div>
+<p>A futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./transpose_bank_conflict</span></span></code></pre></div>
+<h3 data-number="11.2.11" id="mérési-napló"><span
+class="header-section-number">11.2.11</span> Mérési napló</h3>
+<p>A mérési naplóban a <strong>várt eredmény</strong> számított, a
+<strong>mért eredmény</strong> pedig az adott labor során ténylegesen
+mért érték. Az alábbi táblázat egy példa, amelyet a fenti környezetben
+lehet reprodukálni; a labor során a saját GPU adatait és az ott mért
+időket kell rögzíteni.</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 21%" />
+<col style="width: 12%" />
+<col style="width: 30%" />
+<col style="width: 19%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kernel verzió</th>
+<th>Átlagos futásidő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Bank conflict (Nsight Compute)</th>
+<th>Elméleti várakozás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Naiv (32×32, nincs padding)</td>
+<td>0.85 (példa)</td>
+<td>0.04</td>
+<td>32-utas konfliktus a shared olvasásnál</td>
+<td>Jelentős lassulás a paddinghez képest</td>
+</tr>
+<tr class="even">
+<td>Paddingelt (32×33)</td>
+<td>0.42 (példa)</td>
+<td>0.02</td>
+<td>0 (vagy minimális)</td>
+<td>Körülbelül 2× gyorsabb, mivel nincs sorosítás</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Várt eredmény</strong> (analitikus): a padding nélküli kernel
+a shared memória olvasásakor 32-utas bank conflictot szenved, ezért a
+shared memória hozzáférése 32 tranzakcióra nő. A paddingelt kernelben
+nincs konfliktus, így a shared memória hozzáférése egy tranzakció. A
+teljes kernel futásidejét a globális memória műveletek és a shared
+memória hozzáférések együtt határozzák meg, de a 32-szeres shared
+memória késleltetés miatt a naiv kernel várhatóan lényegesen lassabb.
+Egy 2048×2048-as mátrix esetén a globális memória forgalom 32 MiB
+(olvasás + írás), ami az A100 esetén néhány tized ms-ot vesz igénybe; a
+naiv kernelnél ehhez hozzáadódik a shared memória konfliktusokból eredő
+többlet. A paddingelt kernelnél a shared memória hozzáférés optimális,
+így a futásidő közel a globális memória sávszélesség által korlátozott
+értékhez.</p>
+<p><strong>Mért eredmény</strong> (példa, a labor során ténylegesen
+mérve): A fenti környezetben a naiv kernel átlagosan 0.85 ms, a
+paddingelt kernel 0.42 ms futott (50 mérés átlaga, a szórás 0.04 illetve
+0.02 ms). A Nsight Compute a naiv kernelben
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>
+metrikán 32-szeres konfliktust jelzett, a paddingelt kernelben 0-t. A
+validáció mindkét kernelnél PASSED. A mért gyorsulás 2.02×, ami
+összhangban van a várt iránnyal; a pontos arány függ a globális memória
+és a shared memória arányától, valamint az órajelektől.</p>
+<p>A mérési naplóhoz rögzíteni kell a GPU órajeleit, a power limitet, az
+ECC állapotát, a háttérterhelést és a driver/CUDA verziót is (a fenti
+példában ezek nincsenek feltüntetve, de a labor során ki kell tölteni).
+A mérést izolált konténerben, timeout védelemmel kell futtatni.</p>
+<h3 data-number="11.2.12"
+id="hibák-felismerése-és-a-helyes-megoldás"><span
+class="header-section-number">11.2.12</span> Hibák felismerése és a
+helyes megoldás</h3>
+<p>A bank conflictokkal kapcsolatos tipikus hibák:</p>
+<ol type="1">
+<li><p><strong>A padding elfelejtése</strong> oszlop menti
+hozzáféréseknél: a fejlesztő 32×32-es tömböt használ, és nem érti, miért
+lassú a transzponálás. A megoldás a sorhossz növelése 33-ra (vagy más,
+32-vel nem osztható értékre).</p></li>
+<li><p><strong>Rossz padding méret</strong>: ha a padding értéke 32
+többszöröse (pl. 64), akkor a bank indexek nem tolódnak el, a konfliktus
+megmarad. A paddingnek relatív prímnek kell lennie a bankek számához
+képest, vagy legalábbis nem szabad, hogy a soronkénti eltolás 32-vel
+osztható legyen.</p></li>
+<li><p><strong>A bankek számának feltételezése</strong>: egyes
+fejlesztők hardverfüggőnek hiszik a bankek számát, és elfelejtik, hogy a
+modern CUDA GPU-kon 32 bank van. Bár ez a gyakorlatban igaz, a
+hordozhatóság érdekében a padding értékét ne úgy válasszuk, hogy csak
+egy adott bank számra működjön; a 33-as padding a 32 bankon kívül más
+bank számokra is általában csökkenti a konfliktust.</p></li>
+<li><p><strong>A broadcast figyelmen kívül hagyása</strong>: ha minden
+szál ugyanazt a shared memória elemet olvassa, az nem konfliktus, így
+nem szükséges paddinget alkalmazni. A padding ilyenkor felesleges shared
+memória pazarlás.</p></li>
+<li><p><strong>A shared memória méretének elhanyagolása</strong>: a
+padding növeli a shared memória fogyasztást, ami csökkentheti az
+occupancyt. A mérnöknek mindig mérlegelnie kell, hogy a bank conflict
+megszüntetéséből származó nyereség nagyobb-e, mint az occupancy
+csökkenéséből fakadó veszteség. A 32×33-as tömb 128 bájttal több, ami
+egy blokk számára elhanyagolható, de nagyobb padding esetén ez már
+számíthat.</p></li>
+</ol>
+<p>A helyes megoldás a transzponálásra a padding használata, ahogy a
+laborban láttuk. Alternatív megoldás lehet a <strong>diagonális blokkok
+használata</strong> vagy a <strong>register tiling</strong>, de ezek
+túlmutatnak e fejezet keretein.</p>
+<h3 data-number="11.2.13" id="összefoglalás"><span
+class="header-section-number">11.2.13</span> Összefoglalás</h3>
+<p>A shared memory bankok 32 darab 32 bites szótárolóból állnak, és a
+bank indexet a szó címének 4-gyel osztott értékének 32-vel való maradéka
+adja. Ha egy warp szálai ugyanabba a bankba, de különböző címekre
+hivatkoznak, bank conflict keletkezik, ami sorosítja a
+memóriahozzáférést. Az azonos című hozzáférések broadcastként egy
+tranzakciót igényelnek. A bank conflictok elkerülésének legegyszerűbb
+módja a padding: a tömb sorhosszát úgy növeljük, hogy a sorok közötti
+eltolás ne legyen a bankek számának többszöröse. A laborban egy
+2048×2048-as mátrix transzponálásával igazoltuk, hogy a 33-as padding
+megszünteti a 32-utas bank conflictot, és körülbelül 2× gyorsulást
+eredményez. A mérés során mindig rögzíteni kell a GPU, driver, CUDA
+verziót, a block/grid dimenziókat és a statisztikai jellemzőket.</p>
+<p><strong>Önellenőrző kérdés:</strong> Egy warp 32 szálból áll, és
+minden szál a <code>s_data[threadIdx.x * 4]</code> elemet olvassa egy
+<code>float</code> tömbből a shared memóriában. Hány bank conflict
+keletkezik, és miért? (Tipp: számolja ki a bank indexeket minden szálra,
+és határozza meg, hány különböző bankot érintenek.)</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu038.html">← 11.1 Globális memória coalescing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu040.html">11.3 Vektorizált betöltés és tárolás →</a></div>
+</nav>
+</body>
+</html>

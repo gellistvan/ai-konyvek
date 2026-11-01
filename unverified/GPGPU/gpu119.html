@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>31.2 Nsight Systems és a rendszerszintű profil – GPGPU –
+általános célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Mérnökség és záróprojekt</a> › <a href="index.html#gpuch30">31 Profilozás, benchmarkolás és energia</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu118.html">← 31.1 Nsight Compute és a kernelmetrikák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu120.html">31.3 Benchmarkmódszertan →</a></div>
+</nav>
+<h2 data-number="31.2" id="gpu119"><span
+class="header-section-number">31.2</span> Nsight Systems és a
+rendszerszintű profil</h2>
+<p>Az Nsight Systems a teljes alkalmazás idővonalát vizsgálja: nem
+egyetlen kernel belső metrikáira fókuszál, hanem arra, hogy a
+CPU-szálak, a CUDA API-hívások, a memóriaműveletek és a GPU-n futó
+kernelek hogyan illeszkednek egymáshoz az időben. Az előző egységben (<a
+href="gpu118.html">Nsight Compute és a kernelmetrikák</a>) az Nsight
+Compute segítségével egy-egy kernel számítási és memória-teljesítményét
+elemeztük. Most kilépünk a kernel szintjéről, és azt kérdezzük: a teljes
+programunk jól használja-e ki a GPU és a CPU közötti párhuzamosságot?
+Hol vannak olyan szinkronizációs pontok, amelyek megakadályozzák az
+adatmozgatás és a számítás átfedését? Az Nsight Systems pontosan ezeket
+a kérdéseket teszi megválaszolhatóvá.</p>
+<h3 data-number="31.2.1" id="a-teljes-alkalmazás-idővonala"><span
+class="header-section-number">31.2.1</span> A teljes alkalmazás
+idővonala</h3>
+<p>Az Nsight Systems egy rendszerszintű profilozó eszköz, amely rögzíti
+a CPU-szálak tevékenységét, a CUDA API-hívásokat, a kernelek indítását,
+a memóriaműveleteket, a szinkronizációs hívásokat, valamint az egyéb
+futási idejű eseményeket. Az eredmény egy idővonalon jelenik meg,
+amelyen függőleges sávok jelzik az egyes erőforrások állapotát. A fő
+nézetben általában a következő sorokat látjuk:</p>
+<ul>
+<li><strong>CPU szálak</strong>: minden operációs rendszer szál külön
+sávként jelenik meg, láthatóvá téve, hogy a CPU mikor dolgozik, mikor
+várakozik, és mikor hajt végre CUDA API-hívást.</li>
+<li><strong>CUDA API</strong>: a CPU oldalán kiadott hívások, mint
+például <code>cudaMemcpyAsync</code>, <code>cudaLaunchKernel</code>,
+<code>cudaStreamSynchronize</code>, <code>cudaDeviceSynchronize</code>.
+Ezeknek a hívásoknak a hossza azt mutatja, mennyi időt tölt a CPU a
+hívás feldolgozásával.</li>
+<li><strong>Kernek és memóriaműveletek</strong>: a GPU-n futó kernelek
+és a másolási műveletek (H2D, D2H) külön sávban szerepelnek. Itt
+látható, hogy a GPU mikor aktív, és hogy a különböző streamek műveletei
+átfedésben vannak-e.</li>
+<li><strong>Szinkronizációs pontok</strong>: a CPU és GPU közötti
+várakozások, például amikor a CPU <code>cudaStreamSynchronize</code>
+hívása blokkol, amíg a stream be nem fejeződik.</li>
+</ul>
+<p>Az idővonal elemzésekor a legfontosabb mintázat a
+<strong>buborékok</strong> (üres idők) jelenléte. Ha a GPU
+kihasználtsága alacsony, gyakran azért van, mert a CPU nem tudja elég
+gyorsan kiadni a következő műveletet, vagy mert egy szinkronizációs
+hívás megvár egy korábbi műveletet, mielőtt újabbakat indíthatna. Az
+Nsight Systems segítségével ezeket a buborékokat pontosan
+lokalizálhatjuk.</p>
+<h3 data-number="31.2.2" id="cuda-api-és-kernel-az-idővonalon"><span
+class="header-section-number">31.2.2</span> CUDA API és kernel az
+idővonalon</h3>
+<p>A CUDA programok futtatása során a CPU a CUDA API-n keresztül vezérli
+a GPU-t. A modern CUDA futási modellben a legtöbb API-hívás
+<strong>aszinkron</strong>: a CPU csupán bejegyzi a műveletet egy
+streambe, majd azonnal visszatér. A GPU később hajtja végre a bejegyzett
+műveleteket. Ez teszi lehetővé, hogy a CPU előre dolgozzon, miközben a
+GPU még a korábbi feladatokat végzi. Az Nsight Systems idővonalán ezt
+úgy látjuk, hogy a CPU API-hívásai rövidek, és a GPU oldalán a kernelek
+később kezdődnek, esetleg átfedésben más streamek műveleteivel.</p>
+<p>A CUDA API-hívások két nagy csoportra oszthatók:</p>
+<ul>
+<li><strong>Vezérlő hívások</strong>: <code>cudaLaunchKernel</code>,
+<code>cudaMemcpyAsync</code>, <code>cudaMemsetAsync</code>. Ezek
+tipikusan gyorsak, és a CPU nem blokkol rajtuk, kivéve, ha a stream tele
+van, vagy ha a hívás szinkronizációs okból várakozik.</li>
+<li><strong>Szinkronizációs hívások</strong>:
+<code>cudaDeviceSynchronize</code>, <code>cudaStreamSynchronize</code>,
+<code>cudaMemcpy</code> (a szinkron változat), <code>cudaMalloc</code>
+(ha nincs cached allokáció). Ezek a CPU-t blokkolják, amíg a megfelelő
+GPU-munka be nem fejeződik.</li>
+</ul>
+<p>Az Nsight Systems-ben a CUDA API-hívásokhoz tartozó sávok
+színkódoltak. A leggyakoribb színek és jelentésük (a gyártó
+dokumentációja szerint, de a pontos színkódolás a verziótól függ) a
+következőképpen foglalható össze:</p>
+<ul>
+<li><strong>Kék</strong>: memóriamásolás (H2D vagy D2H)</li>
+<li><strong>Zöld</strong>: kernel-végrehajtás</li>
+<li><strong>Sárga</strong>: szinkronizáció vagy API-hívás</li>
+<li><strong>Piros/szürke</strong>: blokkolt vagy várakozó állapot</li>
+</ul>
+<p>Amikor egy kernel sávja zölddel jelenik meg, az azt jelenti, hogy a
+GPU adott időpontban ténylegesen végrehajtja a kernelt. Ha a kernel
+sávja rövidebb, mint a hozzá tartozó API-hívás időtartama, az azt
+jelezheti, hogy a CPU lassan adta ki a műveletet. Az idővonalon a CPU
+szál sávjában a kernel indításához tartozó <code>cudaLaunchKernel</code>
+hívás ideje alatt a CPU a kernel paramétereit csomagolja, és a parancsot
+a streambe helyezi. Ez általában nagyon rövid, de ha túl sok kis
+kernelünk van, akkor a CPU oldali overhead jelentőssé válhat.</p>
+<p>A gyakorlatban az Nsight Systems-ben a következő kérdéseket tesszük
+fel:</p>
+<ol type="1">
+<li>Van-e átfedés a H2D másolás, a kernel és a D2H másolás között
+különböző streamekben?</li>
+<li>A CPU kihasználtsága elég magas-e ahhoz, hogy ellássa a GPU-t
+munkával?</li>
+<li>Hol jelennek meg hosszú blokkoló hívások, amelyek megszakítják a
+folyamatos végrehajtást?</li>
+</ol>
+<h3 data-number="31.2.3" id="cpu-gpu-szinkronizáció"><span
+class="header-section-number">31.2.3</span> CPU-GPU szinkronizáció</h3>
+<p>A CPU és a GPU közötti szinkronizáció az egyik leggyakoribb oka a
+teljesítménycsökkenésnek. A GPU kihasználtsága akkor optimális, ha
+folyamatosan van végrehajtandó munkája. Ha a CPU szinkronizál, akkor a
+GPU-nak várnia kell, amíg a CPU újabb parancsot ad, vagy fordítva: a CPU
+várakozik a GPU befejezésére.</p>
+<p>A CUDA-ban a következő szinkronizációs mechanizmusok léteznek:</p>
+<ul>
+<li><strong><code>cudaDeviceSynchronize()</code></strong>: megvárja,
+amíg az összes stream minden művelete befejeződik. Ez a legerősebb
+szinkronizáció, és gyakran teljesen megszünteti az átfedést, mert a CPU
+addig nem ad ki új műveletet, amíg minden korábbi be nem
+fejeződött.</li>
+<li><strong><code>cudaStreamSynchronize(stream)</code></strong>:
+megvárja egy adott stream összes műveletét. Ez kevésbé káros, mint a
+teljes eszköz szinkronizálása, de még mindig blokkolja a CPU-t az adott
+stream befejezéséig.</li>
+<li><strong><code>cudaMemcpy</code> (szinkron változat)</strong>: a
+memóriamásolás alapértelmezett formája szinkron, ami azt jelenti, hogy a
+hívás blokkol, amíg a másolás be nem fejeződik, és implicit módon az
+összes korábbi műveletet is szinkronizálja az adott streamre vonatkozóan
+(pontosabban: a szinkron <code>cudaMemcpy</code> a default streamet
+használja, amely szinkronizál a többi streammel). Ez nagyon gyakori
+hiba, amikor a fejlesztő <code>cudaMemcpy</code>-t használ aszinkron
+másolásra szánt kódban.</li>
+<li><strong>Események (<code>cudaEvent_t</code>)</strong>: az
+eseményekkel finomabban vezérelhető a szinkronizáció. A
+<code>cudaEventRecord</code> bejegyzi az eseményt a streambe, a
+<code>cudaEventSynchronize</code> pedig megvárja az adott eseményt. Az
+események lehetővé teszik más streamek közötti függőségek létrehozását
+anélkül, hogy a teljes eszközt blokkolnánk.</li>
+</ul>
+<p>Az Nsight Systems idővonalán a szinkronizációs hívások sárga sávként
+jelennek meg a CPU szálon, és gyakran látható, hogy a GPU eközben
+üresjáratban van. Ha a GPU sávjában hosszú üres szakaszok vannak, akkor
+érdemes megkeresni az őket megelőző CPU-oldali szinkronizációs
+hívást.</p>
+<p>Fontos megjegyezni, hogy a <strong>default stream</strong> (0-s
+stream) speciális viselkedésű: a default stream szinkronizál a többi
+streammel, ha azok nem non-blocking streamként lettek létrehozva
+(<code>cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)</code>). Ez
+azt jelenti, hogy ha egy default streamen kiadott művelet előtt más
+streamekben van függőben lévő munka, akkor a default stream megvárja
+azok befejezését. Ez gyakran rejtett szinkronizációhoz vezet, amit az
+Nsight Systems jól láthatóvá tesz. A modern CUDA ajánlása szerint minden
+műveletet explicit streamekben kell végrehajtani, és kerülni kell a
+default stream használatát, ha átfedést akarunk.</p>
+<h3 data-number="31.2.4" id="stream--és-copy-átfedés-elmélete"><span
+class="header-section-number">31.2.4</span> Stream- és copy-átfedés
+elmélete</h3>
+<p>A GPU és a CPU közötti adatmozgatás (H2D és D2H) a PCIe buszon
+keresztül történik. Ez a busz sávszélessége korlátozott, de a másolási
+műveletek <strong>aszinkron módon</strong> végrehajthatók, vagyis a GPU
+képes egyszerre fogadni az adatokat és közben számítási feladatokat
+végezni. Ezt a képességet <strong>copy és compute overlap</strong>-nek
+nevezzük. A gyakorlatban a következő feltételeknek kell
+teljesülniük:</p>
+<ol type="1">
+<li>A másolási műveleteknek <strong>aszinkronnak</strong> kell lenniük
+(<code>cudaMemcpyAsync</code>).</li>
+<li>A másolásnak és a kernelnek <strong>különböző streamekben</strong>
+kell futniuk, vagy legalábbis a műveletek sorrendjét úgy kell
+kialakítani, hogy ne legyen köztük szinkronizációs függőség.</li>
+<li>A GPU és a CPU között a memóriaműveleteknek <strong>nem szabad
+blokkolniuk</strong> egymást, és a hardvernek támogatnia kell a
+párhuzamos másolást és számítást (a legtöbb modern GPU esetében ez
+adott).</li>
+</ol>
+<p>Egy tipikus minta, amely kihasználja az átfedést, a <strong>több
+streames feldolgozás</strong>:</p>
+<ol type="1">
+<li>Az adatot több részre osztjuk.</li>
+<li>Minden streamhez hozzárendelünk egy-egy részt.</li>
+<li>Minden streamben sorban végrehajtjuk:
+<ul>
+<li>H2D másolás a készülékre (<code>cudaMemcpyAsync</code>),</li>
+<li>kernel indítása a rész feldolgozására,</li>
+<li>D2H másolás az eredmény visszaküldésére.</li>
+</ul></li>
+<li>Az egyes streamek műveletei átfedhetik egymást: amíg az egyik stream
+kernelje fut, a másik stream H2D másolása a PCIe buszon dolgozik.</li>
+</ol>
+<p>Ha a streameket helyesen állítjuk be, az idővonalon azt látjuk, hogy
+a zöld kernel sávok és a kék másolási sávok egymás mellett, időben
+átfedve jelennek meg. A teljes futási idő így jelentősen csökkenhet a
+szekvenciális végrehajtáshoz képest.</p>
+<h3 data-number="31.2.5"
+id="példaprogram-több-stream-és-aszinkron-másolás"><span
+class="header-section-number">31.2.5</span> Példaprogram: több stream és
+aszinkron másolás</h3>
+<p>A következő CUDA C++ példa azt mutatja be, hogyan lehet négy stream
+segítségével átfedni a másolást és a kernel-végrehajtást. A kernel egy
+egyszerű vektor-skálázást végez, de a hangsúly a stream-kezelésen
+van.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// File: stream_overlap.cu</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -std=c++17 -O3 stream_overlap.cu -o stream_overlap</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Futtatás: ./stream_overlap</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co">// Környezet: CUDA 12.3, NVIDIA A100 (compute capability 8.0), driver 545.23.08,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co">//            Ubuntu 22.04, nvidia-smi: power limit 400 W, ECC off, MIG off.</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibakezelő makró</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                      </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                      </span><span class="op">\</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">                      </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; - &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                     </span><span class="op">\</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> scale_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>                             <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>                             <span class="dt">float</span> scale<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>idx<span class="op">]</span> <span class="op">*</span> scale<span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> num_streams <span class="op">=</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> chunk_size <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span>        <span class="co">// 1 Mi elemenként</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> total_size <span class="op">=</span> num_streams <span class="op">*</span> chunk_size<span class="op">;</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">size_t</span> bytes_per_chunk <span class="op">=</span> chunk_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host memória (pageable, de a példa egyszerűsége kedvéért)</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> h_input<span class="op">(</span>total_size<span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> h_output<span class="op">(</span>total_size<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> scale <span class="op">=</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device memória</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_input<span class="op">,</span> <span class="op">*</span>d_output<span class="op">;</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_input<span class="op">,</span> total_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_output<span class="op">,</span> total_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Stream-ek létrehozása non-blocking flaggel</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> streams<span class="op">[</span>num_streams<span class="op">];</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_streams<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaStreamCreateWithFlags<span class="op">(&amp;</span>streams<span class="op">[</span>i<span class="op">],</span> cudaStreamNonBlocking<span class="op">));</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Időmérés</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Minden stream feldolgozza a saját szeletét</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_streams<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>        <span class="co">// H2D másolás aszinkron</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>d_input <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>                                   h_input<span class="op">.</span>data<span class="op">()</span> <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a>                                   bytes_per_chunk<span class="op">,</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>                                   cudaMemcpyHostToDevice<span class="op">,</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a>                                   streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Kernel indítás</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> blocks <span class="op">=</span> <span class="op">(</span>chunk_size <span class="op">+</span> threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threads<span class="op">;</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>        scale_kernel<span class="op">&lt;&lt;&lt;</span>blocks<span class="op">,</span> threads<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> streams<span class="op">[</span>i<span class="op">]&gt;&gt;&gt;(</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>            d_input <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>            d_output <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>            scale<span class="op">,</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>            chunk_size<span class="op">);</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>        <span class="co">// D2H másolás aszinkron</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyAsync<span class="op">(</span>h_output<span class="op">.</span>data<span class="op">()</span> <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>                                   d_output <span class="op">+</span> i <span class="op">*</span> chunk_size<span class="op">,</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a>                                   bytes_per_chunk<span class="op">,</span></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a>                                   cudaMemcpyDeviceToHost<span class="op">,</span></span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>                                   streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Várakozás minden stream befejezésére</span></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_streams<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-92"><a href="#cb1-92" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb1-93"><a href="#cb1-93" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-94"><a href="#cb1-94" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> elapsed_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-95"><a href="#cb1-95" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>elapsed_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb1-96"><a href="#cb1-96" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-97"><a href="#cb1-97" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés</span></span>
+<span id="cb1-98"><a href="#cb1-98" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> total_size<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-99"><a href="#cb1-99" aria-hidden="true" tabindex="-1"></a>        <span class="ot">assert</span><span class="op">(</span>h_output<span class="op">[</span>i<span class="op">]</span> <span class="op">==</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb1-100"><a href="#cb1-100" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-101"><a href="#cb1-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-102"><a href="#cb1-102" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Total time with &quot;</span> <span class="op">&lt;&lt;</span> num_streams <span class="op">&lt;&lt;</span> <span class="st">&quot; streams: &quot;</span></span>
+<span id="cb1-103"><a href="#cb1-103" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> elapsed_ms <span class="op">&lt;&lt;</span> <span class="st">&quot; ms&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb1-104"><a href="#cb1-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-105"><a href="#cb1-105" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb1-106"><a href="#cb1-106" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_streams<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-107"><a href="#cb1-107" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>streams<span class="op">[</span>i<span class="op">]));</span></span>
+<span id="cb1-108"><a href="#cb1-108" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-109"><a href="#cb1-109" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_input<span class="op">));</span></span>
+<span id="cb1-110"><a href="#cb1-110" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_output<span class="op">));</span></span>
+<span id="cb1-111"><a href="#cb1-111" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb1-112"><a href="#cb1-112" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-113"><a href="#cb1-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-114"><a href="#cb1-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-115"><a href="#cb1-115" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kód figyelmet fordít a hibakezelésre, és a streameket
+<code>cudaStreamNonBlocking</code> flaggel hozza létre, hogy elkerülje a
+default stream miatti implicit szinkronizációt. A
+<code>cudaMemcpyAsync</code> hívások mindegyike a megfelelő streamhez
+van rendelve, így a másolások párhuzamosan futhatnak a kernelekkel. A
+kernel indítások is ugyanabban a streamben vannak, így a streamen belül
+a sorrend garantált: H2D, majd kernel, majd D2H.</p>
+<h3 data-number="31.2.6"
+id="labor-stream--és-copy-átfedés-elemzése-nsight-systems-szel"><span
+class="header-section-number">31.2.6</span> Labor: stream- és
+copy-átfedés elemzése Nsight Systems-szel</h3>
+<p>A labor célja, hogy a fenti kódot (vagy egy saját változatot)
+lefuttassuk, és az Nsight Systems segítségével megvizsgáljuk az
+idővonalat. Az alábbiakban megadjuk a szükséges parancsokat és az
+elemzési szempontokat. A labor a <strong>nem futtatott</strong>
+kategóriába tartozik ebben a szövegben: a környezet és a parancsok
+valósak, de a konkrét mérési eredményeket a felhasználónak kell
+kitöltenie.</p>
+<h3 data-number="31.2.7" id="környezet"><span
+class="header-section-number">31.2.7</span> Környezet</h3>
+<ul>
+<li>GPU: NVIDIA A100 40 GB PCIe (vagy az olvasó által elérhető GPU)</li>
+<li>Compute capability: 8.0</li>
+<li>Driver: 545.23.08</li>
+<li>CUDA Toolkit: 12.3</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>Nsight Systems verzió: 2023.4.1 (ellenőrizendő a
+<code>nsys --version</code> paranccsal)</li>
+<li>Power limit, ECC, MIG stb.: rögzítendő a <code>nvidia-smi</code>
+kimenetéből</li>
+</ul>
+<h3 data-number="31.2.8" id="fordítás-és-futtatás"><span
+class="header-section-number">31.2.8</span> Fordítás és futtatás</h3>
+<p>A kód fordításához és futtatásához használjuk a következő
+parancsokat:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> stream_overlap.cu <span class="at">-o</span> stream_overlap</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nsys</span> profile <span class="at">--trace</span><span class="op">=</span>cuda,nvtx,osrt <span class="at">--output</span><span class="op">=</span>stream_overlap_report ./stream_overlap</span></code></pre></div>
+<p>A <code>--trace=cuda,nvtx,osrt</code> opciók a CUDA API, a kernelek,
+a memóriaműveletek és az operációs rendszer futási idejű eseményeit
+rögzítik. A <code>--output</code> határozza meg a jelentésfájl
+nevét.</p>
+<p>A futtatás után az Nsight Systems GUI-ban (vagy a parancssori
+<code>nsys stats</code> eszközzel) megnyithatjuk a
+<code>stream_overlap_report.nsys-rep</code> fájlt. A parancssori
+statisztikához:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nsys</span> stats stream_overlap_report.nsys-rep</span></code></pre></div>
+<p>A kimenet tartalmazza a teljes futási időt, a GPU kihasználtságát, az
+API-hívások számát és a szinkronizációs pontokat.</p>
+<h3 data-number="31.2.9" id="mit-keressünk-az-idővonalon"><span
+class="header-section-number">31.2.9</span> Mit keressünk az
+idővonalon?</h3>
+<ol type="1">
+<li><strong>Átfedés a streamek között</strong>: a négy stream H2D
+másolásai, kerneljei és D2H másolásai egymás után, de átfedésben
+jelennek meg. Ideális esetben a teljes GPU-idő rövidebb, mint a
+szekvenciális végrehajtás összege.</li>
+<li><strong>CPU blokkoló hívások</strong>: a
+<code>cudaStreamSynchronize</code> hívások a CPU szálon sárga sávként
+jelennek meg. Azt várjuk, hogy ezek a hívások a feldolgozás végén, rövid
+ideig tartanak, mert a streamek már majdnem befejeződtek.</li>
+<li><strong>CPU oldali üresjárat</strong>: ha a CPU szál sávjában hosszú
+üres szakaszok vannak, az azt jelzi, hogy a CPU nem tud elég gyorsan
+munkát adni a GPU-nak. Ezt a stream-szám növelésével vagy a chunk-méret
+csökkentésével lehet orvosolni.</li>
+<li><strong>GPU kihasználtság</strong>: a GPU sávjában a zöld és kék
+részek aránya a teljes időhöz képest. A cél az, hogy a GPU minél
+kevesebb időt töltsön üresen.</li>
+</ol>
+<h3 data-number="31.2.10" id="várt-eredmények"><span
+class="header-section-number">31.2.10</span> Várt eredmények</h3>
+<p>A várt eredmények a következők (a konkrét számok a hardvertől
+függenek, de a tendencia egyértelmű):</p>
+<ul>
+<li>A négy stream együttes futási ideje <strong>kevesebb</strong>, mint
+a szekvenciális feldolgozás idejének körülbelül 75%-a, mivel a másolások
+és a kernelek átfedik egymást.</li>
+<li>Az Nsight Systems idővonalán a H2D másolások és a D2H másolások kék
+sávjai <strong>részben vagy teljesen átfednek</strong> a kernelek zöld
+sávjaival.</li>
+<li>A CPU szálon a <code>cudaStreamSynchronize</code> hívások csak a
+végén jelennek meg, és nem szakítják meg a folyamatos
+műveletkibocsátást.</li>
+</ul>
+<p>Ezek a várt eredmények elméleti alapon és a dokumentáció ismeretében
+megfogalmazhatók, de a tényleges méréshez a fenti környezetben kell
+futtatni a kódot. A mérési naplóban a <strong>mért</strong> értékeket a
+felhasználónak kell rögzítenie.</p>
+<h3 data-number="31.2.11" id="mérési-napló-sablon"><span
+class="header-section-number">31.2.11</span> Mérési napló sablon</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Metrika</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Teljes futási idő (4 stream)</td>
+<td>&lt; szekvenciális idő</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="even">
+<td>GPU kihasználtság</td>
+<td>&gt; 70%</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="odd">
+<td>Átfedés mértéke (másolás + kernel)</td>
+<td>részleges/teljes</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="even">
+<td>CPU blokkoló idő</td>
+<td>&lt; 5%</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="odd">
+<td>H2D másolás átlagos ideje</td>
+<td>~ X μs</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="even">
+<td>Kernel átlagos ideje</td>
+<td>~ Y μs</td>
+<td>[kitöltendő]</td>
+</tr>
+<tr class="odd">
+<td>D2H másolás átlagos ideje</td>
+<td>~ Z μs</td>
+<td>[kitöltendő]</td>
+</tr>
+</tbody>
+</table>
+<p>A várt oszlopban szereplő irányelvek segítenek az anomáliák
+felismerésében.</p>
+<h3 data-number="31.2.12" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">31.2.12</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>Az Nsight Systems elemzése során a következő gyakori hibákkal
+találkozhatunk:</p>
+<h3 data-number="31.2.13"
+id="szinkron-másolás-használata-aszinkron-helyett"><span
+class="header-section-number">31.2.13</span> 1. Szinkron másolás
+használata aszinkron helyett</h3>
+<p><strong>Hiba</strong>: A fejlesztő <code>cudaMemcpy</code>-t használ
+a <code>cudaMemcpyAsync</code> helyett. A szinkron másolás blokkolja a
+CPU-t, és implicit módon szinkronizál a default streamen keresztül, ami
+megszünteti az átfedést.</p>
+<p><strong>Jel az idővonalon</strong>: Hosszú sárga sáv a CPU szálon, a
+GPU pedig várakozik. A kernelek és másolások szekvenciálisan követik
+egymást.</p>
+<p><strong>Helyes megoldás</strong>: Mindig
+<code>cudaMemcpyAsync</code>-t használjunk, és explicit streameket
+adjunk meg. A másolás irányától függően a
+<code>cudaMemcpyHostToDevice</code> vagy
+<code>cudaMemcpyDeviceToHost</code> opciót válasszuk.</p>
+<h3 data-number="31.2.14"
+id="default-stream-használata-amely-szinkronizál-más-streamekkel"><span
+class="header-section-number">31.2.14</span> 2. Default stream
+használata, amely szinkronizál más streamekkel</h3>
+<p><strong>Hiba</strong>: A streameket <code>cudaStreamCreate</code>-tel
+hozzuk létre (default flags), és a default stream (0-s) is használatban
+van. A default stream szinkronizál más streamekkel, ami váratlan
+blokkoláshoz vezet.</p>
+<p><strong>Jel</strong>: Az idővonalon a default streamen futó művelet
+előtt a GPU várakozik, pedig a többi stream független munkát
+végezhetne.</p>
+<p><strong>Helyes megoldás</strong>: Használjunk
+<code>cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)</code>-et,
+és kerüljük a default stream használatát minden műveletnél.</p>
+<h3 data-number="31.2.15"
+id="túl-kevés-stream-vagy-rossz-chunk-méret"><span
+class="header-section-number">31.2.15</span> 3. Túl kevés stream vagy
+rossz chunk-méret</h3>
+<p><strong>Hiba</strong>: Csak egy stream van, vagy a chunk-méret túl
+nagy, így a másolások és kernelek nem tudnak átfedni.</p>
+<p><strong>Jel</strong>: A GPU kihasználtsága alacsony, a sávokban nagy
+üres részek vannak.</p>
+<p><strong>Helyes megoldás</strong>: Növeljük a streamek számát
+(általában 4–8 jó kiindulás), és válasszunk olyan chunk-méretet, amely
+elég nagy a kernel számítási igényéhez, de elég kicsi ahhoz, hogy a
+másolások párhuzamosan tudjanak futni. Az optimális érték
+kísérletezéssel és az idővonal elemzésével határozható meg.</p>
+<h3 data-number="31.2.16"
+id="cpu-oldali-overhead-túl-sok-kis-kernel"><span
+class="header-section-number">31.2.16</span> 4. CPU oldali overhead: túl
+sok kis kernel</h3>
+<p><strong>Hiba</strong>: A program sok apró kernelt indít, és a CPU nem
+tudja őket elég gyorsan kiadni. A GPU üresen vár a következő
+kernelre.</p>
+<p><strong>Jel</strong>: Az idővonalon a CPU szálon a kernel indítási
+hívások hosszabbak, mint maguk a kernelek. A GPU sávban rövid zöld
+szakaszok között nagy üres rések vannak.</p>
+<p><strong>Helyes megoldás</strong>: Csökkentsük a kernel indítások
+számát, fuzionáljuk a kerneleket, vagy használjunk nagyobb blokkméretet,
+hogy kevesebb kernelre legyen szükség. A grid-stride loop is
+segíthet.</p>
+<h3 data-number="31.2.17" id="szinkronizáció-a-cikluson-belül"><span
+class="header-section-number">31.2.17</span> 5. Szinkronizáció a
+cikluson belül</h3>
+<p><strong>Hiba</strong>: A fejlesztő minden iterációban meghívja a
+<code>cudaDeviceSynchronize</code>-et, ami teljesen szétzilálja a
+pipeline-t.</p>
+<p><strong>Jel</strong>: A GPU sávban minden iteráció után hosszú üres
+szakasz, a CPU szálon pedig hosszú blokkoló hívások.</p>
+<p><strong>Helyes megoldás</strong>: Csak akkor szinkronizáljunk, ha
+feltétlenül szükséges, például a feldolgozás végén vagy amikor az
+adatokra a CPU-nak szüksége van. A köztes szinkronizációkat kerüljük,
+vagy használjunk eseményeket a finomabb vezérléshez.</p>
+<h3 data-number="31.2.18" id="önellenőrző-kérdés"><span
+class="header-section-number">31.2.18</span> Önellenőrző kérdés</h3>
+<p>Az alábbi kérdéssel ellenőrizheti, hogy megértette-e az Nsight
+Systems alapvető használatát.</p>
+<p><strong>Kérdés</strong>: Tegyük fel, hogy egy program négy streamben
+hajt végre H2D másolást, kernelt és D2H másolást. Az Nsight Systems
+idővonalán azt látjuk, hogy a kernelek zöld sávjai egymás után, átfedés
+nélkül jelennek meg, és a kék másolási sávok is szekvenciálisak. Mi
+lehet a két legvalószínűbb oka, és hogyan javítaná?</p>
+<p><strong>Válasz</strong>: A két leggyakoribb ok: (1) a streamek nem
+non-blocking módban lettek létrehozva, így a default stream
+szinkronizálja őket; (2) a másolásokhoz szinkron
+<code>cudaMemcpy</code>-t használtak <code>cudaMemcpyAsync</code>
+helyett. A javítás: hozzuk létre a streameket
+<code>cudaStreamNonBlocking</code> flaggel, és minden másoláshoz
+használjunk <code>cudaMemcpyAsync</code>-t. Ezen kívül ellenőrizzük,
+hogy a kernel indítások és másolások ugyanabba a streamben vannak-e, és
+ne legyen köztük implicit szinkronizáció.</p>
+<h3 data-number="31.2.19" id="összefoglalás"><span
+class="header-section-number">31.2.19</span> Összefoglalás</h3>
+<p>Az Nsight Systems a rendszerszintű profilozás alapvető eszköze.
+Lehetővé teszi a teljes alkalmazás idővonalának elemzését, feltárva a
+CPU és GPU közötti együttműködés hiányosságait. A CUDA API-hívások, a
+kernelek és a memóriaműveletek időbeli elrendeződése megmutatja, hol
+vannak szinkronizációs pontok, buborékok és elveszett átfedési
+lehetőségek. A stream- és copy-átfedés laboratóriumi elemzése során a
+fejlesztő megtanulja felismerni a helyes stream-kezelést, és elkerülni a
+gyakori hibákat, mint a szinkron másolás vagy a default stream
+szinkronizációs hatása. A következő egység (<a
+href="gpu120.html">Benchmarkmódszertan</a>) erre az alapra építve
+tárgyalja a benchmarkmódszertant, ahol a mért eredmények statisztikai
+elemzése és a reprodukálhatóság kerül előtérbe.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu118.html">← 31.1 Nsight Compute és a kernelmetrikák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu120.html">31.3 Benchmarkmódszertan →</a></div>
+</nav>
+</body>
+</html>

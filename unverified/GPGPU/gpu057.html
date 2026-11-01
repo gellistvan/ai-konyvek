@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>15.4 CUDA memóriamodell és scope – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch14">15 Cache, L2, persistence és memóriamodellek</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu056.html">← 15.3 L2 persistence és access policy</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu058.html">16.1 Redukciók →</a></div>
+</nav>
+<h2 data-number="15.4" id="gpu057"><span
+class="header-section-number">15.4</span> CUDA memóriamodell és
+scope</h2>
+<p>Az előző alfejezet a cache-hint-ekkel, az L2-persistence-szel és az
+access policy-val foglalkozott. Ott a kérdés az volt, hogyan lehet a
+gyakran használt adatokat a cache-hierarchia megfelelő szintjén tartani.
+Most a másik oldalt vizsgáljuk: amikor több szál, több blokk vagy akár a
+host és az eszköz egyszerre fér hozzá ugyanahhoz a memóriához, milyen
+garanciákat ad a platform arra, hogy a memóriaműveletek sorrendje és
+láthatósága a várt módon alakul. Ez a CUDA memóriamodell területe, amely
+nem csupán elméleti kérdés, hanem minden producer–consumer, flag-alapú
+szinkronizáció és lock-mentes adatszerkezet alapja.</p>
+<hr />
+<h3 data-number="15.4.1" id="miért-van-szükség-memóriamodellre"><span
+class="header-section-number">15.4.1</span> 1. Miért van szükség
+memóriamodellre?</h3>
+<p>A CPU-programozásból ismert szabály, hogy a fordító és a hardver a
+megfigyelhető viselkedés megőrzése mellett átrendezheti a
+memóriaműveleteket. A GPU-n ez hatványozottan érvényes, mert a
+végrehajtás erősen párhuzamos, a memóriahierarchia többszintű, és a
+szálak különböző utasításütemezőkön futnak. Egy szál által végzett írás
+nem feltétlenül abban a sorrendben válik láthatóvá más szálak számára,
+ahogyan a C++ forráskódban szerepel.</p>
+<p>A klasszikus példa a jól ismert producer–consumer minta, amelyet a
+<code>gpu026</code> és <code>gpu027</code> alfejezetekben már
+említettünk szinkronizációs és atomi kontextusban:</p>
+<pre><code>// Szándék szerint:
+shared int data;
+shared int flag;
+
+// Producer:
+data = 42;
+flag = 1;
+
+// Consumer:
+while (flag != 1) {}
+int result = data;   // 42-t várunk</code></pre>
+<p>Ha semmilyen memóriarendezési garancia nem áll fenn, a producer
+oldalán a <code>data = 42</code> írás és a <code>flag = 1</code> írás
+átrendezhető. A consumer oldalán a <code>flag</code> olvasása és a
+<code>data</code> olvasása is átrendezhető. Az eredmény lehet
+<code>0</code>, egy korábbi érték, sőt hardverfüggő módon bármi. A CUDA
+memóriamodell azért létezik, hogy pontosan meghatározza, mikor és mely
+szálak számára válnak láthatóvá az ilyen műveletek, ha a programozó
+explicit szinkronizációt használ.</p>
+<p>A CUDA memóriamodell alapja a scoped synchronization: minden
+memóriaművelethez tartozik egy hatókör (scope), amely megadja, hogy a
+garantált rendezés mely szálak halmazára érvényes. A scope tehát
+egyszerre láthatósági tartomány és rendezési tartomány.</p>
+<hr />
+<h3 data-number="15.4.2"
+id="a-láthatósági-tartomány-block-device-system"><span
+class="header-section-number">15.4.2</span> 2. A láthatósági tartomány:
+block, device, system</h3>
+<p>A CUDA programozási modell három fő scope-ot különböztet meg a szálak
+együttműködési körétől függően: a thread block scope-ot, a device
+scope-ot és a system scope-ot. Ezeket a <code>gpu030</code> alfejezetben
+bevezetett cooperative groups típusokhoz is hasonlóan kell érteni:
+mindegyik egy-egy szerveződési szintet jelöl.</p>
+<h3 data-number="15.4.3" id="block-scope"><span
+class="header-section-number">15.4.3</span> 2.1 Block scope</h3>
+<p>A <strong>block scope</strong> azt jelenti, hogy a memóriaművelet
+rendezése a thread blockon belüli szálak számára garantált. Ez a
+legszűkebb, de a leggyakrabban használt scope, mert a legtöbb
+szinkronizációs mintát egy blokkon belül valósítjuk meg a shared memory
+segítségével.</p>
+<p>A gyakorlatban a <code>__syncthreads()</code> hívás implicit
+memóriarendezést is ad block scope-ban: a hívás előtti összes írás a
+blokk minden szála számára láthatóvá válik, mielőtt a hívás utáni
+utasítások végrehajtódnak. Amikor azonban nem használunk
+<code>__syncthreads()</code>-et, hanem flag-alapú spin-waitet
+alkalmazunk, akkor explicit fence-re van szükség. A CUDA a következő
+primitív(ek)et biztosítja:</p>
+<pre><code>__threadfence_block();</code></pre>
+<p>Ez a hívás biztosítja, hogy a hívás előtti összes memóriaművelet a
+hívás utáni műveletek előtt válik láthatóvá a thread block összes szála
+számára. Fontos, hogy ez nem magát a memóriaműveletet hajtja végre,
+hanem rendezési korlátot (fence) állít fel.</p>
+<p>A block scope-hoz tartozó atomi műveletek hasonlóképpen csak a
+blokkon belüli láthatóságot garantálják. A klasszikus CUDA atomi
+függvények (például <code>atomicAdd</code>, <code>atomicExch</code>)
+alapértelmezés szerint device scope-ban működnek, de a
+<code>cuda::atomic</code> osztállyal explicit block scope is
+kérhető.</p>
+<h3 data-number="15.4.4" id="device-scope"><span
+class="header-section-number">15.4.4</span> 2.2 Device scope</h3>
+<p>A <strong>device scope</strong> a teljes GPU-ra kiterjedő
+láthatóságot jelenti: a memóriaművelet rendezése az összes szál számára,
+amely ugyanazon az eszközön fut, garantált. Ide tartozik a globális
+memória és a hozzá kapcsolódó L2 cache is.</p>
+<p>A klasszikus primitív:</p>
+<pre><code>__threadfence();</code></pre>
+<p>Ez a hívás a block scope-nál tágabb: a hívás előtti összes
+memóriaművelet a hívás után láthatóvá válik a GPU minden szála számára.
+Ez elengedhetetlen, ha például egyik thread block ír egy globális
+memóriabeli adatot, majd egy másik thread blocknak – amely függetlenül
+fut – meg kell látnia azt.</p>
+<p>A device scope-ot tipikusan akkor használjuk, ha a szinkronizáció nem
+oldható meg <code>__syncthreads()</code>-szel, mert a kommunikáló felek
+különböző blokkban vannak. A grid-szintű szinkronizáció (lásd
+<code>gpu032</code>) ilyenkor cooperative groups segítségével is
+elérhető, de a fence-ek alacsonyabb szintű építőkövekként továbbra is
+fontosak.</p>
+<h3 data-number="15.4.5" id="system-scope"><span
+class="header-section-number">15.4.5</span> 2.3 System scope</h3>
+<p>A <strong>system scope</strong> a legbővebb: a memóriaművelet
+rendezése az egész rendszerre, tehát a GPU-ra és a CPU-ra egyaránt
+érvényes. Ez akkor szükséges, ha a host és a device közvetlenül osztozik
+memórián, például pinned host memórián, managed memórián
+(<code>cudaMallocManaged</code>) vagy peer-to-peer GPU-k közti
+átvitelnél.</p>
+<p>A megfelelő primitív:</p>
+<pre><code>__threadfence_system();</code></pre>
+<p>Ez biztosítja, hogy a hívás előtti memóriaműveletek a hívás után
+láthatóvá válnak a host számára, és fordítva: a host által a device
+memóriájába írt adatok is megfelelően láthatóvá válnak a device szálak
+számára, ha a host oldalán megfelelő szinkronizáció történik (például
+<code>cudaStreamSynchronize</code> vagy
+<code>cudaDeviceSynchronize</code>).</p>
+<p>A system scope a legerősebb, de egyben a legdrágább is, mert a
+rendezés a teljes memóriarendszerre kiterjed, és gyakran kiüríti a
+cache-eket, valamint a host–device kapcsolatot is igénybe veszi. Ezért
+csak akkor szabad használni, ha valóban szükséges a host és a device
+közötti láthatóság.</p>
+<hr />
+<h3 data-number="15.4.6" id="atomi-műveletek-és-memóriarend"><span
+class="header-section-number">15.4.6</span> 3. Atomi műveletek és
+memóriarend</h3>
+<p>Az atomi műveletek azok a read-modify-write műveletek, amelyek
+oszthatatlan egységként hajtódnak végre: egyetlen más szál sem
+figyelheti meg a köztes állapotot. A CUDA-ban a klasszikus atomi
+függvények (<code>atomicAdd</code>, <code>atomicExch</code>,
+<code>atomicCAS</code>, <code>atomicMin</code>, <code>atomicMax</code>
+stb.) a <code>gpu027</code> alfejezetben már bemutatásra kerültek. Itt
+most az atomi műveletek és a memóriarend kapcsolatára koncentrálunk.</p>
+<h3 data-number="15.4.7" id="a-klasszikus-atomik-és-a-korlátok"><span
+class="header-section-number">15.4.7</span> 3.1 A klasszikus atomik és a
+korlátok</h3>
+<p>A klasszikus atomi függvények garantálják az oszthatatlanságot, de
+<strong>nem garantálnak memóriarendezést</strong> a nem atomi
+memóriaműveletekkel szemben. Ez azt jelenti, hogy ha egy szál előbb egy
+<code>data</code> nevű globális értéket ír nem atomi módon, majd egy
+<code>flag</code> atomi változót <code>atomicExch</code>-csel beállít, a
+fordító vagy a hardver átrendezheti a két műveletet. A fogyasztó oldalon
+ugyanez a probléma: az atomi flag olvasása után a <code>data</code> nem
+garantáltan a friss értéket adja vissza.</p>
+<p>A helyes minta a klasszikus atomikkal a következő:</p>
+<pre><code>// Producer (device scope):
+global_data = 42;                 // nem atomi írás
+__threadfence();                  // device scope fence
+atomicExch(&amp;global_flag, 1);      // atomi flag beállítás
+
+// Consumer (device scope):
+while (atomicAdd(&amp;global_flag, 0) == 0) { }
+__threadfence();                  // szükséges, hogy a data olvasása a flag után történjen
+int result = global_data;         // 42-t kell kapni</code></pre>
+<p>A <code>atomicExch</code> és <code>atomicAdd</code> itt csak az atomi
+olvasás-módosítás-írás műveletet végzi el; a körülöttük lévő
+<code>__threadfence()</code> hívások biztosítják, hogy a
+<code>global_data</code> írás a flag beállítása előtt, illetve a
+<code>global_data</code> olvasás a flag leolvasása után történjen. Ez a
+producer–consumer minta a memóriamodell leggyakoribb alkalmazása.</p>
+<h3 data-number="15.4.8"
+id="a-cudaatomic-és-az-explicit-memóriarend"><span
+class="header-section-number">15.4.8</span> 3.2 A cuda::atomic és az
+explicit memóriarend</h3>
+<p>A CUDA C++ újabb generációs fejlesztőeszközei (CUDA 10.0-tól,
+C++11/14/17 környezetben) bevezették a <code>cuda::atomic</code>
+osztálysablont, amely lehetővé teszi a scope és a memóriarend explicit
+megadását. Ezzel elkerülhető a klasszikus <code>__threadfence()</code>
+hívások manuális elhelyezése.</p>
+<p>A <code>cuda::atomic</code> típusparaméterként kapja meg a scope-ot,
+a műveletek pedig memóriarendezési argumentumot:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda/atomic&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>__device__ cuda<span class="op">::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">,</span> cuda<span class="op">::</span>thread_scope_block<span class="op">&gt;</span> block_counter<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>__device__ cuda<span class="op">::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">,</span> cuda<span class="op">::</span>thread_scope_device<span class="op">&gt;</span> device_flag<span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co">// Block scope, release/acquire:</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>block_counter<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> cuda<span class="op">::</span>memory_order_relaxed<span class="op">);</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    block_counter<span class="op">.</span>store<span class="op">(</span><span class="dv">1</span><span class="op">,</span> cuda<span class="op">::</span>memory_order_release<span class="op">);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="co">// ...</span></span></code></pre></div>
+<p>A memóriarendezési lehetőségek a C++11 szabványos
+<code>std::memory_order</code> szintaxisát követik:
+<code>relaxed</code>, <code>acquire</code>, <code>release</code>,
+<code>acq_rel</code> és <code>seq_cst</code>. A
+<code>cuda::atomic</code> előnye, hogy a scope és a memóriarend egyetlen
+típusban és műveletben egyesül, így a fordító pontosan a szükséges
+mértékű rendezést alkalmazhatja. A klasszikus atomi függvények továbbra
+is elérhetők, de ha a kód modern CUDA-verziót céloz, a
+<code>cuda::atomic</code> használata olvashatóbb és kevésbé
+hibalehetőséget rejt magában.</p>
+<h3 data-number="15.4.9" id="fence-primitívek-összefoglalása"><span
+class="header-section-number">15.4.9</span> 3.3 Fence primitívek
+összefoglalása</h3>
+<p>Az alábbi táblázat összefoglalja a klasszikus fence-eket és azok
+hatókörét:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Primitív</th>
+<th>Scope</th>
+<th>Tipikus használat</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>__threadfence_block()</code></td>
+<td>block</td>
+<td>blokkon belüli flag-alapú szinkronizáció, shared memory</td>
+</tr>
+<tr class="even">
+<td><code>__threadfence()</code></td>
+<td>device</td>
+<td>grid-szintű szinkronizáció, global memory</td>
+</tr>
+<tr class="odd">
+<td><code>__threadfence_system()</code></td>
+<td>system</td>
+<td>host–device kommunikáció, managed memory, peer-to-peer</td>
+</tr>
+</tbody>
+</table>
+<p>Mindegyik primitív a hívás előtti memóriaműveleteket a hívás utáni
+műveletek elé rendezi a megadott scope-ban. Fontos, hogy a fence
+önmagában nem szinkronizál; csak a memóriaműveletek sorrendjét
+garantálja. A tényleges szinkronizációhoz a fogyasztó oldalán is szükség
+van a megfelelő fence-re vagy atomi műveletre.</p>
+<hr />
+<h3 data-number="15.4.10" id="labor-fence-és-scope-mérése"><span
+class="header-section-number">15.4.10</span> 4. Labor: fence és scope
+mérése</h3>
+<p>Ebben a laborban három producer–consumer mintát valósítunk meg,
+mindegyiket a megfelelő scope-ban. A cél annak mérése, hogy a fence
+nélküli változatok hogyan viselkednek a helyesen alkalmazott fence-ekkel
+szemben. A mérést izolált környezetben végezzük, timeout beállítással,
+mert a spin-wait hurkok hibás esetben hosszú futást okozhatnak.</p>
+<h3 data-number="15.4.11" id="kiinduló-környezet"><span
+class="header-section-number">15.4.11</span> 4.1 Kiinduló környezet</h3>
+<p>A méréshez a következő környezetparamétereket rögzítjük (a konkrét
+értékeket a saját rendszeren kell kitölteni):</p>
+<pre><code>GPU modell:       NVIDIA T1000 (példa, helyettesítendő)
+Compute capability: 7.5 (példa)
+CUDA version:     12.4 (példa)
+Driver version:   550.54.14 (példa)
+OS:               Ubuntu 22.04 LTS
+Power limit:      gyári, 50 W
+ECC:              off
+MIG:              off</code></pre>
+<p>A tényleges méréseknél ezeket az adatokat mindig rögzíteni kell, mert
+a memóriarendezés hardverfüggő viselkedése erősen kapcsolódik az
+architektúrához.</p>
+<h3 data-number="15.4.12" id="kernel-block-scope"><span
+class="header-section-number">15.4.12</span> 4.2 Kernel: block
+scope</h3>
+<p>Az első kernel egy blokkon belül két szálat használ producerként és
+fogyasztóként. A <code>data</code> és <code>flag</code> értékeket shared
+memory-ban tároljuk, és <code>volatile</code>-tal jelöljük, hogy a
+fordító ne optimalizálja el a poll-ot. A helyes változatban a producer
+<code>__threadfence_block()</code> hívást használ, mielőtt a
+<code>flag</code>-et 1-re állítja; a fogyasztó ugyancsak
+<code>__threadfence_block()</code>-et használ a flag megfigyelése
+után.</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// block_fence_test.cu</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> block_fence_test<span class="op">(</span><span class="dt">int</span><span class="op">*</span> results<span class="op">,</span> <span class="dt">bool</span> use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">int</span> data<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">int</span> flag<span class="op">;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        data <span class="op">=</span> <span class="dv">42</span><span class="op">;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>            __threadfence_block<span class="op">();</span>  <span class="co">// block scope fence</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>        flag <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Spin-wait a flag-re.</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>flag <span class="op">!=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span> <span class="op">}</span>      <span class="co">// volatile nélkül itt nem garantált</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>            __threadfence_block<span class="op">();</span>  <span class="co">// block scope fence</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>        results<span class="op">[</span>blockIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> data<span class="op">;</span> <span class="co">// elvárt érték: 42</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ahhoz, hogy ez a kód helyesen működjön, a <code>flag</code> és a
+<code>data</code> változókat <code>volatile</code>-nak kell jelölni,
+mert a fordító alapból regiszterbe tehetné őket, és a poll soha nem
+látná a másik szál írását. A jelölést a teljes labor kódjában
+elvégezzük.</p>
+<h3 data-number="15.4.13" id="kernel-device-scope"><span
+class="header-section-number">15.4.13</span> 4.3 Kernel: device
+scope</h3>
+<p>A második kernel két különböző thread blockot használ. A
+<code>data</code> és <code>flag</code> globális memóriában vannak, ezért
+device scope fence-re van szükség. A kernel grafikusan két blokkot
+indít: a 0. blokk a producer, az 1. blokk a fogyasztó.</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">// device_fence_test.cu</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> device_fence_test<span class="op">(</span><span class="dt">int</span><span class="op">*</span> data<span class="op">,</span> <span class="dt">int</span><span class="op">*</span> flag<span class="op">,</span> <span class="dt">int</span><span class="op">*</span> results<span class="op">,</span> <span class="dt">bool</span> use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>blockIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span>data <span class="op">=</span> <span class="dv">42</span><span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>                __threadfence<span class="op">();</span>       <span class="co">// device scope fence</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>            atomicExch<span class="op">(</span>flag<span class="op">,</span> <span class="dv">1</span><span class="op">);</span>       <span class="co">// atomi flag beállítás</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>blockIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Spin-wait a flag-re.</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">while</span> <span class="op">(</span>atomicAdd<span class="op">(</span>flag<span class="op">,</span> <span class="dv">0</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> <span class="op">}</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>                __threadfence<span class="op">();</span>       <span class="co">// device scope fence</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>            results<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="op">*</span>data<span class="op">;</span>        <span class="co">// elvárt érték: 42</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>flag</code>-hez atomi műveletet használunk, mert a
+globális memóriában lévő flag írását és olvasását atomosan kell
+végrehajtani. A nem atomi <code>while (*(volatile int*)flag != 1)</code>
+is működhet, de az atomi megoldás jobban dokumentálja a szándékot, és
+hordozhatóbb.</p>
+<h3 data-number="15.4.14" id="kernel-system-scope"><span
+class="header-section-number">15.4.14</span> 4.4 Kernel: system
+scope</h3>
+<p>A harmadik kernel host–device kommunikációt demonstrál. A
+<code>data</code> és a <code>flag</code> memory-mapped host memóriában
+vannak, amelyet <code>cudaHostAlloc</code> segítségével foglalunk le. A
+kernel a <code>__threadfence_system()</code> hívással garantálja, hogy a
+device által írt adat a host számára láthatóvá válik, miután a flag
+beállításra kerül.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// system_fence_test.cu</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> system_fence_test<span class="op">(</span><span class="dt">int</span><span class="op">*</span> data<span class="op">,</span> <span class="dt">int</span><span class="op">*</span> flag<span class="op">,</span> <span class="dt">bool</span> use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>data <span class="op">=</span> <span class="dv">42</span><span class="op">;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>use_fence<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>            __threadfence_system<span class="op">();</span>   <span class="co">// system scope fence</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>        atomicExch<span class="op">(</span>flag<span class="op">,</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A host oldalon a kernel elindítása után a host egy spin-wait
+ciklussal várja a flag beállítását, majd beolvassa a <code>data</code>
+értékét. A host oldalán nincs szükség külön fence-re, mert a
+<code>__threadfence_system()</code> a device oldalán biztosítja a
+láthatóságot; a host általi olvasás a flag beállítása után történik,
+feltéve, hogy a flag-atomik a rendszer scope-ban is látható.</p>
+<h3 data-number="15.4.15" id="build-és-futtatás"><span
+class="header-section-number">15.4.15</span> 4.5 Build és futtatás</h3>
+<p>A labor kódját C++17-tel, <code>nvcc</code>-vel fordítjuk:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_75 <span class="at">-o</span> fence_scope_lab fence_scope_lab.cu</span></code></pre></div>
+<p>A futtatás:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./fence_scope_lab</span></span></code></pre></div>
+<p>A program a három scenariót többször végrehajtja, és minden futás
+után összegzi, hány alkalommal kapott hibás eredményt. A hibás eredmény
+azt jelenti, hogy a <code>data</code> értéke nem 42. A program CUDA
+eseményekkel méri az egyes scenariók futási idejét, és a végén kiírja az
+eredményeket.</p>
+<h3 data-number="15.4.16" id="mérési-módszertan"><span
+class="header-section-number">15.4.16</span> 4.6 Mérési módszertan</h3>
+<p>A mérési protokoll a következő:</p>
+<ol type="1">
+<li><strong>Warm-up:</strong> mindegyik scenariót 1000 iterációval
+futatjuk, hogy a GPU elérje a stabil órajelet.</li>
+<li><strong>Mérés:</strong> mindegyik scenariót 10000 iterációval
+futtatjuk, és minden iterációban egyetlen kernelt indítunk.</li>
+<li><strong>Ismétlés:</strong> a teljes mérést 5-ször megismételjük, és
+az átlagot, valamint a szórást közöljük.</li>
+<li><strong>Időmérés:</strong> CUDA eventekkel
+(<code>cudaEventRecord</code>) mérjük a kernel futási idejét. A host
+oldali overheadet minimalizáljuk azzal, hogy a kernelindításokat
+streambe szervezzük.</li>
+</ol>
+<p>A mérés során a hibás eredményeket is rögzítjük. A correct
+változatoknál 0 hiba várható; a hibás (fence nélküli) változatoknál a
+hibák száma hardverfüggő lehet.</p>
+<h3 data-number="15.4.17" id="várt-eredmények"><span
+class="header-section-number">15.4.17</span> 4.7 Várt eredmények</h3>
+<p>A várt eredmények a memóriamodellből következnek:</p>
+<ul>
+<li><strong>Block scope:</strong> a helyes (fence-el) változatban a
+fogyasztó mindig 42-t kap, mert a block scope fence garantálja, hogy a
+<code>data</code> írás a flag beállítása előtt végrehajtódik, és a flag
+megfigyelése után a <code>data</code> olvasása is rendezett. A fence
+nélküli változatban a fordító vagy a hardver átrendezheti a műveleteket,
+ezért előfordulhat, hogy a fogyasztó <code>0</code>-t vagy korábbi
+értéket kap.</li>
+<li><strong>Device scope:</strong> ugyanez a helyzet, de a garantált
+rendezés a teljes GPU-ra kiterjed. A fogyasztó blokk a device scope
+fence nélkül nem biztos, hogy látja a producer által írt
+<code>data</code> értéket, még akkor sem, ha a flag atomi módon lett
+beállítva.</li>
+<li><strong>System scope:</strong> a hostnak garantáltan látnia kell a
+<code>data</code> értékét, ha a <code>__threadfence_system()</code>
+hívás megtörtént, és a flag beállítása atomi. Ha a fence hiányzik, a
+host egy korábbi vagy nem frissített értéket olvashat.</li>
+</ul>
+<p>Fontos, hogy a gyakorlatban a hiba nem minden futásnál jelentkezik; a
+memóriarendezés hiánya nem determinisztikus. Ezért a nagy ismétlésszámú
+mérés a hibák gyakoriságát mutatja, nem pedig egyetlen futás
+sikerességét.</p>
+<h3 data-number="15.4.18" id="mért-eredmények-és-kiértékelés"><span
+class="header-section-number">15.4.18</span> 4.8 Mért eredmények és
+kiértékelés</h3>
+<p>A mérési naplóban a tényleges értékeket kell rögzíteni. Példa a
+naplóstruktúrára:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Scenario</th>
+<th>Fence</th>
+<th>Futások száma</th>
+<th>Hibák (mért)</th>
+<th>Átlagos kernelidő (μs)</th>
+<th>Szórás (μs)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>block</td>
+<td>nélkül</td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+<tr class="even">
+<td>block</td>
+<td><code>__threadfence_block()</code></td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+<tr class="odd">
+<td>device</td>
+<td>nélkül</td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+<tr class="even">
+<td>device</td>
+<td><code>__threadfence()</code></td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+<tr class="odd">
+<td>system</td>
+<td>nélkül</td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+<tr class="even">
+<td>system</td>
+<td><code>__threadfence_system()</code></td>
+<td>10000</td>
+<td>__</td>
+<td>__</td>
+<td>__</td>
+</tr>
+</tbody>
+</table>
+<p>A várt és a mért értékeket külön kell kezelni. A várt értékek a fenti
+elméleti megfontolásokból adódnak: a helyes változatokban 0 hiba, a
+hibás változatokban nem nulla hiba előfordulhat. A mért értékeket a
+saját környezetben kell kitölteni. Ha a mért adatok eltérnek a várttól,
+ellenőrizni kell a környezetet: a gyorsítótárazás, a
+vezérlőfolyam-átrendezés vagy a nem megfelelő <code>volatile</code>
+hiánya okozhat eltérést.</p>
+<hr />
+<h3 data-number="15.4.19" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">15.4.19</span> 5. Tipikus hibák és
+megelőzésük</h3>
+<p>A memóriamodell hibái gyakran nehezen reprodukálhatók, mert a fordító
+és a hardver viselkedése változó. Az alábbi lista a leggyakoribb hibákat
+és a helyes megoldásokat foglalja össze:</p>
+<ol type="1">
+<li><p><strong>Hiányzó fence a producer oldalán.</strong> A fejlesztő a
+<code>data</code> írása után atomi flag-et használ, de nem helyez el
+<code>__threadfence()</code>-et. A fordító átrendezheti a kódot, és a
+fogyasztó a flag beállítása előtt látja a <code>data</code> írását.
+<strong>Megoldás:</strong> a flag beállítása előtt mindig alkalmazzon
+megfelelő fence-et.</p></li>
+<li><p><strong>Hiányzó fence a fogyasztó oldalán.</strong> A fogyasztó a
+flag megfigyelése után nem helyez el fence-et, így a <code>data</code>
+olvasása a flag megfigyelése előtt is végrehajtódhat.
+<strong>Megoldás:</strong> a flag megfigyelése után fence-elje a
+memóriaműveleteket, vagy használjon <code>cuda::atomic</code>-ot acquire
+memóriarenddel.</p></li>
+<li><p><strong>Nem megfelelő scope kiválasztása.</strong> A fejlesztő
+blokkok közötti kommunikációhoz <code>__threadfence_block()</code>-et
+használ, ami nem garantálja a device scope-ú láthatóságot.
+<strong>Megoldás:</strong> a scope-ot mindig a kommunikáló felek közötti
+legkisebb szükséges körhöz igazítsa: blokkon belül block scope, grid
+szinten device scope, host–device esetén system scope.</p></li>
+<li><p><strong>Nem atomi flag használata globális memóriában.</strong> A
+gyártói példák gyakran <code>volatile int*</code> flag-et használnak, de
+ez csak akkor biztonságos, ha a hozzáférés atomi módon is történik. A
+<code>volatile</code> nem garantál oszthatatlanságot.
+<strong>Megoldás:</strong> globális flag esetén atomi műveletet
+használjon (például <code>atomicExch</code>), és a flag típusa legyen
+<code>int</code> vagy <code>unsigned int</code>.</p></li>
+<li><p><strong>Végtelen spin-wait blokkoló szálak.</strong> Ha a
+fogyasztó folyamatosan polloz anélkül, hogy a producer szálak futnának,
+az eszközleállást okozhat. <strong>Megoldás:</strong> a spin-wait mindig
+időkorlátot kapjon, vagy a fogyasztó szál <code>__nanosleep()</code>
+hívást használjon a várakozás közben. Izolált környezetben a timeout
+beállítása kötelező.</p></li>
+<li><p><strong>Managed memory esetén a host oldali szinkronizáció
+hiánya.</strong> Ha <code>cudaMallocManaged</code> memóriát használunk,
+a host oldali olvasáshoz <code>cudaDeviceSynchronize()</code> hívás
+szükséges. <strong>Megoldás:</strong> a host–device szinkronizációt
+mindig explicit módon hajtsa végre.</p></li>
+</ol>
+<hr />
+<h3 data-number="15.4.20" id="önellenőrző-kérdések"><span
+class="header-section-number">15.4.20</span> 6. Önellenőrző
+kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a block scope és a device scope között? Adjon példát
+arra, amikor a block scope nem elegendő.</li>
+<li>Miért van szükség fence-re akkor is, ha atomi flag-et használunk a
+producer–consumer mintában?</li>
+<li>Hasonlítsa össze a <code>__threadfence_block()</code>, a
+<code>__threadfence()</code> és a <code>__threadfence_system()</code>
+hívásokat. Melyik milyen hatókörben rendezi a memóriaműveleteket?</li>
+<li>Milyen hibalehetőséget rejt a <code>volatile</code> flag használata
+globális memóriában? Hogyan javítható?</li>
+<li>Miért lehet nem determinisztikus a fence nélküli producer–consumer
+minta eredménye? Hogyan befolyásolja ezt a GPU architektúrája?</li>
+</ol>
+<hr />
+<h3 data-number="15.4.21" id="összegzés"><span
+class="header-section-number">15.4.21</span> Összegzés</h3>
+<p>A CUDA memóriamodell a scoped synchronization elvén alapul: minden
+memóriaművelethez tartozik egy hatókör, amely meghatározza, hogy a
+memóriaműveletek sorrendje mely szálak számára garantált. A három fő
+scope — block, device, system — a szinkronizáció szintjét jelöli. A
+helyes párhuzamos programokban a memóriarendezést explicit fence-ekkel
+vagy <code>cuda::atomic</code> típusokkal biztosítjuk, mert a fordító és
+a hardver a teljesítmény érdekében szabadon átrendezheti a
+memóriaműveleteket. A laborban bemutatott producer–consumer minták
+segítenek megérteni a fence-ek szükségességét és a scope-ok helyes
+megválasztását. A következő fejezetben a redukciókra térünk át; ott a
+blokkon belüli szinkronizáció és a memóriarendezés a hatékony és helyes
+implementáció alapját képezi.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu056.html">← 15.3 L2 persistence és access policy</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu058.html">16.1 Redukciók →</a></div>
+</nav>
+</body>
+</html>

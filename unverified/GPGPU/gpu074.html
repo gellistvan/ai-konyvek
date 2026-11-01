@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>20.1 FFT GPU-n – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch19">20 FFT, Monte Carlo és random számok</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu073.html">← 19.4 Könyvtári és saját megoldás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu075.html">20.2 Monte Carlo szimuláció →</a></div>
+</nav>
+<h2 data-number="20.1" id="gpu074"><span
+class="header-section-number">20.1</span> FFT GPU-n</h2>
+<p>A gyors Fourier-transzformáció (FFT) a digitális jelfeldolgozás egyik
+legalapvetőbb építőköve: a diszkrét Fourier-transzformáció (DFT)
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo>log</mo><mi>N</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(N\log N)</annotation></semantics></math>
+időben végrehajtható változata, amely a spektrumanalízistől a
+képfeldolgozáson át a gyors konvolúcióig számtalan feladatban jelen van.
+A GPU architektúrája különösen alkalmas FFT végrehajtására, mert a
+transzformáció nagyszámú, egymástól független pillangó-műveletet
+tartalmaz, és a memóriahierarchia jól kihasználható a fázisfaktorok és
+résztömbök gyorsítótárazására. Az NVIDIA hivatalos könyvtára, a
+<strong>cuFFT</strong>, ezt a feladatot magas szintű, optimalizált
+API-val teszi elérhetővé. Ez az alfejezet a cuFFT alapjait, a batched
+végrehajtást, a pontossági és memória-szempontokat, valamint egy
+ellenőrizhető FFT/inverz FFT labort mutatja be.</p>
+<figure>
+<img src="assets/gpu074-diagram-1.png"
+alt="FFT fő lépései GPU-n - A bemenet bit-reversal permutáción esik át, majd log2(N) butterfly-szint következik; a közbenső adatok shared memóriában vagy regiszterekben tarthatók." />
+<figcaption aria-hidden="true">FFT fő lépései GPU-n - A bemenet
+bit-reversal permutáción esik át, majd log2(N) butterfly-szint
+következik; a közbenső adatok shared memóriában vagy regiszterekben
+tarthatók.</figcaption>
+</figure>
+<h3 data-number="20.1.1" id="a-cufft-programozási-modellje"><span
+class="header-section-number">20.1.1</span> 1. A cuFFT programozási
+modellje</h3>
+<p>A cuFFT a <strong>terv–végrehajtás</strong> (plan–exec) modellt
+követi: először létrehozunk egy transzformációs tervet
+(<code>cufftHandle</code>), amely a kiválasztott mérethez, típushoz és
+batch-hez optimalizált végrehajtási stratégiát tartalmazza, majd ezt a
+tervet többször is felhasználhatjuk különböző adatokra. A terv
+létrehozása viszonylag drága lehet, ezért teljesítménykritikus kódban
+egyszer hozzuk létre, és sokszor hajtjuk végre.</p>
+<p>A cuFFT két fő komplex típust definiál:</p>
+<ul>
+<li><code>cufftComplex</code>: egyszeres pontosságú komplex szám, két
+<code>float</code> taggal (<code>x</code>, <code>y</code>).</li>
+<li><code>cufftDoubleComplex</code>: kétszeres pontosságú komplex szám,
+két <code>double</code> taggal.</li>
+</ul>
+<p>A transzformáció iránya a <code>CUFFT_FORWARD</code> és
+<code>CUFFT_INVERSE</code> konstansokkal adható meg. A cuFFT <strong>nem
+normalizálja</strong> az inverz transzformációt: a forward-inverz páros
+után az eredmény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szerese
+az eredeti jelnek (ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+a transzformáció hossza). A normalizálást a felhasználónak kell
+elvégeznie, általában
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mi>N</mi></mrow><annotation encoding="application/x-tex">1/N</annotation></semantics></math>
+tényezővel való szorzással.</p>
+<p>A transzformáció típusok az adat típusa és a valós/komplex jelleg
+alapján:</p>
+<ul>
+<li><code>CUFFT_C2C</code>: komplex → komplex</li>
+<li><code>CUFFT_R2C</code>: valós → komplex (a kimenet csak az első
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mi>/</mi><mn>2</mn><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">N/2+1</annotation></semantics></math>
+frekvenciát tartalmazza a páros szimmetria miatt)</li>
+<li><code>CUFFT_C2R</code>: komplex → valós (a bemenetnek ugyanazt a
+tömörített formát kell követnie)</li>
+<li><code>CUFFT_Z2Z</code>, <code>CUFFT_D2Z</code>,
+<code>CUFFT_Z2D</code>: kétszeres pontosságú változatok</li>
+</ul>
+<p>A leggyakrabban használt tervező függvények:</p>
+<ul>
+<li><code>cufftPlan1d(&amp;plan, N, type, batch)</code> – 1D
+transzformáció, adott batch mérettel.</li>
+<li><code>cufftPlanMany(&amp;plan, rank, n, inembed, istride, idist, onembed, ostride, odist, type, batch)</code>
+– általános, többdimenziós és testreszabott memóriaelrendezésű
+transzformációkhoz.</li>
+</ul>
+<p>A végrehajtás a
+<code>cufftExecC2C(plan, idata, odata, direction)</code>
+(komplex–komplex) vagy a megfelelő R2C/C2R változatokkal történik. A
+függvények eszközoldali mutatókat várnak, és az aktuális streamhez
+igazodnak (alapértelmezés szerint a default streamhez, de
+<code>cufftSetStream</code> segítségével más streamhez rendelhető).</p>
+<p>A terv felszabadítása <code>cufftDestroy(plan)</code> hívással
+kötelező, különben eszközoldali erőforrások szivárognak.</p>
+<h3 data-number="20.1.2" id="egyszerű-1d-komplex-fft"><span
+class="header-section-number">20.1.2</span> 2. Egyszerű 1D komplex
+FFT</h3>
+<p>A következő CUDA C++ példa egy 1024 hosszúságú komplex jelet
+transzformál, majd az inverz FFT-vel rekonstruálja. A hibaellenőrzéshez
+makrókat használunk, és a mérési időt CUDA eseményekkel rögzítjük.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ (C++17, cuFFT)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cufft.h&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;complex&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iomanip&gt;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                       </span><span class="op">\</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                       </span><span class="op">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                                </span><span class="op">\</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                              </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">                      </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">          </span><span class="op">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                      </span><span class="op">\</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUFFT</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                      </span><span class="op">\</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                       </span><span class="op">\</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span>cufftResult<span class="pp"> </span>res<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                                </span><span class="op">\</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>res<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>CUFFT_SUCCESS<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;cuFFT error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="pp">                      </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; code &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>res<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">                         </span><span class="op">\</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                      </span><span class="op">\</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> batch <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span> pi <span class="op">=</span> <span class="fl">3.14159265358979323846</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host oldali bemeneti jel: cos(2π*4t) + sin(2π*8t), valós részben</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>complex<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;&gt;</span> h_signal<span class="op">(</span>N<span class="op">);</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> t <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>i<span class="op">)</span> <span class="op">/</span> N<span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> val <span class="op">=</span> <span class="bu">std::</span>cos<span class="op">(</span><span class="fl">2.0</span><span class="bu">f</span> <span class="op">*</span> pi <span class="op">*</span> <span class="fl">4.0</span><span class="bu">f</span> <span class="op">*</span> t<span class="op">)</span> <span class="op">+</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>                    <span class="bu">std::</span>sin<span class="op">(</span><span class="fl">2.0</span><span class="bu">f</span> <span class="op">*</span> pi <span class="op">*</span> <span class="fl">8.0</span><span class="bu">f</span> <span class="op">*</span> t<span class="op">);</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>        h_signal<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="bu">std::</span>complex<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>val<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszközoldali pufferek allokálása</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>    cufftComplex<span class="op">*</span> d_signal<span class="op">;</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a>    cufftComplex<span class="op">*</span> d_spectrum<span class="op">;</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    cufftComplex<span class="op">*</span> d_reconstructed<span class="op">;</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_signal<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">)));</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_spectrum<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">)));</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_reconstructed<span class="op">,</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">)));</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemenet feltöltése az eszközön</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_signal<span class="op">,</span> h_signal<span class="op">.</span>data<span class="op">(),</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>                          N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">),</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a>    <span class="co">// cuFFT terv létrehozása</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a>    cufftHandle plan<span class="op">;</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>    CHECK_CUFFT<span class="op">(</span>cufftPlan1d<span class="op">(&amp;</span>plan<span class="op">,</span> N<span class="op">,</span> CUFFT_C2C<span class="op">,</span> batch<span class="op">));</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up a mérés előtt</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>        CHECK_CUFFT<span class="op">(</span>cufftExecC2C<span class="op">(</span>plan<span class="op">,</span> d_signal<span class="op">,</span> d_spectrum<span class="op">,</span> CUFFT_FORWARD<span class="op">));</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Időmérés CUDA eseményekkel</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> iterations <span class="op">=</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> iterations<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>        CHECK_CUFFT<span class="op">(</span>cufftExecC2C<span class="op">(</span>plan<span class="op">,</span> d_signal<span class="op">,</span> d_spectrum<span class="op">,</span> CUFFT_FORWARD<span class="op">));</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> elapsed_ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>elapsed_ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> avg_ms <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>elapsed_ms<span class="op">)</span> <span class="op">/</span> iterations<span class="op">;</span></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Átlagos forward FFT idő: &quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>fixed</span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="bu">std::</span>setprecision<span class="op">(</span><span class="dv">6</span><span class="op">)</span> <span class="op">&lt;&lt;</span> avg_ms <span class="op">&lt;&lt;</span> <span class="st">&quot; ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Spektrum visszamásolása és csúcsok ellenőrzése</span></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>complex<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;&gt;</span> h_spectrum<span class="op">(</span>N<span class="op">);</span></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_spectrum<span class="op">.</span>data<span class="op">(),</span> d_spectrum<span class="op">,</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a>                          N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A két legnagyobb csúcs a pozitív frekvenciákon (0..N/2)</span></span>
+<span id="cb1-92"><a href="#cb1-92" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> max1 <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> max2 <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-93"><a href="#cb1-93" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx1 <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> idx2 <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-94"><a href="#cb1-94" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> k <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> k <span class="op">&lt;=</span> N <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> <span class="op">++</span>k<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-95"><a href="#cb1-95" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> mag <span class="op">=</span> <span class="bu">std::</span>abs<span class="op">(</span>h_spectrum<span class="op">[</span>k<span class="op">]);</span></span>
+<span id="cb1-96"><a href="#cb1-96" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>mag <span class="op">&gt;</span> max1<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-97"><a href="#cb1-97" aria-hidden="true" tabindex="-1"></a>            max2 <span class="op">=</span> max1<span class="op">;</span> idx2 <span class="op">=</span> idx1<span class="op">;</span></span>
+<span id="cb1-98"><a href="#cb1-98" aria-hidden="true" tabindex="-1"></a>            max1 <span class="op">=</span> mag<span class="op">;</span>  idx1 <span class="op">=</span> k<span class="op">;</span></span>
+<span id="cb1-99"><a href="#cb1-99" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>mag <span class="op">&gt;</span> max2<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-100"><a href="#cb1-100" aria-hidden="true" tabindex="-1"></a>            max2 <span class="op">=</span> mag<span class="op">;</span>  idx2 <span class="op">=</span> k<span class="op">;</span></span>
+<span id="cb1-101"><a href="#cb1-101" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-102"><a href="#cb1-102" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-103"><a href="#cb1-103" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Spektrum csúcsok: (&quot;</span> <span class="op">&lt;&lt;</span> idx1 <span class="op">&lt;&lt;</span> <span class="st">&quot;, &quot;</span> <span class="op">&lt;&lt;</span> max1</span>
+<span id="cb1-104"><a href="#cb1-104" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="st">&quot;) és (&quot;</span> <span class="op">&lt;&lt;</span> idx2 <span class="op">&lt;&lt;</span> <span class="st">&quot;, &quot;</span> <span class="op">&lt;&lt;</span> max2 <span class="op">&lt;&lt;</span> <span class="st">&quot;)</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb1-105"><a href="#cb1-105" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-106"><a href="#cb1-106" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Inverz FFT</span></span>
+<span id="cb1-107"><a href="#cb1-107" aria-hidden="true" tabindex="-1"></a>    CHECK_CUFFT<span class="op">(</span>cufftExecC2C<span class="op">(</span>plan<span class="op">,</span> d_spectrum<span class="op">,</span> d_reconstructed<span class="op">,</span> CUFFT_INVERSE<span class="op">));</span></span>
+<span id="cb1-108"><a href="#cb1-108" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>complex<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;&gt;</span> h_reconstructed<span class="op">(</span>N<span class="op">);</span></span>
+<span id="cb1-109"><a href="#cb1-109" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_reconstructed<span class="op">.</span>data<span class="op">(),</span> d_reconstructed<span class="op">,</span></span>
+<span id="cb1-110"><a href="#cb1-110" aria-hidden="true" tabindex="-1"></a>                          N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span>cufftComplex<span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb1-111"><a href="#cb1-111" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-112"><a href="#cb1-112" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Normalizálás és hibaszámítás</span></span>
+<span id="cb1-113"><a href="#cb1-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> max_abs_error <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-114"><a href="#cb1-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-115"><a href="#cb1-115" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>complex<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> recon<span class="op">(</span>h_reconstructed<span class="op">[</span>i<span class="op">].</span>x <span class="op">/</span> N<span class="op">,</span></span>
+<span id="cb1-116"><a href="#cb1-116" aria-hidden="true" tabindex="-1"></a>                                  h_reconstructed<span class="op">[</span>i<span class="op">].</span>y <span class="op">/</span> N<span class="op">);</span></span>
+<span id="cb1-117"><a href="#cb1-117" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> err <span class="op">=</span> <span class="bu">std::</span>abs<span class="op">(</span>h_signal<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> recon<span class="op">);</span></span>
+<span id="cb1-118"><a href="#cb1-118" aria-hidden="true" tabindex="-1"></a>        max_abs_error <span class="op">=</span> <span class="bu">std::</span>max<span class="op">(</span>max_abs_error<span class="op">,</span> err<span class="op">);</span></span>
+<span id="cb1-119"><a href="#cb1-119" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-120"><a href="#cb1-120" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Maximális abszolút hiba inverz FFT után: &quot;</span></span>
+<span id="cb1-121"><a href="#cb1-121" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="bu">std::</span>scientific <span class="op">&lt;&lt;</span> max_abs_error <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb1-122"><a href="#cb1-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-123"><a href="#cb1-123" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb1-124"><a href="#cb1-124" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_reconstructed<span class="op">));</span></span>
+<span id="cb1-125"><a href="#cb1-125" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_spectrum<span class="op">));</span></span>
+<span id="cb1-126"><a href="#cb1-126" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>d_signal<span class="op">));</span></span>
+<span id="cb1-127"><a href="#cb1-127" aria-hidden="true" tabindex="-1"></a>    CHECK_CUFFT<span class="op">(</span>cufftDestroy<span class="op">(</span>plan<span class="op">));</span></span>
+<span id="cb1-128"><a href="#cb1-128" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb1-129"><a href="#cb1-129" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb1-130"><a href="#cb1-130" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-131"><a href="#cb1-131" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-132"><a href="#cb1-132" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kód legfontosabb tanulságai:</p>
+<ol type="1">
+<li><strong>Típuskonverzió</strong>: a host oldali
+<code>std::complex&lt;float&gt;</code> és az eszköz oldali
+<code>cufftComplex</code> közötti másolás közvetlenül működik, mert a
+<code>cufftComplex</code> elrendezése megegyezik a két
+<code>float</code> mezővel rendelkező struktúrával.</li>
+<li><strong>Hibakezelés</strong>: minden CUDA- és cuFFT-hívás után
+ellenőrzünk, így azonnal láthatóvá válik az érvénytelen plan, a nem
+megfelelő mutató vagy az erőforrás-allokációs hiba.</li>
+<li><strong>Warm-up</strong>: a mérés előtt öt futtatással melegítjük a
+GPU-t, hogy az órajelek és a memória-útvonalak stabil állapotba
+kerüljenek.</li>
+<li><strong>CUDA események</strong>: a mérési intervallumot eszközoldali
+eseményekkel rögzítjük, így az aszinkron végrehajtásból eredő torzítás
+minimális.</li>
+<li><strong>Inverz FFT normalizálása</strong>: a rekonstruált jel minden
+elemét osztjuk
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-nel.
+Ha ezt elfelejtjük, a hiba óriási lesz, és az értékek
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szeres
+skálán jelennek meg.</li>
+<li><strong>Takarítás</strong>: a plan és az események felszabadítása
+elengedhetetlen a determinisztikus erőforrás-gazdálkodáshoz.</li>
+</ol>
+<h3 data-number="20.1.3" id="batched-fft-és-méretek"><span
+class="header-section-number">20.1.3</span> 3. Batched FFT és
+méretek</h3>
+<p>Sok gyakorlati alkalmazásban nem egyetlen, hanem sok azonos
+hosszúságú transzformációt kell egyszerre végrehajtani. Ilyen például a
+spektrogram számítása, több csatorna egyidejű feldolgozása vagy a
+képfeldolgozás soronkénti FFT-je. A cuFFT ezt <strong>batch</strong>
+paraméterrel támogatja: a terv létrehozásakor megadott batch érték azt
+jelzi, hogy hány azonos szerkezetű transzformációt hajtunk végre.</p>
+<p>Az egyszerű <code>cufftPlan1d</code> is elfogad batch paramétert, de
+ilyenkor a bemeneti adatokat folytonosan,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+elemű blokkokban kell elhelyezni. Ha a memóriában nem folytonos az
+elrendezés (például egy nagyobb mátrix soraiban), akkor a
+<code>cufftPlanMany</code> függvényt kell használni:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>cufftHandle plan_many<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> n<span class="op">[]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">256</span><span class="op">};</span>              <span class="co">// 1D FFT méret</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> inembed<span class="op">[]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">512</span><span class="op">};</span>        <span class="co">// bemeneti sor hossza (a tényleges adatsor szélesebb lehet)</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> istride <span class="op">=</span> <span class="dv">1</span><span class="op">;</span>              <span class="co">// két szomszédos elem távolsága</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> idist <span class="op">=</span> <span class="dv">512</span><span class="op">;</span>              <span class="co">// két batch elem közötti távolság (sorhossz)</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> onembed<span class="op">[]</span> <span class="op">=</span> <span class="op">{</span><span class="dv">256</span><span class="op">};</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> ostride <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> odist <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> batch_size <span class="op">=</span> <span class="dv">100</span><span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>cufftPlanMany<span class="op">(&amp;</span>plan_many<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> n<span class="op">,</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>              inembed<span class="op">,</span> istride<span class="op">,</span> idist<span class="op">,</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>              onembed<span class="op">,</span> ostride<span class="op">,</span> odist<span class="op">,</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>              CUFFT_C2C<span class="op">,</span> batch_size<span class="op">);</span></span></code></pre></div>
+<p>A fenti konfiguráció 100 darab 256 hosszú FFT-t hajt végre, ahol a
+bemeneti adatok egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mo>×</mo><mn>512</mn></mrow><annotation encoding="application/x-tex">100 \times 512</annotation></semantics></math>
+elemből álló mátrixban helyezkednek el, és minden sor első 256 elemét
+transzformáljuk. A stride-ok és a dist paraméterek pontos beállítása
+kritikus: ha <code>idist</code> nem egyenlő a tényleges sorok közötti
+távolsággal, a cuFFT hibás memóriacímeket olvas.</p>
+<p>A batch méret megválasztásánál három szempontot kell figyelembe
+venni:</p>
+<ul>
+<li><strong>Occupancy</strong>: nagyobb batch méret esetén a cuFFT több
+párhuzamos feladatot tud ütemezni, ami jobb SM-kihasználtsághoz vezet. A
+batch egyetlen kernelhíváson belül több transzformációt futtat, így
+csökken az indítási overhead.</li>
+<li><strong>Memória</strong>: a bemeneti és kimeneti adatoknak
+egyidejűleg az eszköz globális memóriájában kell lenniük. Ha a batch
+méret túl nagy, és nem fér el a GPU memóriájában, az allokáció meghiúsul
+vagy lassú lapozást okoz.</li>
+<li><strong>Streamelés</strong>: nagy adatfolyamok esetén érdemes a
+batch méretet úgy választani, hogy az adatok streamelhetők legyenek, és
+a transzformáció átfedésbe kerülhessen az adatmozgatással.</li>
+</ul>
+<p>A többdimenziós FFT-k közül a 2D és 3D transzformációk a
+<code>cufftPlan2d</code> és <code>cufftPlan3d</code> függvényekkel
+hozhatók létre. A belső implementáció általában sor–oszlop dekompozíciót
+használ, ami kihasználja a batched 1D FFT-k előnyeit. A méretek
+megválasztásánál a cuFFT teljesítménye függ a faktorizálhatóságtól: a 2
+hatvány méretek (radix-2) általában a leggyorsabbak, de a könyvtár más
+prímfaktorokat (3, 5, 7) is támogat. Nagy prímszám méret esetén a cuFFT
+a Bluestein-algoritmusra vált, ami jelentősen lassabb, ezért ilyenkor
+érdemes a jelet nullákkal kiegészíteni a következő 2-hatvány
+méretre.</p>
+<h3 data-number="20.1.4" id="pontosság-és-memória"><span
+class="header-section-number">20.1.4</span> 4. Pontosság és memória</h3>
+<p>A cuFFT két pontossági szintet kínál: <strong>FP32</strong>
+(<code>cufftComplex</code>) és <strong>FP64</strong>
+(<code>cufftDoubleComplex</code>). Az FFT numerikus hibája két fő
+forrásból származik:</p>
+<ol type="1">
+<li><strong>Kerekítési hiba a pillangó-műveletekben</strong>: minden
+összeadás, szorzás és a komplex fázisfaktorokkal való szorzás
+lebegőpontos kerekítést visz be. A hiba nagysága függ a transzformáció
+hosszától és a közbenső értékek nagyságától.</li>
+<li><strong>Fázisfaktorok pontossága</strong>: a cuFFT előre kiszámított
+trigonometrikus értékeket használ, amelyek pontossága az adott típusra
+jellemző.</li>
+</ol>
+<p>Az FP32 esetén a relatív hiba tipikusan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><annotation encoding="application/x-tex">10^{-6}</annotation></semantics></math>–<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>7</mn></mrow></msup><annotation encoding="application/x-tex">10^{-7}</annotation></semantics></math>
+nagyságrendű, míg FP64 esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>15</mn></mrow></msup><annotation encoding="application/x-tex">10^{-15}</annotation></semantics></math>–<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>16</mn></mrow></msup><annotation encoding="application/x-tex">10^{-16}</annotation></semantics></math>.
+Ha nagy dinamikatartományú jelet transzformálunk, vagy a későbbi
+műveletek érzékenyek a kerekítésre, érdemes FP64-et választani. Az FP32
+azonban lényegesen kisebb memóriát igényel és gyorsabb, ezért a legtöbb
+alkalmazásban elegendő.</p>
+<p>A <strong>pontosság és a memória</strong> közötti kapcsolat:</p>
+<ul>
+<li>FP32 esetén minden komplex elem 8 bájtot foglal, így egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>1024</mn></mrow><annotation encoding="application/x-tex">N=1024</annotation></semantics></math>
+hosszú jel 8 KiB-ot igényel bemenetenként és kimenetenként.</li>
+<li>FP64 esetén ez 16 bájt elemenként, azaz 16 KiB.</li>
+<li>A batch méret növelésével a memóriaigény lineárisan nő: 100 batch,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mn>256</mn></mrow><annotation encoding="application/x-tex">N=256</annotation></semantics></math>,
+FP32 esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>100</mn><mo>×</mo><mn>256</mn><mo>×</mo><mn>8</mn><mo>=</mo><mn>204</mn><mo>,</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">100 \times 256 \times 8 = 204{,}8</annotation></semantics></math>
+KiB bemeneti és ugyanennyi kimeneti adat.</li>
+</ul>
+<p>A cuFFT a végrehajtás során <strong>belső munkaterületet</strong> is
+használhat. A <code>cufftPlan1d</code> és <code>cufftPlanMany</code>
+automatikusan lefoglalja a szükséges ideiglenes puffert, ha szükséges,
+de a haladó felhasználók a <code>cufftSetWorkArea</code> függvénnyel
+explicit módon is biztosíthatnak munkaterületet. Ez különösen akkor
+hasznos, ha több tervet szeretnénk ugyanazzal a pufferekkel kiszolgálni,
+vagy ha a plan létrehozása túl sok memóriát foglal.</p>
+<p>A memória és a pontosság együttes ellenőrzésére a laborban a
+forward-inverz roundtrip hibát mérjük: ha a bemeneti jel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>,
+az inverz FFT kimenete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>,
+akkor a normalizálás után
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>≈</mo><mi>x</mi></mrow><annotation encoding="application/x-tex">y \approx x</annotation></semantics></math>.
+A maximális abszolút hiba FP32 esetén jellemzően
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>6</mn></mrow></msup><annotation encoding="application/x-tex">10^{-6}</annotation></semantics></math>–<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>5</mn></mrow></msup><annotation encoding="application/x-tex">10^{-5}</annotation></semantics></math>,
+FP64 esetén
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>15</mn></mrow></msup><annotation encoding="application/x-tex">10^{-15}</annotation></semantics></math>
+alatt marad.</p>
+<h3 data-number="20.1.5" id="labor-fft-és-inverz-fft-ellenőrzése"><span
+class="header-section-number">20.1.5</span> 5. Labor: FFT és inverz FFT
+ellenőrzése</h3>
+<p>A labor célja, hogy a fenti kódot lefordítva és futtatva ellenőrizzük
+a cuFFT működését, rögzítsük a mérési körülményeket, és a várt
+eredményeket összevessük a mért értékekkel. A mérési napló az alábbi
+sablon szerint készül.</p>
+<p><strong>Labor környezet (példa, ellenőrizendő):</strong></p>
+<ul>
+<li>GPU: NVIDIA GeForce RTX 3080 10 GB, compute capability 8.6</li>
+<li>Driver: 535.54.03 (éles környezetben a <code>nvidia-smi</code>
+kimenete alapján ellenőrizendő)</li>
+<li>CUDA Toolkit: 12.2</li>
+<li>cuFFT: a CUDA Toolkit része (például 10.9.0.86)</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>Fordító: nvcc V12.2.140</li>
+</ul>
+<p><strong>Build parancs:</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> fft_cufft fft_cufft.cu <span class="at">-lcufft</span></span></code></pre></div>
+<p><strong>Futtatási parancs:</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./fft_cufft</span></span></code></pre></div>
+<p><strong>Mérési napló (illusztratív adatokkal – a valós futtatás során
+kitöltendő):</strong></p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mért jellemző</th>
+<th>Várt érték</th>
+<th>Mért érték (helyőrző)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Input hossz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math></td>
+<td>1024</td>
+<td>1024</td>
+<td>–</td>
+</tr>
+<tr class="even">
+<td>Batch</td>
+<td>1</td>
+<td>1</td>
+<td>–</td>
+</tr>
+<tr class="odd">
+<td>Típus</td>
+<td>CUFFT_C2C, FP32</td>
+<td>CUFFT_C2C, FP32</td>
+<td>–</td>
+</tr>
+<tr class="even">
+<td>Forward FFT átlag idő</td>
+<td>nincs rögzített, csak referencia</td>
+<td>15,2 µs</td>
+<td>20 ismétlés, warm-up után</td>
+</tr>
+<tr class="odd">
+<td>Szórás (µs)</td>
+<td>–</td>
+<td>0,8 µs</td>
+<td>CUDA eseményekkel mérve</td>
+</tr>
+<tr class="even">
+<td>Spektrum csúcs indexek</td>
+<td>4 és 8 (valamint a tükrözött
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>−</mo><mn>4</mn></mrow><annotation encoding="application/x-tex">N-4</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>−</mo><mn>8</mn></mrow><annotation encoding="application/x-tex">N-8</annotation></semantics></math>)</td>
+<td>4, 8</td>
+<td>A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>0</mn><mi>.</mi><mi>.</mi><mi>N</mi><mi>/</mi><mn>2</mn></mrow><annotation encoding="application/x-tex">0..N/2</annotation></semantics></math>
+tartományban a két legnagyobb csúcs</td>
+</tr>
+<tr class="odd">
+<td>Csúcs amplitúdók</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mi>/</mi><mn>2</mn><mo>≈</mo><mn>512</mn></mrow><annotation encoding="application/x-tex">N/2 \approx 512</annotation></semantics></math>
+(mindkét csúcs)</td>
+<td>511,98 és 512,01</td>
+<td>A bemeneti valós jelből származó eltérés a kerekítésből adódik</td>
+</tr>
+<tr class="even">
+<td>Inverz FFT utáni max abszolút hiba</td>
+<td>&lt;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>4</mn></mrow></msup><annotation encoding="application/x-tex">10^{-4}</annotation></semantics></math>
+(FP32)</td>
+<td>3,2 ×
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>5</mn></mrow></msup><annotation encoding="application/x-tex">10^{-5}</annotation></semantics></math></td>
+<td>normalizálás
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mi>N</mi></mrow><annotation encoding="application/x-tex">1/N</annotation></semantics></math>)
+után</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban szereplő mért értékek <strong>mintaadatok</strong>:
+valós környezetben a tényleges időket, csúcsokat és hibákat a futtatás
+után kell rögzíteni. A mérés előtt legalább 5 warm-up futtatást, majd 20
+mérési iterációt végeztünk; az átlagot és a szórást a kód kiírja. A
+hibaszámításnál a várt érték a bemeneti jel pontos visszaállítása az
+inverz FFT és normalizálás után.</p>
+<p><strong>A várt és mért eredmények szétválasztása:</strong></p>
+<ul>
+<li><strong>Várt</strong>: a spektrumban a két frekvenciacsúcs a 4. és
+8. indexen jelenik meg, amplitúdójuk
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mi>/</mi><mn>2</mn><mo>=</mo><mn>512</mn></mrow><annotation encoding="application/x-tex">N/2 = 512</annotation></semantics></math>
+(a DFT definíciójából következően). Az inverz FFT után a bemeneti jel
+visszaáll, a hiba a numerikus pontosságból adódóan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mn>10</mn><mrow><mo>−</mo><mn>5</mn></mrow></msup><annotation encoding="application/x-tex">10^{-5}</annotation></semantics></math>
+alatt marad.</li>
+<li><strong>Mért</strong>: a program kimenete megadja a tényleges
+csúcsindexeket, amplitúdókat és a maximális abszolút hibát. Ezeket kell
+összehasonlítani a várt értékekkel.</li>
+</ul>
+<h3 data-number="20.1.6" id="tipikus-hibák-és-elkerülésük"><span
+class="header-section-number">20.1.6</span> 6. Tipikus hibák és
+elkerülésük</h3>
+<ol type="1">
+<li><p><strong>Az inverz FFT normalizálásának elhagyása</strong><br />
+A cuFFT nem osztja le az inverz transzformáció eredményét
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-nel.
+Ha ezt elfelejtjük, a rekonstruált jel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szeres
+amplitúdójú lesz, ami a legtöbb alkalmazásban hibás. A megoldás: a
+<code>CUFFT_INVERSE</code> után minden elemet osztani kell a
+transzformáció hosszával, vagy a felhasználási helyen figyelembe venni a
+skálázást.</p></li>
+<li><p><strong>Helytelen batch/stride beállítás a
+<code>cufftPlanMany</code> esetén</strong><br />
+Ha a bemeneti adatok nem folytonosak, és az
+<code>idist</code>/<code>odist</code> értékeket rosszul adjuk meg, a
+cuFFT hibás memóriacímekről olvas, ami nem definiált viselkedést vagy
+rossz eredményt okoz. Mindig ellenőrizzük, hogy a stride-ok pontosan
+tükrözik a tényleges memóriaelrendezést.</p></li>
+<li><p><strong>Típusmismatch</strong><br />
+A <code>cufftExecC2C</code> komplex bemenetet vár. Ha valós jelet
+transzformálunk, és mégis C2C típust használunk, a képzetes részt
+nullára kell állítani. Nagyobb hatékonyság érdekében valós jeleknél
+érdemes <code>CUFFT_R2C</code>-t használni, amely kihasználja a
+szimmetriát, és majdnem felezi a memóriát és a számítási
+költséget.</p></li>
+<li><p><strong>A plan felszabadításának elmulasztása</strong><br />
+A <code>cufftDestroy</code> elhagyása memóriaszivárgáshoz vezet,
+különösen sok plan létrehozása és eldobása esetén. A plan-eket a hatókör
+végén mindig meg kell semmisíteni.</p></li>
+<li><p><strong>Aszinkron végrehajtás figyelmen kívül hagyása a
+mérésnél</strong><br />
+A cuFFT végrehajtás aszinkron a hosthoz képest. Ha az időméréshez nem
+használunk CUDA eseményeket vagy nem hívunk
+<code>cudaDeviceSynchronize</code>-t, a mért idő a host-oldali kiadás
+idejét tükrözi, nem a tényleges GPU végrehajtást.</p></li>
+<li><p><strong>A nem támogatott méretek
+teljesítményhatása</strong><br />
+Bár a cuFFT szinte bármilyen méretet támogat, a nagy prímszám méretek
+(pl. 1021) Bluestein-algoritmust igényelnek, ami lényegesen lassabb,
+mint a 2-hatvány méretek. Ilyenkor érdemes a jelet nullákkal
+kiegészíteni a következő 2-hatvány méretre, vagy a munkafolyamatot a
+gyors faktorokhoz igazítani.</p></li>
+</ol>
+<h3 data-number="20.1.7" id="önellenőrző-kérdés"><span
+class="header-section-number">20.1.7</span> 7. Önellenőrző kérdés</h3>
+<p>Miért kell a cuFFT inverz FFT kimenetét kézzel normalizálni, és mi
+történik, ha ezt elfelejtjük? Milyen numerikus hibajellemzők utalnak
+arra, hogy a normalizálás hiányzik?</p>
+<p><strong>Vázlatos válasz:</strong> A cuFFT mind a forward, mind az
+inverz transzformációt ugyanazzal a definícióval számítja, és az
+inverznél nem alkalmaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mi>N</mi></mrow><annotation encoding="application/x-tex">1/N</annotation></semantics></math>
+skálázást. Ezért a forward–inverz páros után az eredmény
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szerese
+az eredeti jelnek. A normalizálás elhagyása tipikusan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szeres
+amplitúdót és a vártnál sokkal nagyobb abszolút hibát eredményez. Az
+ilyen hiba felismerhető abból, hogy a rekonstruált jel értékei több
+nagyságrenddel nagyobbak, és a jel–zaj viszony romlik. A javítás az
+inverz FFT kimenetének
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mi>N</mi></mrow><annotation encoding="application/x-tex">1/N</annotation></semantics></math>-nel
+való szorzása.</p>
+<h3 data-number="20.1.8" id="összegzés"><span
+class="header-section-number">20.1.8</span> Összegzés</h3>
+<p>A cuFFT a GPU-alapú Fourier-transzformáció hatékony, magas szintű
+eszköze. A terv–végrehajtás modell, a batched végrehajtás, a változatos
+pontosság és a testreszabható memóriaelrendezés együttesen lefedi a
+gyakorlati alkalmazások többségét. A laborban bemutatott 1D komplex FFT
+példa az alapműveleteket, az inverz transzformációt és a numerikus
+ellenőrzést egyaránt gyakoroltatja. A fejezet következő egységei erre az
+alapra építve a Monte Carlo szimulációkat, a cuRAND
+véletlenszám-generátorokat és a sztochasztikus algoritmusokat
+tárgyalják.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu073.html">← 19.4 Könyvtári és saját megoldás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu075.html">20.2 Monte Carlo szimuláció →</a></div>
+</nav>
+</body>
+</html>

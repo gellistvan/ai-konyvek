@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.1 Globális indexszámítás 1D-ben – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch05">6 Kernelírás, indexelés és launch konfiguráció</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu017.html">← 5.4 A végrehajtási modell korlátai</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu019.html">6.2 Többdimenziós indexelés →</a></div>
+</nav>
+<h2 data-number="6.1" id="gpu018"><span
+class="header-section-number">6.1</span> Globális indexszámítás
+1D-ben</h2>
+<p>Amikor egy kernelt elindítunk, a hardver nem ismeri a feladat logikai
+szerkezetét. Csak azt látja, hogy egy rácsnyi (grid) blokkot és
+blokkonként egy adott számú szálat kell ütemeznie. A programozó
+feladata, hogy ebből a hierarchiából egy lineáris, az adathoz illeszkedő
+azonosítót képezzen. Ez a fejezet ezt a leképezést tárgyalja 1D-s tömbök
+esetén. A cél annak megértése, hogyan válik a hardver által biztosított
+három beépített indexből – <code>threadIdx</code>,
+<code>blockIdx</code>, <code>blockDim</code> – a feldolgozandó elem
+globális pozíciója, és miért nélkülözhetetlen a határellenőrzés
+(boundary check), ha a tömb mérete nem osztható a blokkmérettel.</p>
+<p>A fejezetben szereplő kódok CUDA C++ nyelvűek, és az itt bemutatott
+kernel „tankönyvi” jellegű: a hangsúly az indexelésen van, nem a
+memória-átviteli vagy futási sebességen. A labor feladata éppen ezért
+nem egy nagy teljesítményű számítás, hanem egy ellenőrizhető, kis méretű
+példa, amelynél a várt és a mért eredmény pontosan összevethető.</p>
+<figure>
+<img src="assets/gpu018-diagram-1.png"
+alt="Az 1D globális index előállítása - A globális index a block- és thread-index lineáris kombinációja; a határellenőrzésnek a beolvasás előtt kell megtörténnie." />
+<figcaption aria-hidden="true">Az 1D globális index előállítása - A
+globális index a block- és thread-index lineáris kombinációja; a
+határellenőrzésnek a beolvasás előtt kell megtörténnie.</figcaption>
+</figure>
+<h3 data-number="6.1.1"
+id="a-thread-block-és-grid-közötti-kapcsolat"><span
+class="header-section-number">6.1.1</span> A thread, block és grid
+közötti kapcsolat</h3>
+<p>A CUDA végrehajtási modellje három szintre bontja a párhuzamos
+munkát: a szálak egy blokkba szerveződnek, a blokkok pedig egy rácsba. A
+kernel belsejében a szál pozícióját kizárólag beépített, csak olvasható
+változókból tudhatjuk meg:</p>
+<ul>
+<li><code>threadIdx</code> – a szál indexe a blokkon belül. Típusa
+<code>dim3</code>, amely három komponenst tartalmaz:
+<code>threadIdx.x</code>, <code>threadIdx.y</code>,
+<code>threadIdx.z</code>. 1D-s indításnál a <code>y</code> és
+<code>z</code> komponens értéke 0, az <code>x</code> komponens pedig
+<code>0</code> és <code>blockDim.x - 1</code> közé esik.</li>
+<li><code>blockIdx</code> – annak a blokknak az indexe, amelyhez a szál
+tartozik, a rácson belül. Szintén <code>dim3</code> típusú, 1D-s
+indításnál a <code>blockIdx.x</code> értéke <code>0</code> és
+<code>gridDim.x - 1</code> között változik.</li>
+<li><code>blockDim</code> – a blokk mérete, tehát az egy blokkban
+található szálak száma dimenziónként. 1D-s indításnál csak a
+<code>blockDim.x</code> fontos, a többi komponens 1.</li>
+<li><code>gridDim</code> – a rács mérete, tehát a blokkok száma
+dimenziónként. 1D-s indításnál a <code>gridDim.x</code> adja meg, hány
+blokk indult.</li>
+</ul>
+<p>Ezek a változók minden szálban azonos módon olvashatók, de az értékük
+szálanként eltérő. Például egy
+<code>&lt;&lt;&lt;4, 256&gt;&gt;&gt;</code> indításnál a
+<code>gridDim.x</code> értéke 4, a <code>blockDim.x</code> értéke 256; a
+<code>blockIdx.x</code> az egyes blokkokban 0, 1, 2 vagy 3, a
+<code>threadIdx.x</code> pedig minden blokkban 0 és 255 között fut. A
+ténylegesen elindított szálak száma ebben a példában 4 * 256 = 1024.</p>
+<p>A hardver nem ígéri meg, hogy a blokkok sorrendben hajtódnak végre,
+és azt sem, hogy egy blokkon belül a szálak ütemezése milyen sorrendű.
+Az indexszámításnak ezért mindig <strong>determinisztikusnak</strong>
+kell lennie, és kizárólag a fenti beépített változóktól, valamint a
+kernel argumentumaitól szabad függenie. Ha egy szál a
+<code>threadIdx.x</code>-ét ismeri, az még nem elegendő; szüksége van a
+<code>blockIdx.x</code>-re is ahhoz, hogy a rács összes szálán belül
+egyedi pozíciót kapjon.</p>
+<h3 data-number="6.1.2" id="a-globális-index-előállítása-1d-ben"><span
+class="header-section-number">6.1.2</span> A globális index előállítása
+1D-ben</h3>
+<p>A legegyszerűbb és leggyakrabban használt leképezés a következő:</p>
+<pre><code>globalIdx = blockIdx.x * blockDim.x + threadIdx.x</code></pre>
+<p>Ez a képlet a rácson belüli blokkokat egymás után elhelyezve egy
+virtuális, lineáris száltartományt hoz létre. Ha a
+<code>blockDim.x</code> értéke <code>B</code>, akkor a 0. blokk szálai a
+<code>0..B-1</code>, az 1. blokk szálai a <code>B..2B-1</code>
+intervallumba esnek, és így tovább. A
+<code>blockIdx.x * blockDim.x</code> kifejezés tehát megadja az adott
+blokk kezdő indexét, a <code>threadIdx.x</code> pedig ezen belül a szál
+helyét.</p>
+<p>Érdemes hangsúlyozni, hogy a szorzat típusa 1D-s indításnál a
+beépített változók miatt <code>unsigned int</code>. Bár a gyakorlatban a
+grid és blokk mérete rendszerint jóval kisebb, mint az
+<code>unsigned int</code> felső határa, nagy adathalmazoknál a
+<code>blockIdx.x * blockDim.x</code> kifejezés túlcsordulhat. Például ha
+<code>gridDim.x</code> a megengedett maximum közelében van (nagyjából
+2,1 milliárd blokk) és <code>blockDim.x</code> 1024, a szorzat
+meghaladja a 32 bites tartományt. Emiatt erősen ajánlott az indexet
+legalább <code>size_t</code> típusra kasztolni, mielőtt nagy tömbökhöz
+használjuk. A modern CUDA C++ kódokban a következő minta terjedt el:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> idx <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>blockIdx<span class="op">.</span>x<span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span></code></pre></div>
+<p>A <code>static_cast</code> miatt a szorzás már 64 bites unsigned
+értéken történik, így elkerülhető a csendes túlcsordulás. Ez a részlet
+aprónak tűnik, de az 1D-s indexelés egyik leggyakrabban elfelejtett
+buktatója. A képlet logikája természetesen ugyanaz marad, csak a típus
+változik.</p>
+<p>A kernel gyakran egyetlen sorban használja ezt a globális indexet.
+Például egy olyan kernel, amely egy <code>n</code> hosszú tömb
+<code>i</code>-edik elemét az indexének megfelelő értékkel tölti fel,
+így néz ki:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> fillIndices<span class="op">(</span><span class="dt">int</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> idx <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>blockIdx<span class="op">.</span>x<span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>idx<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a szálak egyértelműen leképezik a rácsbeli pozíciójukat a tömb
+egy-egy elemére. A <code>idx &lt; n</code> feltétel a határellenőrzés,
+amelyre a következő szakaszban térünk ki.</p>
+<p>Fontos megjegyezni, hogy a globális index <strong>nem</strong> azonos
+a szál ütemezési sorszámával. A hardver a szálakat nem feltétlenül a
+<code>idx</code> növekvő sorrendjében hajtja végre, és a blokkok közötti
+sorrend sem meghatározott. A <code>idx</code> kizárólag a programozó
+számára biztosít egy konzisztens, az adathoz köthető azonosítót. Ezért
+mondjuk azt, hogy a <code>blockIdx</code>, <code>blockDim</code> és
+<code>threadIdx</code> a kernel logikai koordinátái, míg a hardver
+tényleges végrehajtási rendje a scheduler feladata.</p>
+<h3 data-number="6.1.3" id="túlindexelés-és-boundary-check"><span
+class="header-section-number">6.1.3</span> Túlindexelés és boundary
+check</h3>
+<p>Ritkán fordul elő, hogy a feldolgozandó tömb hossza pontosan osztható
+a választott blokkmérettel. Ha <code>N</code> nem többszöröse
+<code>blockDim.x</code>-nek, az utolsó blokkban több szál indul, mint
+ahány elem feldolgozásra vár. Ilyenkor a globális index egy része kívül
+esik a <code>[0, N-1]</code> intervallumon. Ha a kernel nem ellenőrzi a
+határt, ezek a szálak érvénytelen memóriacímet érhetnek el.</p>
+<p>Klasszikus példa: legyen <code>N = 1000</code>, a blokkméret pedig
+<code>256</code>. A szükséges blokkok számát a felfelé kerekített
+osztással kapjuk:</p>
+<pre><code>blocksPerGrid = ceil(N / 256) = ceil(3.906) = 4</code></pre>
+<p>A 4. blokkban, amelynek <code>blockIdx.x</code> értéke 3, a globális
+indexek a <code>768</code> és <code>1023</code> közötti tartományba
+esnek. Azonban a tömb csak a <code>0..999</code> indexeket tartalmazza.
+A <code>1000..1023</code> indexekre történő írás (vagy olvasás) kívül
+esik a lefoglalt memóriaterületen, ami a CUDA-ban definiálatlan
+viselkedéshez, gyakran
+<code>CUDA error: an illegal memory access was encountered</code>
+üzenethez vezet. A hiba nem mindig azonnal jelentkezik, ezért a
+diagnosztika később is nehéz lehet.</p>
+<p>A megoldás a kernelben egyetlen feltételes utasítás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">// valódi munka, pl. out[idx] = idx;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a <strong>boundary check</strong> biztosítja, hogy csak azok a
+szálak férnek hozzá a tömbhöz, amelyekhez valóban tartozik elem. A
+feltétel hamis ágában a szál egyébként is kilépne, de így explicit módon
+nem végez memóriaműveletet. A költség rendszerint elhanyagolható, és a
+korrektség szempontjából kötelező.</p>
+<p>A boundary check hatására a fenti példában a 4. blokk utolsó 24
+szálja tétlen marad. Ez nem „tökéletes” erőforrás-kihasználás, de
+helyes. A későbbi fejezetben tárgyalt grid-stride loop technika ezt a
+pazarlást hivatott csökkenteni azáltal, hogy a szálak egymás után több
+elemet is feldolgoznak, így a blokkok száma függetlenné válik az adat
+méretétől. Ebben a fejezetben azonban az egyszerű, egy elem egy szálhoz
+rendelés a cél, ezért a boundary check marad a központi eszköz.</p>
+<p>Fontos, hogy a boundary check a <strong>globális indexre</strong>
+vonatkozik, nem a <code>threadIdx</code>-re vagy a
+<code>blockIdx</code>-re. Az <code>if (threadIdx.x &lt; n)</code>
+feltétel például hibás, mert a <code>threadIdx.x</code> minden blokkban
+<code>0..blockDim.x-1</code> között mozog, így az <code>n</code>
+értékétől függően vagy túl keveset, vagy túl sokat engedne.
+Hasonlóképpen az <code>if (blockIdx.x &lt; n)</code> sem helyes, mert a
+blokk indexe nem azonos az elem indexével.</p>
+<p>Nézzünk egy konkrét, futtatható példát. Az alábbi kernel egy
+<code>N</code> elemű <code>float</code> tömböt skáláz egy konstanssal. A
+host oldali <code>N</code> tetszőleges pozitív egész lehet, a kernel a
+boundary check miatt minden esetben korrekt marad:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> scaleVector<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> in<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">float</span> alpha<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> idx <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>blockIdx<span class="op">.</span>x<span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> alpha <span class="op">*</span> in<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel egyetlen szálat rendel egyetlen tömbelemhez, és a
+<code>idx &lt; n</code> feltétel levágja a felesleges szálakat. Ha
+<code>n</code> nagy, a host oldali blokkszámításnak is helyesnek kell
+lennie.</p>
+<h3 data-number="6.1.4"
+id="a-grid-és-block-méret-kiszámítása-host-oldalon"><span
+class="header-section-number">6.1.4</span> A grid és block méret
+kiszámítása host oldalon</h3>
+<p>A kernel indításához a host oldalon meg kell adni a rács és a blokk
+méretét. A leggyakoribb minta 1D-s feldolgozásnál:</p>
+<ol type="1">
+<li>Válasszunk egy blokkméretet, például
+<code>threadsPerBlock = 256</code>.</li>
+<li>Számítsuk ki a blokkok számát felfelé kerekített osztással:</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> blocksPerGrid <span class="op">=</span> <span class="op">(</span>n <span class="op">+</span> threadsPerBlock <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threadsPerBlock<span class="op">;</span></span></code></pre></div>
+<ol start="3" type="1">
+<li>Indítsuk a kernelt ezzel a konfigurációval:</li>
+</ol>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>scaleVector<span class="op">&lt;&lt;&lt;</span>blocksPerGrid<span class="op">,</span> threadsPerBlock<span class="op">&gt;&gt;&gt;(</span>d_in<span class="op">,</span> d_out<span class="op">,</span> alpha<span class="op">,</span> n<span class="op">);</span></span></code></pre></div>
+<p>A <code>blocksPerGrid</code> számításánál az egész osztás
+természetéből adódóan a <code>n + threadsPerBlock - 1</code> kifejezés
+biztosítja a felfelé kerekítést. Például <code>n = 1000</code>,
+<code>threadsPerBlock = 256</code> esetén
+<code>(1000 + 255) / 256 = 4</code>, míg a sima <code>1000 / 256</code>
+3-at adna, ami nem lenne elegendő.</p>
+<p>Fontos ellenőrizni, hogy a kapott <code>blocksPerGrid</code> nem lépi
+túl a hardver <code>gridDim.x</code> korlátját. A mai GPU-kon ez a
+korlát <code>2^31 - 1</code> (nagyjából 2,1 milliárd) blokk, ami a
+legtöbb valós adatnál bőven elég. Ha az adat mérete ezt meghaladná, a
+grid-stride loop vagy többdimenziós grid válik szükségessé. Emellett a
+<code>threadsPerBlock</code> nem lehet nagyobb, mint a hardverenként
+eltérő maximális szálszám (általában 1024). A
+<code>cudaGetDeviceProperties</code> függvénnyel kérdezhető le a pontos
+korlát.</p>
+<p>A launch konfigurációban a <code>blocksPerGrid</code> típusa a
+hagyományos CUDA példákban <code>int</code>, mert a kernel launch
+operátora integer típusokat vár. Ha a számítás <code>size_t</code>
+típussal történt, explicit kasztolásra lehet szükség:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> blocksPerGrid <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;((</span>n <span class="op">+</span> threadsPerBlock <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threadsPerBlock<span class="op">);</span></span></code></pre></div>
+<p>Ez a kasztolás biztonságos, amíg <code>blocksPerGrid</code> a fent
+említett korlát alatt marad. Nagy <code>n</code> esetén azonban
+előbb-utóbb elérjük a 32 bites korlátot; ekkor a grid-stride loop a
+fenntartható megoldás.</p>
+<h3 data-number="6.1.5" id="gyakori-hibák-és-elkerülésük"><span
+class="header-section-number">6.1.5</span> Gyakori hibák és
+elkerülésük</h3>
+<p>Az 1D-s globális indexszámítás egyszerűnek tűnik, mégis számos
+jellegzetes hiba forrása. Az alábbiak a leggyakoribbak.</p>
+<p><strong>1. A szorzás és összeadás sorrendjének
+felcserélése.</strong><br />
+Hibás: <code>idx = threadIdx.x * blockDim.x + blockIdx.x</code>.<br />
+Helyes: <code>idx = blockIdx.x * blockDim.x + threadIdx.x</code>.<br />
+A hibás változatban a <code>threadIdx.x * blockDim.x</code> kifejezés a
+blokkon belüli szál pozícióját szorozza meg a blokk méretével, ami
+átfedő indexeket eredményez. Például <code>blockDim.x = 256</code>
+esetén a 0. blokk 1. szálának hibás indexe <code>256</code>, miközben a
+helyes index <code>1</code> lenne. Ez a hiba gyakran nehezen
+észrevehető, mert a kernel fut, de a memória-hozzáférések szétszórtak és
+rosszak.</p>
+<p><strong>2. A boundary check elhagyása.</strong><br />
+Minden olyan kernelben, ahol a globális index a tömb hosszának nem
+állandó osztója, kötelező az <code>if (idx &lt; n)</code> feltétel.
+Ennek elhagyása a legtöbb esetben érvénytelen memória-hozzáféréshez
+vezet, amelyet a compute-sanitizer vagy az <code>cuda-memcheck</code>
+jelez. A hiba tünete lehet a nem determinisztikus crash, az eldurvult
+adatok vagy a csendes korrupció. A javítás egyszerű, de a
+figyelmetlenség sok időt emészthet fel.</p>
+<p><strong>3. Az index típusának túlcsordulása.</strong><br />
+A <code>blockIdx.x * blockDim.x</code> kifejezés
+<code>unsigned int</code> típusú, és nagy gridnél túlcsordulhat. A már
+említett <code>static_cast&lt;size_t&gt;</code> megoldás mellett fontos,
+hogy a kernel argumentumai is megfelelő típusúak legyenek. Ha a kernel
+<code>int n</code> paramétert vár, de a host oldalon <code>size_t</code>
+érkezik, a 64 bites érték 32 bitesre csonkulhat. A konzisztencia
+érdekében a kernel paramétere és a host oldali számítás is
+<code>size_t</code> legyen.</p>
+<p><strong>4. A blokkméret helytelen megválasztása.</strong><br />
+Bár a hardver megenged bizonyos határokat (például blokkonként maximum
+1024 szál), a gyakorlatban a 256, 512 vagy 1024 a gyakori választás. A
+rossz blokkméret nem feltétlenül okoz indexelési hibát, de befolyásolja
+a teljesítményt. Ebben a fejezetben a korrektségre koncentrálunk, a
+teljesítményoptimalizálás a későbbi részek témája.</p>
+<p><strong>5. A <code>gridDim</code> és <code>blockDim</code>
+összekeverése.</strong><br />
+A globális index képletében kizárólag a <code>blockDim.x</code>
+szerepel, nem a <code>gridDim.x</code>. A <code>gridDim.x</code> azt
+adja meg, hány blokk indult, de az index kiszámításához a blokkon belüli
+szálak számára van szükség. A kettő felcserélése szintén hibás
+indexeléshez vezet.</p>
+<p><strong>6. Több kernel hívásakor a beépített változók értékének
+átmentése.</strong><br />
+A <code>threadIdx</code>, <code>blockIdx</code> stb. csak a kernel
+futása alatt érvényesek, és minden kernelhívásban friss értéket kapnak.
+Nem lehet őket host oldalra kimenteni vagy két kernel között megosztani.
+Ha egy kernelből szeretnénk átadni valamilyen indexet, azt explicit
+módon írjuk ki a globális memóriába.</p>
+<h3 data-number="6.1.6"
+id="labor-1d-indexelés-implementálása-és-ellenőrzése"><span
+class="header-section-number">6.1.6</span> Labor: 1D indexelés
+implementálása és ellenőrzése</h3>
+<p>A fejezet laborja egy olyan CUDA C++ program, amely egy
+<code>N</code> hosszú egész tömböt tölt fel a globális index értékével:
+<code>a[i] = i</code>. A feladat célja, hogy a hallgató a saját
+környezetében futtassa a kódot, ellenőrizze a tömb tartalmát, és
+rögzítse a mérési körülményeket. A kernel szándékosan egyszerű, hogy a
+figyelem az indexelésre és a boundary checkre irányuljon.</p>
+<p>A labor előtt győződjön meg arról, hogy a CUDA Toolkit és a driver
+telepítve van, és a <code>nvidia-smi</code> parancs elérhető. A kódot
+izolált környezetben futtassa, mert a hibás kernel eszközleállást
+okozhat; állítson be timeoutot és visszaállítási tervet.</p>
+<h3 data-number="6.1.7" id="kernel-és-host-kód"><span
+class="header-section-number">6.1.7</span> Kernel és host kód</h3>
+<p>Az alábbi kód egy teljes, fordítható CUDA C++ program. A
+hibakezeléshez egy egyszerű makrót használ, amely minden CUDA API hívás
+után ellenőrzi a hibakódot. A kernel a <code>fillIndices</code> nevet
+viseli, és a globális indexet a fent tárgyalt módon számítja ki.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// fill_indices.cu</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -std=c++17 -O3 -o fill_indices fill_indices.cu</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibakezelő makró</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                        </span><span class="op">\</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                        </span><span class="op">\</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                                 </span><span class="op">\</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                               </span><span class="op">\</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">        </span><span class="op">\</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="pp">                      </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; - &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">         </span><span class="op">\</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                       </span><span class="op">\</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a><span class="co">// Kernel: a tömb i-edik elemét i-vel tölti fel</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> fillIndices<span class="op">(</span><span class="dt">int</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> idx <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>blockIdx<span class="op">.</span>x<span class="op">)</span> <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>        out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>idx<span class="op">);</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A feldolgozandó elemek száma</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> n <span class="op">=</span> <span class="dv">1000</span><span class="op">;</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Blokkméret és rács méret</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> threadsPerBlock <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> blocksPerGrid <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;((</span>n <span class="op">+</span> threadsPerBlock <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threadsPerBlock<span class="op">);</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszköz oldali memória</span></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span><span class="op">*</span> d_out <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_out<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">)));</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel indítás</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    fillIndices<span class="op">&lt;&lt;&lt;</span>blocksPerGrid<span class="op">,</span> threadsPerBlock<span class="op">&gt;&gt;&gt;(</span>d_out<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span>          <span class="co">// kernel launch hibák ellenőrzése</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span>     <span class="co">// szinkronizáció a másolás előtt</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmény visszamásolása</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> h_out<span class="op">(</span>n<span class="op">);</span></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_out<span class="op">.</span>data<span class="op">(),</span> d_out<span class="op">,</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">int</span><span class="op">),</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés: h_out[i] == i minden i-re</span></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>h_out<span class="op">[</span>i<span class="op">]</span> <span class="op">!=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;(</span>i<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;Hiba: h_out[&quot;</span> <span class="op">&lt;&lt;</span> i <span class="op">&lt;&lt;</span> <span class="st">&quot;] = &quot;</span> <span class="op">&lt;&lt;</span> h_out<span class="op">[</span>i<span class="op">]</span></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>                      <span class="op">&lt;&lt;</span> <span class="st">&quot;, várt: &quot;</span> <span class="op">&lt;&lt;</span> i <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a>            ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ok<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Az 1D indexelés helyes: minden elem megegyezik az indexszel.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_out<span class="op">));</span></span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ok <span class="op">?</span> EXIT_SUCCESS <span class="op">:</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel a <code>blockIdx.x * blockDim.x + threadIdx.x</code>
+képletet használja <code>size_t</code>-re kasztolással, majd a
+<code>if (idx &lt; n)</code> feltétellel levédi a felesleges szálakat. A
+host oldalon a <code>blocksPerGrid</code> értéke
+<code>(1000 + 255) / 256 = 4</code>, tehát 4 blokk, blokkonként 256
+szállal. A kernelben a <code>blockIdx.x</code> 0..3 között fut, a
+<code>threadIdx.x</code> 0..255 között. A globális indexek 0..1023-ig
+terjednek, de csak a 0..999 tartomány kerül feldolgozásra; az utolsó 24
+szál tétlen.</p>
+<p>A várt eredmény: a <code>h_out</code> tömb minden eleme pontosan az
+indexe. Ez a program ezt ellenőrzi, és a kimeneten megjeleníti a
+sikert.</p>
+<h3 data-number="6.1.8" id="mérési-napló"><span
+class="header-section-number">6.1.8</span> Mérési napló</h3>
+<p>A könyv konvencióinak megfelelően minden GPU-mérésnél rögzíteni kell
+a környezetet, a mérési módszert és az eredményt. Az alábbi táblázat a
+laborhoz tartozó mérési napló sablonja. A konkrét értékeket a futtatás
+után kell kitölteni, és a <strong>mért</strong> rovatban szereplő adatok
+tényleges mérésből származnak.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Mező</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU modell</td>
+<td>pl. NVIDIA A100 40 GB PCIe</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>pl. 8.0</td>
+</tr>
+<tr class="odd">
+<td>Driver verzió</td>
+<td>pl. 550.54.14</td>
+</tr>
+<tr class="even">
+<td>CUDA Toolkit</td>
+<td>pl. 12.4</td>
+</tr>
+<tr class="odd">
+<td>Operációs rendszer</td>
+<td>pl. Ubuntu 22.04 LTS</td>
+</tr>
+<tr class="even">
+<td>Fordító</td>
+<td>nvcc 12.4.0</td>
+</tr>
+<tr class="odd">
+<td>Kernel</td>
+<td><code>fillIndices</code></td>
+</tr>
+<tr class="even">
+<td>Blokkméret (<code>blockDim.x</code>)</td>
+<td>256</td>
+</tr>
+<tr class="odd">
+<td>Grid méret (<code>gridDim.x</code>)</td>
+<td>4</td>
+</tr>
+<tr class="even">
+<td>Input méret (<code>n</code>)</td>
+<td>1000</td>
+</tr>
+<tr class="odd">
+<td>Precision</td>
+<td>FP32 (a kernel int indexet ír, a precision itt N/A)</td>
+</tr>
+<tr class="even">
+<td>Warm-up iterációk</td>
+<td>10</td>
+</tr>
+<tr class="odd">
+<td>Mérési iterációk</td>
+<td>10</td>
+</tr>
+<tr class="even">
+<td>Átlagos futásidő (kernel)</td>
+<td>pl. 5,2 µs</td>
+</tr>
+<tr class="odd">
+<td>Szórás</td>
+<td>pl. 0,41 µs</td>
+</tr>
+<tr class="even">
+<td>Várt eredmény</td>
+<td><code>h_out[i] == i</code> minden i-re</td>
+</tr>
+<tr class="odd">
+<td>Mért eredmény</td>
+<td>ellenőrzés sikeres</td>
+</tr>
+</tbody>
+</table>
+<p>A kernel futásidejét CUDA event-ekkel mérhetjük. A labor során a
+fenti kódot ki lehet egészíteni <code>cudaEvent_t</code>-vel történő
+időméréssel, majd a mérést legalább 10 ismétléssel átlagolni. A mérés
+előtt érdemes néhány bemelegítő (warm-up) kernelhívást futtatni, hogy az
+eszköz órajele és a memória-állapot stabilizálódjon. Az átlag mellett a
+szórást is közölni kell. A mért futásidő ekkora feladatnál nagyon rövid,
+ezért a mérési bizonytalanság jelentős; emiatt a labor hangsúlya nem a
+sebességen, hanem a korrektségen van.</p>
+<h3 data-number="6.1.9" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">6.1.9</span> Összefoglalás és önellenőrző
+kérdés</h3>
+<p>Ebben a fejezetben az 1D-s globális indexszámítás alapjait jártuk
+körül. A kernelbeli szálak egyértelmű azonosításához a
+<code>blockIdx.x</code>, <code>blockDim.x</code> és
+<code>threadIdx.x</code> beépített változókból a
+<code>globalIdx = blockIdx.x * blockDim.x + threadIdx.x</code> képletet
+használjuk. Mivel a tömb mérete általában nem osztható a blokkmérettel,
+a kernelben mindig gondoskodni kell a <code>if (idx &lt; n)</code>
+határellenőrzésről, amely megakadályozza a túlindexelést. A host oldalon
+a blokkok számát felfelé kerekített osztással számítjuk, és gondot
+fordítunk arra, hogy az index 64 bites típusú legyen a túlcsordulás
+elkerülése érdekében.</p>
+<p>A következő fejezet (<a href="gpu019.html">Többdimenziós
+indexelés</a>) erre az alapra építve a többdimenziós indexelést
+tárgyalja, ahol a <code>dim3</code> típusú <code>y</code> és
+<code>z</code> komponensek is szerepet kapnak. Addig is érdemes az
+alábbi kérdést megválaszolni.</p>
+<p><strong>Önellenőrző kérdés:</strong><br />
+Adott egy <code>N = 1000</code> hosszú tömb, és a
+<code>threadsPerBlock</code> értéke <code>256</code>. Hány blokk indul,
+és összesen hány szál fut? A kernelben miért van szükség boundary
+checkre, és melyik az a feltétel, amely ezt biztosítja? Továbbá: mi
+történne, ha a képletben a <code>blockIdx.x</code> és a
+<code>threadIdx.x</code> sorrendjét felcserélnénk?</p>
+<p>Válasz: <code>blocksPerGrid = ceil(1000 / 256) = 4</code>, összesen
+<code>4 * 256 = 1024</code> szál indul. A 1000 elem miatt az utolsó
+blokkban 24 szál indexe kívül esik a <code>[0, 999]</code> tartományon,
+ezért a kernelben <code>if (idx &lt; n)</code> feltételt kell
+alkalmazni. Ha a képletet felcserélnénk, az indexek átfednének és nem
+lennének egyediek, ami hibás memória-hozzáférést okozna.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu017.html">← 5.4 A végrehajtási modell korlátai</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu019.html">6.2 Többdimenziós indexelés →</a></div>
+</nav>
+</body>
+</html>

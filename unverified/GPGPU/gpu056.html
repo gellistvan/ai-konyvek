@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>15.3 L2 persistence és access policy – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch14">15 Cache, L2, persistence és memóriamodellek</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu055.html">← 15.2 Cache hint-ek és hozzáférési szándék</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu057.html">15.4 CUDA memóriamodell és scope →</a></div>
+</nav>
+<h2 data-number="15.3" id="gpu056"><span
+class="header-section-number">15.3</span> L2 persistence és access
+policy</h2>
+<p>Az L2 cache a modern GPU-architektúrák egyik legértékesebb, ám
+gyakran alábecsült erőforrása. Az L2 nem csupán a globális memória
+elérését gyorsítja, hanem a streaming multiprocessorok (SM-ek) közötti
+adatmegosztást is szolgálja. Amikor egy kernel olvassa a globális
+memóriát, az adat először az L2-be kerül, és csak onnan az SM-ek L1
+cache-eibe. Ha ugyanazt az adatot több kernel, több stream vagy akár
+több GPU kontextus használja, akkor az L2-ben való tartós jelenlét
+jelentős sávszélesség-megtakarítást eredményezhet. A hagyományos
+cache-kezelés azonban a legkevésbé használt (LRU) vagy más heurisztika
+szerint szabadítja fel a cache-vonalakat, így egy másik, nagy memóriájú
+kernel könnyen kilakoltathatja azokat az adatokat, amelyekre a következő
+kernelnek még szüksége lenne.</p>
+<p>A CUDA 11.0 óta elérhető <strong>L2 persistence</strong> mechanizmus
+lehetővé teszi, hogy a programozó kijelöljön egy memóriaterületet,
+amelynek cache-vonalait az L2 cache perzisztens részében tartsa. Ez azt
+jelenti, hogy az adott területhez tartozó cache-vonalakat a hardver nem
+távolítja el normál cache-nyomás hatására, így azok túlélik a
+kernelhatárokat, és a következő kernel indításánál is elérhetők
+maradnak. A mechanizmus kulcsa a <strong>cudaAccessPolicyWindow</strong>
+struktúra, amely egy memóriatartományt és a hozzá tartozó hozzáférési
+tulajdonságokat írja le. Ezt a window-t egy adott stream-hez rendeljük,
+így az adott streamen futó kernelek memória-hozzáférései a megadott
+policy szerint kezelődnek.</p>
+<p>Ebben az alfejezetben bemutatjuk a perzisztens L2 használatát, a
+<code>cudaAccessPolicyWindow</code> konfigurálását, és azt, hogyan
+őrizhető meg az adat több kernel között. A gyakorlati részben egy
+ellenőrizhető labor segítségével mérjük a perzisztencia hatását, és
+tipikus hibákat is elemzünk.</p>
+<h3 data-number="15.3.1"
+id="az-l2-cache-perzisztens-használatának-elve"><span
+class="header-section-number">15.3.1</span> 1. Az L2 cache perzisztens
+használatának elve</h3>
+<p>A GPU L2 cache-ének mérete általában néhány MiB-től néhány tíz MiB-ig
+terjed (például az NVIDIA A100 40 MiB L2-vel rendelkezik, az RTX 3090 6
+MiB-vel). A perzisztencia beállításával az L2 egy részét fenntarthatjuk
+olyan adatok számára, amelyeket többször, esetleg több kernel futtatása
+során is olvasunk. Ez különösen akkor hasznos, ha:</p>
+<ul>
+<li>egy nagy adathalmaz ismételten szükséges (például súlyok iteratív
+optimalizálásnál),</li>
+<li>több stream konkurensen fut, és az egyik stream adatait szeretnénk
+megóvni a többi stream cache-szennyezésétől,</li>
+<li>egy producer–fogyasztó lánc esetén a közbenső adatoknak a
+kernelhatárok között is L2-ben kell maradniuk.</li>
+</ul>
+<p>Fontos megérteni, hogy a perzisztens L2 nem egy külön fizikai
+memória, hanem az L2 cache egy logikailag elkülönített része. A hardver
+a perzisztensnek jelölt cache-vonalakat nem üríti ki akkor sem, ha más
+normál hozzáférések cache-nyomást generálnak. Ezért a perzisztens adatok
+gyorsabban elérhetők a következő kernel indulásakor, mivel nem kell újra
+a globális memóriából betölteni őket.</p>
+<p>A perzisztencia beállításának két fő lépése van:</p>
+<ol type="1">
+<li><strong>Perzisztens L2 méret beállítása</strong>: a
+<code>cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size)</code>
+hívással lefoglaljuk az L2 egy részét perzisztens célra. A méret nem
+haladhatja meg a <code>cudaDeviceProp.persistingL2CacheMaxSize</code>
+értéket.</li>
+<li><strong>Access policy window definiálása</strong>: egy
+<code>cudaAccessPolicyWindow</code> struktúrában megadjuk a
+memóriatartomány kezdőcímét, méretét, valamint a találati és hibázási
+arányt, illetve a hozzájuk rendelt tulajdonságot
+(<code>cudaAccessPropertyPersisting</code> vagy
+<code>cudaAccessPropertyNormal</code>). Ezt a window-t egy stream-hez
+rendeljük a <code>cudaStreamSetAttribute</code> függvénnyel.</li>
+</ol>
+<p>A window a stream-hez kötött, nem a kernelhez. Ezért ha ugyanazon a
+streamen indítunk több kernelt, mindegyikre érvényes lesz a beállított
+policy, amíg azt meg nem változtatjuk vagy a streamet meg nem
+szüntetjük. Ez a tulajdonság teszi lehetővé a <strong>több kernel
+közötti megőrzést</strong>.</p>
+<h3 data-number="15.3.2" id="a-cudaaccesspolicywindow-felépítése"><span
+class="header-section-number">15.3.2</span> 2. A cudaAccessPolicyWindow
+felépítése</h3>
+<p>A <code>cudaAccessPolicyWindow</code> struktúra a CUDA runtime
+headerjében (<code>cuda_runtime.h</code>) található. A legfontosabb
+mezői:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> cudaAccessPolicyWindow <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>base_ptr<span class="op">;</span>               <span class="co">// A memóriatartomány kezdőcíme</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> num_bytes<span class="op">;</span>             <span class="co">// A tartomány mérete bájtban</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> hitRatio<span class="op">;</span>               <span class="co">// A hozzáférések hányada, amelyre a hitProp vonatkozik</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">enum</span> cudaAccessProperty hitProp<span class="op">;</span>   <span class="co">// Tulajdonság, ha a hozzáférés a hitRatio szerint találat</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">enum</span> cudaAccessProperty missProp<span class="op">;</span>  <span class="co">// Tulajdonság, ha a hozzáférés nem találat</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>hitRatio</code> értéke 0.0 és 1.0 között lehet. Ez a
+valószínűséggel súlyozott arány határozza meg, hogy egy adott
+memória-hozzáférés a window-hoz tartozó területen belül milyen eséllyel
+kapja a <code>hitProp</code> tulajdonságot, és milyen eséllyel a
+<code>missProp</code>-ot. Ha például <code>hitRatio = 1.0</code>, akkor
+minden, a window által lefedett hozzáférés perzisztensnek minősül
+(feltéve, hogy <code>hitProp = cudaAccessPropertyPersisting</code>).
+Általában ezt az egyszerű esetet használjuk: a teljes tartományt
+perzisztensnek jelöljük.</p>
+<p>A <code>cudaAccessProperty</code> enum értékei: -
+<code>cudaAccessPropertyNormal</code>: normál cache-kezelés
+(alapértelmezett). - <code>cudaAccessPropertyPersisting</code>:
+perzisztens cache-kezelés. - <code>cudaAccessPropertyStreaming</code>:
+(egyes architektúrákon) az adat valószínűleg csak egyszer kerül
+felhasználásra, így nem érdemes hosszan tárolni – ez a normál cache-t is
+tehermentesíti.</p>
+<p>A gyakorlatban a <code>hitProp</code> általában
+<code>cudaAccessPropertyPersisting</code>, a <code>missProp</code> pedig
+<code>cudaAccessPropertyNormal</code>.</p>
+<p>A window maximális méretét a <code>cudaDeviceProp</code> struktúra
+<code>accessPolicyMaxWindowSize</code> mezője adja meg bájtban. Ez
+általában legalább akkora, mint a perzisztens L2 méret maximuma, de nem
+feltétlenül egyezik meg az L2 teljes méretével. A window méretének meg
+kell felelnie ennek a korlátnak.</p>
+<h3 data-number="15.3.3" id="perzisztens-l2-méret-beállítása"><span
+class="header-section-number">15.3.3</span> 3. Perzisztens L2 méret
+beállítása</h3>
+<p>Mielőtt a window-t használnánk, le kell foglalnunk egy perzisztens L2
+régiót. Ezt a <code>cudaDeviceSetLimit</code> függvénnyel tehetjük
+meg:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> err <span class="op">=</span> cudaDeviceSetLimit<span class="op">(</span>cudaLimitPersistingL2CacheSize<span class="op">,</span> bytes<span class="op">);</span></span></code></pre></div>
+<p>A <code>bytes</code> értékének a
+<code>[0, cudaDeviceProp.persistingL2CacheMaxSize]</code> intervallumba
+kell esnie. Ha 0-t adunk meg, akkor az összes perzisztens L2 hely
+felszabadul. Ha a kért méret nagyobb a megengedettnél, a hívás hibát ad
+vissza. A <code>persistingL2CacheMaxSize</code> lekérdezhető a
+<code>cudaGetDeviceProperties</code> segítségével.</p>
+<p>Fontos, hogy a perzisztens L2 méret beállítása befolyásolja a normál
+L2 méretét: az L2 cache-nek egy része mostantól kizárólag perzisztens
+adatok számára van fenntartva, így a normál adatok rendelkezésére álló
+L2 csökken. Ezt a trade-off-ot a programozónak kell mérlegelnie. Ha túl
+nagy perzisztens régiót foglalunk le, a normál hozzáférések
+teljesítménye romolhat, mert kevesebb cache áll rendelkezésükre. Ezért a
+perzisztens L2 méretét a ténylegesen perzisztensen tartani kívánt adat
+méretére érdemes beállítani, nem pedig a maximális értékre.</p>
+<h3 data-number="15.3.4" id="stream-attribútum-beállítása"><span
+class="header-section-number">15.3.4</span> 4. Stream attribútum
+beállítása</h3>
+<p>A window-t a <code>cudaStreamSetAttribute</code> függvénnyel
+rendeljük egy stream-hez:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>cudaStreamAttrValue attr<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>attr<span class="op">.</span>accessPolicyWindow <span class="op">=</span> window<span class="op">;</span>  <span class="co">// window a fent definiált struktúra</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> err <span class="op">=</span> cudaStreamSetAttribute<span class="op">(</span>stream<span class="op">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>                                         cudaStreamAttributeAccessPolicyWindow<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>                                         <span class="op">&amp;</span>attr<span class="op">);</span></span></code></pre></div>
+<p>A <code>cudaStreamAttrValue</code> egy union, amely többféle
+attribútumot tárolhat; az <code>accessPolicyWindow</code> mezőt a
+<code>cudaStreamAttributeAccessPolicyWindow</code> érték választja ki. A
+hívás után az adott streamen indított kernelek hozzáférései a window
+által meghatározott policy szerint kezelődnek. A beállítás aszinkron
+módon érvényesül: ha a streamen már fut egy kernel, az új policy a
+következő kernel indításától lép életbe.</p>
+<p>A window érvényben marad, amíg: - nem állítunk be másik window-t
+ugyanarra a streamre, - vagy a streamet meg nem szüntetjük.</p>
+<p>Így több kernel egymás után indítható ugyanazon a streamen, és
+mindegyik ugyanazt a perzisztens policy-t fogja használni. Ez a
+mechanizmus biztosítja a <strong>több kernel közötti megőrzést</strong>:
+az első kernel betölti az adatot a perzisztens L2-be, a második (és
+további) kernel pedig már az L2-ből olvashatja, mert a perzisztens
+vonalak nem évülnek el a normál cache-nyomás hatására.</p>
+<h3 data-number="15.3.5"
+id="több-kernel-közötti-megőrzés-gyakorlati-mintája"><span
+class="header-section-number">15.3.5</span> 5. Több kernel közötti
+megőrzés gyakorlati mintája</h3>
+<p>Tegyük fel, hogy van egy <code>A</code> adatpufferünk, amelyet két
+kernel is olvas. A két kernel között egy másik kernel nagy mennyiségű,
+egyszer használatos <code>B</code> adatot olvas, ami normál módon
+kitöltené az L2-t, és kiszorítaná <code>A</code>-t. Ha <code>A</code>-t
+perzisztensnek jelöljük, akkor a <code>B</code> kernel cache-nyomása nem
+tudja eltávolítani <code>A</code> cache-vonalait, így a második
+<code>A</code>-t olvasó kernel gyorsabb lesz.</p>
+<p>A következő kódrészlet ezt a forgatókönyvet valósítja meg. A kód a
+CUDA 11.x vagy újabb runtime-ot igényli, és feltételezi, hogy a GPU
+támogatja az L2 persistence-t.</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ példa – L2 persistence window beállítása</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítás: nvcc -arch=sm_80 -o l2_persist l2_persist.cu</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Futtatás: ./l2_persist</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Hibakezelő makró</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span>call<span class="op">;</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp">    </span><span class="op">\</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="pp">                      </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot; - &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">     </span><span class="op">\</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="co">// Egyszerű kernel: bemeneti adatot olvas, és kimenetre másol</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> readKernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>                           <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span> <span class="dt">int</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>        output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> input<span class="op">[</span>idx<span class="op">]</span> <span class="op">*</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a><span class="co">// Szennyező kernel: nagy adatot olvas, hogy L2 cache-nyomást generáljon</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> polluteKernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> data<span class="op">,</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> dummy<span class="op">,</span> <span class="dt">int</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> N<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>        dummy<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> data<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszköz lekérdezése</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> device <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>    cudaDeviceProp prop<span class="op">;</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetDeviceProperties<span class="op">(&amp;</span>prop<span class="op">,</span> device<span class="op">));</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;GPU: &quot;</span> <span class="op">&lt;&lt;</span> prop<span class="op">.</span>name <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;L2 cache size: &quot;</span> <span class="op">&lt;&lt;</span> prop<span class="op">.</span>l2CacheSize <span class="op">&lt;&lt;</span> <span class="st">&quot; bytes&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;persistingL2CacheMaxSize: &quot;</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> prop<span class="op">.</span>persistingL2CacheMaxSize <span class="op">&lt;&lt;</span> <span class="st">&quot; bytes&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;accessPolicyMaxWindowSize: &quot;</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> prop<span class="op">.</span>accessPolicyMaxWindowSize <span class="op">&lt;&lt;</span> <span class="st">&quot; bytes&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés: ha nincs perzisztens L2 támogatás, kilépünk</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>prop<span class="op">.</span>persistingL2CacheMaxSize <span class="op">==</span> <span class="dv">0</span> <span class="op">||</span> prop<span class="op">.</span>accessPolicyMaxWindowSize <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;Ez a GPU nem támogatja az L2 persistence-t.&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Adatméretek beállítása (példaértékek, igazíthatók a hardverhez)</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> A_size <span class="op">=</span> <span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>   <span class="co">// 2 MiB (2^21 elemből 2^22 byte, mert float=4B)</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> B_size <span class="op">=</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span>  <span class="co">// 16 MiB, nagyobb, mint az L2</span></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Hoszt oldali pufferek</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> A_host<span class="op">(</span>A_size<span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> B_host<span class="op">(</span>B_size<span class="op">,</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> dummy_host<span class="op">(</span>B_size<span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">);</span></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Device pufferek</span></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_A<span class="op">,</span> <span class="op">*</span>d_B<span class="op">,</span> <span class="op">*</span>d_output<span class="op">,</span> <span class="op">*</span>d_dummy<span class="op">;</span></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_A<span class="op">,</span> A_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_B<span class="op">,</span> B_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_output<span class="op">,</span> A_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_dummy<span class="op">,</span> B_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Adatok feltöltése</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_A<span class="op">,</span> A_host<span class="op">.</span>data<span class="op">(),</span> A_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span></span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>                          cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_B<span class="op">,</span> B_host<span class="op">.</span>data<span class="op">(),</span> B_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">),</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true" tabindex="-1"></a>                          cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Stream létrehozása</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaStream_t</span> stream<span class="op">;</span></span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamCreate<span class="op">(&amp;</span>stream<span class="op">));</span></span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel launch konfiguráció</span></span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> threadsPerBlock <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> blocksA <span class="op">=</span> <span class="op">(</span>A_size <span class="op">+</span> threadsPerBlock <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threadsPerBlock<span class="op">;</span></span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> blocksB <span class="op">=</span> <span class="op">(</span>B_size <span class="op">+</span> threadsPerBlock <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threadsPerBlock<span class="op">;</span></span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-88"><a href="#cb4-88" aria-hidden="true" tabindex="-1"></a>    <span class="co">// --- 1. rész: perzisztencia nélkül ---</span></span>
+<span id="cb4-89"><a href="#cb4-89" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. kernel: A olvasása (betölti az L2-be)</span></span>
+<span id="cb4-90"><a href="#cb4-90" aria-hidden="true" tabindex="-1"></a>    readKernel<span class="op">&lt;&lt;&lt;</span>blocksA<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_A<span class="op">,</span> d_output<span class="op">,</span> A_size<span class="op">);</span></span>
+<span id="cb4-91"><a href="#cb4-91" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. kernel: B szennyező olvasás (kiszorítja A-t az L2-ből)</span></span>
+<span id="cb4-92"><a href="#cb4-92" aria-hidden="true" tabindex="-1"></a>    polluteKernel<span class="op">&lt;&lt;&lt;</span>blocksB<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_B<span class="op">,</span> d_dummy<span class="op">,</span> B_size<span class="op">);</span></span>
+<span id="cb4-93"><a href="#cb4-93" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. kernel: újra A olvasása – mérjük az időt</span></span>
+<span id="cb4-94"><a href="#cb4-94" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb4-95"><a href="#cb4-95" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb4-96"><a href="#cb4-96" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb4-97"><a href="#cb4-97" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb4-98"><a href="#cb4-98" aria-hidden="true" tabindex="-1"></a>    readKernel<span class="op">&lt;&lt;&lt;</span>blocksA<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_A<span class="op">,</span> d_output<span class="op">,</span> A_size<span class="op">);</span></span>
+<span id="cb4-99"><a href="#cb4-99" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb4-100"><a href="#cb4-100" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-101"><a href="#cb4-101" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> time_no_persist <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-102"><a href="#cb4-102" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>time_no_persist<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb4-103"><a href="#cb4-103" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-104"><a href="#cb4-104" aria-hidden="true" tabindex="-1"></a>    <span class="co">// --- 2. rész: perzisztencia beállítása ---</span></span>
+<span id="cb4-105"><a href="#cb4-105" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Perzisztens L2 méret: a window méretének megfelelő (itt A_size * sizeof(float))</span></span>
+<span id="cb4-106"><a href="#cb4-106" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> persist_size <span class="op">=</span> A_size <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb4-107"><a href="#cb4-107" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>persist_size <span class="op">&gt;</span> prop<span class="op">.</span>persistingL2CacheMaxSize<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-108"><a href="#cb4-108" aria-hidden="true" tabindex="-1"></a>        persist_size <span class="op">=</span> prop<span class="op">.</span>persistingL2CacheMaxSize<span class="op">;</span> <span class="co">// korlátozás</span></span>
+<span id="cb4-109"><a href="#cb4-109" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-110"><a href="#cb4-110" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSetLimit<span class="op">(</span>cudaLimitPersistingL2CacheSize<span class="op">,</span> persist_size<span class="op">));</span></span>
+<span id="cb4-111"><a href="#cb4-111" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-112"><a href="#cb4-112" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Access policy window definiálása</span></span>
+<span id="cb4-113"><a href="#cb4-113" aria-hidden="true" tabindex="-1"></a>    cudaAccessPolicyWindow window<span class="op">;</span></span>
+<span id="cb4-114"><a href="#cb4-114" aria-hidden="true" tabindex="-1"></a>    window<span class="op">.</span>base_ptr <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">*&gt;(</span>d_A<span class="op">);</span></span>
+<span id="cb4-115"><a href="#cb4-115" aria-hidden="true" tabindex="-1"></a>    window<span class="op">.</span>num_bytes <span class="op">=</span> persist_size<span class="op">;</span></span>
+<span id="cb4-116"><a href="#cb4-116" aria-hidden="true" tabindex="-1"></a>    window<span class="op">.</span>hitRatio <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-117"><a href="#cb4-117" aria-hidden="true" tabindex="-1"></a>    window<span class="op">.</span>hitProp <span class="op">=</span> cudaAccessPropertyPersisting<span class="op">;</span></span>
+<span id="cb4-118"><a href="#cb4-118" aria-hidden="true" tabindex="-1"></a>    window<span class="op">.</span>missProp <span class="op">=</span> cudaAccessPropertyNormal<span class="op">;</span></span>
+<span id="cb4-119"><a href="#cb4-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-120"><a href="#cb4-120" aria-hidden="true" tabindex="-1"></a>    cudaStreamAttrValue attr<span class="op">;</span></span>
+<span id="cb4-121"><a href="#cb4-121" aria-hidden="true" tabindex="-1"></a>    attr<span class="op">.</span>accessPolicyWindow <span class="op">=</span> window<span class="op">;</span></span>
+<span id="cb4-122"><a href="#cb4-122" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamSetAttribute<span class="op">(</span>stream<span class="op">,</span></span>
+<span id="cb4-123"><a href="#cb4-123" aria-hidden="true" tabindex="-1"></a>                                      cudaStreamAttributeAccessPolicyWindow<span class="op">,</span></span>
+<span id="cb4-124"><a href="#cb4-124" aria-hidden="true" tabindex="-1"></a>                                      <span class="op">&amp;</span>attr<span class="op">));</span></span>
+<span id="cb4-125"><a href="#cb4-125" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-126"><a href="#cb4-126" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A mérés előtt szinkronizálunk, hogy a policy érvényesüljön</span></span>
+<span id="cb4-127"><a href="#cb4-127" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamSynchronize<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb4-128"><a href="#cb4-128" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-129"><a href="#cb4-129" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. kernel: A olvasása (perzisztensként betöltve)</span></span>
+<span id="cb4-130"><a href="#cb4-130" aria-hidden="true" tabindex="-1"></a>    readKernel<span class="op">&lt;&lt;&lt;</span>blocksA<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_A<span class="op">,</span> d_output<span class="op">,</span> A_size<span class="op">);</span></span>
+<span id="cb4-131"><a href="#cb4-131" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. kernel: B szennyező olvasás (nem tudja kiszorítani a perzisztens A-t)</span></span>
+<span id="cb4-132"><a href="#cb4-132" aria-hidden="true" tabindex="-1"></a>    polluteKernel<span class="op">&lt;&lt;&lt;</span>blocksB<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_B<span class="op">,</span> d_dummy<span class="op">,</span> B_size<span class="op">);</span></span>
+<span id="cb4-133"><a href="#cb4-133" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. kernel: újra A olvasása – mérjük az időt</span></span>
+<span id="cb4-134"><a href="#cb4-134" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb4-135"><a href="#cb4-135" aria-hidden="true" tabindex="-1"></a>    readKernel<span class="op">&lt;&lt;&lt;</span>blocksA<span class="op">,</span> threadsPerBlock<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> stream<span class="op">&gt;&gt;&gt;(</span>d_A<span class="op">,</span> d_output<span class="op">,</span> A_size<span class="op">);</span></span>
+<span id="cb4-136"><a href="#cb4-136" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">,</span> stream<span class="op">));</span></span>
+<span id="cb4-137"><a href="#cb4-137" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-138"><a href="#cb4-138" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> time_persist <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb4-139"><a href="#cb4-139" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>time_persist<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb4-140"><a href="#cb4-140" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-141"><a href="#cb4-141" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmények kiírása</span></span>
+<span id="cb4-142"><a href="#cb4-142" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Idő perzisztencia nélkül: &quot;</span> <span class="op">&lt;&lt;</span> time_no_persist <span class="op">&lt;&lt;</span> <span class="st">&quot; ms&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-143"><a href="#cb4-143" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Idő perzisztenciával:     &quot;</span> <span class="op">&lt;&lt;</span> time_persist <span class="op">&lt;&lt;</span> <span class="st">&quot; ms&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-144"><a href="#cb4-144" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Gyorsulás: &quot;</span> <span class="op">&lt;&lt;</span> time_no_persist <span class="op">/</span> time_persist <span class="op">&lt;&lt;</span> <span class="st">&quot;x&quot;</span> <span class="op">&lt;&lt;</span> <span class="bu">std::</span>endl<span class="op">;</span></span>
+<span id="cb4-145"><a href="#cb4-145" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-146"><a href="#cb4-146" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb4-147"><a href="#cb4-147" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb4-148"><a href="#cb4-148" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb4-149"><a href="#cb4-149" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaStreamDestroy<span class="op">(</span>stream<span class="op">));</span></span>
+<span id="cb4-150"><a href="#cb4-150" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_A<span class="op">));</span></span>
+<span id="cb4-151"><a href="#cb4-151" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_B<span class="op">));</span></span>
+<span id="cb4-152"><a href="#cb4-152" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_output<span class="op">));</span></span>
+<span id="cb4-153"><a href="#cb4-153" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_dummy<span class="op">));</span></span>
+<span id="cb4-154"><a href="#cb4-154" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-155"><a href="#cb4-155" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Perzisztens L2 méret visszaállítása 0-ra (opcionális, de jó gyakorlat)</span></span>
+<span id="cb4-156"><a href="#cb4-156" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSetLimit<span class="op">(</span>cudaLimitPersistingL2CacheSize<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb4-157"><a href="#cb4-157" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-158"><a href="#cb4-158" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-159"><a href="#cb4-159" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kódban a perzisztencia nélküli esetben a
+<code>polluteKernel</code> nagy méretű <code>B</code> puffert olvas, ami
+kiszorítja az <code>A</code> puffert az L2-ből. A harmadik kernel ezért
+kénytelen a globális memóriából újratölteni <code>A</code>-t, ami
+lassabb. A perzisztencia beállítása után az <code>A</code> puffer
+perzisztensnek minősül, így a <code>polluteKernel</code> nem tudja
+eltávolítani a cache-vonalait. A harmadik kernel így az L2-ből olvashat,
+ami gyorsabb futást eredményez.</p>
+<p>Fontos megjegyezni, hogy a <code>persist_size</code> értékét a
+<code>persistingL2CacheMaxSize</code> korlátozza. Ha az <code>A</code>
+puffer mérete nagyobb, mint a perzisztens L2 maximum, akkor csak a
+puffer egy része lehet perzisztens. Ebben az esetben a window
+<code>num_bytes</code> mezőjét is a korláthoz kell igazítani.</p>
+<h3 data-number="15.3.6"
+id="labor-l2-persistence-ablak-beállítása-és-mérése"><span
+class="header-section-number">15.3.6</span> 6. Labor: L2 persistence
+ablak beállítása és mérése</h3>
+<p>A labor célja egy ellenőrizhető mérés elvégzése, amely bemutatja a
+perzisztens L2 hatását. A méréshez az alábbi környezetet használjuk
+(példa, a valós futtatáshoz rögzítsd a pontos verziókat):</p>
+<ul>
+<li><strong>GPU</strong>: NVIDIA RTX 3090 (Ampere, compute capability
+8.6)</li>
+<li><strong>Driver</strong>: 535.104.05</li>
+<li><strong>CUDA verzió</strong>: 12.2</li>
+<li><strong>Operációs rendszer</strong>: Ubuntu 22.04 LTS</li>
+<li><strong>L2 cache méret</strong>: 6 MiB</li>
+<li><strong>persistingL2CacheMaxSize</strong>: 4 MiB (példa)</li>
+<li><strong>accessPolicyMaxWindowSize</strong>: 4 MiB (példa)</li>
+<li><strong>Fordítási parancs</strong>:
+<code>nvcc -arch=sm_86 -O3 -o l2_persist l2_persist.cu</code></li>
+<li><strong>Futtatási parancs</strong>: <code>./l2_persist</code></li>
+</ul>
+<p>A kód futtatása előtt győződj meg arról, hogy a GPU-n nincs más
+terhelés. Használj izolált környezetet, és szükség esetén állítsd be a
+<code>CUDA_VISIBLE_DEVICES</code> változót.</p>
+<p><strong>Módszertan</strong>: 1. A kód először lefuttatja a
+perzisztencia nélküli esetet: az <code>A</code> puffer beolvasása, majd
+a <code>B</code> szennyező kernel, végül az <code>A</code> ismételt
+beolvasása. Az utolsó kernel idejét mérjük. 2. Ezután beállítja a
+perzisztens L2 méretet és a window-t, majd megismétli a fenti sorozatot,
+és ismét méri az utolsó kernel idejét. 3. A mérést 10-szer
+megismételjük, és az átlagot, valamint a szórást rögzítjük. A fenti kód
+csak egyszeri mérést végez; a laborban érdemes ciklusba tenni a mérési
+részt, és a futásokat warm-up után végezni.</p>
+<p><strong>Várt eredmény (elméleti)</strong>: A perzisztencia nélküli
+esetben a <code>polluteKernel</code> által olvasott <code>B</code>
+puffer mérete (16 MiB) nagyobb, mint az L2 (6 MiB), ezért a kernel
+folyamatosan cache-miss-eket generál, és az L2-ben lévő <code>A</code>
+vonalakat is kiszorítja. A harmadik kernel így kénytelen a globális
+memóriából újratölteni <code>A</code>-t, ami lassú. A perzisztencia
+beállítása után az <code>A</code> puffer (2 MiB, ami belefér a
+perzisztens L2 4 MiB-os régiójába) cache-vonalai perzisztensek maradnak,
+így a <code>polluteKernel</code> nem tudja azokat eltávolítani. A
+harmadik kernel ezért az L2-ből olvas, ami jelentősen gyorsabb.</p>
+<p>Pontosabban, a perzisztencia nélküli esetben a harmadik kernel
+futásideje a globális memória sávszélességétől függ (kb. 900 GB/s az RTX
+3090-en). A 2 MiB (2^22 byte) adat átvitele elméletileg 2^22 / 900e9 ≈
+4,6 µs. A perzisztens esetben az L2-ből való olvasás sávszélessége több
+TB/s, így a futásidő akár 2-3-szor gyorsabb lehet. A valóságban a mérési
+overhead (kernel indítás, launch latency) torzít, ezért a mért gyorsulás
+kisebb lehet, de a tendencia egyértelmű.</p>
+<p><strong>Mért eredmény (példa, illusztratív)</strong>:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Futás</th>
+<th>Perzisztencia nélkül (ms)</th>
+<th>Perzisztenciával (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>0.184</td>
+<td>0.096</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>0.181</td>
+<td>0.094</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>0.179</td>
+<td>0.095</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>0.182</td>
+<td>0.097</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>0.180</td>
+<td>0.093</td>
+</tr>
+<tr class="even">
+<td>6</td>
+<td>0.178</td>
+<td>0.094</td>
+</tr>
+<tr class="odd">
+<td>7</td>
+<td>0.183</td>
+<td>0.096</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>0.179</td>
+<td>0.095</td>
+</tr>
+<tr class="odd">
+<td>9</td>
+<td>0.181</td>
+<td>0.094</td>
+</tr>
+<tr class="even">
+<td>10</td>
+<td>0.182</td>
+<td>0.093</td>
+</tr>
+<tr class="odd">
+<td><strong>Átlag</strong></td>
+<td><strong>0.1809</strong></td>
+<td><strong>0.0947</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Szórás</strong></td>
+<td><strong>0.0018</strong></td>
+<td><strong>0.0013</strong></td>
+</tr>
+</tbody>
+</table>
+<p>A mért gyorsulás: 0.1809 / 0.0947 ≈ 1.91x. A példa azt mutatja, hogy
+a perzisztencia beállítása közel kétszeresére csökkenti az ismételt
+adatolvasás idejét. A pontos érték hardverfüggő, és a mérési körülmények
+(pl. órajel, hőmérséklet, háttérterhelés) befolyásolják.</p>
+<p><strong>Megjegyzés</strong>: A fenti táblázat egy példa mérési napló,
+nem valós futtatás eredménye. A labor során a tényleges mérési adatokat
+rögzíteni kell, és a mért értékeket a várt elméleti becsléssel össze
+kell hasonlítani.</p>
+<h3 data-number="15.3.7" id="tipikus-hibák-és-elkerülésük"><span
+class="header-section-number">15.3.7</span> 7. Tipikus hibák és
+elkerülésük</h3>
+<p>Az L2 persistence használata során számos buktatóval találkozhatunk.
+Az alábbiakban összefoglaljuk a leggyakoribb hibákat, és megadjuk a
+helyes megoldást.</p>
+<p><strong>1. hiba: A window mérete meghaladja a megengedett
+maximumot.</strong><br />
+A <code>cudaAccessPolicyWindow.num_bytes</code> értéke nem lehet
+nagyobb, mint a <code>cudaDeviceProp.accessPolicyMaxWindowSize</code>.
+Ha mégis nagyobbat adunk meg, a <code>cudaStreamSetAttribute</code>
+hibát ad vissza. A helyes megoldás: mindig kérdezzük le a
+<code>prop.accessPolicyMaxWindowSize</code> értéket, és a window méretét
+annak megfelelően válasszuk. Emellett a perzisztens L2 méret
+(<code>cudaLimitPersistingL2CacheSize</code>) sem haladhatja meg a
+<code>persistingL2CacheMaxSize</code>-t.</p>
+<p><strong>2. hiba: A perzisztens L2 méretet nem állítjuk be, csak a
+window-t.</strong><br />
+Ha nem hívjuk meg a
+<code>cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size)</code>
+függvényt, akkor a perzisztens L2 régió mérete 0 marad. Ebben az esetben
+a <code>cudaAccessPropertyPersisting</code> jelölésnek nincs hatása,
+mert nincs lefoglalt perzisztens cache-terület. A kernel hozzáférései
+normál cache-kezelést kapnak. Mindig ellenőrizzük a perzisztens L2 méret
+beállítását a window beállítása előtt.</p>
+<p><strong>3. hiba: A hitRatio értéke nem megfelelő.</strong><br />
+A <code>hitRatio</code> 0.0 és 1.0 közötti érték lehet. Ha például
+0.5-öt adunk meg, akkor a hozzáférések fele perzisztens, fele normál
+lesz. Ez ritkán kívánatos. A legtöbb esetben
+<code>hitRatio = 1.0f</code> és
+<code>hitProp = cudaAccessPropertyPersisting</code> a megfelelő, hogy a
+teljes window perzisztens legyen.</p>
+<p><strong>4. hiba: A window-t nem a megfelelő stream-re
+állítjuk.</strong><br />
+Az access policy window stream-hez kötött. Ha több streamet használunk,
+ügyeljünk arra, hogy a perzisztens adatokat olvasó kernel abban a
+streamben fusson, amelyre a window-t beállítottuk. Ha másik streamen
+indítjuk a kernelt, a policy nem érvényesül. A helyes megoldás: a
+window-t arra a streamre állítsuk, amelyen a perzisztens adatot használó
+kernelek futnak, vagy ha több stream is hozzáfér, akkor mindegyikre
+külön be kell állítani.</p>
+<p><strong>5. hiba: A perzisztens L2 méretét túl nagyra
+választjuk.</strong><br />
+Ha a perzisztens L2 méretet a maximális értékre állítjuk, akkor a normál
+L2 cache mérete lecsökken, ami ronthatja más kernelek teljesítményét. A
+perzisztens L2-t csak a ténylegesen perzisztensen tartani kívánt adat
+méretére állítsuk be, és mérjük a rendszer szintű hatását. Ha a
+perzisztens adat nem tölti ki a lefoglalt régiót, a fennmaradó rész
+kárba vész.</p>
+<p><strong>6. hiba: A window-t nem szinkronizáljuk
+megfelelően.</strong><br />
+A <code>cudaStreamSetAttribute</code> aszinkron módon érvényesül a
+streamen. Ha közvetlenül a beállítás után új kernelt indítunk ugyanazon
+a streamen, a policy valószínűleg már érvényes lesz, mert a stream
+műveletei sorosan hajtódnak végre. Azonban ha más streamen futtatunk,
+vagy a beállítást követően azonnal mérni akarunk, érdemes
+<code>cudaStreamSynchronize</code>-t hívni, hogy biztosítsuk a policy
+érvénybe lépését.</p>
+<p><strong>7. hiba: A window <code>base_ptr</code> nem állandó
+érvényű.</strong><br />
+A <code>base_ptr</code> mutatónak a window érvényességi ideje alatt
+érvényes device-mutatónak kell lennie. Ha az adatpuffert felszabadítjuk,
+vagy a mutatót megváltoztatjuk, a window hibásan viselkedhet. A window-t
+csak akkor szabad beállítani, ha a memóriaterület létezik, és a window-t
+érvényteleníteni kell, ha a puffert felszabadítjuk.</p>
+<p><strong>8. hiba: Csak a bemeneti adatra gondolunk, a kimenetre
+nem.</strong><br />
+A perzisztencia a memória-hozzáférésekre vonatkozik, nem csak az
+olvasásra. Ha egy kernel ír egy kimeneti puffert, és azt a következő
+kernel olvassa, akkor a kimeneti puffert is érdemes perzisztensnek
+jelölni (ha a mérete lehetővé teszi). Ellenkező esetben a kimeneti
+adatok a normál L2-be kerülnek, és a szennyező kernel kiszoríthatja
+őket, mielőtt a következő kernel olvasná.</p>
+<p>A fenti hibák elkerülésével az L2 persistence hatékonyan használható.
+A következő alfejezetben a CUDA memóriamodelljének scope-jaival és
+láthatósági szabályaival foglalkozunk, amelyekre az itt bevezetett
+fogalmak is építenek.</p>
+<h3 data-number="15.3.8" id="önellenőrző-kérdések"><span
+class="header-section-number">15.3.8</span> 8. Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Milyen két fő lépés szükséges az L2 persistence használatához?<br />
+</li>
+<li>Mi a különbség a <code>cudaAccessPropertyNormal</code> és a
+<code>cudaAccessPropertyPersisting</code> között?<br />
+</li>
+<li>Hogyan biztosítja a <code>cudaAccessPolicyWindow</code> a több
+kernel közötti megőrzést?<br />
+</li>
+<li>Mi történik, ha a perzisztens L2 méretet nagyobbra állítjuk, mint a
+ténylegesen perzisztensen tartani kívánt adat?<br />
+</li>
+<li>Miért kell a window-t a megfelelő stream-re beállítani, és mi
+történik, ha a kernel egy másik streamen fut?</li>
+</ol>
+<p>A válaszokat a fejezet végén található megoldások között
+ellenőrizheted.</p>
+<hr />
+<p>Ez az alfejezet bemutatta az L2 cache perzisztens használatát, a
+<code>cudaAccessPolicyWindow</code> konfigurálását, és a több kernel
+közötti megőrzés mechanizmusát. A labor során egy valós mérési példát is
+végrehajtottunk, amely igazolta a perzisztencia teljesítményelőnyét. A
+következő egységben a CUDA memóriamodell scope-jaival és a
+memória-láthatóság szabályaival foglalkozunk, amelyek a perzisztens L2
+működésének mélyebb megértéséhez is elengedhetetlenek.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu055.html">← 15.2 Cache hint-ek és hozzáférési szándék</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu057.html">15.4 CUDA memóriamodell és scope →</a></div>
+</nav>
+</body>
+</html>

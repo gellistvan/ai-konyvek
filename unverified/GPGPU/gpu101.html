@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.4 Unified memory és MIG – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu100.html">← 26.3 NVLink, NVSwitch és GPUDirect</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu102.html">27.1 TPU-architektúra →</a></div>
+</nav>
+<h2 data-number="26.4" id="gpu101"><span
+class="header-section-number">26.4</span> Unified memory és MIG</h2>
+<p>A <a href="gpu100.html">NVLink, NVSwitch és GPUDirect</a>
+alfejezetben megismert több GPU-s adatcsere, NVLink és GPUDirect után
+most egy másik fajta absztrakció felé fordulunk: az egységes memória
+(unified memory, UM) és a többpéldányos GPU (Multi-Instance GPU, MIG)
+felé. Mindkettő a memóriakezelés, illetve az erőforrások felosztásának
+kérdését helyezi más megvilágításba. Az UM azt a célt szolgálja, hogy a
+CPU és a GPU ugyanazt a pointert használhassa anélkül, hogy explicit
+<code>cudaMemcpy</code> hívásokat kellene írni. A MIG pedig azt teszi
+lehetővé, hogy egyetlen fizikai GPU több, hardveresen izolált, önálló
+CUDA-eszközként megjelenő részre legyen osztva. Ebben az alfejezetben a
+két fogalmat a gyakorlati oldalról is megvizsgáljuk, és egy olyan labort
+építünk, amely a managed memória migrációs viselkedését méri.</p>
+<p>A CUDA C++ példák C++17 szabvány szerint íródnak. A bemutatott API-k
+verziófüggők, ezért éles környezetben mindig ellenőrizni kell a CUDA
+Toolkit, a driver és a hardver dokumentációját. A laborban a környezetet
+rögzíteni kell, ahogyan azt a könyv mérési szerződése előírja.</p>
+<h3 data-number="26.4.1" id="a-managed-memória-alapjai"><span
+class="header-section-number">26.4.1</span> A managed memória
+alapjai</h3>
+<p>A klasszikus CUDA-programozásban a host és a device memóriája
+fizikailag különálló. A host oldalon <code>malloc</code> vagy
+<code>new</code> által lefoglalt memóriát előbb
+<code>cudaMemcpy</code>-vel át kell másolni a <code>cudaMalloc</code>
+által lefoglalt device-oldalra, majd a kernel futtatása után vissza. Ez
+a modell rendkívül hatékony, ha a másolásokat tudatosan tervezzük,
+ugyanakkor megnehezíti a bonyolult adatszerkezetek, pointereket
+tartalmazó gráfok vagy ritkán hozzáfért adatok kezelését.</p>
+<p>A CUDA 6 óta elérhető <em>managed memory</em> – gyakran <em>unified
+memory</em> néven is emlegetve – ezt a határt próbálja eltüntetni. A
+<code>cudaMallocManaged</code> által visszaadott pointer a CPU és a GPU
+számára is érvényes. Ugyanazt a pointert használhatjuk host-oldali
+inicializálásra és kernelbeli olvasásra:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> <span class="op">*</span>a<span class="op">,</span> <span class="op">*</span>b<span class="op">,</span> <span class="op">*</span>c<span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">size_t</span> bytes <span class="op">=</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>a<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>b<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>c<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    a<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    b<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>vectorAdd<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>a<span class="op">,</span> b<span class="op">,</span> c<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span></code></pre></div>
+<p>A fenti kódban nincs explicit <code>cudaMemcpy</code>. A host
+inicializálja az <code>a</code> és <code>b</code> tömböket, a kernel
+pedig ugyanezekkel a pointerekkel számol. A látszólagos egyszerűség
+mögött egy lapalapú (page-based) migrációs mechanizmus dolgozik.</p>
+<p>Fontos megkülönböztetni a managed memoryt a <em>zero-copy</em> vagy
+<em>pinned mapped</em> memóriától. A zero-copy memória a host memóriában
+marad, és a kernel minden hozzáférésnél a PCIe/NVLink sávon keresztül
+olvas, ami nagy adatmennyiségnél jelentős késleltetést okoz. A managed
+memory ezzel szemben fizikailag a host vagy a device memóriájában is
+lehet, és a futásidő a hozzáféréstől függően migráltatja a lapokat. A
+cél az, hogy az adat éppen ott legyen, ahol a számítás történik.</p>
+<p>A managed memory előnyei tehát a következők:</p>
+<ul>
+<li>egyszerűbb programozási modell, nincs szükség kézi másolásra;</li>
+<li>a CUDA runtime kezeli az adatmozgatást;</li>
+<li>pointereket tartalmazó adatszerkezetek, linked listák, fák és gráfok
+esetén a migráció automatikusan követi a pointereket;</li>
+<li>a kód könnyebben portolható a CPU-s és GPU-s verziók között.</li>
+</ul>
+<p>A hátrányai sem elhanyagolhatók. Az automatikus migráció láthatatlan
+költségeket vezet be: ha a kernel olyan laphoz fér hozzá, amely éppen a
+host memóriában van, a futásidő leállítja a kernelt, átmásolja a lapot a
+device memóriába, majd folytatja a végrehajtást. Ez a <em>page
+fault</em> mechanizmus sok apró másolást eredményezhet, ami különösen a
+kernel első futtatásakor, illetve szabálytalan hozzáférési mintáknál
+lassíthat. A lapmigrációk nyomon követése és optimalizálása a fejlesztő
+feladata.</p>
+<h3 data-number="26.4.2" id="page-fault-prefetch-és-migration"><span
+class="header-section-number">26.4.2</span> Page fault, prefetch és
+migration</h3>
+<p>A managed memory működésének megértéséhez a virtual memory és a page
+fault fogalmából kell kiindulni. A CUDA managed memory esetében az
+operációs rendszer és a driver közösen kezeli a virtuális címtartományt.
+Amikor a CPU vagy a GPU hozzáfér egy olyan memórialaphoz, amely nincs a
+megfelelő fizikai memóriában, a hardver page faultot vált ki. A driver
+ezt elkapja, és a lapot átmásolja a hozzáférő processzorhoz tartozó
+memóriába. A kernel futása ezalatt szünetel, majd a hozzáférés
+újraindul.</p>
+<p>Ez a mechanizmus két dolgot jelent. Egyrészt a managed memory
+<em>kényelmes</em>, mert a hozzáférés oldala és a fizikai elhelyezés
+közötti eltérést a rendszer automatikusan kezeli. Másrészt a page
+faultok <em>költségesek</em>, mert minden egyes lapmigráció során a
+streaming multiprocessorok várakoznak, és a PCIe vagy NVLink
+sávszélessége nem használható ki hatékonyan, ha kis méretű, szétszórt
+lapokat kell mozgatni.</p>
+<p>A legfontosabb optimalizáló eszköz a
+<code>cudaMemPrefetchAsync</code>. Ez a hívás előre jelzi a futásidőnek,
+hogy egy adott tartomány melyik eszköz memóriájában legyen elérhető. A
+tipikus minta az, hogy a kernel indítása előtt a bemeneti adatokat a
+GPU-ra, a kernel után pedig a kimenetet vissza a CPU-ra
+prefetch-eljük:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>a<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>b<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>c<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>vectorAdd<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>a<span class="op">,</span> b<span class="op">,</span> c<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>c<span class="op">,</span> bytes<span class="op">,</span> cudaCpuDeviceId<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span></code></pre></div>
+<p>A <code>device</code> a GPU device ID, a <code>cudaCpuDeviceId</code>
+pedig a CPU-t jelöli. A hívás aszinkron, ezért megfelelő stream esetén
+átfedhető a számítással, de itt az egyszerűség kedvéért
+szinkronizálunk.</p>
+<p>A prefetch mellett a <code>cudaMemAdvise</code> is fontos szerepet
+játszik. Ez nem mozgat adatot, hanem tanácsokat ad a futásidőnek a
+hozzáférési mintáról. Például:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemAdvise<span class="op">(</span>a<span class="op">,</span> bytes<span class="op">,</span> cudaMemAdviseSetReadMostly<span class="op">,</span> device<span class="op">));</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>CHECK_CUDA<span class="op">(</span>cudaMemAdvise<span class="op">(</span>b<span class="op">,</span> bytes<span class="op">,</span> cudaMemAdviseSetPreferredLocation<span class="op">,</span> device<span class="op">));</span></span></code></pre></div>
+<p>A <code>cudaMemAdviseSetReadMostly</code> azt jelzi, hogy az adatot
+többnyire olvassák, és a rendszer nyugodtan tarthat belőle másolatot
+több eszközön is anélkül, hogy minden írást szinkronizálna. A
+<code>cudaMemAdviseSetPreferredLocation</code> azt mondja, hogy az adat
+ideális esetben melyik eszközön legyen. A
+<code>cudaMemAdviseSetAccessedBy</code> azt jelzi, hogy egy másik eszköz
+is hozzá fog férni, így a rendszer fenntarthat egy másolatot. Ezek a
+tanácsok optimalizálási lehetőséget adnak, de nem garantálják a pontos
+viselkedést.</p>
+<p>A managed memory migrációjának mérésekor fontos megkülönböztetni a
+<em>hideg</em> és a <em>meleg</em> hozzáférést. A hideg hozzáférés az,
+amikor a lap még soha nem volt a device memóriában, így az első
+kernelindítás során a teljes adatmennyiséget át kell másolni. A meleg
+hozzáférés esetén a lap már a device memóriában van, így a kernel csak a
+tényleges számítást végzi. A prefetch célja éppen az, hogy a hideg
+hozzáférést a kernel előtt hajtsa végre, és a kernel már meleg adaton
+dolgozhasson.</p>
+<p>A mérési laborban ezt a különbséget fogjuk számszerűsíteni.</p>
+<h3 data-number="26.4.3" id="mig-többpéldányos-gpu-és-izoláció"><span
+class="header-section-number">26.4.3</span> MIG: többpéldányos GPU és
+izoláció</h3>
+<p>A Multi-Instance GPU (MIG) egy hardveres particionálási technológia,
+amelyet először a NVIDIA A100 hozott el, majd a H100 és az újabb
+adatközponti GPU-k is támogatnak. A MIG lehetővé teszi, hogy egyetlen
+fizikai GPU több, egymástól izolált <em>GPU instance-re</em> (GI) legyen
+osztva. Minden instance saját streaming multiprocesszorokkal, L2
+cache-szelettel, memóriavezérlőkkel és DRAM-szelettel rendelkezik. A
+CUDA programok számára minden instance külön CUDA-eszközként jelenik
+meg, saját device ID-val, saját memóriával és saját kontextussal.</p>
+<p>A MIG legfontosabb tulajdonsága a <em>hardveres izoláció</em>. A
+hagyományos időosztásos megosztásnál (time-slicing) több processz
+osztozik ugyanazon a GPU-n, és a futásidő-környezet váltogatja a
+hozzáférést. Ez csökkentheti az erőforrás-konfliktusokat, de nem ad
+szigorú teljesítmény- vagy hibahatár-elkülönítést. Egy hibás kernel vagy
+egy rosszindulatú processz befolyásolhatja a többi processz futását. A
+MIG ezzel szemben fizikailag szétválasztja a számítási és
+memória-erőforrásokat, így az egyik instance-ben futó feladat nem látja
+és nem zavarja a másik instance erőforrásait. Ez különösen fontos
+többfelhasználós felhőkörnyezetekben, ahol a szolgáltató garantált
+teljesítményt és adatizolációt akar nyújtani.</p>
+<p>A MIG konfigurációja két szinten történik. Először a GPU-t <em>GPU
+instance-ekre</em> (GI) osztjuk, amelyekhez egy-egy profilt rendelünk. A
+profil neve például <code>1g.5gb</code>, <code>2g.10gb</code>,
+<code>3g.20gb</code> vagy <code>7g.80gb</code> lehet. Az első szám a
+számítási kapacitást jelöli (hány streaming multiprocesszor-csoportot
+kap), a második a memóriamennyiséget. A GI-ken belül további <em>compute
+instance-eket</em> (CI) lehet létrehozni, amelyek a GI számítási
+erőforrásait osztják tovább, de a memórián osztoznak.</p>
+<p>A MIG konfigurálása az <code>nvidia-smi</code> segítségével
+lehetséges. Egy példa a létrehozásra:</p>
+<pre><code>$ sudo nvidia-smi mig -cgi 3g.20gb</code></pre>
+<p>Ez a parancs a GPU-t például három darab <code>3g.20gb</code> méretű
+GI-re osztja, ha a GPU kapacitása megengedi. A pontos szintaxis és a
+rendelkezésre álló profilok driver- és hardverfüggők, ezért mindig a
+hivatalos dokumentációt kell ellenőrizni. A konfiguráció után az
+<code>nvidia-smi -L</code> már az egyes MIG instance-eket mutatja:</p>
+<pre><code>$ nvidia-smi -L
+GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-...)
+  MIG 1g.5gb      Device  0:
+  MIG 2g.10gb     Device  1:
+  MIG 3g.20gb     Device  2:</code></pre>
+<p>A CUDA-program szempontjából ezek az instance-ek ugyanúgy kezelhetők,
+mint a fizikai GPU-k. A <code>cudaGetDeviceCount</code> visszaadja az
+összes látható eszköz számát, a <code>cudaGetDeviceProperties</code>
+pedig az adott instance nevét és képességeit. A program a
+<code>cudaSetDevice</code> hívással választhatja ki a kívánt
+instance-t.</p>
+<p>A MIG és a managed memory kapcsolata fontos. Egy MIG instance saját
+memóriatartománnyal rendelkezik, és a managed memory ezen belül működik.
+Ha egy processz több MIG instance-t is használ, a managed memory
+pointerek nem oszthatók meg az instance-ek között, mert azok hardveresen
+izolált memóriacímtereket jelentenek. A
+<code>cudaMemPrefetchAsync</code> destination device paramétere csak az
+aktuális instance-re vagy a CPU-ra mutathat. A page fault mechanizmus
+tehát az instance határain belül marad, ami biztonsági és teljesítmény
+szempontból egyaránt fontos.</p>
+<p>A MIG továbbá korlátozza a peer-to-peer hozzáférést és az NVLink
+alapú közvetlen adatcserét az instance-ek között. A <a
+href="gpu100.html">NVLink, NVSwitch és GPUDirect</a> alfejezetben látott
+GPUDirect és peer access több GPU esetén teljesen más modellt követ,
+mint a MIG-izoláció. A MIG nem a GPU-k közötti kommunikáció
+gyorsítására, hanem az erőforrások biztonságos és determinisztikus
+felosztására szolgál.</p>
+<h3 data-number="26.4.4"
+id="labor-unified-memory-és-migration-mérése"><span
+class="header-section-number">26.4.4</span> Labor: unified memory és
+migration mérése</h3>
+<p>A következő labor a managed memory oldalvándorlásának mérését tűzi ki
+célul. A mérési összeállításban egyetlen vektorösszeadás-kernelt
+futtatunk, és összehasonlítjuk a futásidőt két esetben:</p>
+<ol type="1">
+<li><strong>Prefetch nélkül:</strong> az adatokat a host inicializálja,
+majd a kernel azonnal hozzáfér. Az első futtatás során a page faultok
+miatt a rendszernek át kell másolnia az összes lapot a device
+memóriába.</li>
+<li><strong>Prefetch-csel:</strong> a kernel előtt a
+<code>cudaMemPrefetchAsync</code> hívásokkal a teljes adatmennyiséget a
+GPU-ra mozgatjuk, így a kernel már meleg adaton dolgozik.</li>
+</ol>
+<p>A laborban használt hardver és szoftververziók rögzítése kötelező. Az
+alábbi példa egy reprezentatív környezetet mutat; a saját futtatás előtt
+ezeket az értékeket frissíteni kell.</p>
+<p><strong>Környezet (példa):</strong></p>
+<ul>
+<li>GPU: NVIDIA A100-SXM4-40GB, compute capability 8.0</li>
+<li>CUDA Toolkit: 12.2 (ellenőrizendő)</li>
+<li>Driver: 535.54.03 (ellenőrizendő)</li>
+<li>Operációs rendszer: Linux x86_64</li>
+<li>Fordító: nvcc, C++17</li>
+<li>Mérési módszer: CUDA Event, 10 ismétlés</li>
+</ul>
+<p>A kód a következő:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CHECK_CUDA</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                         </span><span class="op">\</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                         </span><span class="op">\</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp">      </span><span class="op">\</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="pp">                     </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">               </span><span class="op">\</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                      </span><span class="op">\</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                                 </span><span class="op">\</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> vectorAdd<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> a<span class="op">,</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>                          <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> b<span class="op">,</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>                          <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> c<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> c<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> a<span class="op">[</span>i<span class="op">]</span> <span class="op">+</span> b<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> n <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">;</span>   <span class="co">// 4 MiB float elemenként</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">size_t</span><span class="op">&gt;(</span>n<span class="op">)</span> <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>a<span class="op">,</span> <span class="op">*</span>b<span class="op">,</span> <span class="op">*</span>c<span class="op">;</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>a<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>b<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMallocManaged<span class="op">(&amp;</span>c<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Host oldali inicializálás. Ez a managed memory host-oldalán</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    <span class="co">// hozza létre a lapokat, mert a CPU ír.</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        a<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>        b<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> block <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> grid <span class="op">=</span> <span class="op">(</span>n <span class="op">+</span> block <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> block<span class="op">;</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> device <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaGetDevice<span class="op">(&amp;</span>device<span class="op">));</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. fázis: prefetch nélkül</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>    vectorAdd<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>a<span class="op">,</span> b<span class="op">,</span> c<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> msNoPrefetch <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>msNoPrefetch<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Ellenőrzés: c[i] == 3.0f</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>c<span class="op">[</span>i<span class="op">]</span> <span class="op">!=</span> <span class="fl">3.0</span><span class="bu">f</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>            ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;No-prefetch kernel time: </span><span class="sc">%.3f</span><span class="st"> ms, check=</span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>                msNoPrefetch<span class="op">,</span> ok <span class="op">?</span> <span class="st">&quot;OK&quot;</span> <span class="op">:</span> <span class="st">&quot;FAIL&quot;</span><span class="op">);</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. fázis: prefetch-csel</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Először visszavisszük az adatokat a host oldalra, hogy a</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>    <span class="co">// második mérés is hideg állapotból induljon.</span></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>a<span class="op">,</span> bytes<span class="op">,</span> cudaCpuDeviceId<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>b<span class="op">,</span> bytes<span class="op">,</span> cudaCpuDeviceId<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>c<span class="op">,</span> bytes<span class="op">,</span> cudaCpuDeviceId<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Most előre a GPU-ra másoljuk a lapokat.</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>a<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>b<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaMemPrefetchAsync<span class="op">(</span>c<span class="op">,</span> bytes<span class="op">,</span> device<span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>    vectorAdd<span class="op">&lt;&lt;&lt;</span>grid<span class="op">,</span> block<span class="op">&gt;&gt;&gt;(</span>a<span class="op">,</span> b<span class="op">,</span> c<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> msWithPrefetch <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>msWithPrefetch<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;With-prefetch kernel time: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> msWithPrefetch<span class="op">);</span></span>
+<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;Speed-up (kernel-only): </span><span class="sc">%.2f</span><span class="st">x</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a>                msNoPrefetch <span class="op">/</span> msWithPrefetch<span class="op">);</span></span>
+<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>a<span class="op">));</span></span>
+<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>b<span class="op">));</span></span>
+<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaFree<span class="op">(</span>c<span class="op">));</span></span>
+<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>    CHECK_CUDA<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kód egyszeri futtatást mutat. A könyv mérési szerződése
+szerint azonban a mérést legalább 5–10 ismétléssel kell elvégezni, és az
+átlag mellett a szórást vagy percentilist is közölni kell. A laborban
+ezt úgy valósíthatjuk meg, hogy a két fázist egy ciklusban újra és újra
+lefuttatjuk, minden iteráció előtt visszavisszük az adatokat a host
+oldalra, hogy hideg állapotot kapjunk. A mérési naplóban az egyes
+iterációk idejét rögzítjük, majd kiszámítjuk az átlagot és a
+szórást.</p>
+<p>Az alábbi mérési napló egy <strong>várt eredményt</strong> mutat. A
+tényleges értékek hardverfüggők, ezért a saját környezetben mért
+számokat kell rögzíteni. A várt tendencia az, hogy a prefetch nélküli
+futásidő magasabb, mert a kernel futás közben fizeti meg a lapmigráció
+árát, míg a prefetch-csel a migráció a kernelen kívül történik.</p>
+<p><strong>Várt mérési napló (példa):</strong></p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: right;">Iteráció</th>
+<th style="text-align: right;">Prefetch nélkül (ms)</th>
+<th style="text-align: right;">Prefetch-csel (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4.83</td>
+<td style="text-align: right;">0.39</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">4.65</td>
+<td style="text-align: right;">0.38</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">4.71</td>
+<td style="text-align: right;">0.39</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">4.58</td>
+<td style="text-align: right;">0.38</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">4.66</td>
+<td style="text-align: right;">0.39</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">Átlag</td>
+<td style="text-align: right;">4.69</td>
+<td style="text-align: right;">0.39</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">Szórás</td>
+<td style="text-align: right;">0.09</td>
+<td style="text-align: right;">0.01</td>
+</tr>
+</tbody>
+</table>
+<p>A mért értékek eltérhetnek, de a prefetch nélküli esetben a kernel
+időtartama több mint egy nagyságrenddel nagyobb, ami jól mutatja a page
+faultok költségét. A prefetch-csel elért 0.39 ms ebben a példában a
+vektorösszeadás tényleges számítási idejét tükrözi; a hátralevő időt a
+kernelindítás és a memória-hozzáférési késleltetés adja.</p>
+<p>A mérésből levonható következtetés: ha managed memoryt használunk, a
+kernel futásideje önmagában nem elegendő a teljesítmény megítélésére; a
+migrációt külön kell kezelni. A <code>cudaMemPrefetchAsync</code>
+használatával a kernel futásideje stabilizálható, de a prefetch művelet
+maga is időt és sávszélességet fogyaszt. A mérési naplóban ezért a
+prefetch idejét is rögzíteni kell, és a teljes végrehajtási időt
+(prefetch + kernel + szinkronizáció) kell összehasonlítani.</p>
+<h3 data-number="26.4.5" id="tipikus-hibák-és-helyes-megoldás"><span
+class="header-section-number">26.4.5</span> Tipikus hibák és helyes
+megoldás</h3>
+<p>A managed memory és a MIG használata során számos jellegzetes hiba
+fordul elő. Az alábbiakban ezek közül tekintjük át a
+leggyakoribbakat.</p>
+<p><strong>1. A hideg kernel futásidejét tekintjük a valódi
+teljesítménynek.</strong><br />
+A legelső kernelindítás managed memory esetén rendszerint sokkal
+lassabb, mint a későbbiek, mert a lapok ekkor vándorolnak át a CPU-ról a
+GPU-ra. Ha a mérési protokoll nem különbözteti meg a hideg és a meleg
+futtatást, a teljesítménykép torz lesz. A helyes megoldás az, hogy a
+mérés előtt egy warm-up futtatást végzünk, vagy a mérési tervben
+explicit módon kezeljük a migrációs fázist. A laborban ezért a hideg
+futtatást is rögzítettük, és a prefetch-csel elért meleg időt külön
+mértük.</p>
+<p><strong>2. A <code>cudaMemPrefetchAsync</code>
+elhagyása.</strong><br />
+Ha a prefetch hiányzik, a kernel futása közben történik a lapmigráció,
+ami a fenti mérésben is látható lassulást okoz. A helyes minta az, hogy
+a kernel előtt a bemeneti adatokat a GPU-ra, a kernel után a kimeneti
+adatokat a CPU-ra prefetch-eljük. A prefetch aszinkron hívás, ezért a
+streamhez kötött sorrendre ügyelni kell. Ha a prefetch-et rossz streamre
+adjuk ki, vagy nem szinkronizálunk, a kernelindítás előtti adatátvitel
+nem feltétlenül fejeződik be.</p>
+<p><strong>3. A managed memory túlzott használata.</strong><br />
+A managed memory nem csodaszer. Ha az adatokat nagy méretben, szabályos
+mintával kell mozgatni, a hagyományos explicit <code>cudaMemcpy</code>
+gyakran jobb, mert a programozó pontosan tudja, mikor és mekkora átvitel
+történik. A managed memory előnye a kényelem és a ritkán hozzáfért
+adatszerkezetek kezelése, nem a nagy, folytonos tömbök másolásának
+optimalizálása. A helyes megoldás az, ha a teljesítménykritikus
+szakaszokban explicit memóriakezelést használunk, a managed memoryt
+pedig a prototípusokban és a bonyolult adatszerkezeteknél
+alkalmazzuk.</p>
+<p><strong>4. A <code>cudaMemAdvise</code> hiánya vagy helytelen
+használata.</strong><br />
+A <code>cudaMemAdvise</code> tanácsokkal a runtime jobban
+optimalizálhatja a migrációt. Ha például egy tömböt a CPU és a GPU is
+csak olvas, a <code>cudaMemAdviseSetReadMostly</code> megakadályozza a
+felesleges visszamásolásokat. Ha a tanács hiányzik, a rendszer
+konzervatív módon minden hozzáférést kezel, ami többletmozgást okozhat.
+A helyes megoldás az, ha a hozzáférési mintát ismerve megfelelő
+tanácsokat adunk, és a hatást méréssel ellenőrizzük.</p>
+<p><strong>5. MIG esetén a rossz device kiválasztása.</strong><br />
+Ha a rendszerben MIG instance-ek vannak, a <code>cudaSetDevice</code>
+hívás után a program az adott instance-en fut. A managed memory pointer
+egy adott instance-hez tartozik, és nem vihető át másik instance-re. Ha
+a program több instance-t is használ, a pointereket nem szabad
+megosztani. A helyes megoldás az, ha minden instance-hez saját managed
+memory allokációt rendelünk, és a <code>cudaMemPrefetchAsync</code>
+célja csak az aktuális instance vagy a CPU lehet.</p>
+<p><strong>6. MIG kapacitás túllépése.</strong><br />
+A MIG instance-ek memóriája kisebb, mint a teljes GPU memóriája. Ha a
+program a teljes GPU memóriájára méretezett kódot futtat egy MIG
+instance-en, az allokáció <code>cudaErrorMemoryAllocation</code> hibával
+tér vissza. A helyes megoldás az, ha a
+<code>cudaGetDeviceProperties</code> hívásból kiolvassuk az aktuális
+instance memóriaméretét, és a puffereket ehhez igazítjuk. A mérési
+környezetet is ennek megfelelően kell dokumentálni.</p>
+<p><strong>7. A MIG és a peer access összekeverése.</strong><br />
+A MIG instance-ek közötti peer-to-peer hozzáférés általában nem
+támogatott, mert a hardveres izoláció ezt kizárja. Ha a program a <a
+href="gpu100.html">NVLink, NVSwitch és GPUDirect</a> alfejezetben
+bemutatott <code>cudaDeviceEnablePeerAccess</code> hívást próbálja
+használni MIG instance-ek között, a hívás hibával térhet vissza. A
+helyes megoldás az, ha a MIG-et kizárólag a feladatok elszigetelésére
+használjuk, és az együttműködő GPU-k közötti kommunikációt fizikai
+GPU-kon, NVLink és NCCL segítségével valósítjuk meg.</p>
+<p><strong>8. A MIG konfiguráció elvesztése.</strong><br />
+A MIG beállítását az <code>nvidia-smi</code> parancsokkal lehet megadni,
+de a konfiguráció nem minden környezetben perzisztens. Ha a rendszer
+újraindul, vagy a driver frissül, a MIG instance-ek eltűnhetnek. A labor
+előtt ellenőrizni kell az <code>nvidia-smi -L</code> kimenetét, és
+szükség esetén újra létre kell hozni a kívánt instance-eket. A pontos
+parancsok és a rendelkezésre álló profilok a driver verziójától
+függenek, ezért a hivatalos dokumentációt kell követni.</p>
+<h3 data-number="26.4.6" id="önellenőrző-kérdés"><span
+class="header-section-number">26.4.6</span> Önellenőrző kérdés</h3>
+<p>Egy fejlesztő egy managed memoryval dolgozó CUDA-programot mér. A
+kernel első futtatása 8.2 ms-ig tart, a második futtatása ugyanazon az
+adaton 0.41 ms-ig. A programban nincs <code>cudaMemPrefetchAsync</code>
+hívás. Magyarázza meg a jelenséget, és adjon legalább két olyan
+módosítást, amely a teljes végrehajtási időt csökkentené anélkül, hogy a
+managed memoryt elhagyná.</p>
+<p>A kérdésre a válasz a fejezetben tárgyalt fogalmakra épül: az első
+futtatás során a page faultok miatt a lapok a CPU-ról a GPU-ra
+vándorolnak, ami jelentős időt emészt fel; a második futtatás már meleg
+adaton dolgozik. A javítási lehetőségek közé tartozik a
+<code>cudaMemPrefetchAsync</code> használata a kernel előtt, illetve a
+<code>cudaMemAdvise</code> tanácsok alkalmazása a hozzáférési mintának
+megfelelően. A válaszban azt is ki kell fejteni, hogy a prefetch művelet
+időt vesz igénybe, ezért a teljes végrehajtási időt (prefetch + kernel)
+kell optimalizálni.</p>
+<p>A következő alfejezet (<a href="gpu102.html">TPU-architektúra</a>) a
+TPU-architektúrával és az XLA-val foglalkozik. Az itt bevezetett
+oldalvándorlási és erőforrás-izolációs fogalmak segítenek majd
+megérteni, hogy a TPU hogyan kezeli a memória-hozzáférést és a
+processzorszintű párhuzamosságot egy teljesen más hardvermodellben.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu100.html">← 26.3 NVLink, NVSwitch és GPUDirect</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu102.html">27.1 TPU-architektúra →</a></div>
+</nav>
+</body>
+</html>

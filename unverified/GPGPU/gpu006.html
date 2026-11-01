@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>3.1 SIMT és warp-végrehajtás – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz1">I. RÉSZ – Alapok és GPU-architektúra</a> › <a href="index.html#gpuch02">3 GPU-architektúra: SIMT, warp, SM és memória</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu005.html">← 2.4 Mikor éri meg GPU-ra vinni egy feladatot?</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu007.html">3.2 Streaming multiprocessor és végrehajtási egységek →</a></div>
+</nav>
+<h2 data-number="3.1" id="gpu006"><span
+class="header-section-number">3.1</span> SIMT és warp-végrehajtás</h2>
+<p>A GPGPU-programozás középpontjában az a felismerés áll, hogy a
+grafikus processzorok több ezer könnyűsúlyú végrehajtási egysége nem
+egymástól független, különálló magokként viselkedik, hanem szorosan
+összekapcsolt csoportokban hajtja végre az utasításokat. Ez a
+szerveződés határozza meg mindazt, amit később a memóriaelérés
+optimalizálásáról, az occupancy-ről vagy a kerneltervezésről tanulni
+fogunk. Ebben az alfejezetben a CUDA-végrehajtási modell legalapvetőbb
+rétegét, a SIMT (Single-Instruction, Multiple-Thread) elvet és annak
+hardveres megvalósulását, a warpot vizsgáljuk meg.</p>
+<figure>
+<img src="assets/gpu006-diagram-1.png"
+alt="Egy warp végrehajtása divergens ág esetén - A 32 szál közös utasítást kap; elágazásnál aktív maszkok keletkeznek, és a két út sorban fut, majd a warp rekonvergál." />
+<figcaption aria-hidden="true">Egy warp végrehajtása divergens ág esetén
+- A 32 szál közös utasítást kap; elágazásnál aktív maszkok keletkeznek,
+és a két út sorban fut, majd a warp rekonvergál.</figcaption>
+</figure>
+<h3 data-number="3.1.1"
+id="a-simt-modell-párhuzamosság-egy-utasításfolyamban"><span
+class="header-section-number">3.1.1</span> 6.1. A SIMT-modell:
+párhuzamosság egy utasításfolyamban</h3>
+<p>A hagyományos CPU-magok általában egy utasításfolyamot hajtanak
+végre, és a párhuzamosságot több, viszonylag független mag, illetve a
+magon belüli vektoros utasítások (SIMD – Single-Instruction,
+Multiple-Data) biztosítják. A GPU ettől eltérő gondolati modellt kínál:
+a programozó úgy ír kódot, mintha minden egyes adatelemhez külön szál
+tartozna, mindegyik szál saját utasításmutatóval és regiszterkészlettel
+rendelkezne, és egymástól függetlenül futnának. Ezt a látszólagos
+függetlenséget nevezzük SIMT-modellnek.</p>
+<p>A valóságban azonban a hardver nem minden szálhoz rendel hozzá egy
+teljesen független vezérlőegységet. Ehelyett a szálakat rögzített méretű
+csoportokba, úgynevezett warpokba szervezi, és egy csoport minden tagja
+ugyanazt az utasítást hajtja végre ugyanabban az órajelciklusban. Ez a
+szervezés teszi lehetővé, hogy a hardver a vezérlési logikát
+(utasításlehívás, dekódolás, ütemezés) a csoport szintjén ossza meg,
+miközben az aritmetikai és memória-műveleteket a csoport tagjain
+párhuzamosan, adatpárhuzamos módon végzi el.</p>
+<p>Fontos megkülönböztetnünk a SIMT-t a klasszikus SIMD-től. A CPU-s
+SIMD-utasítások esetén a programozó explicit módon vektorregiszterekkel
+dolgozik, például AVX-512 esetén <code>__m512</code> típusokkal, és a
+vektor szélessége a forráskódban is látható. Ezzel szemben a CUDA
+kernelben a programozó skaláris kódot ír, mintha minden szálnak saját
+skaláris regiszterei lennének:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.4, A100, CC 8.0, Linux x86_64)
+__global__ void add_kernel(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        c[i] = a[i] + b[i];
+    }
+}</code></pre>
+<p>A kernelben sehol nem jelenik meg vektortípus, mégis a hardver
+egyszerre 32 szálra (egy warp) hajtja végre ugyanazt az összeadást,
+amennyiben azok a szálak ugyanabba a vezérlési ágba tartoznak. A SIMT
+tehát egy programozói absztrakció, amely a szálak közötti függetlenség
+illúzióját adja, miközben a hardver a szálak csoportjait szinkron módon,
+lockstep üzemmódban futtatja.</p>
+<p>A SIMT-modell előnye a programozó számára, hogy a párhuzamos kódot
+egyszerűbben lehet kifejezni, mint explicit vektorizálással. Nem kell
+kézzel szétbontani a ciklusokat a vektorregiszter szélességének
+megfelelő darabokra, és nem kell külön kezelni a vektorregiszterek
+feltöltését és kipakolását. Ugyanakkor a modellnek vannak
+következményei, amelyeket a divergencia tárgyalásakor részletezünk: ha a
+szálak nem ugyanazt az utasítást hajtják végre, a hardver kénytelen
+sorosítani az eltérő ágakat.</p>
+<h3 data-number="3.1.2"
+id="a-warp-mint-hardveres-végrehajtási-egység"><span
+class="header-section-number">3.1.2</span> 6.2. A warp mint hardveres
+végrehajtási egység</h3>
+<p>A CUDA hardveres végrehajtási alapegysége a warp. Minden
+GPU-generációban a warp mérete 32 szál, és ez az érték a NVIDIA
+dokumentációjában rögzített konstans. A szálak csoportosítása warpokba
+determinisztikus: a szálakat a <code>threadIdx.x</code> értéke szerint
+növekvő sorrendben osztják 32-es csoportokba. Ha például egy blokk 256
+szálat tartalmaz, az első warp a 0–31 sorszámú szálakat, a második a
+32–63 sorszámú szálakat foglalja magában, és így tovább.</p>
+<p>A warp minden tagját lane-nek nevezzük. A lane sorszámát a
+<code>threadIdx.x % 32</code> kifejezés adja meg, és a hardver ezt a
+sorszámot használja arra, hogy a warp szintű műveletekben, például a
+shuffle-műveletekben meghatározza az adatcsere irányát. A lane sorszám a
+kernel futása során nem változik, és a <code>threadIdx.x / 32</code>
+egész osztás a warp sorszámát adja a blokkon belül.</p>
+<p>A hardver szempontjából a warp egyetlen utasításfolyam, amely 32
+adatelemre vonatkozik. A streaming multiprocesszor (SM)
+utasításütemezője minden órajelciklusban egy vagy több warp számára
+választ ki egy utasítást, és az SM végrehajtó egységei a warp 32
+lane-jére párhuzamosan alkalmazzák azt. Ha az SM rendelkezik például 32
+FP32 végrehajtó egységgel, akkor egy FP32 összeadás egyetlen
+órajelciklus alatt végrehajtható a teljes warp számára. Ha az SM csak 16
+FP32 egységet tartalmaz, akkor a hardver két ütemben hajtja végre
+ugyanazt az utasítást, először az alsó 16, majd a felső 16 lane
+számára.</p>
+<p>A warp fogalma tehát két szinten értelmezendő. Egyrészt programozói
+szempontból a warp a szálak olyan csoportja, amely egyszerre, ugyanazt
+az utasítást hajtja végre. Másrészt hardveres szempontból a warp az az
+utasításütemezési egység, amelyet az SM scheduler kezel. A két
+értelmezés közötti kapcsolat a lockstep végrehajtás: amíg a warp szálai
+ugyanazt az utasítást hajtják végre, a hardver teljes párhuzamossággal
+dolgozik.</p>
+<p>Érdemes megjegyezni, hogy a CUDA programozási modell nem ígéri a
+warpok egymáshoz viszonyított sorrendjét. Két különböző warp futása
+tetszőleges sorrendben átlapolódhat, és a hardver az erőforrások
+kihasználása érdekében aktívan váltogatja a warpok végrehajtását. Amikor
+egy warp memória-műveletre vár (például globális memóriából olvas), az
+SM ütemezője egy másik, már futásra kész warp számára ad ki utasítást.
+Ez a warp-szintű átlapolás az egyik legfontosabb mechanizmus a
+memória-késleltetés elrejtésére, amelyet az <a
+href="gpu042.html">Occupancy és erőforrás-korlátok</a> alfejezetben
+részletesen vizsgálunk.</p>
+<h3 data-number="3.1.3"
+id="branch-divergence-amikor-a-szálak-útjai-szétválnak"><span
+class="header-section-number">3.1.3</span> 6.3. Branch divergence:
+amikor a szálak útjai szétválnak</h3>
+<p>A SIMT-modell legfontosabb teljesítménybeli következménye az
+elágazások kezelésénél jelentkezik. Amikor a kernelben feltételes
+utasítás szerepel, például:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.4, A100, CC 8.0, Linux x86_64)
+__global__ void conditional_kernel(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        if (input[i] &gt; 0.0f) {
+            output[i] = sqrtf(input[i]);
+        } else {
+            output[i] = -sqrtf(-input[i]);
+        }
+    }
+}</code></pre>
+<p>a hardver szempontjából a kérdés az, hogy a warp 32 szálának
+feltételkiértékelése ugyanarra az eredményre vezet-e. Ha a feltétel a
+warp minden lane-jére ugyanazt az értéket adja, a végrehajtás egyszerű:
+a hardver a teljes warpot az egyik ágba irányítja, és minden lane
+ugyanazt az utasítást hajtja végre.</p>
+<p>Ha azonban a feltétel a warp egyes lane-jeire igaz, másokra hamis,
+akkor a warpon belül <strong>branch divergence</strong> lép fel. A
+hardver ilyenkor nem tudja a két ágat párhuzamosan végrehajtani, mert a
+SIMT-modell szerint a warp egyszerre csak egy utasítást hajthat végre. A
+megoldás az, hogy a hardver az eltérő utasítási útvonalakat sorosítja:
+először az egyik ágba tartozó lane-ek aktívak, a többi lane inaktív,
+majd a másik ág következik a korábban inaktív lane-ekkel.</p>
+<p>Az aktív lane-ek halmazát <strong>aktív maszknak</strong> (active
+mask) nevezzük. Ez egy 32 bites bitsorozat, amelyben az 1-es bit aktív
+lane-t jelöl. Amikor a hardver az egyik ágat hajtja végre, az aktív
+maszk csak azokat a lane-eket tartalmazza, amelyek ebbe az ágba
+tartoznak. A nem aktív lane-ek végrehajtó egységei ilyenkor üresjáratban
+vannak, de nem hajtanak végre utasítást, és a regisztereik értéke nem
+változik. Az inaktív lane-ek tehát nem okoznak hibás eredményt, csupán a
+hardver párhuzamos kapacitásának egy részét nem használják ki.</p>
+<p>A divergens végrehajtásnak költsége van. Ha a warp fele az egyik
+ágba, fele a másikba tartozik, a hardvernek mindkét ágat végre kell
+hajtania, tehát a divergens szakasz végrehajtási ideje körülbelül a két
+ág végrehajtási idejének összege. Ez a teljesítménycsökkenés nem jelent
+hibás eredményt, de a kernel futásidejét jelentősen megnövelheti. A
+legrosszabb esetben a warp 32 lane-je 32 különböző útvonalon halad, így
+a hardver 32-szeres sorosítást szenved el.</p>
+<p>A gyakorlatban a divergence akkor okoz jelentős problémát, ha a
+feltétel a warp szálai között véletlenszerűen oszlik meg. Ha a feltétel
+a warp szintjén koherens, vagyis a warp minden lane-je ugyanazt az ágat
+választja, a divergence elkerülhető. A tipikus eset a
+<code>threadIdx.x</code>-től függő feltétel, például amikor a feltétel a
+lane páros vagy páratlan voltától függ. Ilyenkor minden warpban pontosan
+16 páros és 16 páratlan lane van, tehát minden warp divergens lesz.
+Ezzel szemben a <code>blockIdx.x</code>-től függő feltétel általában
+warp-koherens, mivel a blockIdx értéke a blokk minden warpjára
+ugyanaz.</p>
+<h3 data-number="3.1.4"
+id="rekonvergencia-a-warp-visszatérése-a-közös-útra"><span
+class="header-section-number">3.1.4</span> 6.4. Rekonvergencia: a warp
+visszatérése a közös útra</h3>
+<p>A divergens végrehajtás nem tart örökké. Amikor a hardver minden
+eltérő ágat végrehajtott, a warp lane-jei újra találkoznak a közös
+végrehajtási ponton, és innen kezdve ismét lockstep üzemmódban, azaz
+egyetlen utasításfolyamként folytatják a futást. Ezt a folyamatot
+<strong>rekonvergenciának</strong> nevezzük.</p>
+<p>A rekonvergencia pontja tipikusan az elágazást közvetlenül megelőző
+és az azt követő utasítások közötti programpont, ahol a feltételes ágak
+újra egyesülnek. A CUDA hardver a rekonvergenciát automatikusan kezeli:
+az SM a warp állapotát nyomon követi, és amikor a divergens szakasz
+véget ér, az aktív maszkot újra a teljes warpra állítja. A programozónak
+nincs szüksége explicit utasításra a rekonvergenciához, de tudnia kell,
+hogy a divergens szakasz után a warp ismét teljes párhuzamossággal
+fut.</p>
+<p>Fontos azonban megérteni a rekonvergencia hatókörét. A hardver a
+rekonvergenciát az utasításfolyam szintjén kezeli, nem a
+programszemantika szintjén. Ha a kernelben egy <code>if</code>
+elágazáson belül egy hosszú ciklus szerepel, és a ciklus feltétele
+lane-enként eltérő iterációszámhoz vezet, a divergens szakasz jelentősen
+elnyúlhat. A rekonvergencia ilyenkor is megtörténik, de csak akkor,
+amikor az összes lane befejezte a saját ágát. A hardver nem tudja
+“megszakítani” a lassabb lane-eket, tehát a warp végrehajtási ideje a
+leglassabb lane által meghatározott lesz.</p>
+<p>A rekonvergencia mechanizmusa a mai GPU-architektúrákban stack-alapú
+kezeléssel valósul meg. Amikor a warp divergens elágazáshoz ér, a
+hardver elmenti a rekonvergenciaponthoz tartozó aktív maszkot és a
+program counter értéket, majd az egyik ágat kezdi végrehajtani a
+megfelelő aktív maszkkal. Amikor ez az ág befejeződik, a hardver
+visszatér a mentett ponthoz, és a másik ágat hajtja végre a kiegészítő
+aktív maszkkal. Ez a folyamat tetszőleges mélységig ismétlődhet, ha a
+divergens ágak maguk is divergens elágazásokat tartalmaznak. A
+legrosszabb esetben a divergencia exponenciálisan növelheti a
+végrehajtandó útvonalak számát, de a gyakorlatban a mélyen beágyazott
+divergens elágazások ritkák, és a teljesítményprofilozók általában jól
+jelzik őket.</p>
+<h3 data-number="3.1.5"
+id="divergencia-és-teljesítmény-gyakorlati-következmények"><span
+class="header-section-number">3.1.5</span> 6.5. Divergencia és
+teljesítmény: gyakorlati következmények</h3>
+<p>A branch divergence teljesítményre gyakorolt hatása közvetlenül
+mérhető. Tekintsünk egy olyan kernelt, amely a bemeneti tömb elemei
+alapján választ két különböző számítási ág között, és az ágak
+számításigénye eltérő:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.4, A100, CC 8.0, Linux x86_64)
+__global__ void branchy_kernel(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        if (input[i] &gt; 0.5f) {
+            // Nehezebb ág: 10 szorzás
+            float x = input[i];
+            for (int j = 0; j &lt; 10; ++j) {
+                x = x * 1.0001f + 0.0001f;
+            }
+            output[i] = x;
+        } else {
+            // Könnyű ág: 1 szorzás
+            output[i] = input[i] * 2.0f;
+        }
+    }
+}</code></pre>
+<p>Ha a bemeneti adatokat úgy generáljuk, hogy a 0,5-ös küszöb a warp
+szálai között véletlenszerűen teljesül, a hardvernek minden warpban
+mindkét ágat végre kell hajtania, ezért a kernel futásideje a nehezebb
+ág által meghatározott lesz. Ha ezzel szemben a bemeneti adatokat úgy
+állítjuk elő, hogy a küszöb a warp szintjén koherens (például a blokk
+minden páros indexű eleme 0,1, minden páratlan indexű eleme 0,9, de a
+blokkmérete 256, és a feltétel a blokk indexétől függ), a divergence
+elkerülhető. A mérhető teljesítménykülönbség a két eset között jelentős
+lehet, és ezt a laborgyakorlatban részletesen bemutatjuk.</p>
+<p>A programozó szempontjából a legfontosabb irányelv a
+<strong>warp-kohézió</strong> megőrzése. A feltételeket lehetőség
+szerint úgy kell megfogalmazni, hogy azok a warp szintjén egységesek
+legyenek. Ha például a kernel egy nagy adathalmazból csak bizonyos
+elemeket dolgoz fel, és a szűrési feltétel a warp lane-jei között
+véletlenszerűen teljesül, a divergens végrehajtás elkerülhető azzal,
+hogy a warpot először koherens blokkokra bontjuk, vagy a szűrést egy
+külön lépésben, kompaktáló művelettel végezzük el, amely után a
+feldolgozó kernel már tömör, koherens adatokon dolgozik.</p>
+<p>A divergence hatása azonban nem mindig egyforma. Ha a divergens ágak
+mindkét oldalán rövid, hasonló számításigényű utasítások szerepelnek, a
+sorosítás költsége kicsi. Ha a feltétel ritkán teljesül, és a divergens
+ág csak ritkán aktív, a hardver a ritka ág végrehajtása előtt
+megvizsgálhatja, hogy van-e egyáltalán aktív lane, és ha nincs, az ágat
+átugorja. Ez a <strong>skip optimization</strong> a modern
+GPU-architektúrákban szabványos, és azt jelenti, hogy a teljesen inaktív
+ágak nem kerülnek végrehajtásra. A korai kilépés (early exit)
+optimalizálás azt is lehetővé teszi, hogy a hardver bizonyos feltételek
+mellett az elágazást a feltétel kiértékelése nélkül kezelje, ha az aktív
+maszk eleve üres.</p>
+<h3 data-number="3.1.6"
+id="warp-szintű-primitívek-és-a-divergence-elkerülése"><span
+class="header-section-number">3.1.6</span> 6.6. Warp-szintű primitívek
+és a divergence elkerülése</h3>
+<p>A CUDA programozási modell számos olyan eszközt kínál, amelyekkel a
+divergencia elkerülhető vagy hatása csökkenthető. Az egyik legfontosabb
+eszköz a <strong>warp shuffle</strong> művelet, amely lehetővé teszi,
+hogy a warp lane-jei közvetlenül adatot cseréljenek egymással anélkül,
+hogy a shared memóriát kellene használni. A shuffle-műveletek használata
+nem igényel explicit szinkronizációt, és a hardver közvetlenül a
+regiszterek között mozgatja az adatokat. A leggyakrabban használt
+shuffle-utasítás a <code>__shfl_sync</code>:</p>
+<pre class="cuda"><code>// CUDA C++ (C++17, NVCC 12.4, A100, CC 8.0, Linux x86_64)
+__global__ void shuffle_example(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x % 32;
+    if (i &lt; n) {
+        float val = input[i];
+        // A warp jobbra lépteti az adatokat: minden lane a lane-1 értékét kapja
+        float shifted = __shfl_down_sync(0xffffffff, val, 1);
+        output[i] = shifted;
+    }
+}</code></pre>
+<p>A <code>0xffffffff</code> maszk a warp minden lane-jét aktívként
+jelöli, és a <code>__shfl_down_sync</code> a megadott delta értékkel
+lefelé lépteti az adatokat a warpon belül. A shuffle-műveletek a
+divergence szempontjából is relevánsak, mert a maszk paraméter pontosan
+megadja, hogy mely lane-ek vesznek részt a műveletben. Ha a maszk nem a
+teljes warp, akkor a művelet csak a megadott aktív lane-ekre vonatkozik,
+és a többi lane értéke változatlan marad.</p>
+<p>A shuffle-műveletek mellett a <strong>warp vote</strong> és
+<strong>warp match</strong> műveletek is hasznosak. A
+<code>__all_sync</code>, <code>__any_sync</code> és
+<code>__ballot_sync</code> függvények a warp aktív lane-jeinek
+feltételét értékelik ki, és a <code>__match_any_sync</code> az azonos
+értékű lane-eket azonosítja. Ezekkel a primitívekkel a kernel olyan
+műveleteket végezhet el, mint a warp-szintű redukció vagy a warp-szintű
+tömörítés, anélkül, hogy divergens útvonalakat kellene bejárnia.</p>
+<p>A modern CUDA (a compute capability 7.0-tól kezdődően) a
+<code>__syncwarp</code> utasítást is kínálja, amely a warp lane-jei
+közötti szinkronizációt biztosít. Ez a blokk-szintű
+<code>__syncthreads</code> warp-szintű megfelelője, és a warp-szintű
+kódban akkor használható, ha a lane-ek közötti sorrend fontos, de a
+teljes blokk szinkronizálása felesleges lenne.</p>
+<h3 data-number="3.1.7"
+id="labor-warp-szintű-végrehajtás-szimulációja-és-mérése"><span
+class="header-section-number">3.1.7</span> 6.7. Labor: warp-szintű
+végrehajtás szimulációja és mérése</h3>
+<p>A következő laborgyakorlat célja, hogy a SIMT-végrehajtás és a branch
+divergence elméleti ismereteit egy mérhető, reprodukálható kísérletben
+ellenőrizzük. A gyakorlat három kernelt hasonlít össze: egy
+divergenciamentes változatot, egy warp-kohéziót megtartó változatot és
+egy szándékosan divergens változatot. A mérési környezet adatait
+pontosan rögzítjük.</p>
+<p><strong>GPU-konfiguráció (helyőrző, izolált labor):</strong> - GPU:
+NVIDIA A100 (vagy a laborkörnyezetben elérhető, itt rögzítendő típus) -
+Compute capability: 8.0 - Driver: 550.54.15 (verzió ellenőrizendő a
+laborkörnyezetben) - CUDA: 12.4 - Operációs rendszer: Linux x86_64
+(Ubuntu 22.04) - NVCC: 12.4, C++17 szabvány - Power limit: 300 W (a
+mérési naplóban rögzítendő) - ECC: ki - MIG: kikapcsolva -
+Háttérterhelés: nincs (izolált konténer)</p>
+<p><strong>Kernel a divergencia mérésére:</strong></p>
+<pre class="cuda"><code>// divergence_lab.cu – CUDA C++ (C++17, NVCC 12.4, A100, CC 8.0, Linux x86_64)
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;chrono&gt;
+
+// Hibamakró az összes CUDA API-hívás ellenőrzésére
+#define CUDA_CHECK(call)                                                        \
+    do {                                                                        \
+        cudaError_t err = (call);                                               \
+        if (err != cudaSuccess) {                                               \
+            fprintf(stderr, &quot;CUDA hiba: %s, fajl: %s, sor: %d\n&quot;,              \
+                    cudaGetErrorString(err), __FILE__, __LINE__);               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+
+// 1) Divergenciamentes kernel: a feltétel a warp szintjén egységes
+__global__ void coherent_kernel(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        // A feltétel a blockIdx.x-től függ, ami minden warpban azonos
+        bool heavy = (blockIdx.x % 2 == 0);
+        float x = input[i];
+        if (heavy) {
+            for (int j = 0; j &lt; 10; ++j) x = x * 1.0001f + 0.0001f;
+            output[i] = x;
+        } else {
+            output[i] = x * 2.0f;
+        }
+    }
+}
+
+// 2) Warp-kohéziós kernel: a feltétel a threadIdx.x / 32-től függ
+__global__ void warp_coherent_kernel(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        bool heavy = ((threadIdx.x / 32) % 2 == 0);
+        float x = input[i];
+        if (heavy) {
+            for (int j = 0; j &lt; 10; ++j) x = x * 1.0001f + 0.0001f;
+            output[i] = x;
+        } else {
+            output[i] = x * 2.0f;
+        }
+    }
+}
+
+// 3) Szándékosan divergens kernel: a feltétel a lane párosságától függ
+__global__ void divergent_kernel(const float* input, float* output, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) {
+        bool heavy = ((threadIdx.x % 32) % 2 == 0);
+        float x = input[i];
+        if (heavy) {
+            for (int j = 0; j &lt; 10; ++j) x = x * 1.0001f + 0.0001f;
+            output[i] = x;
+        } else {
+            output[i] = x * 2.0f;
+        }
+    }
+}
+
+// Mérési segédfüggvény: warm-up, 10 ismétlés, átlag és szórás
+float measure_kernel(void (*kernel)(const float*, float*, int), 
+                     const float* d_input, float* d_output, int n,
+                     dim3 grid, dim3 block) {
+    // Warm-up
+    for (int i = 0; i &lt; 5; ++i) {
+        kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_input, d_output, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    
+    const int reps = 10;
+    float times[reps];
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+    
+    for (int i = 0; i &lt; reps; ++i) {
+        CUDA_CHECK(cudaEventRecord(start));
+        kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_input, d_output, n);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, start, stop));
+        times[i] = ms;
+    }
+    
+    float sum = 0.0f;
+    for (int i = 0; i &lt; reps; ++i) sum += times[i];
+    float mean = sum / reps;
+    
+    float var = 0.0f;
+    for (int i = 0; i &lt; reps; ++i) {
+        float d = times[i] - mean;
+        var += d * d;
+    }
+    float stddev = sqrtf(var / reps);
+    
+    printf(&quot;  Átlag: %.4f ms, szórás: %.4f ms\n&quot;, mean, stddev);
+    
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return mean;
+}
+
+int main() {
+    const int n = 1 &lt;&lt; 24; // 16M elem
+    const int block_size = 256;
+    const int grid_size = (n + block_size - 1) / block_size;
+    
+    // Host memória allokálása
+    float* h_input = new float[n];
+    float* h_output = new float[n];
+    
+    // Bemeneti adatok inicializálása
+    for (int i = 0; i &lt; n; ++i) {
+        h_input[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+    }
+    
+    // Eszközmemória allokálása
+    float* d_input = nullptr;
+    float* d_output = nullptr;
+    CUDA_CHECK(cudaMalloc(&amp;d_input, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_output, n * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, h_input, n * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // Grid és block konfiguráció
+    dim3 block(block_size);
+    dim3 grid(grid_size);
+    
+    printf(&quot;Divergencia mérés, n=%d, block=%d, grid=%d\n&quot;, n, block_size, grid_size);
+    
+    printf(&quot;1) Divergenciamentes (blockIdx-alapú) kernel:\n&quot;);
+    measure_kernel(coherent_kernel, d_input, d_output, n, grid, block);
+    
+    printf(&quot;2) Warp-kohéziós (threadIdx/32 alapú) kernel:\n&quot;);
+    measure_kernel(warp_coherent_kernel, d_input, d_output, n, grid, block);
+    
+    printf(&quot;3) Divergens (lane-párosság alapú) kernel:\n&quot;);
+    measure_kernel(divergent_kernel, d_input, d_output, n, grid, block);
+    
+    // Ellenőrzés: a kimenetek azonosak-e?
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, n * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // (Itt további validáció lehet: a három kernel kimenetének összehasonlítása)
+    
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+    delete[] h_input;
+    delete[] h_output;
+    
+    // Az eszköz hibáinak ellenőrzése
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceReset());
+    return 0;
+}</code></pre>
+<p><strong>Fordítási parancs:</strong></p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 divergence_lab.cu <span class="at">-o</span> divergence_lab</span></code></pre></div>
+<p><strong>Futtatási parancs:</strong></p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./divergence_lab</span></span></code></pre></div>
+<p><strong>Várt eredmény (elemzés, nem mért adat):</strong> A
+divergenciamentes kernelben a <code>heavy</code> feltétel a
+<code>blockIdx.x</code>-től függ, amely minden warpban azonos. Ezért a
+hardver a teljes warpot vagy a nehezebb, vagy a könnyebb ágba irányítja,
+és nincs divergence. A futásidő a blokkok fele a nehezebb, fele a
+könnyebb ágat hajtja végre.</p>
+<p>A warp-kohéziós kernelben a <code>heavy</code> feltétel a
+<code>threadIdx.x / 32</code>-től függ, amely szintén minden lane-re
+azonos a warpon belül. A divergence tehát ebben a kernelben sem lép
+fel.</p>
+<p>A divergens kernelben a <code>heavy</code> feltétel a lane
+párosságától függ: minden warpban pontosan 16 páros és 16 páratlan lane
+van. A hardvernek minden warpban mindkét ágat végre kell hajtania, ezért
+a teljes futásidő várhatóan jelentősen megnő a másik két kernelhez
+képest. A várható arány a nehezebb ág súlyától függ; a példában a
+nehezebb ág 10 szorzást tartalmaz, a könnyebb ág 1-et, így a divergens
+kernel futásideje közelítőleg a 10 szorzásos ág teljes költségét fizeti
+meg minden warpban, míg a koherens kernelek a blokkok fele számára csak
+a könnyű ágat hajtják végre.</p>
+<p><strong>Mérési napló (elkülönítve a várt eredményektől):</strong> A
+tényleges mérési eredményeket a laborkörnyezetben kell rögzíteni, az
+alábbi táblázat szerint:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Kernel</th>
+<th>Átlag (ms)</th>
+<th>Szórás (ms)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>coherent</td>
+<td>(mért)</td>
+<td>(mért)</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>warp_coherent</td>
+<td>(mért)</td>
+<td>(mért)</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>divergent</td>
+<td>(mért)</td>
+<td>(mért)</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>A mérési naplóban rögzíteni kell a pontos GPU-típust, a drivert, a
+CUDA-verziót, az órajelet és a power limitet. A mérést legalább 10
+ismétléssel, warm-up után kell elvégezni, és az átlag mellett a szórást
+is közölni kell. A mérési eredményeket a várt elemzéstől elkülönítve
+kell dokumentálni, és a nem futtatott körülményeket jelölni kell.</p>
+<h3 data-number="3.1.8" id="gyakori-hibák-és-megelőzésük"><span
+class="header-section-number">3.1.8</span> 6.8. Gyakori hibák és
+megelőzésük</h3>
+<p>A SIMT-modell megértésének hiánya számos tipikus programozói hibához
+vezet. Az egyik leggyakoribb hiba az, amikor a fejlesztő azt
+feltételezi, hogy a szálak a kernelben megadott sorrendben hajtódnak
+végre. A CUDA végrehajtási modell nem garantálja sem a blokkok, sem a
+warpok sorrendjét, és a <code>__syncthreads</code> csak a blokkon belüli
+szinkronizációt biztosítja. A szálak közötti függőségeket ezért explicit
+szinkronizációs primitívekkel kell kezelni.</p>
+<p>Egy másik gyakori tévedés a warp méretének feltételezése. Bár a
+jelenlegi NVIDIA GPU-kban a warp mérete 32, a programozónak nem szabad
+erre a konstansra építenie a kód logikáját olyan módon, amely a jövőbeni
+architektúrákon megtörik. A CUDA biztosítja a <code>warpSize</code>
+eszközkonstanst, de a legjobb gyakorlat az, hogy a kernel logikáját a
+warp méretétől függetlenül fogalmazzuk meg, kivéve, ha a teljesítmény
+szempontjából elengedhetetlen a warp-szintű optimalizálás.</p>
+<p>A harmadik tipikus hiba a divergencia alábecsülése. A fejlesztők
+gyakran azt gondolják, hogy egy <code>if</code> elágazás elhanyagolható
+költséggel bír, különösen akkor, ha a feltétel csak kis részben
+teljesül. Azonban ha a feltétel a warp szintjén véletlenszerűen oszlik
+meg, minden warp kénytelen mindkét ágat végrehajtani, függetlenül attól,
+hogy hány lane tartozik az egyes ágakba. A megoldás a feltétel
+warp-kohézióra törekvő megfogalmazása, vagy a divergens részek
+elválasztása a fő számítási útvonaltól.</p>
+<p>Végül gyakori hiba a shuffle- és vote-műveletek maszkjának helytelen
+megadása. A <code>__shfl_sync</code>, <code>__all_sync</code> és hasonló
+függvények minden hívásánál meg kell adni az aktív lane-ek maszkját, és
+a maszknak pontosan meg kell egyeznie a hívásban részt vevő szálak
+halmazával. Ha a maszk a warp minden lane-jét tartalmazza, a
+<code>0xffffffff</code> értéket kell használni. Ha a maszk nem
+tartalmazza az összes lane-t, a nem szereplő lane-ek viselkedése
+definiálatlan, és a program hibás eredményt adhat.</p>
+<h3 data-number="3.1.9" id="ellenőrző-kérdések"><span
+class="header-section-number">3.1.9</span> 6.9. Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Magyarázd el, mi a különbség a SIMT és a SIMD között! Miért előnyös
+a SIMT a programozó számára?</li>
+<li>Mi a warp, és hogyan osztódnak a szálak warpokba? Mekkora a warp
+mérete a jelenlegi NVIDIA GPU-architektúrákban?</li>
+<li>Mi a branch divergence, és miért növeli a végrehajtási időt? Hogyan
+kerülhető el a divergence a gyakorlatban?</li>
+<li>Mi a rekonvergencia, és mikor következik be? Mi történik, ha a
+divergens ágak különböző hosszúságúak?</li>
+<li>Milyen warp-szintű primitíveket ismersz, és mire használhatók? Mi a
+szerepe az aktív maszknak ezekben a műveletekben?</li>
+</ol>
+<h3 data-number="3.1.10" id="összefoglalás"><span
+class="header-section-number">3.1.10</span> 6.10. Összefoglalás</h3>
+<p>A SIMT-modell a CUDA programozási modell alapköve. A hardver a
+szálakat warpokba szervezi, és egy warp minden lane-je ugyanazt az
+utasítást hajtja végre lockstep üzemmódban. Amikor a szálak feltétele
+eltérő ágakba vezet, branch divergence lép fel, amely a hardver
+párhuzamos kapacitásának kihasználatlanságához vezet. A rekonvergencia
+automatikus, de a divergens szakasz hossza a leglassabb ág által
+meghatározott. A programozó a warp-kohézió megőrzésével és a warp-szintű
+primitívek használatával jelentősen csökkentheti a divergence költségét.
+A következő alfejezetben a streaming multiprocesszor felépítését és a
+végrehajtási egységek szerveződését vizsgáljuk meg, amelyekre ez a
+warp-szintű modell épül.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu005.html">← 2.4 Mikor éri meg GPU-ra vinni egy feladatot?</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu007.html">3.2 Streaming multiprocessor és végrehajtási egységek →</a></div>
+</nav>
+</body>
+</html>

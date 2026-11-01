@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.1 Redukciók – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Párhuzamos algoritmusok</a> › <a href="index.html#gpuch15">16 Redukciók, scan és histogram</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu057.html">← 15.4 CUDA memóriamodell és scope</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu059.html">16.2 Scan (prefix sum) →</a></div>
+</nav>
+<h2 data-number="16.1" id="gpu058"><span
+class="header-section-number">16.1</span> Redukciók</h2>
+<p>A redukció az egyik leggyakoribb adatpárhuzamos minta: egy
+<code>N</code> elemű tömb elemeit egyetlen értékké kombináljuk egy
+asszociatív operátorral, például összegzéssel, maximum- vagy
+minimumkereséssel, logikai ÉS/VAGY kapcsolattal. Soros végrehajtásban a
+redukció <code>N-1</code> műveletet igényel, és <code>O(N)</code> időt
+vesz igénybe. A GPU párhuzamos modelljében viszont a műveletek egy része
+egymással párhuzamosan is végrehajtható, így elvileg
+<code>O(log N)</code> lépésszám is elérhető. Ez a fejezet a párhuzamos
+összegredukciót járja körül, a redukciófa elvétől a gyakorlatban is jól
+használható warp-szintű shuffle alapú megvalósításig. Az itt bemutatott
+minták a későbbi fejezetekben a scan, a hisztogram és a könyvtári
+megoldások alapjául szolgálnak.</p>
+<figure>
+<img src="assets/gpu058-diagram-1.png"
+alt="Redukciófa egy blokkban - A páronkénti összegzés minden lépésben felezi az aktív szálak számát; a warp-szintű shuffle és a shared memory együtt csökkenti a szinkronizációs költséget." />
+<figcaption aria-hidden="true">Redukciófa egy blokkban - A páronkénti
+összegzés minden lépésben felezi az aktív szálak számát; a warp-szintű
+shuffle és a shared memory együtt csökkenti a szinkronizációs
+költséget.</figcaption>
+</figure>
+<h3 data-number="16.1.1"
+id="redukciófa-páronkénti-kombinálás-rétegenként"><span
+class="header-section-number">16.1.1</span> Redukciófa: páronkénti
+kombinálás rétegenként</h3>
+<p>A redukciófa lényege, hogy a bemeneti elemeket páronként
+összekombináljuk, majd az így kapott részeredményeket újra páronként,
+egészen addig, amíg egyetlen érték marad. Nyolc elem esetén az első
+rétegben négy párhuzamos összeadás hajtható végre, a másodikban kettő, a
+harmadikban pedig egy. A lépések száma <code>log_2 N</code>, feltéve,
+hogy minden rétegben elegendő párhuzamos hardver áll rendelkezésre. A
+hardveres szálak számának csökkenése azonban azt jelenti, hogy a fa
+alsóbb szintjein egyre kevesebb szál dolgozik, a többi pedig inaktív. A
+naiv, feltételes indexelésű megoldásban ez warp-divergenciát okoz, mert
+egy warp 32 szálának egy része aktív, másik része nem.</p>
+<p>A redukciófa elvét legegyszerűbben egy shared memory-ba töltött
+blokkszintű tömbön érthetjük meg. Tegyük fel, hogy
+<code>blockDim.x = 256</code>, és minden szál betölt egy elemet a
+globális memóriából a shared memory-ba. Ezután a következő ciklus
+rétegenként felez egy <code>stride</code> távolságot:</p>
+<pre><code>for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+    if (threadIdx.x &lt; s) {
+        sdata[threadIdx.x] += sdata[threadIdx.x + s];
+    }
+    __syncthreads();
+}</code></pre>
+<p>Az első iterációban a 0–127 indexű szálak összeadják a 128–255 indexű
+elemeket, a másodikban a 0–63 indexűek a 64–127 indexűeket, és így
+tovább. A <code>__syncthreads()</code> minden réteg után biztosítja,
+hogy a shared memory-beli frissítések minden szál számára láthatóvá
+váljanak, mielőtt a következő réteg olvassa őket. Ez a minta a
+redukciófa közvetlen megvalósítása, de van két hátránya: a
+<code>threadIdx.x &lt; s</code> feltétel miatt a warpon belüli
+divergencia jelentős, és a shared memory hozzáférések száma
+<code>N/2 + N/4 + … + 1 ≈ N</code> művelet, ami bár párhuzamos, a
+memóriaforgalom miatt nem optimális.</p>
+<p>A divergencia és a felesleges shared memory forgalom csökkenthető, ha
+a redukciót először a 32 szálból álló warpon belül végezzük el. A warp a
+CUDA végrehajtási modell alapegysége: a szálak szinkron léptekben
+hajtódnak végre, és az úgynevezett warp shuffle műveletekkel
+közvetlenül, regiszterekből cserélhetnek adatot anélkül, hogy shared
+vagy globális memóriába kellene írniuk.</p>
+<h3 data-number="16.1.2"
+id="warp-szintű-redukció-__shfl_down_sync-segítségével"><span
+class="header-section-number">16.1.2</span> Warp-szintű redukció
+<code>__shfl_down_sync</code> segítségével</h3>
+<p>A <code>__shfl_down_sync(mask, var, delta)</code> intrinsic egy
+teljes warpon belül minden aktív szálnak megadja annak a szálnak a
+<code>var</code> értékét, amelynek az indexe <code>lane + delta</code>,
+ha az aktív. A <code>mask</code> egy 32 bites bitmaszk, amely a részt
+vevő szálakat jelöli; teljes warp esetén <code>0xffffffff</code>. A
+művelet szinkron módon fut a warpon belül, ezért az explicit
+<code>__syncwarp()</code> általában nem szükséges, de a maszknak
+tartalmaznia kell a kommunikáló szálakat, különben a viselkedés nem
+definiált.</p>
+<p>Egy warp összegredukciója a következőképpen valósítható meg:</p>
+<pre class="cuda"><code>// CUDA C++20, NVIDIA nvcc 12.5 (ellenőrizendő a helyi verzió)
+__device__ float warpReduceSum(float val) {
+    // Feltételezzük, hogy a teljes warp aktív, ezért a maszk 0xffffffff.
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}</code></pre>
+<p>Az első lépésben minden szál hozzáadja a 16-tal távolabbi szál
+értékét, így a 0–15. szálak a 0–15 és 16–31 értékek összegét
+tartalmazzák. A második lépésben a 8-cal távolabbi értéket adjuk hozzá,
+és így tovább. Öt lépés után a 0. szál birtokolja a teljes warp
+összegét. A művelet során nem történik shared vagy global memory
+hozzáférés, csak regiszterek közötti adatcsere, ami lényegesen kisebb
+késleltetést és nagyobb sávszélességet eredményez.</p>
+<p>Fontos, hogy a <code>__shfl_down_sync</code> maszkjában minden olyan
+szálnak szerepelnie kell, amelytől adatot kérünk. Ha a warpban inaktív
+szálak vannak, például azért, mert a bemeneti feltétel miatt nem minden
+szál töltött be elemet, akkor a maszkot ennek megfelelően kell
+módosítani. A legegyszerűbb, ha a redukciót megelőzően a hiányzó
+elemeket 0-val töltjük fel, és a teljes warp maszkját használjuk.</p>
+<h3 data-number="16.1.3"
+id="blokkszintű-redukció-shared-memory-és-warp-shuffle-kombinációja"><span
+class="header-section-number">16.1.3</span> Blokkszintű redukció: shared
+memory és warp shuffle kombinációja</h3>
+<p>Egy blokk tipikusan több warpot tartalmaz (például 256 szál = 8
+warp). A blokkszintű redukcióhoz először minden warp kiszámítja a saját
+részösszegét a fenti warp-szintű redukcióval, majd a warp-összegeket
+egyetlen szál képviseli. Ezeket a részösszegeket shared memory-ba írjuk,
+ahol az első warp újabb warp-szintű redukciót hajt végre rajtuk. A
+megvalósítás a következő:</p>
+<pre class="cuda"><code>__global__ void reduce_kernel(const float* __restrict__ g_idata,
+                              float* __restrict__ g_odata,
+                              unsigned int n) {
+    extern __shared__ float sdata[];  // dinamikus shared memory
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int i        = blockIdx.x * blockDim.x + tid;
+    const unsigned int lane     = tid &amp; 31;
+    const unsigned int warpId   = tid &gt;&gt; 5;
+
+    // Bemenet betöltése: a tömb végét kinullázzuk, hogy a redukció helyes maradjon.
+    float val = (i &lt; n) ? g_idata[i] : 0.0f;
+
+    // 1. lépés: warp-szintű redukció
+    val = warpReduceSum(val);
+
+    // 2. lépés: minden warp 0. szála kiírja a warp összegét a shared memory-ba
+    if (lane == 0) {
+        sdata[warpId] = val;
+    }
+    __syncthreads();  // a shared memory írások láthatóvá tétele
+
+    // 3. lépés: az első warp betölti a warp-összegeket, és újra redukál
+    if (warpId == 0) {
+        // A warp-összegek száma = blockDim.x / 32.
+        // A hiányzó slotokat 0-val töltjük fel a teljes warp maszkhoz.
+        const unsigned int numWarps = blockDim.x &gt;&gt; 5;
+        val = (lane &lt; numWarps) ? sdata[lane] : 0.0f;
+        val = warpReduceSum(val);
+        if (lane == 0) {
+            g_odata[blockIdx.x] = val;
+        }
+    }
+}</code></pre>
+<p>Ebben a kernelben minden blokk egy részösszeget számít ki, és azt a
+<code>g_odata</code> tömb <code>blockIdx.x</code> indexű elemébe írja. A
+shared memory méretét dinamikusan adjuk meg a kernel indításakor:
+<code>blockDim.x / 32 * sizeof(float)</code>. Ha a blokkméret 256, akkor
+ez 8 float, azaz 32 bájt. A <code>__syncthreads()</code> biztosítja,
+hogy minden warp 0. szála által írt érték látható legyen az első warp
+számára.</p>
+<p>A kernel fenti változata egyetlen blokkos, vagyis ha a grid mérete 1,
+akkor a teljes tömböt egy blokk redukálja, feltéve, hogy
+<code>n &lt;= blockDim.x</code>. Nagyobb tömbök esetén két szintre van
+szükség: az első kernel a bemeneti tömböt blokkokra osztja, és minden
+blokk egy részösszeget ír ki, a második kernel pedig ezeket a
+részösszegeket redukálja egyetlen értékké. Ezt a mintát gyakran
+kétfázisú redukciónak nevezik. A második fázisban a grid mérete 1, a
+blokkméret pedig akkora, hogy a részösszegek száma elférjen egy
+blokkban.</p>
+<h3 data-number="16.1.4"
+id="redukciós-sorrend-és-numerikus-pontosság"><span
+class="header-section-number">16.1.4</span> Redukciós sorrend és
+numerikus pontosság</h3>
+<p>A lebegőpontos összeadás nem asszociatív: <code>(a + b) + c</code> és
+<code>a + (b + c)</code> a kerekítés miatt eltérő eredményt adhat. Ezért
+a párhuzamos redukció eredménye bitre pontosan általában nem egyezik meg
+a soros CPU-referenciával. A redukciófa páronkénti sorrendje más
+kerekítési utat jelent, mint a balról jobbra haladó soros összegzés. A
+különbség FP32 esetén tipikusan a <code>10^{-6}</code> relatív hiba
+nagyságrendjében mozog, de nagy elemszám vagy kedvezőtlen adateloszlás
+esetén nagyobb is lehet. FP64 esetén a hiba lényegesen kisebb, de nem
+tűnik el.</p>
+<p>A gyakorlatban ezért a GPU-redukció ellenőrzésekor mindig tűréshatárt
+kell megadni. Egy elterjedt megközelítés:</p>
+<pre><code>allowed_error = 1e-4 * sum(abs(x_i))   // FP32 esetén</code></pre>
+<p>vagy a relatív hiba:</p>
+<pre><code>rel_error = abs(cpu_sum - gpu_sum) / max(abs(cpu_sum), 1.0f)</code></pre>
+<p>A determinizmus szempontjából fontos, hogy a párhuzamos redukció
+sorrendje függ a blokkmérettől, a grid méretétől és a hardver
+ütemezésétől. Ugyanaz a kernel ugyanazon a GPU-n általában
+determinisztikus, de ha a blokkméretet megváltoztatjuk, az eredmény
+kismértékben eltérhet. A könyv későbbi fejezete (<a
+href="gpu123.html">Determinizmus és redukciók</a>) részletesen
+foglalkozik a determinizmussal; itt annyit rögzítünk, hogy a párhuzamos
+redukciót mindig a numerikus pontosság és a reprodukálhatóság tudatában
+kell értékelni.</p>
+<h3 data-number="16.1.5"
+id="gyakorlati-példa-teljes-összegredukció"><span
+class="header-section-number">16.1.5</span> Gyakorlati példa: teljes
+összegredukció</h3>
+<p>A következő CUDA C++ példa kétfázisú redukciót valósít meg,
+hibakezeléssel és CPU-ellenőrzéssel. A kód a labor alapjául szolgál; a
+GPU-konfigurációt és a mérési naplót a helyi környezethez kell
+igazítani.</p>
+<pre class="cuda"><code>// reduce_sum.cu
+// CUDA C++20, NVIDIA nvcc 12.5 (ellenőrizendő: nvcc --version)
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+
+// Egyszerű hibamakró a CUDA API-hívások ellenőrzésére.
+#define CHECK_CUDA(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = call;                                             \
+        if (err != cudaSuccess) {                                           \
+            fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;,                   \
+                    __FILE__, __LINE__, cudaGetErrorString(err));           \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
+    } while (0)
+
+// Warp-szintű összegredukció teljes warp aktivitás mellett.
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Blokkszintű részösszeg-kernel.
+// Minden blokk egy részösszeget ír a d_partial tömbbe.
+__global__ void reduce_partial_kernel(const float* __restrict__ g_idata,
+                                      float* __restrict__ g_odata,
+                                      unsigned int n) {
+    extern __shared__ float sdata[];
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int i        = blockIdx.x * blockDim.x + tid;
+    const unsigned int lane     = tid &amp; 31;
+    const unsigned int warpId   = tid &gt;&gt; 5;
+
+    float val = (i &lt; n) ? g_idata[i] : 0.0f;
+
+    val = warpReduceSum(val);
+
+    if (lane == 0) {
+        sdata[warpId] = val;
+    }
+    __syncthreads();
+
+    if (warpId == 0) {
+        const unsigned int numWarps = blockDim.x &gt;&gt; 5;
+        val = (lane &lt; numWarps) ? sdata[lane] : 0.0f;
+        val = warpReduceSum(val);
+        if (lane == 0) {
+            g_odata[blockIdx.x] = val;
+        }
+    }
+}
+
+// Végső redukciós kernel egyetlen blokkal.
+__global__ void reduce_final_kernel(const float* __restrict__ g_idata,
+                                    float* __restrict__ g_odata,
+                                    unsigned int n) {
+    extern __shared__ float sdata[];
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int lane     = tid &amp; 31;
+    const unsigned int warpId   = tid &gt;&gt; 5;
+
+    float val = (tid &lt; n) ? g_idata[tid] : 0.0f;
+
+    val = warpReduceSum(val);
+
+    if (lane == 0) {
+        sdata[warpId] = val;
+    }
+    __syncthreads();
+
+    if (warpId == 0) {
+        const unsigned int numWarps = blockDim.x &gt;&gt; 5;
+        val = (lane &lt; numWarps) ? sdata[lane] : 0.0f;
+        val = warpReduceSum(val);
+        if (lane == 0) {
+            g_odata[0] = val;
+        }
+    }
+}
+
+// CPU referencia: soros, balról jobbra haladó FP32 összeg.
+float cpu_sum(const std::vector&lt;float&gt;&amp; data) {
+    float sum = 0.0f;
+    for (float x : data) sum += x;
+    return sum;
+}
+
+int main() {
+    // Labor paraméterek: ellenőrizendő a helyi környezetben.
+    const unsigned int N = 1u &lt;&lt; 22;        // 4 194 304 elem
+    const unsigned int blockSize = 256;
+    const unsigned int numBlocks = (N + blockSize - 1) / blockSize;
+    const unsigned int smemSize = (blockSize / 32) * sizeof(float);
+
+    // GPU konfiguráció (példa, a mérési naplóban frissítendő):
+    // NVIDIA GeForce RTX 3060, driver 550.54.14, CUDA 12.5,
+    // compute capability 8.6, ECC ki, MIG ki.
+    CHECK_CUDA(cudaSetDevice(0));
+    cudaDeviceProp prop;
+    CHECK_CUDA(cudaGetDeviceProperties(&amp;prop, 0));
+    printf(&quot;GPU: %s, CC %d.%d\n&quot;, prop.name, prop.major, prop.minor);
+
+    // Bemenet inicializálása: FP32 értékek [0,1) tartományban.
+    std::vector&lt;float&gt; h_data(N);
+    for (unsigned int i = 0; i &lt; N; ++i) {
+        h_data[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+    }
+
+    // Device memória allokálása.
+    float *d_data, *d_partial, *d_result;
+    CHECK_CUDA(cudaMalloc(&amp;d_data, N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&amp;d_partial, numBlocks * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&amp;d_result, sizeof(float)));
+
+    // Másolás host -&gt; device.
+    CHECK_CUDA(cudaMemcpy(d_data, h_data.data(), N * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    // Első fázis: blokkonkénti részösszegek.
+    reduce_partial_kernel&lt;&lt;&lt;numBlocks, blockSize, smemSize&gt;&gt;&gt;
+        (d_data, d_partial, N);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Második fázis: részösszegek redukciója.
+    reduce_final_kernel&lt;&lt;&lt;1, blockSize, smemSize&gt;&gt;&gt;
+        (d_partial, d_result, numBlocks);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Eredmény visszamásolása.
+    float h_result = 0.0f;
+    CHECK_CUDA(cudaMemcpy(&amp;h_result, d_result, sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    // CPU referencia és hiba.
+    float reference = cpu_sum(h_data);
+    float abs_error = std::fabs(reference - h_result);
+    float rel_error = abs_error / std::fmax(std::fabs(reference), 1.0f);
+
+    printf(&quot;CPU sum      : %.9f\n&quot;, reference);
+    printf(&quot;GPU sum      : %.9f\n&quot;, h_result);
+    printf(&quot;Abszolút hiba: %.9e\n&quot;, abs_error);
+    printf(&quot;Relatív hiba : %.9e\n&quot;, rel_error);
+
+    // Egyszerű ellenőrzés FP32 tűréssel.
+    const float tolerance = 1e-4f * static_cast&lt;float&gt;(N);
+    if (rel_error &lt; 1e-5f) {
+        printf(&quot;Ellenőrzés OK: a GPU-redukció a tűréshatáron belül van.\n&quot;);
+    } else {
+        printf(&quot;Ellenőrzés HIBA: a redukció eltérése túl nagy!\n&quot;);
+    }
+
+    CHECK_CUDA(cudaFree(d_data));
+    CHECK_CUDA(cudaFree(d_partial));
+    CHECK_CUDA(cudaFree(d_result));
+    return 0;
+}</code></pre>
+<p>A kód a <code>blockSize = 256</code> értékkel dolgozik, így egy blokk
+8 warpot tartalmaz. A shared memory mérete 8 float = 32 bájt. A
+<code>reduce_partial_kernel</code> indításakor a grid mérete
+<code>numBlocks</code>, ami 4 millió elem és 256-os blokkméret esetén 16
+384 blokk. A második kernel egyetlen blokkal redukálja a 16 384
+részösszeget; mivel a blokkméret 256, a kernel elején a
+<code>tid &lt; n</code> feltétel biztosítja, hogy a tömb végét 0-ként
+kezeljük. Ez a megoldás tetszőleges <code>N</code>-re skálázható, amíg a
+részösszegek száma egyetlen blokkba fér. Ha a tömb ennél is nagyobb, a
+kétfázisú redukció rekurzívan vagy három fázissal bővíthető.</p>
+<p>A fenti kódban a <code>CHECK_CUDA</code> makró minden API-hívást
+ellenőriz, a kernelindítások után pedig <code>cudaGetLastError</code> és
+<code>cudaDeviceSynchronize</code> biztosítja, hogy az aszinkron hibák
+is felszínre kerüljenek. A <code>cudaFree</code> hívások a példa
+rövidsége miatt a program végén egyszerre történnek; a hibakezelést a
+laborban minden felszabadításnál is alkalmazni kell.</p>
+<h3 data-number="16.1.6"
+id="labor-összegredukció-mérése-és-validációja"><span
+class="header-section-number">16.1.6</span> Labor: összegredukció mérése
+és validációja</h3>
+<p>A labor célja az összegredukciós kernel futtatása, a mérési napló
+rögzítése, valamint a mért és a várt eredmény elkülönítése. Az alábbiak
+egy lehetséges labor-sablont mutatnak be; a konkrét értékeket a saját
+környezetben kell felvenni, és a mérési naplót ennek megfelelően
+kitölteni. A megadott GPU-konfiguráció példa, nem ellenőrzött mérés.</p>
+<p><strong>Labor paraméterek (példa, helyettesítendő):</strong></p>
+<ul>
+<li>GPU: NVIDIA GeForce RTX 3060</li>
+<li>Driver: 550.54.14</li>
+<li>CUDA: 12.5</li>
+<li>Compute capability: 8.6</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>Fordító: nvcc 12.5, <code>-O3 -arch=sm_86</code></li>
+<li>Bemenet: <code>N = 4 194 304</code> darab FP32 véletlenszám
+<code>[0,1)</code> intervallumban</li>
+<li>Blokkméret: 256, grid: 16 384 (első fázis), 1 (második fázis)</li>
+<li>Precision: FP32</li>
+</ul>
+<p><strong>Build és futtatás:</strong></p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> reduce_sum reduce_sum.cu</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./reduce_sum</span></span></code></pre></div>
+<p><strong>Ellenőrzés és várt eredmény:</strong></p>
+<p>A CPU-referencia egy soros, balról jobbra haladó FP32 összegzés. A
+GPU-redukció ettől a kerekítési sorrend miatt kismértékben eltérhet. A
+várt eredményt a CPU-összeg adja, a mért eredményt a GPU-kimenet. A
+kettőt külön kell naplózni:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Oszlop</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>CPU-s referencia (soros FP32)</td>
+<td>pl. 2097152.000000000</td>
+</tr>
+<tr class="even">
+<td>GPU redukció (kétfázisú, FA)</td>
+<td>pl. 2097151.875000000</td>
+</tr>
+<tr class="odd">
+<td>Abszolút hiba</td>
+<td>pl. 0.125000000</td>
+</tr>
+<tr class="even">
+<td>Relatív hiba</td>
+<td>pl. 5.96e-08</td>
+</tr>
+<tr class="odd">
+<td>Tűréshatár <code>1e-4 * N</code></td>
+<td>419.4304</td>
+</tr>
+</tbody>
+</table>
+<p>A példában a CPU-összeg <code>2097152.0</code> akkor adódna, ha a
+véletlenszámok összege pontosan ennyi; a valós mérés ettől eltér. A
+táblázat értékei illusztrációk, nem mért adatok. A laborban a tényleges
+futás során kapott értékeket kell rögzíteni, és a hibát a fenti képletek
+szerint kiszámítani.</p>
+<p><strong>Mérési napló (példa, kitöltendő):</strong></p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Metrika</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Átlagos teljes futásidő (első kernel + második)</td>
+<td>pl. 0.85 ms</td>
+</tr>
+<tr class="even">
+<td>Első kernel átlagos ideje (10 ismétlés)</td>
+<td>pl. 0.80 ms</td>
+</tr>
+<tr class="odd">
+<td>Második kernel átlagos ideje</td>
+<td>pl. 0.05 ms</td>
+</tr>
+<tr class="even">
+<td>Effektív sávszélesség (teljes adatmozgatásra)</td>
+<td>pl. <code>N*4 / idő</code> ≈ 20 GB/s</td>
+</tr>
+<tr class="odd">
+<td>Occupancy (Nsight Compute)</td>
+<td>pl. 75%</td>
+</tr>
+<tr class="even">
+<td>Regiszterhasználat (első kernel)</td>
+<td>pl. 24</td>
+</tr>
+<tr class="odd">
+<td>Shared memory / blokk</td>
+<td>32 bájt</td>
+</tr>
+<tr class="even">
+<td>L1/L2 találati arány</td>
+<td>pl. Nsight szerint</td>
+</tr>
+</tbody>
+</table>
+<p>A mérés előtt a szokásos warm-up legalább 2-3 kernelhívás, majd 10
+ismétlés átlaga és szórása szükséges. A futásidőt CUDA eventekkel vagy
+<code>std::chrono</code> + <code>cudaDeviceSynchronize</code> méréssel
+lehet rögzíteni. A sávszélességet a ténylegesen mozgatott adatokra kell
+számítani: a bemeneti tömb <code>N*4</code> bájtját olvassuk, a kimenet
+néhány bájt, tehát a domináns forgalom a beolvasás.</p>
+<h3 data-number="16.1.7" id="tipikus-hibák-és-megelőzésük"><span
+class="header-section-number">16.1.7</span> Tipikus hibák és
+megelőzésük</h3>
+<ol type="1">
+<li><p><strong>Hiányzó <code>__syncthreads()</code> a shared memory
+írása és olvasása között.</strong> A warp-összegek kiírása után az első
+warp csak akkor olvashatja a shared memory-t, ha minden szál láthatóvá
+tette az írást. A szinkronizáció elhagyása esetén az eredmény nem
+definiált, és a hiba nehezen reprodukálható.</p></li>
+<li><p><strong>Nem megfelelő maszk a warp shuffle-höz.</strong> Ha a
+warpban nem mind a 32 szál aktív, akkor a <code>__shfl_down_sync</code>
+maszknak pontosan a részt vevő szálakat kell tartalmaznia. A
+<code>0xffffffff</code> használata inaktív szálakkal együtt nem
+definiált viselkedéshez vezet. A fenti kód ezt úgy kerüli el, hogy a
+hiányzó elemeket 0-val tölti fel, így a teljes warp aktív.</p></li>
+<li><p><strong>Bank conflict a shared memory redukcióban.</strong> A
+klasszikus <code>sdata[tid] += sdata[tid + s]</code> minta FP32 esetén
+általában bank conflict-mentes, mert a hozzáférési távolság
+<code>s</code> és a hozzáférési tartomány <code>s</code> elem, ami 32
+elemnél kisebb esetén diszjunkt bankokat eredményez. Ha azonban a tömb
+elemei nem 32 bitesek, vagy a hozzáférési minta stride-ja 32
+többszöröse, akkor bank conflict léphet fel. A warp shuffle alapú
+megoldás ezt teljesen kiküszöböli.</p></li>
+<li><p><strong>Divergencia a feltételes indexelés miatt.</strong> A
+<code>if (tid &lt; s)</code> típusú redukciós ciklusban a warp egy része
+inaktív, ami teljesítménycsökkenést okoz. A shuffle-alapú redukció nem
+igényel ilyen feltételt, mert minden szál aktívan részt vesz a warp
+belső műveleteiben.</p></li>
+<li><p><strong>A blokkméret és a shared memory méret helytelen
+összhangja.</strong> Ha a dinamikus shared memory méretét rosszul adjuk
+meg, például a warp-összegek számánál kisebbet, akkor a kernel
+túlírhatja a memóriát, vagy a fordító hibát jelez. A méretet mindig a
+<code>blockDim.x / 32 * sizeof(float)</code> képletből kell számítani,
+és a kernel indításakor a harmadik argumentumban átadni.</p></li>
+</ol>
+<h3 data-number="16.1.8" id="önellenőrző-kérdések"><span
+class="header-section-number">16.1.8</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért <code>O(log N)</code> lépésszámú a redukciófa, és milyen
+hardveres erőforrások korlátozzák ezt a gyakorlatban?</li>
+<li>Milyen előnyei vannak a <code>__shfl_down_sync</code> alapú
+warp-redukciónak a shared memory-alapú fa-redukcióval szemben?</li>
+<li>Miért térhet el a GPU-redukció eredménye a soros CPU-összegzéstől,
+és hogyan adhatunk meg ésszerű tűréshatárt?</li>
+<li>A kétfázisú redukcióban miért van szükség a második kernelre? Mikor
+lenne elegendő egyetlen kernel?</li>
+<li>Milyen hibát okoz, ha a <code>__syncthreads()</code> hívást
+elhagyjuk a warp-összegek shared memory-ba írása után?</li>
+</ol>
+<p>Ezek a kérdések a fejezet fő tanulási céljait ellenőrzik: a
+redukciófa elvének, a warp-szintű redukciónak, a numerikus pontosságnak
+és a gyakori hibáknak a megértését. A következő alfejezet (<a
+href="gpu059.html">Scan (prefix sum)</a>) ezekre az alapokra építve a
+scan (prefix sum) algoritmust tárgyalja, ahol a redukcióhoz hasonló fa-
+és warp-szintű minták jelennek meg, de a kimenet nem egyetlen érték,
+hanem egy teljes tömb.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu057.html">← 15.4 CUDA memóriamodell és scope</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu059.html">16.2 Scan (prefix sum) →</a></div>
+</nav>
+</body>
+</html>

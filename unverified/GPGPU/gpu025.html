@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>7.4 Memóriaterek kiválasztása – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch06">7 Memóriaterek: global, shared, local, constant és texture</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu024.html">← 7.3 Local, constant és texture memória</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu026.html">8.1 Blokk-szintű szinkronizáció →</a></div>
+</nav>
+<h2 data-number="7.4" id="gpu025"><span
+class="header-section-number">7.4</span> Memóriaterek kiválasztása</h2>
+<p>A memóriaterek kiválasztása a CUDA-kernel tervezésének egyik
+legnagyobb hatású döntése. Nem az a kérdés, hogy „melyik memóriatér a
+leggyorsabb”, hanem az, hogy egy adott adat melyik memóriatérben éri el
+a legjobb kompromisszumot a késleltetés, a sávszélesség és a láthatóság
+szempontjából. A regiszterek gyakorlatilag nulla késleltetésűek, de csak
+egyetlen szálra látszanak. A global memory a teljes grid számára
+elérhető, de a DRAM-késleltetés több száz ciklus is lehet. A shared,
+constant, local és texture terek közé esnek; a helyes választás a
+hozzáférési mintától, az élettartamtól és az írási/olvasási igénytől
+függ. Ebben az alfejezetben egy döntési keretet építünk fel,
+megvizsgáljuk egy kernel memóriaprofilját, majd egy ellenőrizhető
+laborban elkészítjük a memóriatér-döntési táblázatot.</p>
+<h3 data-number="7.4.1"
+id="döntési-keret-latency-bandwidth-és-scope"><span
+class="header-section-number">7.4.1</span> Döntési keret: latency,
+bandwidth és scope</h3>
+<p>A memóriatér-választás három műszaki tengelye a következő.</p>
+<p><strong>Latency (késleltetés):</strong> Az az idő, amennyi egy
+memóriaművelet elindítása és az adat rendelkezésre állása között telik
+el. A GPU a késleltetést elsősorban szálak közötti átfedéssel (latency
+hiding) rejti el, de a forrás memóriatér nagyságrendileg meghatározza a
+várakozási időt. A regiszterek hozzáférése gyakorlatilag az utasítás
+végrehajtásának része. A shared memory késleltetése jellemzően 20–40
+ciklus nagyságrendű, míg a global memory elérése cache nélkül több száz
+ciklust is jelenthet. A constant memória késleltetése broadcast esetén
+közel áll a regiszterhez, konfliktus esetén viszont drámaian romlik.</p>
+<p><strong>Bandwidth (sávszélesség):</strong> A másodpercenként átvihető
+bájtok mennyisége. A global memória sávszélessége a DRAM-ból származik,
+és tipikusan a GPU egyik legszűkebb erőforrása. A shared memory
+sávszélessége nagyságrenddel nagyobb, mert on-chip memória. A constant
+memória széles sávszélességet tud biztosítani, ha a warp minden szála
+ugyanazt a címet olvassa (broadcast). A local memória valójában a global
+memóriába kerül, tehát sávszélessége a global memoryéval megegyező,
+hiába neve „local”. A texture memória sávszélessége a textúra
+gyorsítótáron keresztül a 2D-s térbeli lokalitást használja ki.</p>
+<p><strong>Scope (láthatóság):</strong> Azt mondja meg, hogy egy adat
+mely végrehajtási egységek számára elérhető. A CUDA-végrehajtási
+hierarchiában a szál, a warp, a block, a grid és a host szintjei
+léteznek. A regiszterek szál-szintűek, a shared memory block-szintű, a
+global memory grid-szintű, a constant memória grid-szintű (írásra
+host-oldalról, olvasásra device-szinten), a local memória szál-szintű,
+de fizikailag global memóriában lakik. A scope megszabja, hogy egy
+adatot milyen szinkronizációs mechanizmussal lehet megosztani, és milyen
+élettartamot várhatunk el.</p>
+<p>A döntési folyamat első lépése tehát az adat életciklusának és
+hozzáférési mintájának feltérképezése. Kérdezzük meg:</p>
+<ul>
+<li>Hány szál használja ugyanazt az adatot?</li>
+<li>Csak olvasásra vagy írásra is?</li>
+<li>Mennyi az adat mérete?</li>
+<li>Milyen időközönként férünk hozzá?</li>
+<li>Van-e térbeli vagy időbeli lokalitás?</li>
+<li>Kell-e a host és a device között mozgatni?</li>
+<li>Lehet-e a hozzáférést broadcasttá alakítani?</li>
+</ul>
+<p>Ezekre a kérdésekre adott válaszokból áll össze a döntési
+táblázat.</p>
+<h3 data-number="7.4.2"
+id="az-öt-klasszikus-cuda-memóriatér-döntési-szempontjai"><span
+class="header-section-number">7.4.2</span> Az öt klasszikus
+CUDA-memóriatér döntési szempontjai</h3>
+<p>A korábbi alfejezetekben már bemutattuk az egyes memóriaterek
+technikai hátterét, itt kifejezetten a kiválasztás szempontjait
+foglaljuk össze.</p>
+<h3 data-number="7.4.3" id="global-memory"><span
+class="header-section-number">7.4.3</span> Global memory</h3>
+<p>A global memory az alapértelmezett nagyméretű, grid-szintű
+memóriatér. Ide kerülnek a <code>cudaMalloc</code>-kal allokált
+pufferek, a <code>cudaMemcpy</code>-vel feltöltött tömbök és a
+kernelparaméterként átadott mutatók által címzett adatok. Használata
+akkor indokolt, ha:</p>
+<ul>
+<li>az adat mérete meghaladja a shared vagy constant memória
+kapacitását,</li>
+<li>az adatot több block, a teljes grid vagy a host és a device közösen
+használja,</li>
+<li>írásra is szükség van,</li>
+<li>az adat élettartama túlnyúlik egyetlen kernelhíváson.</li>
+</ul>
+<p>A global memory költsége csökkenthető coalesced hozzáféréssel,
+vectorizált betöltéssel és L1/L2 cache-barát mintával. Ha egy adatot
+csak egyszer olvasunk, és nincs más lehetőség, akkor a global memory a
+természetes választás. Ha azonban ugyanazt a blokkon belül többször
+újraolvassuk, érdemes megfontolni a shared memory-ba másolást.</p>
+<h3 data-number="7.4.4" id="shared-memory"><span
+class="header-section-number">7.4.4</span> Shared memory</h3>
+<p>A shared memory block-szintű, on-chip, programozható, alacsony
+késleltetésű memóriatér. Akkor válasszuk, ha:</p>
+<ul>
+<li>ugyanazt az adatot egy blockon belül több szál szeretné elérni,</li>
+<li>a hozzáférések között adatcsere vagy csoportos redukció
+szükséges,</li>
+<li>egy global memóriából betöltött adatdarabot újrahasznosítunk tiling
+vagy stencil során,</li>
+<li>a hozzáférést bank-konfliktusmentesre tudjuk szervezni.</li>
+</ul>
+<p>A shared memory mérete korlátozott: tipikusan 48–164 KiB SM-enként, a
+konfigurációtól és architektúrától függően. Ha a teljes probléma
+elférne, akkor is figyelni kell arra, hogy a shared memory használata
+csökkenti az occupancy-t, mert egy SM-en a blockok száma korlátozott. A
+döntés során ezért mindig ellenőrizni kell, hogy a shared memória által
+elért global-memory-megtakarítás nagyobb-e, mint az
+occupancy-csökkenésből adódó latency-hiding romlás.</p>
+<h3 data-number="7.4.5" id="constant-memory"><span
+class="header-section-number">7.4.5</span> Constant memory</h3>
+<p>A constant memory grid-szintű, olvasható a device számára, de írni
+jellemzően a host írhat (<code>cudaMemcpyToSymbol</code>). Akkor
+előnyös, ha:</p>
+<ul>
+<li>ugyanazt a néhány bájtnyi paramétert a warp minden szála olvassa
+anélkül, hogy a hozzáférési címek különböznének,</li>
+<li>a hozzáférés broadcast mintájú: például egy skála, offset, filter
+együttható vagy táblázat,</li>
+<li>az adat nem változik a kernel futása alatt.</li>
+</ul>
+<p>A constant memória broadcast sávszélessége kiváló, de ha egy warpen
+belül különböző címekről olvasnak a szálak, a hozzáférés sorosodik, és a
+teljesítmény drasztikusan romlik. Ezért az olyan adat, amelyet a szálak
+különböző indexekkel érnek el, nem ide való. Ha a táblázat mérete nagy
+és véletlenszerű indexekkel olvassuk, a global memory vagy a texture
+memória jobb választás lehet.</p>
+<h3 data-number="7.4.6" id="local-memory"><span
+class="header-section-number">7.4.6</span> Local memory</h3>
+<p>A local memory fogalma megtévesztő: ez szál-szintű, de fizikailag a
+global memóriában tárolódik. Akkor használja a fordító, ha a bemeneti
+forráskódban szereplő lokális változó nem fér el a regiszterekben, vagy
+ha a tömb indexelése dinamikus, és a tömb nem konvertálható
+regiszterekre. A local memória használata rendszerint kerülendő:</p>
+<ul>
+<li>ha egy tömb mérete kicsi és a hozzáférések statikusak, akkor a
+fordító regiszterekben tarthatja;</li>
+<li>ha nagy, dinamikusan indexelt privát tömb szükséges, akkor is
+gondoljunk arra, hogy a valódi adatmegosztás lehetőségét kihasználjuk
+shared memory segítségével.</li>
+</ul>
+<p>A local memory a kernel memóriaprofiljában gyakran a „local
+load/store” tranzakciókban jelenik meg, és gyengíti a teljesítményt. A
+döntési táblázatban a local memory elsősorban figyelmeztető bejegyzés:
+ha a profilban nagy local forgalom látható, akkor a kernel regiszter-
+vagy shared-memory-kialakítását újra kell gondolni.</p>
+<h3 data-number="7.4.7" id="texture-memory"><span
+class="header-section-number">7.4.7</span> Texture memory</h3>
+<p>A texture memory egy speciális, read-only elérési út, amelyet
+textúraobjektumokkal vagy textúra referenciákkal érhetünk el. Akkor
+használjuk, ha:</p>
+<ul>
+<li>2D/3D térbeli lokalitás van a hozzáférésekben, és a cache-sorok
+kihasználása fontos,</li>
+<li>interpolációt, normalizált koordinátákat vagy címzési módokat
+szeretnénk használni,</li>
+<li>a hozzáférés read-only, és a hardware textúra gyorstár kihasználása
+előnyös.</li>
+</ul>
+<p>A modern GPU-ken a textúra memória sok esetben a global memory
+cache-elt eléréséhez hasonló, így nem szabad automatikusan „gyorsabbnak”
+tekinteni. A döntés során a textúra akkor indokolt, ha a mintavételi
+mód, a szűrés vagy a határkezelés hardveres támogatása csökkenti a kód
+komplexitását, illetve ha a hozzáférési minták miatt a textúra cache
+jobb találati arányt ad.</p>
+<h3 data-number="7.4.8" id="memóriatér-döntési-táblázat"><span
+class="header-section-number">7.4.8</span> Memóriatér-döntési
+táblázat</h3>
+<p>A döntési táblázat egy tömör összefoglaló eszköz, amelyet fejlesztés
+közben a kernel tervezésekor használhatunk. Az alábbi táblázat a CUDA
+memóriatereit foglalja össze a fő döntési dimenziók mentén. A
+számértékek nagyságrendi becslések, és hardverfüggőek; mindig az adott
+GPU compute capability szerint kell pontosítani.</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Memóriatér</th>
+<th>Scope</th>
+<th>Élettartam</th>
+<th>Hozzáférési jellemzők</th>
+<th>Írás/olvasás</th>
+<th>Jellemző késleltetés</th>
+<th>Sávszélesség-osztály</th>
+<th>Mikor válasszuk?</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Regiszter</td>
+<td>Szál</td>
+<td>Kernel során</td>
+<td>Statikus, privát</td>
+<td>Írható/olvasható</td>
+<td>0–1 ciklus</td>
+<td>Maximum</td>
+<td>Minden gyakran használt skalár, kis tömb</td>
+</tr>
+<tr class="even">
+<td>Local memory</td>
+<td>Szál</td>
+<td>Kernel során</td>
+<td>Privát, de DRAM-ban</td>
+<td>Írható/olvasható</td>
+<td>400–800 ciklus</td>
+<td>Global szint</td>
+<td>Kerülendő; csak ha a fordító spillt generál</td>
+</tr>
+<tr class="odd">
+<td>Shared memory</td>
+<td>Block</td>
+<td>Block futása</td>
+<td>Alacsony késleltetésű, on-chip</td>
+<td>Írható/olvasható</td>
+<td>20–40 ciklus</td>
+<td>Nagyon nagy</td>
+<td>Blokk-szintű újrafelhasználás, tiling, kommunikáció</td>
+</tr>
+<tr class="even">
+<td>Constant memory</td>
+<td>Grid</td>
+<td>Kernel során (host írás)</td>
+<td>Broadcast, read-only</td>
+<td>Device olvassa, host írja</td>
+<td>Broadcast: alacsony; konfliktus: magas</td>
+<td>Nagy broadcast esetén</td>
+<td>Warp-uniform paraméterek, táblázatok</td>
+</tr>
+<tr class="odd">
+<td>Global memory</td>
+<td>Grid</td>
+<td>Alkalmazás során</td>
+<td>Nagyméretű, cache-elt</td>
+<td>Írható/olvasható</td>
+<td>400–800 ciklus</td>
+<td>DRAM-sávszélesség</td>
+<td>Nagy adatok, grid-szintű megosztás, írás</td>
+</tr>
+<tr class="even">
+<td>Texture memory</td>
+<td>Grid</td>
+<td>Kernel során (read-only)</td>
+<td>2D/3D lokalitás, interpoláció</td>
+<td>Device olvassa</td>
+<td>Cache-től függő</td>
+<td>Változó</td>
+<td>Képinterpoláció, szűrés, speciális címzés</td>
+</tr>
+</tbody>
+</table>
+<p>Ez a táblázat a labor alapja is. A mérések során a táblázat
+sávszélességre és késleltetésre vonatkozó celláit a saját GPU-n mért
+értékekkel és a kernelprofilból származó mutatókkal támasztjuk alá.</p>
+<h3 data-number="7.4.9" id="kernel-memóriaprofiljának-felépítése"><span
+class="header-section-number">7.4.9</span> Kernel memóriaprofiljának
+felépítése</h3>
+<p>A memóriatér-döntés nem szakadhat el a méréstől. Egy kernel
+memóriaprofilja azt mondja meg, hogy a kernel futása során milyen
+memóriaterekből mennyi adatot mozgatunk, milyen hatékonysággal, és hol
+keletkeznek várakozások. A profil elkészítésének lépései:</p>
+<ol type="1">
+<li><p><strong>Felmérjük a hasznos adatforgalmat.</strong> Hány bájtot
+olvasunk és írunk a global memoryból? Hány bájtot töltünk be a shared
+memorybe? A hasznos forgalom az algoritmus által ténylegesen megkívánt
+adatmennyiség.</p></li>
+<li><p><strong>Megnézzük a tényleges memóriatranzakciókat.</strong> A
+global memória nem bájtonként, hanem 32-, 64- vagy 128 bájtos
+szektorokban mozog. A memóriaprofilból kiderül, hogy a kért szektorok
+hány százalékát használjuk ki. A coalescing hatékonysága a hasznos
+bájtok és a ténylegesen beolvasott szektorok bájtjainak aránya.</p></li>
+<li><p><strong>Megvizsgáljuk a shared memory bank
+konfliktusokat.</strong> A shared memory elérési mintája lehet
+conflict-free, vagy okozhat 2-, 4-, 8-utas konfliktust. A profilban a
+bank conflictok száma azt jelzi, hogy a döntés egyébként helyes, de a
+adatelrendezés nem optimális.</p></li>
+<li><p><strong>Azonosítjuk a local memory spillt.</strong> Ha a
+regiszterhasználat meghaladja a rendelkezésre álló regisztereket, a
+fordító local memóriába ír. A profilban a local load/store tranzakciók
+jelennek meg. Ezt a döntési táblázatban a local memória sorához
+kapcsoljuk.</p></li>
+<li><p><strong>Értelmezzük a cache találati arányokat.</strong> Az L1 és
+L2 találati arányok megmutatják, hogy a global memory hozzáférésekből
+mennyit sikerül elkerülni. A shared memory tiling célja gyakran az, hogy
+a global hozzáférések helyett L1/shared hozzáféréseket
+használjunk.</p></li>
+<li><p><strong>Összevetjük a mért sávszélességet a névleges
+csúccsal.</strong> A Roofline-modellből ismert, hogy a kernel lehet
+memória-korlátos vagy számítás-korlátos. A memóriaprofilból kiolvasott
+forgalom és idő hányadosa adja a tényleges sávszélességet, amelyet a GPU
+specifikációjával kell összehasonlítani.</p></li>
+</ol>
+<p>A Nsight Compute ilyen mutatói közé tartoznak például:</p>
+<ul>
+<li><code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum</code></li>
+<li><code>l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum</code></li>
+<li><code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum</code></li>
+<li><code>smsp__sass_inst_executed_op_local_ld.sum</code></li>
+<li><code>smsp__sass_inst_executed_op_local_st.sum</code></li>
+<li><code>gpu__time_duration.sum</code></li>
+</ul>
+<p>Ezeket a metrikaneveket a Nsight Compute verziója és architektúra
+szerint ellenőrizni kell, és a laborban a pontos név szerepeljen. A cél
+az, hogy a memóriatér-döntés számszerűen is igazolható legyen.</p>
+<h3 data-number="7.4.10"
+id="labor-memóriatér-döntési-táblázat-és-mérés"><span
+class="header-section-number">7.4.10</span> Labor: memóriatér-döntési
+táblázat és mérés</h3>
+<p>Az alábbi labor egy olyan kis CUDA-projektet mutat be, amelyben
+ugyanaz a feladat több memóriatér-kialakítással fut. A feladat egyszerű:
+egy bemeneti vektort skálázunk egy konstanssal, eltolunk egy
+konstanssal, majd blokkonként összegezzük a részeredményeket. A
+kialakítások lehetőséget adnak a global, constant, shared és local
+memória szerepének demonstrálására.</p>
+<h3 data-number="7.4.11" id="kernelváltozatok"><span
+class="header-section-number">7.4.11</span> Kernelváltozatok</h3>
+<ol type="1">
+<li><strong>Global-only változat:</strong> minden szál kiolvassa a
+bemeneti elemet a global memoryból, elvégzi a skálázást és eltolást,
+majd kiírja az eredményt.</li>
+<li><strong>Constant-táras változat:</strong> a skála és az offset
+értékeket constant memóriába tesszük, így a warp minden szála broadcast
+hozzáférést kap.</li>
+<li><strong>Shared-redukciós változat:</strong> a blokk beolvassa a
+bemeneti szegmenst, a szálak az egyes elemeket shared memóriába írják,
+majd fa-struktúrájú redukcióval blokkonkénti összeget számolnak.</li>
+<li><strong>Local-memory-büntetés változat:</strong> egy privát tömböt
+dinamikusan indexelünk, hogy a fordító local memoryt használjon; ezzel
+megmutatjuk a local memória árát.</li>
+</ol>
+<h3 data-number="7.4.12" id="cuda-c-példakód"><span
+class="header-section-number">7.4.12</span> CUDA C++ példakód</h3>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// fordítás: nvcc -O3 -arch=sm_89 -o memlab memlab.cu</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// megjegyzés: a kód a labor izolált környezetéhez készült,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// éles rendszeren és hitelesítő adattal ne futtassuk.</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                     </span><span class="op">\</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                     </span><span class="op">\</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span><span class="va">err__</span><span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span><span class="va">err__</span><span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                          </span><span class="op">\</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="bu">std::</span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA hiba: </span><span class="sc">%s</span><span class="st">, fajl: </span><span class="sc">%s</span><span class="st">, sor: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp">       </span><span class="op">\</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="pp">                         </span>cudaGetErrorString<span class="op">(</span><span class="va">err__</span><span class="op">),</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">);</span><span class="pp">     </span><span class="op">\</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span><span class="cf">return</span><span class="pp"> </span><span class="va">err__</span><span class="op">;</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_scale<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_offset<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="dt">int</span> BLOCK<span class="op">&gt;</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> global_only_scale<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>                                  <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>                                  <span class="dt">float</span> scale<span class="op">,</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>                                  <span class="dt">float</span> offset<span class="op">,</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>                                  <span class="dt">int</span> n<span class="op">)</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> v <span class="op">=</span> x<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> fmaf<span class="op">(</span>v<span class="op">,</span> scale<span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="dt">int</span> BLOCK<span class="op">&gt;</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> constant_scale<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">int</span> n<span class="op">)</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> v <span class="op">=</span> x<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> fmaf<span class="op">(</span>v<span class="op">,</span> c_scale<span class="op">,</span> c_offset<span class="op">);</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span> <span class="op">&lt;</span><span class="dt">int</span> BLOCK<span class="op">&gt;</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> shared_reduce<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> block_sum<span class="op">,</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> n<span class="op">)</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> sdata<span class="op">[</span>BLOCK<span class="op">];</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> v <span class="op">=</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> x<span class="op">[</span>i<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> fmaf<span class="op">(</span>v<span class="op">,</span> c_scale<span class="op">,</span> c_offset<span class="op">);</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> v<span class="op">;</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a>    __syncthreads<span class="op">();</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> stride <span class="op">=</span> BLOCK <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> stride <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> stride <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">&lt;</span> stride<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>threadIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>threadIdx<span class="op">.</span>x <span class="op">+</span> stride<span class="op">];</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>threadIdx<span class="op">.</span>x <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a>        block_sum<span class="op">[</span>blockIdx<span class="op">.</span>x<span class="op">]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> local_penalty<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> x<span class="op">,</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> y<span class="op">,</span></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>                              <span class="dt">int</span> kMax<span class="op">)</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A tmp[] dinamikusan indexelt, ezért a fordító nagy valószínűséggel</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>    <span class="co">// local memoryt használ. A kMax paraméter miatt a ciklus nem unrollható.</span></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> tmp<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> k <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> k <span class="op">&lt;</span> kMax<span class="op">;</span> <span class="op">++</span>k<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a>            tmp<span class="op">[</span>k<span class="op">]</span> <span class="op">=</span> x<span class="op">[</span>i<span class="op">]</span> <span class="op">*</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>k<span class="op">);</span></span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> k <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> k <span class="op">&lt;</span> kMax<span class="op">;</span> <span class="op">++</span>k<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a>            sum <span class="op">+=</span> tmp<span class="op">[</span>k<span class="op">];</span></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a>        y<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>local_penalty</code> kernelben a <code>tmp</code> tömb mérete
+128 float. A fordító akkor tudná regiszterben tartani, ha minden
+hozzáférést konstans indexszel oldana fel. Mivel a <code>k</code>
+változó futás közben, a <code>kMax</code> paramétertől függően változik,
+a tömböt valószínűleg local memoryba helyezi. Ezt a mérési profilban a
+local tranzakciók növekedése mutatja majd.</p>
+<p>A host oldalon a mérési ciklus:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> BLOCK <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> GRID <span class="op">=</span> <span class="op">(</span>N <span class="op">+</span> BLOCK <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> BLOCK<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> ITER_WARMUP <span class="op">=</span> <span class="dv">5</span><span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> ITER_MEAS <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> nBytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> h_in<span class="op">(</span>N<span class="op">),</span> h_out<span class="op">(</span>N<span class="op">);</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> h_in<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> <span class="op">*</span>d_x<span class="op">,</span> <span class="op">*</span>d_y<span class="op">,</span> <span class="op">*</span>d_sum<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_x<span class="op">,</span> nBytes<span class="op">));</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_y<span class="op">,</span> nBytes<span class="op">));</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_sum<span class="op">,</span> GRID <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_x<span class="op">,</span> h_in<span class="op">.</span>data<span class="op">(),</span> nBytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> scale <span class="op">=</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">,</span> offset <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpyToSymbol<span class="op">(</span>c_scale<span class="op">,</span> <span class="op">&amp;</span>scale<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpyToSymbol<span class="op">(</span>c_offset<span class="op">,</span> <span class="op">&amp;</span>offset<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">)));</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> it <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> it <span class="op">&lt;</span> ITER_WARMUP<span class="op">;</span> <span class="op">++</span>it<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>        global_only_scale<span class="op">&lt;</span>BLOCK<span class="op">&gt;&lt;&lt;&lt;</span>GRID<span class="op">,</span> BLOCK<span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_y<span class="op">,</span> scale<span class="op">,</span> offset<span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés: global-only</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> times<span class="op">[</span>ITER_MEAS<span class="op">];</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> it <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> it <span class="op">&lt;</span> ITER_MEAS<span class="op">;</span> <span class="op">++</span>it<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        global_only_scale<span class="op">&lt;</span>BLOCK<span class="op">&gt;&lt;&lt;&lt;</span>GRID<span class="op">,</span> BLOCK<span class="op">&gt;&gt;&gt;(</span>d_x<span class="op">,</span> d_y<span class="op">,</span> scale<span class="op">,</span> offset<span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>times<span class="op">[</span>it<span class="op">],</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> avg <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> var <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> it <span class="op">=</span> <span class="dv">1</span><span class="op">;</span> it <span class="op">&lt;</span> ITER_MEAS<span class="op">;</span> <span class="op">++</span>it<span class="op">)</span> avg <span class="op">+=</span> times<span class="op">[</span>it<span class="op">];</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    avg <span class="op">/=</span> <span class="op">(</span>ITER_MEAS <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> it <span class="op">=</span> <span class="dv">1</span><span class="op">;</span> it <span class="op">&lt;</span> ITER_MEAS<span class="op">;</span> <span class="op">++</span>it<span class="op">)</span> var <span class="op">+=</span> <span class="op">(</span>times<span class="op">[</span>it<span class="op">]</span> <span class="op">-</span> avg<span class="op">)</span> <span class="op">*</span> <span class="op">(</span>times<span class="op">[</span>it<span class="op">]</span> <span class="op">-</span> avg<span class="op">);</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>    var <span class="op">/=</span> <span class="op">(</span>ITER_MEAS <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>printf<span class="op">(</span><span class="st">&quot;[global-only] atlag: </span><span class="sc">%.3f</span><span class="st"> ms, szoras: </span><span class="sc">%.3f</span><span class="st"> ms</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> avg<span class="op">,</span> <span class="bu">std::</span>sqrt<span class="op">(</span>var<span class="op">));</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Hasonló mérés a constant_scale és shared_reduce esetén</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A local_penalty kernel mérésénél a kMax legyen pl. 64.</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_x<span class="op">));</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_y<span class="op">));</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_sum<span class="op">));</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A mérésnél az első iterációt a warm-up után a mérésből kihagytuk, a
+maradékból átlagot és szórást számolunk. A
+<code>constant_scale</code>-hez hasonló mérési ciklus kell. A
+<code>shared_reduce</code> kimeneti tömbje a blokkonkénti összeg, így a
+global írás forgalom kisebb. A <code>local_penalty</code> esetén a
+<code>kMax</code> értékét a híváskor adjuk meg, például 64.</p>
+<h3 data-number="7.4.13" id="mérési-konfiguráció"><span
+class="header-section-number">7.4.13</span> Mérési konfiguráció</h3>
+<p>A labor a következő, izolált környezetben fut. A példaértékek
+helyőrzők, és a tényleges mérés előtt az adott gépen rögzíteni kell.</p>
+<ul>
+<li><strong>GPU:</strong> NVIDIA RTX 4090, 24 GiB GDDR6X, compute
+capability 8.9, GPU órajel: boosted, power limit: 450 W, ECC off, MIG
+off, virtualizáció nincs.</li>
+<li><strong>Meghajtó:</strong> NVIDIA driver 550.54.14.</li>
+<li><strong>CUDA toolkit:</strong> 12.4, nvcc 12.4,
+<code>-O3 -arch=sm_89</code>.</li>
+<li><strong>OS:</strong> Ubuntu 22.04, kernel 6.5.0.</li>
+<li><strong>Háttérterhelés:</strong> idle, <code>nvidia-smi</code>
+szerint nincs más GPU-folyamat.</li>
+<li><strong>Bemenet:</strong> <code>N = 1&lt;&lt;22</code> float,
+<code>BLOCK = 256</code>, <code>GRID = 16384</code>.</li>
+</ul>
+<p>Ez a konfiguráció a mérési napló fejlécébe tartozik.</p>
+<h3 data-number="7.4.14"
+id="mérési-napló-várt-és-mért-elkülönítve"><span
+class="header-section-number">7.4.14</span> Mérési napló (várt és mért
+elkülönítve)</h3>
+<p>A laborátadandó egy olyan táblázat, amelyben a <strong>várt
+tendencia</strong> oszlop a memóriatér-döntési érvelésből következik, a
+<strong>mért</strong> oszlop pedig a saját futásból származik. Az alábbi
+táblázat a várt tendenciákat és a mérési mezőket mutatja. A mért értékek
+a könyv szövegében nem ellenőrzött futásból származnak, ezért a labor
+során kell kitölteni.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kernelváltozat</th>
+<th>Várt memóriatér-hatás</th>
+<th>Várt tendencia</th>
+<th>Mért idő (ms)</th>
+<th>Mért sávszélesség (GB/s)</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>global_only_scale</td>
+<td>Global olvasás/írás, coalesced</td>
+<td>Alapvonal</td>
+<td>______</td>
+<td>______</td>
+<td>Két global hozzáférés elemenként</td>
+</tr>
+<tr class="even">
+<td>constant_scale</td>
+<td>Constant broadcast a skálára</td>
+<td>Gyorsabb a global-only-nál</td>
+<td>______</td>
+<td>______</td>
+<td>Nincs extra DRAM-forgalom a paraméterekre</td>
+</tr>
+<tr class="odd">
+<td>shared_reduce</td>
+<td>Shared használat, global forgalom töredéke</td>
+<td>Kevesebb global sávszélesség, de shared használat</td>
+<td>______</td>
+<td>______</td>
+<td>Blockonként egy kimeneti összeg</td>
+</tr>
+<tr class="even">
+<td>local_penalty</td>
+<td>Local memória spill a privát tömbhöz</td>
+<td>Lassabb, több DRAM-forgalom</td>
+<td>______</td>
+<td>______</td>
+<td>A local valójában global memória</td>
+</tr>
+</tbody>
+</table>
+<p>A mérési naplóhoz tartozik a Nsight Compute parancs:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--metrics</span> l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum, <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum, <span class="dt">\</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>l1tex__data_bank_conflicts_pipe_lsu_mem_shared.sum, <span class="dt">\</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>smsp__sass_inst_executed_op_local_ld.sum, <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>gpu__time_duration.sum <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>./memlab</span></code></pre></div>
+<p>A kimeneti metrikaneveket a telepített Nsight Compute verziójához
+kell igazítani. A profilozás során külön figyeljünk a
+<code>local_penalty</code> kernelre: a local load tranzakciók száma
+jelentősen megnő.</p>
+<h3 data-number="7.4.15"
+id="a-memóriatér-döntési-táblázat-kitöltése"><span
+class="header-section-number">7.4.15</span> A memóriatér-döntési
+táblázat kitöltése</h3>
+<p>A labor végső eredménye egy <strong>memóriatér-döntési
+táblázat</strong>, amely a kerneltervezéshez használható. A fenti
+összefoglaló táblázatot a mérési eredményekkel pontosítjuk. A
+laborátadandó a következő formátumban készülhet:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Döntési kérdés</th>
+<th>Válasz</th>
+<th>Választott memóriatér</th>
+<th>Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Az adat mérete nagy (&gt;1 MB)?</td>
+<td>Igen</td>
+<td>Global</td>
+<td>Shared nem elég nagy</td>
+</tr>
+<tr class="even">
+<td>Több block is használja?</td>
+<td>Igen</td>
+<td>Global</td>
+<td>Scope megköveteli</td>
+</tr>
+<tr class="odd">
+<td>Csak egy blockon belül használt?</td>
+<td>Igen</td>
+<td>Shared</td>
+<td>Alacsony késleltetés</td>
+</tr>
+<tr class="even">
+<td>Ugyanazt az értéket olvassa minden szál?</td>
+<td>Igen</td>
+<td>Constant</td>
+<td>Broadcast</td>
+</tr>
+<tr class="odd">
+<td>Dinamikus indexelés privát tömbre?</td>
+<td>Nem</td>
+<td>Regiszter</td>
+<td>Local elkerülése</td>
+</tr>
+<tr class="even">
+<td>Írni kell a host felől?</td>
+<td>Igen</td>
+<td>Global</td>
+<td>Constant read-only</td>
+</tr>
+</tbody>
+</table>
+<p>A laborban a hallgató ezt a táblázatot a saját kernelére is el kell
+tudja készíteni, és a mérési naplóval igazolni a választást.</p>
+<h3 data-number="7.4.16" id="opencl-párhuzam"><span
+class="header-section-number">7.4.16</span> OpenCL párhuzam</h3>
+<p>Az OpenCL programozási modellben a CUDA-memóriatereknek megfelelnek a
+következő címterek:</p>
+<table>
+<thead>
+<tr class="header">
+<th>CUDA</th>
+<th>OpenCL</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Regiszter</td>
+<td>Private</td>
+<td>Work-item</td>
+</tr>
+<tr class="even">
+<td>Local memory</td>
+<td>Private (fizikailag DRAM)</td>
+<td>Work-item</td>
+</tr>
+<tr class="odd">
+<td>Shared memory</td>
+<td>Local</td>
+<td>Work-group</td>
+</tr>
+<tr class="even">
+<td>Constant memory</td>
+<td>Constant</td>
+<td>Work-group/global, read-only</td>
+</tr>
+<tr class="odd">
+<td>Global memory</td>
+<td>Global</td>
+<td>Minden work-group</td>
+</tr>
+</tbody>
+</table>
+<p>A döntési táblázat az OpenCL-ben is használható, de az OpenCL C
+kernelben a <code>__private</code>, <code>__local</code>,
+<code>__constant</code> és <code>__global</code> minősítőket használjuk.
+A memóriatér-választás szempontjai azonosak. Az OpenCL-ben a constant
+memória használata gyakran a kernel argumentumaira korlátozódik, és a
+shared memoryt a <code>__local</code> paraméter vagy
+<code>__local</code> változó adja. A döntéshez az OpenCL eszköz
+<code>CL_DEVICE_LOCAL_MEM_SIZE</code> és
+<code>CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE</code> értékeit is figyelembe
+kell venni.</p>
+<h3 data-number="7.4.17" id="opencl-példa"><span
+class="header-section-number">7.4.17</span> OpenCL példa</h3>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordítási ellenőrzésre szánt OpenCL C példa.</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// A laborban a CUDA kernellel párhuzamosan csak akkor futtassuk,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// ha OpenCL eszköz elérhető és az izolált környezet engedi.</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>kernel <span class="dt">void</span> scale_shared<span class="op">(</span>global <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> x<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>                         global <span class="dt">float</span><span class="op">*</span> block_sum<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>                         local <span class="dt">float</span><span class="op">*</span> sdata<span class="op">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>                         constant <span class="dt">float</span> scale<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>                         constant <span class="dt">float</span> offset<span class="op">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>                         <span class="dt">int</span> n<span class="op">)</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> lid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> v <span class="op">=</span> <span class="op">(</span>gid <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> x<span class="op">[</span>gid<span class="op">]</span> <span class="op">:</span> <span class="dv">0</span><span class="er">.0f</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> mad<span class="op">(</span>v<span class="op">,</span> scale<span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>lid<span class="op">]</span> <span class="op">=</span> v<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> stride <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> stride <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> stride <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>lid <span class="op">&lt;</span> stride<span class="op">)</span> sdata<span class="op">[</span>lid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>lid <span class="op">+</span> stride<span class="op">];</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> block_sum<span class="op">[</span>get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>constant float scale</code> és
+<code>constant float offset</code> a CUDA constant memória analógiája, a
+<code>local float* sdata</code> pedig a shared memory.</p>
+<h3 data-number="7.4.18" id="jaxxla-megfontolások"><span
+class="header-section-number">7.4.18</span> JAX/XLA megfontolások</h3>
+<p>A JAX-ben a felhasználó általában nem választ közvetlenül
+memóriateret; az XLA fordító dönt arról, hogy egy adott műveletet hogyan
+valósít meg GPU-n vagy TPU-n. A memóriatér-döntés azonban itt is fontos,
+csak a füst alatt. A JAX-kódban a <code>jax.numpy</code> vagy
+<code>jax.lax</code> hívásokból XLA HLO gráf lesz, amelyből a háttér a
+hardvernek megfelelő kernel(eke)t generál. A shared memory és registers
+allokációt a kernelgenerátor végzi.</p>
+<p>A döntési táblázat JAX szempontból így módosul:</p>
+<ul>
+<li>A global memoryt a JAX pufferek és a device-okon tárolt tömbök
+képviselik.</li>
+<li>A constant memóriát a fordító a warpenként uniform konstansokra
+használhatja, de explicit CUDA-konstans nincs a JAX-ben.</li>
+<li>A shared memoryt az XLA az olyan redukciókhoz, konvolúciókhoz
+használja, ahol a blockon belüli újrafelhasználás nagy.</li>
+<li>A local memoryt a JAX közvetlenül nem teszi láthatóvá, de a rosszul
+optimalizált kernel okozhat regiszter spillt, amit a profilban local
+tranzakcióként látunk.</li>
+</ul>
+<p>Egy JAX-példa, amely ugyanazt a skálázást és blokkredukciót XLA-ra
+bízza:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># JAX példa, illusztráció; valós TPU/GPU futtatáshoz izolált környezet kell.</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># A memóriatér-választást itt az XLA végzi.</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>key <span class="op">=</span> jax.random.key(<span class="dv">0</span>)</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> jax.random.normal(key, (<span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span>,), dtype<span class="op">=</span>jnp.float32)</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">@jax.jit</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> scale_and_sum(x):</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A scale és offset XLA-konstansként beolvadhat,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="co"># a redukció során a back-end shared/constant trafikot optimalizál.</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> jnp.<span class="bu">sum</span>(<span class="fl">0.5</span> <span class="op">*</span> x <span class="op">+</span> <span class="fl">1.0</span>)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> scale_and_sum(x)</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(result.block_until_ready())</span></code></pre></div>
+<p>A JAX-ben a memóriatér-döntést a kernelprofilban az XLA HLO alapján
+követhetjük nyomon, de a felhasználói kód szintjén a „scope” és a
+„latency” nem közvetlenül vezérelhető. A labor döntési táblázatában
+ezért a JAX sorban azt tüntetjük fel, hogy a memóriatér-választást a
+fordító garantálja, a mérési naplóban pedig az XLA back-end profilját
+adjuk meg.</p>
+<h3 data-number="7.4.19" id="tipikus-hibák-és-helyes-választások"><span
+class="header-section-number">7.4.19</span> Tipikus hibák és helyes
+választások</h3>
+<p>A memóriatér-kiválasztás során gyakori hibák a következők.</p>
+<p><strong>Hiba 1: minden megosztott adatot shared memoryba
+teszünk.</strong> A shared memory kapacitása korlátozott, és használata
+csökkenti az occupancy-t. Ha egy adatot a blockon belül csak egyszer
+olvasunk, a global memoryból való coalesced olvasás gyakran jobb, mint a
+shared-be másolás.</p>
+<p><strong>Hiba 2: constant memoryba teszünk véletlenszerűen indexelt
+tömböt.</strong> A constant memória akkor gyors, ha egy warp minden
+szála ugyanazt a címet olvassa. Ha a szálak különböző elemeket kérnek, a
+hozzáférés sorosodik, és a teljesítmény összeomlik. Ilyen adatot global
+vagy texture memóriába tegyünk.</p>
+<p><strong>Hiba 3: a local memóriát „helyi gyorsítótárnak”
+képzeljük.</strong> A local memória a global memóriában lakik. A
+<code>local_penalty</code> kernel megmutatja, hogy a privát tömbök rossz
+indexelése miatt a DRAM-forgalom megnő. A megoldás az, hogy a tömböt
+regiszterekben tartsuk, vagy ha a méret nagy, shared memoryt
+használjunk.</p>
+<p><strong>Hiba 4: a texture memóriát automatikusan gyorsabbnak
+gondoljuk.</strong> A textúra memória előnye a speciális címzési és
+szűrési módokban, valamint a 2D/3D cache-optimalizációban van, nem pedig
+egy minden esetben nagyobb nyers sávszélességben. Ha nincs interpoláció
+vagy speciális határkezelés, a global memory read-only cache-sel gyakran
+ugyanolyan jó.</p>
+<p><strong>Hiba 5: nem mérjük a memóriaprofil sávszélességét.</strong> A
+kernel lehet felszínesen „gyors”, de a globális memóriatranzakciók száma
+magas. A Nsight Compute profilban a sector/request mutatók megmutatják,
+hogy a döntés hatékony-e. A laborban minden kernelváltozathoz rögzíteni
+kell a global load/store szektorok számát.</p>
+<h3 data-number="7.4.20" id="a-döntési-folyamat-összefoglalása"><span
+class="header-section-number">7.4.20</span> A döntési folyamat
+összefoglalása</h3>
+<p>A memóriatér-kiválasztás ismételhető lépései:</p>
+<ol type="1">
+<li><strong>Az adat életciklusának felmérése:</strong> Milyen hosszan
+él, hány szál látja, kell-e írni?</li>
+<li><strong>A hozzáférési minta elemzése:</strong> Coalesced, broadcast,
+strided, véletlen, 2D-s?</li>
+<li><strong>A méret ellenőrzése:</strong> Elfér-e shared/constant
+memóriában? Mekkora a local memória spill?</li>
+<li><strong>A döntési táblázat alkalmazása:</strong> Válasszunk a fenti
+táblázat soraiból.</li>
+<li><strong>Költség-haszon elemzés:</strong> A választás javítja-e a
+sávszélességet, csökkenti-e a késleltetést, vagy csak az occupancy-t
+rontja?</li>
+<li><strong>Mérés és profil:</strong> A választott kialakítást futtassuk
+le, mérjük a memóriaprofil-mutatókat, és hasonlítsuk a várt
+tendenciához.</li>
+<li><strong>Iteráció:</strong> Ha a profil nem igazolja a várt hatást,
+vizsgáljuk meg a bank konfliktusokat, a coalescinget vagy a cache
+találatokat.</li>
+</ol>
+<p>A memóriaterek közötti döntés tehát nem egyetlen szabály, hanem egy
+keret, amelyet mérésekkel kell validálni. A laborban elkészített
+táblázat a későbbi fejezetekben is alapul szolgál: a shared memory
+tiling, a coalescing és a cache-optimalizálás mind visszavezethető erre
+a döntési folyamatra.</p>
+<h3 data-number="7.4.21" id="önellenőrző-kérdés"><span
+class="header-section-number">7.4.21</span> Önellenőrző kérdés</h3>
+<p>Egy kernelben egy 1024 elemű súlytáblázatot használunk. A súlyokat
+minden szál olvassa, de a szálak indexe a táblázatban különböző: az 1.
+szál a 0. elemet, a 2. szál az 1. elemet, és így tovább. A súlyok nem
+változnak a kernel futása alatt. Melyik memóriateret választanád?</p>
+<p><strong>Válasz:</strong> A constant memória rossz választás lenne,
+mert a hozzáférés nem warp-uniform: a szálak különböző címeket olvasnak,
+ami sorosodáshoz vezet. Ha a táblázat kicsi, érdemes a shared memoryba
+tölteni a block elején, mert a blokk szintű újrafelhasználás
+kihasználható. Ha a táblázat nagyobb és a hozzáférés read-only, a global
+memory vagy a texture memory lehet jó választás. A döntési táblázatban a
+constant sorát tehát csak broadcast hozzáférésnél használjuk.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu024.html">← 7.3 Local, constant és texture memória</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu026.html">8.1 Blokk-szintű szinkronizáció →</a></div>
+</nav>
+</body>
+</html>

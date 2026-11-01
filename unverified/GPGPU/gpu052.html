@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.3 Double buffering és pipeline – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch13">14 Shared memory tiling, async copy és pipelining</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu051.html">← 14.2 Aszinkron másolás (cp.async)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu053.html">14.4 Tiling és pipeline mérése →</a></div>
+</nav>
+<h2 data-number="14.3" id="gpu052"><span
+class="header-section-number">14.3</span> Double buffering és
+pipeline</h2>
+<p>A dupla pufferelés és a pipeline nem csupán egy újabb optimalizálási
+trükk, hanem a GPU-programozás egyik központi gondolata: a memória és a
+számítás valójában két, egymástól részben független erőforrás, amelyeket
+akkor használunk ki jól, ha egyszerre dolgoztatjuk őket. Az előző
+alfejezetben megismert <code>cp.async</code> lehetővé tette, hogy a
+globális memóriából a shared memoryba irányuló másolást anélkül indítsuk
+el, hogy a szálnak várnia kellene a befejezésre. Ebben az alfejezetben
+ezt az aszinkron másolást többszintű csővezetékké szervezzük, és
+megnézzük, hogyan lehet a másolási késleltetést a számítás mögé
+rejteni.</p>
+<figure>
+<img src="assets/gpu052-diagram-1.png"
+alt="Kétfokozatú pipeline - A következő tile betöltése egy időben fut a jelenlegi tile számításával; a dupla buffer teszi lehetővé az átfedést." />
+<figcaption aria-hidden="true">Kétfokozatú pipeline - A következő tile
+betöltése egy időben fut a jelenlegi tile számításával; a dupla buffer
+teszi lehetővé az átfedést.</figcaption>
+</figure>
+<h3 data-number="14.3.1"
+id="miért-van-szükség-a-számítás-és-az-adatmozgatás-átfedésére"><span
+class="header-section-number">14.3.1</span> Miért van szükség a számítás
+és az adatmozgatás átfedésére?</h3>
+<p>A GPU végrehajtási modelljében a memóriaműveletek és az aritmetikai
+utasítások más-más hardveregységeken futnak. A globális memóriából a
+shared memoryba irányuló másolás tipikusan több száz órajelciklusig is
+eltart, miközben az SM számítási egységei eközben üresen járhatnak, ha a
+kernel szinkron módon vár. Ez a latencia-elrejtés alapkérdése: nem a
+memória műveletet kell gyorsabbá tenni önmagában, hanem a várakozási
+időt hasznos számítással kell kitölteni.</p>
+<p>A hagyományos, szinkron tilingnél a blokk életciklusa ismétlődő
+szakaszokból áll:</p>
+<ol type="1">
+<li>minden szál kiszámítja a következő csempe globális indexeit,</li>
+<li>betölti az adatokat a shared memoryba,</li>
+<li><code>__syncthreads()</code> biztosítja, hogy a teljes csempe
+rendelkezésre álljon,</li>
+<li>a szálak feldolgozzák a csempét,</li>
+<li><code>__syncthreads()</code> biztosítja, hogy a shared memory már
+nem kell, mielőtt a következő csempe felülírná.</li>
+</ol>
+<p>Ebben a menetrendben a másolás és a számítás soha nem fut egy időben.
+A második lépés alatt az SM számítási egységei többnyire tétlenek, míg a
+negyedik lépés alatt a memória-útvonalak nem dolgoznak. A pipeline célja
+az, hogy a következő csempe másolása már akkor folyamatban legyen,
+amikor az aktuális csempe feldolgozása még tart.</p>
+<p>A dupla pufferelés ennek a legegyszerűbb megvalósítása. Két shared
+memory puffert tartunk fenn; amíg az egyikből számolunk, a másikba
+töltjük a következő adagot. A csere nem adatot mozgat, hanem csak a
+pufferszerepeket cseréli fel. A megfelelő szinkronizációval elérhető,
+hogy a másolási késleltetés egy része vagy egésze a számítási idő alá
+kerüljön.</p>
+<p>A „stage” kifejezés a pipeline egy szakaszát jelöli. A legegyszerűbb
+esetben két szakasz van:</p>
+<ul>
+<li>egy <strong>producer</strong> szakasz, amely a globális memóriából a
+shared memoryba másol,</li>
+<li>egy <strong>consumer</strong> szakasz, amely a shared memoryból
+olvas, és valamilyen számítást végez.</li>
+</ul>
+<p>A két szakasz között egy szinkronizációs pont, azaz
+<strong>barrier</strong> biztosítja, hogy a consumer csak akkor kezdje
+el a puffert olvasni, ha a producer már befejezte a feltöltését, és hogy
+a producer ne írja felül a puffert addig, amíg a consumer még
+olvassa.</p>
+<h3 data-number="14.3.2" id="stage-buffer-és-barrier-fogalma"><span
+class="header-section-number">14.3.2</span> Stage, buffer és barrier
+fogalma</h3>
+<p>A pipeline mélysége azt mondja meg, hogy hány csempe feldolgozása
+lehet egyszerre folyamatban a különböző fázisokban. A kétfokozatú
+pipeline két puffert használ, és egyszerre legfeljebb két csempe van
+jelen: az egyik már betöltve, a másik éppen töltődik vagy feldolgozás
+alatt áll. A háromfokozatú pipeline három puffert használ, és így
+tovább.</p>
+<p>Fontos megkülönböztetni a pufferek számát a pipeline tényleges
+mélységétől. A kétpufferes séma általában egy csempe számítását és a
+következő csempe másolását fedi át, ezért két szakasz mélységű. A
+hárompufferes sémában a másolási, az esetleges előkészítő és a számítási
+fázisok jobban szétválaszthatók.</p>
+<p>A barrier itt nemcsak a <code>__syncthreads()</code> hívást jelenti,
+hanem a csővezeték szakaszainak találkozási pontját is. A CUDA aszinkron
+másolási modelljében kétféle várakozásra van szükség:</p>
+<ul>
+<li><strong>Másolás befejezésére várás</strong>: a <code>cp.async</code>
+csoportokhoz tartozó <code>wait_group</code> a másolás hardveres
+állapotát figyeli. Ez nem blokkolja a teljes blokkot, csak az adott
+szálat, és nem garantálja a shared memory láthatóságát a többi szál
+számára.</li>
+<li><strong>Blokk-szintű szinkronizáció</strong>: a
+<code>__syncthreads()</code> a blokk összes szálát egy pontra hozza, és
+memória-akadályt is jelent. Erre azért van szükség, mert a másolást
+tipikusan több szál együtt végzi, és a consumer szakasz csak akkor
+olvashat, ha minden producer szál végzett.</li>
+</ul>
+<p>A helyes minta tehát az, hogy a másolás befejezésére várunk, majd
+<code>__syncthreads()</code>-et hívunk, és csak utána engedjük a
+fogyasztói fázist a pufferhez. Ha a sorrend megfordul, versenyhelyzet
+keletkezik: a szál elérheti a <code>__syncthreads()</code>-et, mielőtt a
+saját másolási csoportja befejeződött volna, és így a többi szál olyan
+memóriát olvashat, amelyet még nem írt fel mindenki.</p>
+<p>A gyakorlatban a CUDA C++ a következő hívásokat biztosítja a
+<code>&lt;cuda_pipeline.h&gt;</code> fejlécben:</p>
+<ul>
+<li><code>__pipeline_memcpy_async(dst_smem, src_gmem, bytes)</code>
+elindít egy aszinkron másolást,</li>
+<li><code>__pipeline_commit()</code> a megelőző másolásokat egy
+csoportba zárja,</li>
+<li><code>__pipeline_wait_prior(n)</code> várakoztatja a hívó szálat,
+amíg a folyamatban lévő csoportok közül a legutóbbi <code>n</code>
+kivételével mindegyik be nem fejeződik.</li>
+</ul>
+<p>A <code>wait_prior</code> finomabb vezérlést ad, mint az egyszerű
+<code>wait_group 0</code>. A <code>n</code> paraméter azt szabályozza,
+hogy hány befejezetlen másoláscsoport maradhat még folyamatban. Ez a
+többszintű pipeline kulcsa: ahelyett, hogy megvárnánk az összes
+másolást, csak a legkorábbi csoportokat várjuk meg, így a későbbi
+csoportok még közben tölthetik a saját puffereiket. A
+<code>__pipeline_wait_prior(0)</code> megvárja az összes elkötelezett
+csoportot.</p>
+<p>Alacsonyabb szinten a PTX utasítások a következők:</p>
+<ul>
+<li><code>cp.async.ca.shared.global [dst], [src], 16;</code></li>
+<li><code>cp.async.commit_group;</code></li>
+<li><code>cp.async.wait_group 0;</code></li>
+</ul>
+<p>A PTX-szintű kiírás akkor hasznos, ha valaki saját absztrakciót épít,
+vagy ha a CUDA C++ burkoló hívás viselkedését akarja pontosan
+ellenőrizni. Ebben a könyvben a hordozható CUDA C++ réteget részesítjük
+előnyben, de a PTX-formát is bemutatjuk, hogy a mögöttes hardveres
+viselkedés ne maradjon homályban.</p>
+<h3 data-number="14.3.3" id="kétfokozatú-pipeline-az-alapminta"><span
+class="header-section-number">14.3.3</span> Kétfokozatú pipeline: az
+alapminta</h3>
+<p>Tekintsünk egy egyszerű, mégis jól mérhető feladatot: egy blokk egy
+nagy, egydimenziós bemeneti tömb egymást követő csempéit dolgozza fel,
+és minden csempére egy állítható költségű transzformációt alkalmaz. A
+transzformáció legyen elég egyszerű ahhoz, hogy a kódot könnyen
+ellenőrizhessük, de legyen benne egy mesterséges számítási ciklus,
+amellyel a memória és a számítás arányát hangolni tudjuk.</p>
+<p>A kétpufferes kernel vázlata a következő:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ 17, illusztráció; a pontos launch paramétereket és a</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// compute capability viselkedést a laborban ellenőrizni kell.</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_pipeline.h&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="dt">int</span> kTile <span class="op">=</span> <span class="dv">4096</span><span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="dt">int</span> kThreads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> pipelined_transform_2stage<span class="op">(</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> work_per_element<span class="op">)</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> buf<span class="op">[</span><span class="dv">2</span><span class="op">][</span>kTile<span class="op">];</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tile_idx <span class="op">=</span> blockIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tiles <span class="op">=</span> gridDim<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Az első csempe globális kezdőindexe.</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> base <span class="op">=</span> tile_idx <span class="op">*</span> kTile<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A blokk által kezelt csempék száma.</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> my_tiles <span class="op">=</span> <span class="op">(</span>n <span class="op">-</span> base <span class="op">+</span> kTile <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> kTile<span class="op">;</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>my_tiles <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Elindítjuk az első csempe aszinkron betöltését.</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> stage <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes <span class="op">=</span> kTile <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    __pipeline_memcpy_async<span class="op">(&amp;</span>buf<span class="op">[</span>stage<span class="op">][</span><span class="dv">0</span><span class="op">],</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>                            input <span class="op">+</span> base<span class="op">,</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>                            bytes<span class="op">);</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    __pipeline_commit<span class="op">();</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> t <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> t <span class="op">&lt;</span> my_tiles<span class="op">;</span> <span class="op">++</span>t<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A következő csempe másolását már a jelenlegi számítás előtt</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>        <span class="co">// elindíthatjuk, ha van még következő csempe.</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> next_base <span class="op">=</span> base <span class="op">+</span> <span class="op">(</span>t <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">*</span> kTile<span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>        <span class="dt">bool</span> has_next <span class="op">=</span> <span class="op">(</span>t <span class="op">+</span> <span class="dv">1</span> <span class="op">&lt;</span> my_tiles<span class="op">);</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Várunk az aktuális csempe másolására. A wait_prior(1) csak</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>        <span class="co">// a legutóbbi csoport (a következő csempe másolása) előtti</span></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>        <span class="co">// csoportot várja meg, azaz a jelenlegi csempét.</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>        __pipeline_wait_prior<span class="op">(</span>has_next <span class="op">?</span> <span class="dv">1</span> <span class="op">:</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Feldolgozzuk a jelenlegi puffert.</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span> i <span class="op">&lt;</span> kTile<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> idx <span class="op">=</span> base <span class="op">+</span> t <span class="op">*</span> kTile <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>            <span class="dt">float</span> val <span class="op">=</span> buf<span class="op">[</span>stage<span class="op">][</span>i<span class="op">];</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> w <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> w <span class="op">&lt;</span> work_per_element<span class="op">;</span> <span class="op">++</span>w<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a>                val <span class="op">=</span> <span class="fl">0.999</span><span class="bu">f</span> <span class="op">*</span> val <span class="op">+</span> <span class="fl">0.001</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> val<span class="op">;</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ha van következő csempe, indítsuk el a másolást a másik</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>        <span class="co">// pufferbe. A stage-indexet először átváltjuk.</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>has_next<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> next_stage <span class="op">=</span> stage <span class="op">^</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>            __pipeline_memcpy_async<span class="op">(&amp;</span>buf<span class="op">[</span>next_stage<span class="op">][</span><span class="dv">0</span><span class="op">],</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>                                    input <span class="op">+</span> next_base<span class="op">,</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>                                    bytes<span class="op">);</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>            __pipeline_commit<span class="op">();</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a>            stage <span class="op">=</span> next_stage<span class="op">;</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A feldolgozás után minden szálnak készen kell lennie a</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>        <span class="co">// pufferrel, mielőtt a következő iteráció felülírná.</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kódban a <code>stage</code> változó a két puffer közötti váltást
+jelzi. A <code>wait_prior</code> első hívása az adott iterációban a
+jelenlegi csempe másolását várja meg, miközben a következő csempe
+másolása már elindulhatott. Ha nincs következő csempe, a
+<code>wait_prior(0)</code> minden elkötelezett másolást bevár.</p>
+<p>A két <code>__syncthreads()</code> közül az első a másolás befejezése
+utáni láthatóságot biztosítja, a második pedig azt, hogy a következő
+iterációban a másolás ne kezdje el felülírni a még olvasott puffert. A
+kódban a <code>__pipeline_wait_prior</code> és a
+<code>__syncthreads</code> sorrendje kritikus; ha a
+<code>__syncthreads()</code> előbb lenne, a blokk egy része akkor is
+átléphetne a feldolgozásra, amikor még nem minden szál másolása
+végzett.</p>
+<p>A kétpufferes változat a szinkron változathoz képest akkor hoz
+jelentős gyorsulást, ha a másolási idő és a számítási idő összemérhető.
+Ha a számítási idő nagyon kicsi, a pipeline nem sokat segít, mert a
+blokk akkor is a memóriára vár. Ha a számítási idő nagyon nagy, a
+másolási idő eltörpül, és a pipeline szintén nem látszik jelentősnek. Az
+optimális tartomány az, amikor a másolás és a számítás időigénye hasonló
+nagyságrendű.</p>
+<h3 data-number="14.3.4"
+id="a-pipeline-mélysége-és-a-többszintű-szervezés"><span
+class="header-section-number">14.3.4</span> A pipeline mélysége és a
+többszintű szervezés</h3>
+<p>A kétpufferes pipeline egyszerre egy csempe másolását és egy csempe
+feldolgozását engedi. A hárompufferes pipeline tovább mélyíti az
+átfedést: miközben az egyik csempét feldolgozzuk, a következő már
+töltődik, a harmadik puffer pedig már fogadhatja az azt követő másolási
+kérelmet, vagy éppen előkészítés alatt áll.</p>
+<p>A mélyebb pipeline előnye, hogy a memória-alrendszer hosszabb ideig
+telítve marad. A <code>cp.async</code> másolások indítása nem blokkoló,
+ezért a szál gyorsan több másolási csoportot is elkötelezhet. A
+hardveres várakozási mechanizmusok pontosan ezt a több befejezetlen
+csoportot kezelik. A <code>wait_prior(n)</code> paramétere így a
+pipeline mélységét szabályozza. Ha a kernelben legfeljebb <code>D</code>
+befejezetlen másoláscsoport lehet, akkor a consumer szakasz előtt
+tipikusan <code>wait_prior(D-1)</code>-et hívunk, mert a legfrissebb
+csoport még hadd folyjon.</p>
+<p>A háromfokozatú változat vázlata a következő lehet:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// CUDA C++ 17, illusztráció; a pontos pufferszám és wait_prior érték</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// a cél GPU-n mérendő és ellenőrizendő.</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">constexpr</span> <span class="dt">int</span> kStages <span class="op">=</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> pipelined_transform_3stage<span class="op">(</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> input<span class="op">,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> work_per_element<span class="op">)</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    __shared__ <span class="dt">float</span> buf<span class="op">[</span>kStages<span class="op">][</span>kTile<span class="op">];</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tile_idx <span class="op">=</span> blockIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> base <span class="op">=</span> tile_idx <span class="op">*</span> kTile<span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> my_tiles <span class="op">=</span> <span class="op">(</span>n <span class="op">-</span> base <span class="op">+</span> kTile <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> kTile<span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>my_tiles <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> stage <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes <span class="op">=</span> kTile <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Az első kStages csempe másolását indítjuk el, amennyiben léteznek.</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> prefetch <span class="op">=</span> min<span class="op">(</span>kStages<span class="op">,</span> my_tiles<span class="op">);</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> p <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> p <span class="op">&lt;</span> prefetch<span class="op">;</span> <span class="op">++</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        __pipeline_memcpy_async<span class="op">(&amp;</span>buf<span class="op">[</span>p<span class="op">][</span><span class="dv">0</span><span class="op">],</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>                                input <span class="op">+</span> base <span class="op">+</span> p <span class="op">*</span> kTile<span class="op">,</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>                                bytes<span class="op">);</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        __pipeline_commit<span class="op">();</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> t <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> t <span class="op">&lt;</span> my_tiles<span class="op">;</span> <span class="op">++</span>t<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> next_tile <span class="op">=</span> t <span class="op">+</span> kStages<span class="op">;</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">bool</span> has_next <span class="op">=</span> <span class="op">(</span>next_tile <span class="op">&lt;</span> my_tiles<span class="op">);</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Várunk az aktuális csempe csoportjára. A legfeljebb</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>        <span class="co">// kStages-1 újabb csoportot hagyunk futni.</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        __pipeline_wait_prior<span class="op">(</span>has_next <span class="op">?</span> <span class="op">(</span>kStages <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">:</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Feldolgozás a buf[stage] pufferből.</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> threadIdx<span class="op">.</span>x<span class="op">;</span> i <span class="op">&lt;</span> kTile<span class="op">;</span> i <span class="op">+=</span> blockDim<span class="op">.</span>x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> idx <span class="op">=</span> base <span class="op">+</span> t <span class="op">*</span> kTile <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>            <span class="dt">float</span> val <span class="op">=</span> buf<span class="op">[</span>stage<span class="op">][</span>i<span class="op">];</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> w <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> w <span class="op">&lt;</span> work_per_element<span class="op">;</span> <span class="op">++</span>w<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>                val <span class="op">=</span> <span class="fl">0.999</span><span class="bu">f</span> <span class="op">*</span> val <span class="op">+</span> <span class="fl">0.001</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> val<span class="op">;</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A következő csempe másolását indítjuk az éppen felszabadult</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>        <span class="co">// pufferbe.</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>has_next<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> next_stage <span class="op">=</span> next_tile <span class="op">%</span> kStages<span class="op">;</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>            __pipeline_memcpy_async<span class="op">(&amp;</span>buf<span class="op">[</span>next_stage<span class="op">][</span><span class="dv">0</span><span class="op">],</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>                                    input <span class="op">+</span> base <span class="op">+</span> next_tile <span class="op">*</span> kTile<span class="op">,</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>                                    bytes<span class="op">);</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>            __pipeline_commit<span class="op">();</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>        stage <span class="op">=</span> <span class="op">(</span>stage <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> kStages<span class="op">;</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>        __syncthreads<span class="op">();</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a pufferszám és a pipeline mélysége egyaránt
+<code>kStages</code>. A <code>prefetch</code> az első néhány csempe
+másolását azonnal elindítja, hogy a pipeline ne induljon üresen. A
+<code>wait_prior(kStages - 1)</code> pontosan annyi csoportot hagy
+életben, amennyi a következő iterációk számára még kell.</p>
+<p>A mélység növelése nem korlátlanul kifizetődő. Minden újabb puffer
+shared memoryt foglal, és minden újabb szint szinkronizációs költséget,
+valamint regiszternyomást is jelenthet. A túl mély pipeline emellett
+csökkentheti az occupancy-t, mert a megnövekedett shared memoryigény
+miatt kevesebb blokk fér el egy SM-en. A legtöbb gyakorlati kernelben a
+2–4 szint a jellemző; a nagyobb mélység csak akkor indokolt, ha a
+másolási késleltetés nagyon nagy, vagy ha a számítási fázis rövid, de
+sűrűn ismétlődik.</p>
+<h3 data-number="14.3.5"
+id="hogyan-rejti-el-a-pipeline-az-adatmozgatást"><span
+class="header-section-number">14.3.5</span> Hogyan rejti el a pipeline
+az adatmozgatást?</h3>
+<p>A pipeline akkor működik jól, ha a fogyasztói fázis időtartama
+nagyobb vagy egyenlő a producer fázis időtartamánál. Ha a számítási idő
+<code>T_c</code>, a másolási idő <code>T_m</code>, és a szinkronizációs
+overhead <code>T_s</code>, akkor a kétpufferes változat egy csempére eső
+ideje közelítőleg:</p>
+<p><code>T_pipe ≈ max(T_c, T_m) + T_s</code></p>
+<p>A szinkron verzióban viszont:</p>
+<p><code>T_sync ≈ T_c + T_m + T_s</code></p>
+<p>Ez az idealizált modell azt mutatja, hogy a pipeline a két idő közül
+a nagyobbikra csökkenti a feldolgozási időt. Ha <code>T_c</code> és
+<code>T_m</code> egyenlő, a gyorsulás közel kétszeres. Ha az egyik
+sokkal nagyobb a másiknál, a gyorsulás elhanyagolható, mert a
+<code>max</code> értékét a nagyobb idő határozza meg.</p>
+<p>A valóságban a <code>T_m</code> és a <code>T_c</code> nem mindig
+független. A memória-sávszélességen több blokk osztozik, és a számítási
+egységek is versenyeznek a regiszterekért, a shared memoryért és a
+kibocsátási sávszélességért. Ezért a fenti formula inkább gondolati
+keret, mint pontos előrejelzés.</p>
+<p>A dupla pufferelés különösen akkor hatékony, ha a másolás időben
+elnyúlik, és közben a számítás nem szorul ugyanarra az erőforrásra. A
+<code>cp.async</code> utasítások a globális memória és a shared memory
+közötti útvonalat használják, míg az aritmetikai utasítások a
+regiszterfájlhoz és a végrehajtó egységekhez kötődnek. Ezért a két
+tevékenység nagyobb valószínűséggel futhat párhuzamosan.</p>
+<h3 data-number="14.3.6" id="tipikus-hibák-és-javításuk"><span
+class="header-section-number">14.3.6</span> Tipikus hibák és
+javításuk</h3>
+<p>Az alábbi hibák a leggyakrabban fordulnak elő a double buffering és
+pipeline implementációkban:</p>
+<ol type="1">
+<li><p><strong>A puffer felülírása a fogyasztás befejezése
+előtt.</strong><br />
+Ha a második <code>__syncthreads()</code> hiányzik, a gyors szálak
+elkezdhetik a következő csempe másolását abba a pufferba, amelyet a
+lassú szálak még olvasnak. A tünet nem determinisztikus: időnként helyes
+eredmény, időnként eltérés, és a hiba a mérési körülményektől függően
+eltűnhet vagy előjöhet. A megoldás az, hogy a feldolgozási ciklus után
+mindig <code>__syncthreads()</code> áll, mielőtt a puffer
+újrahasznosításra kerül.</p></li>
+<li><p><strong>A <code>wait_prior</code> és a
+<code>__syncthreads()</code> sorrendjének felcserélése.</strong><br />
+A <code>__syncthreads()</code> nem várja meg a folyamatban lévő
+aszinkron másolásokat. Ha valaki <code>__syncthreads()</code>-et hív a
+<code>wait_prior</code> elé, a blokk szálai átléphetnek a fogyasztói
+fázisba, miközben a saját másolási csoportjuk még nem fejeződött be. Ez
+versenyhelyzet, ezért a <code>wait_prior</code>-t mindig a
+<code>__syncthreads()</code> elé kell tenni.</p></li>
+<li><p><strong>Rossz <code>wait_prior</code> érték
+használata.</strong><br />
+A <code>wait_prior(0)</code> minden befejezetlen csoportot bevár, ezért
+nem hagy semmilyen átfedést. A túl nagy érték viszont megengedi, hogy a
+fogyasztó a még befejezetlen puffert olvassa. Az értéket a tényleges
+pipeline mélységhez kell igazítani, és a éles kódban érdemes fordítási
+idejű konstansként vagy jól dokumentált futtatási paraméterként
+kezelni.</p></li>
+<li><p><strong>Az első csempe másolásának elhagyása a ciklus
+előtt.</strong><br />
+Ha a pipeline az első iterációban nem talál betöltött csempét, a
+fogyasztó szakasz a inicializálatlan shared memoryból olvas. Ez gyakran
+NaN-ekben vagy nagy számértékekben jelentkezik, különösen FP32 esetén. A
+helyes minta az, hogy a belépés előtt legalább az első csempét
+elindítjuk.</p></li>
+<li><p><strong>A határok és az üres csempék kezelésének
+hibája.</strong><br />
+A <code>my_tiles</code>, a <code>has_next</code> és a
+<code>prefetch</code> logika gyakran hibás, ha a tömb mérete nem
+osztható a csempemérettel. A kernelnek pontosan kell kezelnie a hiányos
+utolsó csempét, és az írást globális indexellenőrzéssel kell védenie. A
+laborban érdemes többféle <code>n</code> értékkel futtatni, beleértve a
+<code>kTile - 1</code>, <code>kTile</code>, <code>kTile + 1</code> és
+<code>kStages * kTile</code> közeli méreteket is.</p></li>
+<li><p><strong>A túlzott mélység miatti
+occupancy-csökkenés.</strong><br />
+A mélyebb pipeline nagyobb shared memóriát foglal, ezért kevesebb blokk
+fér el SM-en. Ha a fogyasztói szakasz amúgy is sok szálat és regisztert
+használ, a mélység növelése akár lassulást is okozhat. A mérési naplóban
+ezért érdemes az occupancy, a shared memory és a regiszterhasználat
+értékeit is rögzíteni.</p></li>
+</ol>
+<h3 data-number="14.3.7"
+id="labor-két--és-többszintű-pipeline-mérése"><span
+class="header-section-number">14.3.7</span> Labor: két- és többszintű
+pipeline mérése</h3>
+<p>A labor célja, hogy a fenti mintát saját környezetben, ellenőrzött
+módon mérje. A következőkben egy CUDA C++ példát adunk, amely egy
+csempefeldolgozó kernelt valósít meg, és a szinkron, kétpufferes,
+valamint hárompufferes változatot hasonlítja össze. A kód nem tartalmaz
+valós hitelesítő adatot, és a futtatáshoz csak saját vagy engedélyezett
+GPU használható.</p>
+<h3 data-number="14.3.8" id="build-és-futtatás"><span
+class="header-section-number">14.3.8</span> Build és futtatás</h3>
+<p>A laborhoz CUDA 12.x toolkit és Compute Capability 8.0 támogatású GPU
+ajánlott. A fordítási parancs a következő lehet:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="dt">\</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="at">-I.</span> pipeline_lab.cu <span class="at">-o</span> pipeline_lab</span></code></pre></div>
+<p>A futtatás előtt a GPU-t ellenőrizni kell:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvidia-smi</span> <span class="at">--query-gpu</span><span class="op">=</span>name,driver_version,power.limit <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>           <span class="at">--format</span><span class="op">=</span>csv</span></code></pre></div>
+<p>A kernel futtatása előtt legalább 10 bemelegítő iterációt kell
+végezni, majd a mérést 5–10 ismétléssel, az átlag mellett a szórással
+együtt kell rögzíteni. A hibás vagy túl hosszú kernel futtatásához
+timeout-ot és izolált környezetet kell biztosítani.</p>
+<h3 data-number="14.3.9" id="a-mérési-napló-sablonja"><span
+class="header-section-number">14.3.9</span> A mérési napló sablonja</h3>
+<p>Az alábbi napló illusztráció; a számok nem mért értékek, hanem a
+laborban ellenőrizendő helyőrzők.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>NVIDIA RTX 4070 (helyőrző)</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>8.9 (helyőrző)</td>
+</tr>
+<tr class="odd">
+<td>DRAM</td>
+<td>12 GB (helyőrző)</td>
+</tr>
+<tr class="even">
+<td>CUDA</td>
+<td>12.4 (helyőrző)</td>
+</tr>
+<tr class="odd">
+<td>Driver</td>
+<td>550.54 (helyőrző)</td>
+</tr>
+<tr class="even">
+<td>OS</td>
+<td>Ubuntu 22.04 (helyőrző)</td>
+</tr>
+<tr class="odd">
+<td>Power limit</td>
+<td>200 W (helyőrző)</td>
+</tr>
+<tr class="even">
+<td>ECC</td>
+<td>off</td>
+</tr>
+<tr class="odd">
+<td>MIG</td>
+<td>off</td>
+</tr>
+<tr class="even">
+<td>n</td>
+<td>32 MiB float</td>
+</tr>
+<tr class="odd">
+<td>kTile</td>
+<td>4096 float</td>
+</tr>
+<tr class="even">
+<td>kThreads</td>
+<td>256</td>
+</tr>
+<tr class="odd">
+<td>work_per_element</td>
+<td>1, 4, 16</td>
+</tr>
+<tr class="even">
+<td>Ismétlések</td>
+<td>10</td>
+</tr>
+<tr class="odd">
+<td>Warm-up</td>
+<td>10</td>
+</tr>
+</tbody>
+</table>
+<p>A három kernelre mért átlagos futásidő (ms) és a sávszélesség (GB/s)
+a következő táblázatban foglalható össze:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: right;">work_per_element</th>
+<th style="text-align: right;">Sync</th>
+<th style="text-align: right;">2-stage</th>
+<th style="text-align: right;">3-stage</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4,2</td>
+<td style="text-align: right;">3,1</td>
+<td style="text-align: right;">2,9</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">5,8</td>
+<td style="text-align: right;">3,0</td>
+<td style="text-align: right;">2,9</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">9,1</td>
+<td style="text-align: right;">8,6</td>
+<td style="text-align: right;">8,5</td>
+</tr>
+</tbody>
+</table>
+<p>A fenti értékek <strong>nem mért eredmények</strong>, hanem a várható
+irányok illusztrációi. A valódi mérésnél a <code>work_per_element</code>
+növelésével a számítási idő nő, ezért a memóriaidő relatív súlya
+csökken. Alacsony <code>work_per_element</code> értéknél a pipeline
+hatása nagyobb, mert a másolás jelentős részt képvisel. Magas
+<code>work_per_element</code> értéknél a kernel számítás-korlátos, így a
+pipeline kevésbé látszik.</p>
+<p>A mérési naplóban a mért és a várt eredményt külön kell jelölni,
+ahogyan azt a könyv mérési szerződése előírja. A fenti táblázatban ezért
+szerepel a „helyőrző” megjegyzés.</p>
+<h3 data-number="14.3.10" id="a-mérés-értelmezése"><span
+class="header-section-number">14.3.10</span> A mérés értelmezése</h3>
+<p>A 2-stage változat az egyszerű szinkronhoz képest akkor gyorsul, ha a
+másolási időt sikerül a számítás alá rejteni. A 3-stage változat további
+kis gyorsulást adhat, de a nyereség csökkenő. A mérés során érdemes az
+<code>n</code> méretét is változtatni, mert kis méretnél a
+kernelindítási overhead dominál, nagy méretnél pedig a
+memória-sávszélesség telítődhet.</p>
+<p>A <code>cp.async</code> másolásoknak van egy minimális hasznos
+mérete. Kis csempéknél a másolásindítás és a szinkronizáció költsége
+nagyobb lehet, mint a megtakarított idő. A laborban érdemes a
+<code>kTile</code> értékét 1 KiB, 4 KiB, 16 KiB és 64 KiB között is
+változtatni, és a legjobb beállítást megkeresni.</p>
+<h3 data-number="14.3.11" id="opencl-és-jax-kitekintés"><span
+class="header-section-number">14.3.11</span> OpenCL és JAX
+kitekintés</h3>
+<p>A double buffering nem csak CUDA-specifikus. OpenCL-ben a
+<code>async_work_group_copy</code> vagy a
+<code>clEnqueueCopyBuffer</code> eseményekkel összekapcsolt
+parancssor-végrehajtás lehetővé teszi, hogy a másolás és a kernel
+végrehajtása átfedésben fusson. A munkacsoporton belüli puffereléshez
+hasonló elvek érvényesek, de a szinkronizációt a
+<code>barrier(CLK_LOCAL_MEM_FENCE)</code> és az események kombinációja
+adja.</p>
+<p>JAX-ban a pipeline-t jellemzően a XLA fordító automatikusan alakítja
+ki a <code>jax.lax</code> primitívek és a <code>jax.remat</code> vagy a
+megfelelő <code>scan</code> operátorok alapján. Haladó esetben a
+<code>jax.experimental.pallas</code> segítségével explicit,
+kernel-szintű pipeline írható, de ennek részletei túlmutatnak ezen
+alfejezet keretein. A TPU/OpenCL példáknál is fel kell tüntetni, ha a
+kód csak fordítási ellenőrzésen esett át, és nem futott valódi
+hardveren.</p>
+<h3 data-number="14.3.12" id="ellenőrző-kérdések"><span
+class="header-section-number">14.3.12</span> Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért kell két külön szinkronizációs pont egy kétpufferes pipeline
+iterációban? Melyik pont mit véd?</li>
+<li>Mi történik, ha a <code>__pipeline_wait_prior(1)</code> helyett
+<code>__pipeline_wait_prior(0)</code>-t hívunk a következő csempe
+másolásának indítása után?</li>
+<li>Hogyan változik a pipeline haszna, ha a számítási idő sokkal
+nagyobb, mint a másolási idő? Indokolja válaszát a
+<code>T_pipe ≈ max(T_c, T_m) + T_s</code> összefüggéssel.</li>
+</ol>
+<p>A válaszok ellenőrzéséhez a következő gondolatmenet használható. Az
+1. kérdésnél az első <code>__syncthreads()</code> a másolás befejezése
+utáni láthatóságot, a második a puffer újrahasznosításának biztonságát
+adja. A 2. kérdésnél a <code>wait_prior(0)</code> minden befejezetlen
+másolást bevár, ezért a következő csempe másolása nem folyik a számítás
+alatt, és a pipeline elveszti az átfedési előnyét. A 3. kérdésnél a
+<code>max(T_c, T_m)</code> értékét a nagy számítási idő határozza meg,
+ezért a csővezeték nem tudja csökkenteni a teljes időt, mert a
+memóriaidő eltörpül a számítás mellett.</p>
+<h3 data-number="14.3.13" id="a-következő-lépés"><span
+class="header-section-number">14.3.13</span> A következő lépés</h3>
+<p>A <a href="gpu053.html">Tiling és pipeline mérése</a> alfejezet ezt a
+fogalmat a tiling és a pipeline együttes mérésére terjeszti ki. Ott a
+<code>cp.async</code> mellett a hagyományos szinkron másolást, a
+vektorizált betöltést és a csempeformák hatását is összehasonlítjuk. Az
+itt bemutatott két- és hárompufferes minta lesz az alapja annak a mérési
+keretnek, amelyben a Roofline-modell és az occupancy közötti kapcsolatot
+is számszerűsíteni fogjuk.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu051.html">← 14.2 Aszinkron másolás (cp.async)</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu053.html">14.4 Tiling és pipeline mérése →</a></div>
+</nav>
+</body>
+</html>

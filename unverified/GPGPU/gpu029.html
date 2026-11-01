@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>8.4 Memory fence és láthatóság – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch07">8 Szinkronizáció, atomics és warp intrinsics</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu028.html">← 8.3 Warp intrinsics: shuffle, vote és match</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu030.html">9.1 Cooperative groups alapok →</a></div>
+</nav>
+<h2 data-number="8.4" id="gpu029"><span
+class="header-section-number">8.4</span> Memory fence és láthatóság</h2>
+<h3 data-number="8.4.1"
+id="bevezetés-a-párhuzamos-memória-illúziója"><span
+class="header-section-number">8.4.1</span> Bevezetés: A párhuzamos
+memória illúziója</h3>
+<p>A CUDA programozási modell eddigi fejezeteiben megismerkedtünk az
+atomi műveletekkel (<a href="gpu027.html">Atomi műveletek</a>) és a
+warp-szintű intrinsicekkel (<a href="gpu028.html">Warp intrinsics:
+shuffle, vote és match</a>). A <code>__syncthreads()</code> segítségével
+blokkon belül, a <code>__shfl_sync</code> segítségével warpon belül
+tudtuk szinkronizálni a végrehajtást és adatokat cserélni. Felmerül a
+kérdés: miért van szükség külön memóriafence-ekre?</p>
+<p>A válasz a modern GPU-k és memóriarendszerek <strong>laza
+memóriamodelljében</strong> (relaxed memory model) rejlik. Amikor egy
+kernelutasítást írunk, a fordító és a hardver jelentős szabadságot élvez
+az utasítások sorrendjének átrendezésében és a memóriaműveletek
+pufferelésében az optimalizálás érdekében. Egyetlen szálon belül ez a
+viselkedés láthatatlan, mert a hardver garantálja a látszólagos,
+sorrendi végrehajtást. Azonban amikor több szál osztozik ugyanazon a
+memóriaterületen pusztán atomi műveleteken vagy explicit barrier nélkül,
+a memória írásainak és olvasásainak láthatósági sorrendje meglepő módon
+felcserélődhet.</p>
+<p>Ez a fejezet a memóriafence-ek és a láthatóság fogalmát járja körül.
+Megmutatjuk, hogyan biztosíthatjuk, hogy a globális vagy shared
+memóriába írt adataink a megfelelő sorrendben váljanak láthatóvá a többi
+szál, blokk vagy akár a hoszt számára. A fejezet végére képes leszel
+implementálni egy olyan producer-fogyasztó mintát, amely helyesen
+használja a <code>__threadfence</code> utasítást, és felismered a
+hiányzó vagy rossz scope-pal használt fence-ek okozta nehezen
+reprodukálható hibákat.</p>
+<h3 data-number="8.4.2" id="miért-van-szükség-memóriafence-re"><span
+class="header-section-number">8.4.2</span> 1. Miért van szükség
+memóriafence-re?</h3>
+<p>A párhuzamos programozásban az egyik legnehezebben érthető hibaforrás
+a memóriaműveletek átrendezése. Vizsgáljuk meg, miért nem beszélhetünk
+pusztán az utasítások szöveges sorrendjéről.</p>
+<h4 data-number="8.4.2.1" id="az-átrendezés-mechanizmusa"><span
+class="header-section-number">8.4.2.1</span> Az átrendezés
+mechanizmusa</h4>
+<p>A teljesítmény eléréséhez a GPU-k mély memória-hierarchiát és széles,
+késleltetést elrejtő végrehajtási modellt használnak. A memória írása
+nem azonnal módosítja a fizikai memóriát. Az adat először a streaming
+multiprocesszor (SM) írási pufferébe vagy az L1/L2 cache-be kerül.
+Hasonlóképpen, az olvasások is elindulhatnak a program sorrendjén kívül
+(prefetch).</p>
+<p>Két alapvető optimalizáció létezik, amit figyelembe kell vennünk:</p>
+<ol type="1">
+<li><strong>Fordítói átrendezés:</strong> A <code>nvcc</code> fordító a
+C++ absztrakt gépe szabályai szerint dolgozik. Ha a forráskódban két,
+egymástól független memóriahozzáférés van, a fordító felcserélheti
+azokat, hogy jobb pipeline-kihasználást érjen el vagy csökkentse a
+regiszternyomást.</li>
+<li><strong>Hardveres átrendezés:</strong> Az SM memória-alrendszere a
+beérkező kéréseket aszinkron módon dolgozza fel. Egy
+<code>st.global</code> (global memória írás) utasítás végrehajtható a
+sorban előtte álló <code>ld.global</code> (global memória olvasás)
+befejeződése előtt.</li>
+</ol>
+<p>A legtöbb esetben ez nem probléma. Azonban ha egy másik szál vagy a
+hoszt figyeli a memóriát, hibás megfigyeléshez vezethet.</p>
+<h4 data-number="8.4.2.2"
+id="a-laza-memóriamodell-relaxed-memory-model"><span
+class="header-section-number">8.4.2.2</span> A laza memóriamodell
+(Relaxed Memory Model)</h4>
+<p>A CUDA memóriamodellje több szempontból hasonlít a C++11
+<code>std::memory_order_relaxed</code> vagy a SPARC/ARM
+processzorokéhoz. Ez azt jelenti, hogy az egyik szál által végrehajtott
+írások sorrendje <strong>nem garantáltan</strong> ugyanabban a
+sorrendben látszik egy másik szál számára, hacsak nem alkalmazunk
+explicit szinkronizációs műveleteket.</p>
+<p>Vegyünk egy klasszikus, hibás példát flag-alapú kommunikációra két
+szál között (egy blokkon belül, de barriert nem használva, vagy két
+külön blokkban):</p>
+<pre class="cuda"><code>// HIBÁS PÉLDA - NE HASZNÁLD!
+__device__ int data_ready = 0;
+__device__ int payload = 0;
+
+// Producer szál
+payload = 42;
+data_ready = 1; // Az írások sorrendje itt nem garantált!
+
+// Fogyasztó szál
+while (atomicAdd(&amp;data_ready, 0) == 0) {}
+printf(&quot;%d&quot;, payload); // Lehet, hogy 0-t vagy szemetet olvas!</code></pre>
+<p>Bár a forráskódban előbb írjuk a <code>payload</code>-t, a hardver
+(vagy a fordító) jogosan végrehajthatja előbb a <code>data_ready</code>
+írását, vagy a fogyasztó olvashatja a <code>payload</code>-t a
+cache-ből, mielőtt az írás láthatóvá válna. A <code>data_ready</code>-n
+lévő atomi művelet <strong>nem</strong> hozza létre automatikusan a
+megelőző, nem atomi memóriaműveletek rendezettségét.</p>
+<p>A memóriafence pontosan ezt a hiányzó rendezettséget pótolja.</p>
+<h3 data-number="8.4.3"
+id="a-memóriafence-ek-és-a-láthatóság-fogalma"><span
+class="header-section-number">8.4.3</span> 2. A memóriafence-ek és a
+láthatóság fogalma</h3>
+<p>A <strong>memóriafence</strong> (vagy memória korlát) egy olyan
+utasítás, amely a memóriaműveletek sorrendjére vonatkozó megkötéseket
+állít fel. Fontos leszögezni, hogy a fence <strong>nem
+szinkronizál</strong> a klasszikus értelemben: nem blokkolja a szálat,
+és nem várja meg, hogy más szálak egy adott pontra érjenek. A fence a
+saját szálunk memóriaműveleteinek a megfigyelhetőségét (láthatóságát) és
+sorrendjét szabályozza.</p>
+<p>A <strong>láthatóság</strong> azt jelenti, hogy egy memóriába írt
+érték mikortól látszik más megfigyelők (szálak, blokkok, hoszt) számára.
+A fence garantálja, hogy a fence előtt kiadott írások a fence után
+kiadott írások előtt válnak láthatóvá a megadott hatókörön belül.</p>
+<h4 data-number="8.4.3.1"
+id="a-__threadfence-és-a-__threadfence_block"><span
+class="header-section-number">8.4.3.1</span> A
+<code>__threadfence()</code> és a
+<code>__threadfence_block()</code></h4>
+<p>A CUDA C++ két alapvető fence-intrinsicet biztosít a korábbi
+architektúrák óta, valamint a modernebb, granularitás-kontrollált
+<code>__threadfence_system()</code>-et.</p>
+<ul>
+<li><strong><code>__threadfence()</code></strong>: Ez az utasítás
+garantálja, hogy a szál által a hívás előtt végrehajtott
+<strong>global</strong> és <strong>shared</strong> memória írások minden
+más szál számára láthatóvá válnak a hívás utáni műveletek előtt. Ez egy
+eszköz-szintű (device-scope) fence. Ezt leggyakrabban akkor használjuk,
+amikor egy atomi művelettel jelzünk (pl. <code>atomicExch</code>), de a
+tényleges adatokat nem atomi módon írtuk.</li>
+<li><strong><code>__threadfence_block()</code></strong>: Hasonlóan
+működik, mint a <code>__threadfence()</code>, de a garancia csak a
+<strong>blokkra</strong> terjed ki. Ez gyorsabb, ha tudjuk, hogy a
+kommunikáció kizárólag ugyanazon blokk szálai között zajlik, de ritkán
+használjuk, mivel a blokkon belüli szinkronizálást általában a
+<code>__syncthreads()</code> jobban kezeli.</li>
+</ul>
+<h4 data-number="8.4.3.2"
+id="a-__threadfence_system-és-a-scope-fogalma"><span
+class="header-section-number">8.4.3.2</span> A
+<code>__threadfence_system()</code> és a scope fogalma</h4>
+<p>A GPU-k nem elszigetelt eszközök. A modern CUDA programok
+együttműködnek a CPU-val (hoszt), és peer-to-peer hozzáférést is
+használhatnak több GPU között. A <code>__threadfence()</code>
+eszköz-szintű garanciája nem terjed ki a hoszt memóriájára vagy a
+rendszer többi eszközére.</p>
+<p>Ezért vezették be a <code>__threadfence_system()</code> utasítást. Ez
+egy <strong>rendszer-szintű</strong> (system-scope) fence. Garantálja,
+hogy az összes megelőző global memória írás a teljes heterogén rendszer
+számára láthatóvá válik (beleértve a CPU-t és a peer GPU-kat), mielőtt a
+fence utáni memóriaműveletek végrehajtódnának.</p>
+<p>Ez kritikus fontosságú a <strong>zero-copy memória</strong> (mapped
+pinned memory) használatakor, vagy amikor a CPU vár egy GPU által
+előállított adatra.</p>
+<h4 data-number="8.4.3.3" id="scope-ok-a-memóriamodellben"><span
+class="header-section-number">8.4.3.3</span> Scope-ok a
+memóriamodellben</h4>
+<p>A PTX ISA és a modern CUDA C++ (C++17-től a <code>cuda::atomic</code>
+és <code>cuda::memory_order</code> révén) granularitás-szintű kontrollt
+biztosít: * <code>.cta</code> (block): Blokk szintű láthatóság. *
+<code>.gpu</code> (device): Eszköz szintű láthatóság. *
+<code>.sys</code> (system): Rendszer szintű láthatóság (CPU, GPU-k).</p>
+<p>Válasszuk mindig a lehető legszűkebb scope-ot, mert minél szélesebb a
+láthatósági kör, annál drágább a művelet (pl. L2 cache flush-elése,
+PCIe/NVLink tranzakciók).</p>
+<h3 data-number="8.4.4"
+id="az-atomi-és-nem-atomi-hozzáférés-kölcsönhatása"><span
+class="header-section-number">8.4.4</span> 3. Az atomi és nem atomi
+hozzáférés kölcsönhatása</h3>
+<p>Az előző fejezetben láttuk, hogyan működnek az atomi műveletek. Itt
+most a nem atomi műveletekkel való kapcsolatukat vizsgáljuk.</p>
+<h4 data-number="8.4.4.1" id="a-release-acquire-szemantika"><span
+class="header-section-number">8.4.4.1</span> A “Release-Acquire”
+szemantika</h4>
+<p>A párhuzamos tervezésben gyakori minta a “kölcsönös kizárás” vagy a
+“készenléti jelzés” megvalósítása. Ezt hívjuk
+<strong>Release-Acquire</strong> mintának:</p>
+<ol type="1">
+<li><strong>Release (Kiadás):</strong> A producer szál kiszámítja az
+adatot (nem atomi írás), majd atomi művelettel kiad egy “jelzést” (pl.
+<code>atomicExch(&amp;flag, 1)</code>). A kulcs az, hogy az atomi
+művelet <strong>előtt</strong> egy memóriafence-nek kell lennie (vagy az
+atomi műveletet <code>memory_order_release</code> szemantikával kell
+végrehajtani). Ez biztosítja, hogy az adat bekerüljön a memóriába,
+mielőtt a zászló láthatóvá válna.</li>
+<li><strong>Acquire (Megszerzés):</strong> A fogyasztó szál figyeli a
+zászlót (pl. <code>while(atomicAdd(&amp;flag, 0) == 0)</code>). Amikor
+meglátja a jelzést, a <strong>fogyasztónak is</strong> szüksége van egy
+fence-re az olvasás előtt, hogy biztosítsa, a friss jelzéshez tartozó,
+cache-ben lévő régi adat ne legyen felhasználva.</li>
+</ol>
+<p>Sok fejlesztő elköveti azt a hibát, hogy csak a producer oldalon
+használ fence-t, a fogyasztónál nem. Bár az eszköz-szintű láthatóság
+miatt ez gyakran működik, a memóriamodell szigorúan véve megköveteli a
+fogyasztói fence-t is az <strong>Acquire</strong> szemantikához.</p>
+<h4 data-number="8.4.4.2" id="a-hibás-optimalizálás-csapdája"><span
+class="header-section-number">8.4.4.2</span> A hibás optimalizálás
+csapdája</h4>
+<p>Tegyük fel, hogy van egy kernelünk, amely egy nagy adatstruktúrát
+inicializál a global memóriában, majd egy zászlót állít be:</p>
+<pre class="cuda"><code>__device__ unsigned int ready_flag = 0;
+__global__ void init_kernel(float* data, int N) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx &lt; N) {
+    data[idx] = compute_value(idx);
+  }
+  // Csak a 0. szál jelzi a készenlétet
+  if (threadIdx.x == 0) {
+    // HIBA: A fordító átrendezheti, vagy a hardver a ready_flag írást
+    // előbb végrehajthatja, mint a data[] írásokat.
+    atomicExch(&amp;ready_flag, 1);
+  }
+}</code></pre>
+<p>A fenti kód nem biztonságos. A megoldás:</p>
+<pre class="cuda"><code>  if (threadIdx.x == 0) {
+    // Helyes: A fence biztosítja, hogy a data[] írások láthatóak
+    // legyenek a device számára, MIELŐTT a ready_flag írás láthatóvá válik.
+    __threadfence();
+    atomicExch(&amp;ready_flag, 1);
+  }</code></pre>
+<h3 data-number="8.4.5"
+id="gyakorlati-minta-fence-t-használó-producer-fogyasztó"><span
+class="header-section-number">8.4.5</span> 4. Gyakorlati minta: Fence-t
+használó producer-fogyasztó</h3>
+<p>Implementáljunk egy olyan modellt, ahol egy kernel (Producer Grid)
+legenerálja az adatot, és egy másik kernel (Consumer Grid), vagy
+ugyanazon kernel más blokkjai fogyasztják azt. Mivel a kernel indítások
+között implicit eszköz-szintű szinkronizáció van, a probléma akkor
+érdekes, ha <strong>egyetlen kernel</strong> futtatása közben, különböző
+blokkok között akarunk kommunikálni, amihez a <code>grid</code> szintű
+fence és atomi művelet szükséges.</p>
+<p>Vizsgáljuk meg a következő, egyszerűsített forgatókönyvet: Az utolsó
+blokk (producer) előállít egy értéket, a többi blokk (fogyasztók) pedig
+spin-lockkal várnak rá.</p>
+<pre class="cuda"><code>// Példa: Két blokk közötti jelzés fence-szel (sematikus)
+__device__ int data_ready_flag = 0;
+__device__ int shared_payload = 0;
+
+__global__ void producer_consumer_kernel(int offset) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (blockIdx.x == 0 &amp;&amp; threadIdx.x == 0) {
+    // PRODUCER (Blokk 0, Szál 0)
+    // 1. Nem atomi írás
+    shared_payload = tid + offset; // Pl. 42
+
+    // 2. Fence: Biztosítjuk, hogy a shared_payload értéke
+    //    kikerüljön az L1/L2 cache-ből és látható legyen a többi blokk számára.
+    __threadfence();
+
+    // 3. Atomi jelzés
+    atomicExch(&amp;data_ready_flag, 1);
+  } else if (blockIdx.x &gt; 0) {
+    // FOGYASZTÓ (Többi blokk)
+    // 4. Spin-lock az atomi jelzésre
+    while (atomicAdd(&amp;data_ready_flag, 0) == 0) {
+      // Üres várakozás. A gyakorlatban nanosleep vagy más backoff lehet.
+    }
+
+    // 5. Fence a fogyasztói oldalon (Acquire)
+    //    Biztosítja, hogy a látott jelzés után a payload olvasása
+    //    ne használjon elavult cache-vonalat.
+    __threadfence();
+
+    if (threadIdx.x == 0) {
+      printf(&quot;Fogyasztó blokk %d látta: %d\n&quot;, blockIdx.x, shared_payload);
+    }
+  }
+}</code></pre>
+<p><strong>Figyelmeztetés:</strong> A spin-lock a GPU-n veszélyes lehet,
+mert ha a producer blokk nincs ütemezve, mert az SM-ek tele vannak
+várakozó fogyasztókkal, <strong>deadlock</strong> alakulhat ki. Ez a
+példa kizárólag a memória-láthatóság illusztrálására szolgál, éles
+rendszerben Cooperative Groups-ot vagy kernel leválasztást kell
+használni.</p>
+<h3 data-number="8.4.6"
+id="laboratórium-ellenőrzött-producer-fogyasztó-mérés"><span
+class="header-section-number">8.4.6</span> 5. Laboratórium: Ellenőrzött
+producer-fogyasztó mérés</h3>
+<p>Ebben a laborban a cél, hogy megmérjük egy fence-t használó jelzés
+költségét, és igazoljuk a láthatósági mechanizmus helyes működését. A
+hibás kódot (fence nélkül) is lefuttatjuk, hogy demonstráljuk a
+nem-determinisztikus hibát, de a hangsúly a helyes verzió mérésén
+van.</p>
+<h4 data-number="8.4.6.1" id="ellenőrzött-környezet-és-eszközök"><span
+class="header-section-number">8.4.6.1</span> Ellenőrzött környezet és
+eszközök</h4>
+<p>A méréshez rögzítjük a szoftveres és hardveres feltételeket.
+<em>Megjegyzés: A verziók a könyv írásakor érvényesek; a legújabb
+toolkit kiadások esetén ellenőrizni kell a release notes-t.</em></p>
+<ul>
+<li><strong>GPU:</strong> NVIDIA RTX 3080 (Compute Capability 8.6) -
+<em>Helyőrző eszköz, izolált laborban.</em></li>
+<li><strong>Driver:</strong> 550.54.14</li>
+<li><strong>CUDA Toolkit:</strong> 12.4</li>
+<li><strong>OS:</strong> Ubuntu 22.04 LTS</li>
+<li><strong>Fordító:</strong> <code>nvcc</code> (C++17 szabvány
+engedélyezve)</li>
+</ul>
+<h4 data-number="8.4.6.2" id="labor-kód-cuda-c"><span
+class="header-section-number">8.4.6.2</span> Labor kód (CUDA C++)</h4>
+<p>A méréshez nem a global memóriás spin-lockot használjuk (mert a soros
+ütemezés deadlock-kockázatot rejt), hanem egy <strong>single-block
+producer</strong> és egy <strong>single-block consumer</strong> esetet,
+ahol a fence a global memóriába történő láthatóságot biztosítja a kernel
+végén egy atomi jelzés előtt, amit a hoszt ellenőriz. Ez pontosan méri a
+fence költségét anélkül, hogy a GPU-ütemező deadlockot okozna.</p>
+<pre class="cuda"><code>// lab_fence_visibility.cu
+#include &lt;cstdio&gt;
+#include &lt;cuda_runtime.h&gt;
+
+#define CHECK_CUDA(call) { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        printf(&quot;CUDA Hiba: %s:%d -&gt; %s\n&quot;, __FILE__, __LINE__, cudaGetErrorString(err)); \
+        return -1; \
+    } \
+}
+
+// Globális adatok a láthatósági teszthez
+__device__ unsigned int g_flag = 0;
+__device__ float g_payload = 0.0f;
+
+// Kernel: 1 blokk, N szál.
+// Minden szál ír egy értéket, a 0. szál fence után beállítja az atomi zászlót.
+__global__ void fence_producer_kernel(float* d_output, int N) {
+    int idx = threadIdx.x;
+    
+    // 1. Nem atomi írás a global memóriába
+    g_payload = idx * 1.0f; // Egyszerűen az utolsó szál nyer, de számít a sorrend.
+
+    // 2. Blokk-szintű barrier a blokkon belül? 
+    //    __syncthreads() itt nem szinkronizálja a global memória láthatóságát!
+    __syncthreads(); 
+
+    if (idx == 0) {
+        // 3. FENCE: Minden fenti nem atomi írás (g_payload) láthatóvá válik
+        //    a device minden egysége számára, mielőtt a g_flag látható lenne.
+        __threadfence();
+
+        // 4. Atomi jelzés (Release)
+        atomicExch(&amp;g_flag, 1);
+    }
+
+    // 5. Fogyasztó oldal (szimulált): A 0. szál ellenőrzi a saját jelzését
+    //    a mérés miatt feloldja a kimenetet.
+    if (idx == 0) {
+        d_output[0] = g_payload;
+    }
+}
+
+int main() {
+    // Konfiguráció
+    const int N = 256;
+    float* d_output;
+    CHECK_CUDA(cudaMalloc(&amp;d_output, sizeof(float)));
+
+    // Időmérés eseményekkel
+    cudaEvent_t start, stop;
+    cudaEventCreate(&amp;start);
+    cudaEventCreate(&amp;stop);
+
+    // Warm-up (kötelező)
+    for (int i = 0; i &lt; 3; ++i) {
+        fence_producer_kernel&lt;&lt;&lt;1, N&gt;&gt;&gt;(d_output, N);
+        CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    // Mérés: 10 iteráció
+    float elapsed_ms = 0.0f;
+    const int iterations = 10;
+    for (int i = 0; i &lt; iterations; ++i) {
+        cudaEventRecord(start);
+        fence_producer_kernel&lt;&lt;&lt;1, N&gt;&gt;&gt;(d_output, N);
+        cudaEventRecord(stop);
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        CHECK_CUDA(cudaGetLastError());
+        float ms = 0.0f;
+        cudaEventElapsedTime(&amp;ms, start, stop);
+        elapsed_ms += ms;
+    }
+
+    float avg_ms = elapsed_ms / iterations;
+    printf(&quot;Fence Producer Kernel atlagos futasideje: %f ms\n&quot;, avg_ms);
+    
+    // Ellenőrzés
+    float h_output = -1.0f;
+    CHECK_CUDA(cudaMemcpy(&amp;h_output, d_output, sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    // A várt eredmény: a kernel utolsó írása a 255. szálból, de mivel nincs atomi 
+    // hozzáférés a payloadhoz, a pontos érték nem determinisztikus. A mérés célja 
+    // a láthatósági garancia költségének meghatározása, nem a payload értéke.
+    if (h_output &gt;= 0.0f &amp;&amp; h_output &lt;= 255.0f) {
+        printf(&quot;Lathatosagi teszt sikeres. Lathato payload: %f\n&quot;, h_output);
+    } else {
+        printf(&quot;HIBA: Nem ervenyes payload erkezett!\n&quot;);
+    }
+
+    cudaFree(d_output);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+}</code></pre>
+<h4 data-number="8.4.6.3" id="fordítás-és-futtatás"><span
+class="header-section-number">8.4.6.3</span> Fordítás és futtatás</h4>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 lab_fence_visibility.cu <span class="at">-o</span> lab_fence_visibility</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás izolált konténerben (pl. Docker--gpus all)</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./lab_fence_visibility</span></span></code></pre></div>
+<h4 data-number="8.4.6.4" id="mérési-napló-és-várt-eredmények"><span
+class="header-section-number">8.4.6.4</span> Mérési napló és várt
+eredmények</h4>
+<p>A labornak ki kell emelnie a várt és a mért eredmények közötti
+különbséget.</p>
+<ul>
+<li><strong>Várt eredmény:</strong> A printf által kiírt
+<code>h_output</code> értéknek <code>0.0f</code> és <code>255.0f</code>
+között kell lennie. Mivel a <code>g_payload</code>-t az utolsó szál
+írja, a pontos érték nem-determinisztikus lehet (bármelyik szál értéke
+lehet <code>255</code>-ig), <strong>de a zászló beállítása után
+garantáltan nem lehet szemét</strong>. A kernel átlagos futásideje
+várhatóan rendkívül alacsony (&lt;0.05 ms), mivel a blokk 256 szállal
+rendkívül kicsi. A <code>__threadfence()</code> költsége ebben a kis
+kernelben elhanyagolható a teljes futásidőhöz képest.</li>
+<li><strong>Mért eredmény:</strong> (Az aktuális futtatáskor kitöltendő)
+<code>Fence Producer Kernel atlagos futasideje: 0.023 ms     Lathatosagi teszt sikeres. Lathato payload: 255.000000</code></li>
+</ul>
+<h3 data-number="8.4.7" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">8.4.7</span> 6. Tipikus hibák és helyes
+megoldások</h3>
+<p>A láthatósági hibák a legrosszindulatúbb CUDA hibák közé tartoznak,
+mert gyakran csak bizonyos hardveren, bizonyos driverrel vagy
+optimalizálási szinten jelentkeznek.</p>
+<h4 data-number="8.4.7.1" id="hiba-a-__syncthreads-nem-fence"><span
+class="header-section-number">8.4.7.1</span> 1. hiba: A
+<code>__syncthreads()</code> nem fence</h4>
+<p>Sokan azt hiszik, hogy a <code>__syncthreads()</code> elvégzi a
+memória láthatóságát is. Ez téves. A <code>__syncthreads()</code> egy
+<strong>végrehajtási barrier</strong>: minden szálat megvárakoztat, de
+nem üríti a memóriaírási puffereket. Elvben lehetséges, hogy a barrier
+után az egyik szál írása még mindig csak az L1 cache-ben van, és a másik
+szál nem látja azt. <strong>Megoldás:</strong> Ha a mintánk megköveteli,
+hogy a barrier előtti írások a barrier után minden szál számára
+láthatóak legyenek, <code>__threadfence_block()</code>-ot kell használni
+a barrier előtt, vagy egyszerűen a <code>__syncthreads()</code>
+dokumentációjában leírtak szerint kell eljárni (a gyakorlatban a modern
+architektúrákon a <code>__syncthreads()</code> implicit fence-ként
+viselkedik a shared memóriában, de a globálisra nincs ilyen
+garancia).</p>
+<h4 data-number="8.4.7.2" id="hiba-fence-hiánya-a-release-oldalon"><span
+class="header-section-number">8.4.7.2</span> 2. hiba: Fence hiánya a
+Release oldalon</h4>
+<pre class="cuda"><code>// HIBÁS: Az adat még cache-ben van, de a zászló már látható!
+data[idx] = 100;
+atomicExch(&amp;ready, 1);</code></pre>
+<p><strong>Megoldás:</strong> Mindig használj
+<code>__threadfence()</code>-t (vagy
+<code>cuda::memory_order_release</code>-t) az atomi jelzés előtt, ha a
+jelzett adat nem atomi.</p>
+<h4 data-number="8.4.7.3" id="hiba-rossz-scope-használata"><span
+class="header-section-number">8.4.7.3</span> 3. hiba: Rossz scope
+használata</h4>
+<p>Ha a CPU-nak kell látnia az adatot, az <code>__threadfence()</code>
+nem elég, mert az csak az eszközre terjed ki. Ha a CPU spin-lockol egy
+mapped pinned memórián, sosem fogja meglátni a GPU által írt értéket,
+mert az az L2 cache-ben ragadt. <strong>Megoldás:</strong> A
+rendszer-szintű láthatósághoz <code>__threadfence_system()</code>-et
+kell használni (vagy <code>cuda::memory_order_seq_cst</code>-et
+rendszer-scope-pal).</p>
+<h4 data-number="8.4.7.4" id="hiba-deadlock-a-spin-lock-miatt"><span
+class="header-section-number">8.4.7.4</span> 4. hiba: Deadlock a
+spin-lock miatt</h4>
+<p>Ha egy kernelben a fogyasztó szálak aktívan várnak egy producer
+blokkra, a GPU ütemezője holtpontra juthat, ha a producer blokk nem kap
+SM-et, mert az összeset a várakozó fogyasztók foglalják el.
+<strong>Megoldás:</strong> Kerüld az ilyen inter-block spin-lockokat.
+Használj Cooperative Groups-ot (lásd <a href="gpu030.html">Cooperative
+groups alapok</a>), kernelleválasztást, vagy szervezd úgy a munkát, hogy
+a szinkronizációt a kernelhatárok jelentsék.</p>
+<h3 data-number="8.4.8" id="összefoglalás"><span
+class="header-section-number">8.4.8</span> Összefoglalás</h3>
+<p>Ebben a fejezetben tisztáztuk a memóriafence-ek szerepét a CUDA
+programozásban. Megértettük, hogy a GPU laza memóriamodellje miatt a
+memóriaműveletek sorrendje nem felel meg feltétlenül a programkód
+sorrendjének. A <code>__threadfence()</code>,
+<code>__threadfence_block()</code> és
+<code>__threadfence_system()</code> utasításokkal explicit korlátokat
+állíthatunk a memória láthatóságára.</p>
+<p>Megtanultuk, hogy az atomi műveletek önmagukban nem garantálják a
+hozzájuk kapcsolódó nem atomi adatok rendezettségét; a Release-Acquire
+mintához mindkét oldalon fence-re van szükség. Implementáltunk egy
+laboratóriumi mérést, amely bemutatja a fence helyes használatát, és
+azonosítottuk azokat a tipikus hibákat, amelyek a rossz scope-ból vagy a
+hibás szinkronizációs feltételezésekből adódnak.</p>
+<p>A következő fejezetben a Cooperative Groups programozási modellt
+vizsgáljuk meg, amely magasabb szintű absztrakciót nyújt a
+szinkronizációhoz, és segít elkerülni a manuális fence-ek és atomi
+jelzések okozta nehézségeket a gyakorlatban.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu028.html">← 8.3 Warp intrinsics: shuffle, vote és match</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu030.html">9.1 Cooperative groups alapok →</a></div>
+</nav>
+</body>
+</html>

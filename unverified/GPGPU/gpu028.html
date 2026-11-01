@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>8.3 Warp intrinsics: shuffle, vote és match – GPGPU – általános
+célú számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch07">8 Szinkronizáció, atomics és warp intrinsics</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu027.html">← 8.2 Atomi műveletek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu029.html">8.4 Memory fence és láthatóság →</a></div>
+</nav>
+<h2 data-number="8.3" id="gpu028"><span
+class="header-section-number">8.3</span> Warp intrinsics: shuffle, vote
+és match</h2>
+<p>A warp-szintű kommunikáció a CUDA egyik leghatékonyabb eszköze, mert
+kihasználja, hogy a warp fizikailag is együtt ütemezett, ezért a szálak
+közötti adatcsere megvalósítható regiszterek szintjén, anélkül hogy a
+lassú osztott vagy globális memóriát érintenénk. Ebben az alfejezetben a
+<code>__shfl_sync</code>, a <code>__ballot_sync</code> és a
+<code>__match_any_sync</code> intrinsiceket vizsgáljuk, különös
+tekintettel a szinkronizációs maszkokra, amelyek a Volta architektúra
+óta kötelezőek és a helyes használat kulcsai.</p>
+<h3 data-number="8.3.1"
+id="miért-van-szükség-warp-szintű-kommunikációra"><span
+class="header-section-number">8.3.1</span> Miért van szükség warp-szintű
+kommunikációra?</h3>
+<p>A GPU programozási modelljében a szálak blokkokba és warpokba
+szerveződnek. Egy warp 32 szálból áll, és a hardver ezeket a szálakat
+egyszerre, lockstep módon hajtja végre. Ez a szoros együttműködés
+lehetővé teszi, hogy a szálak közvetlenül hozzáférjenek egymás
+regisztereinek bizonyos értékeihez, anélkül hogy a globális vagy az
+osztott memórián keresztül bonyolult és lassú adatcserét kellene
+végrehajtani. A hagyományos megoldás, a shared memory +
+<code>__syncthreads()</code>, minden adatcserénél szinkronizációs pontot
+és memóriaműveleteket igényel. A warp intrinsicek ezzel szemben egyetlen
+hardveres utasítással végzik el a szomszédos szálak közötti adatcserét,
+ráadásul a warp eleve szinkronban van, így nincs szükség explicit
+barrierre. Ez alacsony késleltetést és nagy sávszélességet eredményez,
+ami különösen fontos a redukciók, a rendezés, a prefix összegek és a
+szavazásos algoritmusok esetén.</p>
+<h3 data-number="8.3.2" id="szinkronizációs-maszkok-alapjai"><span
+class="header-section-number">8.3.2</span> Szinkronizációs maszkok
+alapjai</h3>
+<p>A Volta architektúra bevezetésével a CUDA végrehajtási modellje
+finomabb lett: a szálak ütemezése nem garantálja, hogy egy warp összes
+szál mindig egyszerre, szigorú lockstepben hajtódik végre. Emiatt a
+régi, implicit warp-szinkronra épülő intrinsicek (például a maszk
+nélküli <code>__shfl</code>, <code>__ballot</code>) nem biztonságosak.
+Az új, <code>_sync</code> utótagú intrinsicek ezért megkövetelik, hogy a
+programozó explicit módon megadja, mely szálak vesznek részt az adott
+műveletben. Ezt a halmazt <strong>szinkronizációs maszknak</strong>
+(sync mask) nevezzük.</p>
+<p>A maszk egy 32 bites előjel nélküli egész szám, amelyben az i-edik
+bit az i-edik lane-t (a warp i-edik szálát) jelöli. Ha egy bit 1, a
+hozzá tartozó szál részt vesz a műveletben. Az összes résztvevő szálnak
+ugyanazt a maszkot kell megadnia, különben a viselkedés nem definiált. A
+maszk nem lehet 0, és minden benne jelölt szálnak aktívnak kell lennie a
+hívás pillanatában. A maszkot a programozó kézzel is megadhatja, például
+<code>0xffffffff</code> jelöli a teljes, konvergens warp-ot. Divergens
+warp esetén azonban csak a konvergens ágban lévő szálakat szabad
+feltüntetni.</p>
+<p>A <code>__activemask()</code> intrinsic lekérdezi az éppen aktív
+szálak maszkját. Bár kényelmes, óvatosan kell használni, mert az értéke
+attól függ, hogy a hívás pillanatában milyen divergencia áll fenn. Ha a
+maszkot egy olyan ponton mentjük el, ahol minden szál aktív, majd később
+egy divergens ágban használjuk, a maszk már nem lesz helyes, és
+definiálatlan viselkedéshez vezethet. A legjobb gyakorlat, hogy a
+maszkot közvetlenül az intrinsic hívása előtt, a konvergens szakaszban
+számoljuk ki, vagy kézzel adjuk meg, ha pontosan tudjuk, mely szálak
+futnak.</p>
+<h3 data-number="8.3.3" id="shfl_sync-és-változatai"><span
+class="header-section-number">8.3.3</span> <code>__shfl_sync</code> és
+változatai</h3>
+<p>A shuffle intrinsic lehetővé teszi, hogy egy warp szálai közvetlenül
+hozzáférjenek egymás regisztereinek értékéhez. A leggyakoribb változat a
+<code>__shfl_sync</code>:</p>
+<pre class="cuda"><code>T __shfl_sync(unsigned mask, T var, int srcLane, int width = 32);</code></pre>
+<p>Minden résztvevő szál visszaadja a <code>srcLane</code> sorszámú szál
+<code>var</code> változójának értékét. A <code>width</code> paraméter
+lehetővé teszi, hogy a warp kisebb alcsoportokra osztódjon; ilyenkor az
+indexelés a csoport elejéhez képest értendő. Ha a <code>srcLane</code>
+kívül esik az aktuális csoporton, a hívó szál a saját <code>var</code>
+értékét kapja vissza (clamp nélküli változat). A gyakorlatban a
+<code>width</code> alapértelmezett 32, így a teljes warpra
+vonatkozik.</p>
+<p>Példa szétszórásra (broadcast), ahol minden szál megkapja a 0. sáv
+értékét:</p>
+<pre class="cuda"><code>float leader_val = __shfl_sync(0xffffffff, val, 0);</code></pre>
+<p>Ezután minden szál <code>leader_val</code>-ja a warp 0. lane-jének
+<code>val</code> értékét tartalmazza.</p>
+<p>A redukciókhoz azonban a <code>__shfl_down_sync</code> és a
+<code>__shfl_xor_sync</code> változatok praktikusabbak. A
+<code>__shfl_down_sync</code> a magasabb sorszámú száltól veszi az
+értéket:</p>
+<pre class="cuda"><code>T __shfl_down_sync(unsigned mask, T var, unsigned delta, int width = 32);</code></pre>
+<p>Minden szál a <code>lane + delta</code> sáv <code>var</code>-ját
+kapja meg. Ha a cél sáv kívül esik a csoporton, a saját érték marad. Ez
+a minta ideális a fa alapú redukcióhoz:</p>
+<pre class="cuda"><code>float val = input[tid];
+for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+}</code></pre>
+<p>Itt az első lépésben a 0–15. sávok a 16–31. sávoktól kapnak értéket,
+majd a 0–7. sávok a 8–15.-től, és így tovább. A ciklus végén a 0. sávban
+van a teljes warp összege.</p>
+<p>A <code>__shfl_xor_sync</code> a butterfly mintázatot valósítja
+meg:</p>
+<pre class="cuda"><code>T __shfl_xor_sync(unsigned mask, T var, int laneMask, int width = 32);</code></pre>
+<p>Itt a hívó szál a <code>lane ^ laneMask</code> sávtól kap értéket,
+ahol <code>laneMask</code> általában 1, 2, 4, 8 vagy 16. Ez a módszer
+akkor hasznos, ha minden szálnak meg kell kapnia a redukció
+részeredményét, például prefix összegeknél vagy rendezésnél. A
+redukciónál is használható, de a <code>__shfl_down_sync</code>
+kényelmesebb, mert csak a 0. sávnak kell az eredmény.</p>
+<p>Fontos szabályok: - A maszknak minden résztvevő szálat tartalmaznia
+kell. Ha a warp divergens, a maszk csak az éppen konvergens szálakat
+jelölheti. - A forrás sávnak aktívnak kell lennie a maszkban. Ha nem
+aktív, a visszatérési érték nem definiált. - A <code>width</code>
+paraméternek 2 hatványának kell lennie, és legfeljebb 32. - A régi,
+maszk nélküli <code>__shfl</code>, <code>__shfl_down</code> stb.
+elavultak, és Volta+ architektúrán nem biztonságosak.</p>
+<h3 data-number="8.3.4" id="ballot_sync"><span
+class="header-section-number">8.3.4</span>
+<code>__ballot_sync</code></h3>
+<p>A <code>__ballot_sync</code> a warp-szintű szavazás eszköze. Minden
+résztvevő szál kiértékeli a predikátumát, és az intrinsic egyetlen 32
+bites maszkot ad vissza, amelyben az i-edik bit 1, ha az i-edik szál
+predikátuma igaz volt. A függvény szignatúrája:</p>
+<pre class="cuda"><code>unsigned __ballot_sync(unsigned mask, int predicate);</code></pre>
+<p>Minden szál ugyanazt a maszkot kapja vissza, ezért a szavazás
+eredménye könnyen továbbadható. A leggyakoribb felhasználási esetek:</p>
+<ul>
+<li>Annak eldöntése, hogy van-e olyan szál, amelyre igaz a feltétel:
+<code>__popc(ballot) &gt; 0</code>.</li>
+<li>A feltételt teljesítő szálak számának meghatározása:
+<code>__popc(ballot)</code>.</li>
+<li>Az első olyan szál indexének meghatározása, amelyre igaz a feltétel:
+<code>__ffs(ballot) - 1</code> (az <code>__ffs</code> a legkisebb
+beállított bit pozícióját adja 1-től indexelve).</li>
+<li>Vezető szál kiválasztása a konvergens ágban, például
+memóriafelszabadításnál vagy egyetlen szál által végrehajtandó
+műveletnél.</li>
+</ul>
+<p>Példa: egy warpban megkeressük az első negatív elemet:</p>
+<pre class="cuda"><code>unsigned mask = __ballot_sync(0xffffffff, val &lt; 0.0f);
+int leader = __ffs(mask) - 1;  // 0, ha nincs ilyen
+if (leader &gt;= 0 &amp;&amp; (int)(threadIdx.x % 32) == leader) {
+    // csak a kiválasztott szál hajtja végre
+}</code></pre>
+<p>A <code>__ballot_sync</code> különösen hasznos olyan esetekben, ahol
+a divergens ágakból kell visszatérni, vagy amikor a szálak közötti
+feltételes viselkedést kell összesíteni anélkül, hogy osztott memóriát
+használnánk.</p>
+<h3 data-number="8.3.5" id="match_any_sync"><span
+class="header-section-number">8.3.5</span>
+<code>__match_any_sync</code></h3>
+<p>A <code>__match_any_sync</code> lehetővé teszi, hogy a warp szálai
+csoportosítsák magukat egy adott kulcs szerint. A függvény visszaad egy
+maszkot, amelyben azok a sávok szerepelnek, amelyeknek ugyanaz az
+értékük, mint a hívó szál értéke:</p>
+<pre class="cuda"><code>unsigned __match_any_sync(unsigned mask, T value);</code></pre>
+<p>A <code>T</code> lehet 32 vagy 64 bites egész, illetve lebegőpontos
+típus. A visszaadott maszk minden résztvevő szál számára a saját
+kulcsának megfelelő csoportot jelöli. Ez a mechanizmus hasznos például
+duplikátumok keresésére, particionálásra vagy olyan algoritmusokban,
+ahol a warp szálait érték szerint kell csoportosítani.</p>
+<p>Példa: keressük meg, mely szálak osztoznak ugyanazon a kulcson:</p>
+<pre class="cuda"><code>int key = data[tid];
+unsigned same = __match_any_sync(0xffffffff, key);
+if (__popc(same) &gt; 1) {
+    // ez a szál egy csoport tagja, ahol legalább egy másik szál is ugyanazt a kulcsot kapta
+}
+int leader = __ffs(same) - 1; // a csoport vezetője</code></pre>
+<p>Létezik <code>__match_all_sync</code> is, amely akkor ad vissza
+teljes maszkot, ha minden szál értéke azonos; ellenkező esetben 0-t ad.
+Ez gyors egyezőség-ellenőrzést tesz lehetővé anélkül, hogy a memóriában
+kellene összehasonlítani.</p>
+<p>A <code>__match_any_sync</code> a legújabb architektúrákon (Volta és
+újabb) érhető el, és hatékony hardveres támogatást kap.</p>
+<h3 data-number="8.3.6"
+id="szinkronizációs-maszkok-a-gyakorlatban"><span
+class="header-section-number">8.3.6</span> Szinkronizációs maszkok a
+gyakorlatban</h3>
+<p>A maszkok helyes használata a warp intrinsicek leggyakoribb hibája.
+Foglaljuk össze a legfontosabb szabályokat:</p>
+<ol type="1">
+<li><strong>A maszk nem lehet 0.</strong> Ha nincs aktív szál, nem
+szabad meghívni az intrinsicet.</li>
+<li><strong>A maszknak minden résztvevő szálat tartalmaznia
+kell.</strong> Ha egy szál a maszkban 0 bitet kap, de mégis aktív, az
+nem hiba, de ha egy szál a maszkban 1 bitet kap, de nem aktív, az
+undefined viselkedés.</li>
+<li><strong>Az összes résztvevő szálnak ugyanazt a maszkot kell
+megadnia.</strong> Ez azt jelenti, hogy a maszk értékét nem szabad
+szálanként eltérően kiszámolni.</li>
+<li><strong>A maszknak a hívás pillanatában konvergens szálakat kell
+jelölnie.</strong> Divergens warpban csak a konvergens ág szálai
+szerepelhetnek.</li>
+<li><strong>A <code>__activemask</code> használatakor ügyeljünk arra,
+hogy a maszk a hívás időpontjában érvényes legyen.</strong> Ne mentsük
+el a teljes konvergens maszkot, majd használjuk egy későbbi divergens
+szakaszban.</li>
+</ol>
+<p>Példa hibás kódra:</p>
+<pre class="cuda"><code>unsigned mask = __activemask(); // minden szál aktív, mask = 0xffffffff
+if (threadIdx.x &lt; 16) {
+    // Ez az ág csak 16 szálon fut, de a mask még mindig 0xffffffff
+    float v = __shfl_sync(mask, val, 0); // HIBA: a maszk olyan szálakat is jelöl, amelyek nem aktívak
+}</code></pre>
+<p>Helyes megoldás: a maszkot az ágon belül számítsuk ki, vagy adjuk meg
+kézzel a konvergens szálak maszkját (például <code>0x0000ffff</code>, ha
+az alsó 16 szál aktív).</p>
+<p>Egy másik tipikus hiba, amikor a maszkot a <code>__ballot_sync</code>
+visszatérési értékéből származtatjuk, de a szavazás után a szálak
+divergálnak, és a maszkot később egy másik intrinsicben használjuk. A
+maszkot mindig az adott intrinsic hívásához kell igazítani.</p>
+<h3 data-number="8.3.7" id="labor-warp-shuffle-és-vote-példa"><span
+class="header-section-number">8.3.7</span> Labor: warp shuffle és vote
+példa</h3>
+<p>A következő labor egy egyszerű CUDA programot mutat be, amely két
+kernelt tartalmaz: az első egy warp-szintű redukciót valósít meg
+<code>__shfl_down_sync</code> segítségével, a második pedig egy
+szavazást <code>__ballot_sync</code> segítségével. A kód fordítható és
+futtatható, a hibákat makróval ellenőrizzük, és a CPU oldalon
+referenciát számolunk.</p>
+<h3 data-number="8.3.8" id="kód-warp_intrinsics_demo.cu"><span
+class="header-section-number">8.3.8</span> Kód:
+<code>warp_intrinsics_demo.cu</code></h3>
+<pre class="cuda"><code>#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;vector&gt;
+
+// Hibakezelő makró
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = call;                                                \
+        if (err != cudaSuccess) {                                              \
+            std::fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__,        \
+                         __LINE__, cudaGetErrorString(err));                   \
+            std::exit(EXIT_FAILURE);                                           \
+        }                                                                      \
+    } while (0)
+
+// Warp-szintű redukció shuffle_down-nal, majd atomiAdd az eredményre
+__global__ void warp_reduce_kernel(const float* input, float* output) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    float val = input[tid];
+
+    // Warp redukció: a 0. sáv kapja az összeget
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+
+    // Minden warp 0. sávja atomikusan hozzáadja a részösszeget
+    if ((threadIdx.x &amp; 31) == 0) {
+        atomicAdd(output, val);
+    }
+}
+
+// Szavazó kernel: minden szál arról szavaz, hogy a threadIdx.x páros-e
+__global__ void warp_vote_kernel(unsigned int* masks, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid &gt;= n) return;
+
+    // A szavazás: a predikátum igaz, ha a szál indexe a blokkon belül páros
+    unsigned int mask = __ballot_sync(0xffffffff, (threadIdx.x &amp; 1) == 0);
+
+    // Csak a warp első szálja menti a maszkot
+    if ((threadIdx.x &amp; 31) == 0) {
+        // A maszkok tömbjébe írjuk: blokk * warpsPerBlock + warpIndex
+        masks[blockIdx.x * (blockDim.x / 32) + (threadIdx.x &gt;&gt; 5)] = mask;
+    }
+}
+
+int main() {
+    constexpr int n = 1 &lt;&lt; 12;          // 4096 elem
+    constexpr int blockDim = 256;       // 8 warp / blokk
+    constexpr int gridDim = (n + blockDim - 1) / blockDim; // 16 blokk
+    constexpr int warpsPerBlock = blockDim / 32;
+    constexpr int numWarps = gridDim * warpsPerBlock;
+
+    // Host oldali adatok
+    std::vector&lt;float&gt; h_input(n, 1.0f);  // minden elem 1.0
+    float h_output = 0.0f;
+    std::vector&lt;unsigned int&gt; h_masks(numWarps, 0);
+
+    // Device memória
+    float *d_input, *d_output;
+    unsigned int *d_masks;
+    CUDA_CHECK(cudaMalloc(&amp;d_input, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_output, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_masks, numWarps * sizeof(unsigned int)));
+
+    // Másolás és inicializálás
+    CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), n * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_output, 0, sizeof(float)));
+
+    // Kernel indítás
+    warp_reduce_kernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(d_input, d_output);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    warp_vote_kernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(d_masks, n);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Eredmények visszamásolása
+    CUDA_CHECK(cudaMemcpy(&amp;h_output, d_output, sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_masks.data(), d_masks,
+                          numWarps * sizeof(unsigned int),
+                          cudaMemcpyDeviceToHost));
+
+    // CPU referencia
+    float expected_sum = static_cast&lt;float&gt;(n); // mivel minden elem 1.0
+    std::vector&lt;unsigned int&gt; expected_masks(numWarps, 0);
+    for (int w = 0; w &lt; numWarps; ++w) {
+        // Minden warpban a páros lane-ek bitjei 1-esek
+        // A warp teljes, mert n és blockDim osztható 32-vel
+        expected_masks[w] = 0x55555555u;
+    }
+
+    // Ellenőrzés
+    bool ok = true;
+    if (std::fabs(h_output - expected_sum) &gt; 1e-3f) {
+        std::fprintf(stderr, &quot;Redukció hibás: kapott %f, várt %f\n&quot;,
+                     h_output, expected_sum);
+        ok = false;
+    }
+    for (int w = 0; w &lt; numWarps; ++w) {
+        if (h_masks[w] != expected_masks[w]) {
+            std::fprintf(stderr, &quot;Vote maszk hibás a(z) %d warpban: kapott 0x%08X, várt 0x%08X\n&quot;,
+                         w, h_masks[w], expected_masks[w]);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        std::printf(&quot;Minden ellenőrzés sikeres.\n&quot;);
+        std::printf(&quot;Redukció eredménye: %f (várt %f)\n&quot;, h_output, expected_sum);
+        std::printf(&quot;Első néhány vote maszk: 0x%08X, 0x%08X\n&quot;,
+                    h_masks[0], h_masks[1]);
+    }
+
+    // Tisztítás
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_masks));
+
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}</code></pre>
+<h3 data-number="8.3.9" id="build-és-futtatás"><span
+class="header-section-number">8.3.9</span> Build és futtatás</h3>
+<p>A kódot C++17 szabvánnyal, a megfelelő architektúrára fordítjuk.
+Például egy NVIDIA RTX 3080 (compute capability 8.6) esetén:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> warp_intrinsics_demo warp_intrinsics_demo.cu</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./warp_intrinsics_demo</span></span></code></pre></div>
+<p>Ha a GPU régebbi, például compute capability 7.0, az
+<code>-arch=sm_70</code> flag használható. A program sikeres futtatás
+esetén a <code>"Minden ellenőrzés sikeres."</code> üzenetet írja ki.</p>
+<h3 data-number="8.3.10" id="mérési-napló"><span
+class="header-section-number">8.3.10</span> Mérési napló</h3>
+<p>A laborhoz tartozó mérési naplót az alábbi táblázat szerint kell
+kitölteni. A várható eredmény a CPU-referenciából származik; a mért
+oszlopot a futtatás után kell rögzíteni.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU modell</td>
+<td>NVIDIA GeForce RTX 3080 (példa)</td>
+</tr>
+<tr class="even">
+<td>Compute capability</td>
+<td>8.6</td>
+</tr>
+<tr class="odd">
+<td>Driver</td>
+<td>550.54.14</td>
+</tr>
+<tr class="even">
+<td>CUDA verzió</td>
+<td>12.5</td>
+</tr>
+<tr class="odd">
+<td>Operációs rendszer</td>
+<td>Ubuntu 22.04 LTS</td>
+</tr>
+<tr class="even">
+<td>Fordítási parancs</td>
+<td><code>nvcc -std=c++17 -arch=sm_86 ...</code></td>
+</tr>
+<tr class="odd">
+<td>Input méret (<code>n</code>)</td>
+<td>4096</td>
+</tr>
+<tr class="even">
+<td>Block méret</td>
+<td>256</td>
+</tr>
+<tr class="odd">
+<td>Grid méret</td>
+<td>16</td>
+</tr>
+<tr class="even">
+<td>Warm-up iterációk</td>
+<td>5</td>
+</tr>
+<tr class="odd">
+<td>Mért iterációk</td>
+<td>20</td>
+</tr>
+<tr class="even">
+<td>Redukció várt eredménye</td>
+<td>4096.0</td>
+</tr>
+<tr class="odd">
+<td>Redukció mért eredménye</td>
+<td><em>(olvasói mérés)</em></td>
+</tr>
+<tr class="even">
+<td>Vote maszk várt értéke</td>
+<td>0x55555555 minden warpban</td>
+</tr>
+<tr class="odd">
+<td>Vote maszk mért értéke</td>
+<td><em>(olvasói mérés)</em></td>
+</tr>
+<tr class="even">
+<td>Kernel futási idő (átlag)</td>
+<td><em>(olvasói mérés)</em></td>
+</tr>
+<tr class="odd">
+<td>Szórás / percentilis</td>
+<td><em>(olvasói mérés)</em></td>
+</tr>
+<tr class="even">
+<td>Megjegyzés</td>
+<td>A kód időmérést nem tartalmaz; az</td>
+</tr>
+<tr class="odd">
+<td></td>
+<td>időmérést <code>cudaEvent</code>-tel lehet</td>
+</tr>
+<tr class="even">
+<td></td>
+<td>hozzáadni, vagy <code>nsys</code> profilozóval.</td>
+</tr>
+</tbody>
+</table>
+<p>A mért futásidő és a várt/mért eredmények elkülönítése biztosítja,
+hogy az olvasó reprodukálhatóan ellenőrizhesse a kernelek működését.</p>
+<h3 data-number="8.3.11" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">8.3.11</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A warp intrinsicek használata során a következő hibák fordulnak elő
+leggyakrabban:</p>
+<ol type="1">
+<li><strong>Elavult, maszk nélküli intrinsic használata.</strong> A
+<code>__shfl</code>, <code>__ballot</code> stb. Volta+ architektúrán nem
+biztonságosak. Mindig a <code>_sync</code> változatot használjuk, és
+adjuk meg a maszkot.</li>
+<li><strong>Helytelen maszk divergens warpban.</strong> Ha a warp egy
+része kilépett, a maszknak csak az aktív szálakat kell tartalmaznia. A
+teljes <code>0xffffffff</code> maszk használata ilyenkor undefined
+viselkedést okoz.</li>
+<li><strong>A forrás sáv nem aktív.</strong> Ha a
+<code>__shfl_sync</code> forrás sávja nem szerepel a maszkban, az
+eredmény nem definiált. Ezt különösen akkor kell ellenőrizni, ha a
+<code>srcLane</code> dinamikusan számított.</li>
+<li><strong>A maszk nincs összhangban a <code>width</code>
+paraméterrel.</strong> Ha a <code>width</code> kisebb, mint a warp
+mérete, a maszknak a csoporton belüli szálakat kell jelölnie, nem
+feltétlenül a teljes maszkot.</li>
+<li><strong>A <code>__ballot_sync</code> eredményének
+félreértelmezése.</strong> A visszaadott érték bitmaszk, nem pedig a
+szálak száma. A számosságot <code>__popc</code>-vel kell
+kiszámítani.</li>
+<li><strong>A <code>__match_any_sync</code> eredményének nem megfelelő
+vezetőválasztás.</strong> A csoport vezetőjét a visszaadott maszk
+legkisebb beállított bitjéből kell kinyerni
+(<code>__ffs(mask) - 1</code>), nem pedig feltételezni, hogy a 0. sáv
+mindig része a csoportnak.</li>
+</ol>
+<h3 data-number="8.3.12" id="önellenőrző-kérdések"><span
+class="header-section-number">8.3.12</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért követelnek meg explicit szinkronizációs maszkot a Volta utáni
+warp intrinsicek? Mi történik, ha a maszk 0, vagy ha olyan szálat is
+tartalmaz, amely nem aktív?</li>
+<li>Mi a különbség a <code>__shfl_down_sync</code> és a
+<code>__shfl_xor_sync</code> között? Melyiket választanád egy
+warp-szintű redukció megvalósításához, és miért?</li>
+<li>Egy warp divergens: az első 16 szál belép egy <code>if</code> ágba,
+a második 16 nem. Hogyan kell megválasztani a maszkot, ha az ágon belül
+<code>__shfl_sync</code>-ot akarunk használni? Adj példát a maszk
+értékére.</li>
+<li>A <code>__ballot_sync</code> visszatérési értéke mit tartalmaz?
+Hogyan határozható meg belőle a feltételt teljesítő szálak száma?</li>
+<li>Milyen veszélyei vannak annak, ha a <code>__activemask</code>
+eredményét elmentjük, és később használjuk egy másik
+konvergencia-állapotban? Indokold meg a választ.</li>
+</ol>
+<h3 data-number="8.3.13" id="összegzés-és-átvezetés"><span
+class="header-section-number">8.3.13</span> Összegzés és átvezetés</h3>
+<p>A warp intrinsicek – <code>__shfl_sync</code>,
+<code>__ballot_sync</code> és <code>__match_any_sync</code> – a
+regiszterek közötti közvetlen adatcserét, szavazást és csoportosítást
+tesznek lehetővé anélkül, hogy a lassabb memóriatereket igénybe vennénk.
+Az explicit szinkronizációs maszkok bevezetése a Volta architektúrával
+együtt nagyobb kontrollt adott a programozónak, de egyben nagyobb
+fegyelmet is követel. A helyes használat kulcsa, hogy mindig tisztában
+legyünk a warp aktuális konvergencia-állapotával, és a maszkot ennek
+megfelelően adjuk meg.</p>
+<p>Ezek az eszközök nem csak a teljesítményoptimalizálásban fontosak,
+hanem alapját képezik a bonyolultabb párhuzamos mintáknak is, mint
+például a warp-szintű rendezés, a prefix összegek vagy a gyors
+szavazásos döntések. A következő alfejezetben a memória-láthatósággal és
+a memory fence-ekkel foglalkozunk, amelyek azt szabályozzák, hogy a
+szálak közötti adatcserék milyen sorrendben és milyen hatókörrel válnak
+láthatóvá. A warp intrinsicek által bevezetett fogalmak – különösen a
+szinkronizáció és a konvergencia – közvetlenül kapcsolódnak ahhoz, hogy
+a memóriaműveletek helyes sorrendjét biztosítsuk.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu027.html">← 8.2 Atomi műveletek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu029.html">8.4 Memory fence és láthatóság →</a></div>
+</nav>
+</body>
+</html>

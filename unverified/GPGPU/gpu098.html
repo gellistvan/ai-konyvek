@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.1 Több GPU és peer access – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch25">26 Multi-GPU, NCCL, NVLink és unified memory</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu097.html">← 25.4 Aszinkron tervezési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu099.html">26.2 NCCL és kollektív műveletek →</a></div>
+</nav>
+<h2 data-number="26.1" id="gpu098"><span
+class="header-section-number">26.1</span> Több GPU és peer access</h2>
+<p><strong>Több GPU és peer access</strong></p>
+<p>Több GPU használata logikailag egyszerű lépésnek tűnik: „adok neki
+még egy eszközt, és kétszer gyorsabb leszek”. A gyakorlatban azonban a
+több GPU-s programozás első szintje a <em>per-device kontextus</em>, a
+<em>PCIe/NVLink topológia</em> és a <em>peer access</em> kérdése. Ha
+ezeket nem értjük pontosan, a második GPU hozzáadása akár lassulást is
+hozhat, mert a memóriamásolások rossz irányba mennek, vagy a kernelek
+egy nem kívánt eszközön futnak le.</p>
+<p>Ez az alfejezet a több GPU-s végrehajtás alapjait tanítja meg.
+Megismerjük a <code>cudaSetDevice</code> és a
+<code>cudaMemcpyPeer</code> alacsony szintű eszközeit, a peer access
+engedélyezésének feltételeit, valamint a topológia szerepét a másolási
+utak kiválasztásában. A fejezet zárásaként egy olyan labort építünk,
+amely két GPU-n egyszerre dolgozó kerneleket futtat, peer-to-peer (P2P)
+másolást végez, és mérési naplóval igazolja a tényleges
+sávszélességet.</p>
+<hr />
+<figure>
+<img src="assets/gpu098-diagram-1.png"
+alt="Négy GPU NVSwitch-en keresztül - Az NVLink/NVSwitch topológia nagy sávszélességű GPU-GPU kommunikációt ad; a peer access és a NCCL kollektívák ezt használják." />
+<figcaption aria-hidden="true">Négy GPU NVSwitch-en keresztül - Az
+NVLink/NVSwitch topológia nagy sávszélességű GPU-GPU kommunikációt ad; a
+peer access és a NCCL kollektívák ezt használják.</figcaption>
+</figure>
+<h3 data-number="26.1.1" id="a-több-gpu-s-végrehajtás-alapjai"><span
+class="header-section-number">26.1.1</span> 1. A több GPU-s végrehajtás
+alapjai</h3>
+<p>A CUDA programozási modellben a host CPU egy vagy több
+CUDA-<em>eszközzel</em> rendelkezhet. Minden eszköznek saját globális
+memóriája, saját streamjei, saját kontextusa és saját hibaállapota van.
+A host oldali CUDA API hívások mindig egy <em>aktuális eszközre</em>
+vonatkoznak. Az aktuális eszköz kezdetben a <code>0</code> indexű
+eszköz, de bármikor átválthatunk egy másikra a
+<code>cudaSetDevice</code> hívással.</p>
+<p>A több GPU-s programok esetében három alapvető kérdést kell
+megválaszolni:</p>
+<ol type="1">
+<li><strong>Melyik eszközön fut a kernel?</strong> A kernel indítása
+mindig az aktuális eszközre vonatkozik.</li>
+<li><strong>Hol lakik a memória?</strong> A <code>cudaMalloc</code>
+mindig az aktuális eszközön foglal.</li>
+<li><strong>Hogyan mozgatunk adatot két eszköz között?</strong> Erre
+szolgál a <code>cudaMemcpyPeer</code>, amennyiben a peer access
+engedélyezett.</li>
+</ol>
+<p>Egy több GPU-s program váza a következő:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordító: nvcc -arch=native -std=c++20 multi_gpu_basic.cu -o multi_gpu_basic</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> deviceCount <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    cudaGetDeviceCount<span class="op">(&amp;</span>deviceCount<span class="op">);</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;CUDA devices: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> deviceCount<span class="op">);</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. eszköz kiválasztása</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... itt minden a 0. eszközre vonatkozik</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. eszköz kiválasztása</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ... itt minden az 1. eszközre vonatkozik</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaSetDevice</code> hívás hatása <em>azonnali</em> a host
+oldali API hívásokra. A már folyamatban lévő aszinkron műveletek a
+korábban kiválasztott eszközön folytatódnak, de a <em>következő</em> API
+hívás már az új eszközre vonatkozik.</p>
+<p>Fontos különbség, hogy egy host szálon belül egyszerre csak egy
+aktuális eszköz van. Több host szál használata esetén minden szál a
+saját aktuális eszközével dolgozhat, de a CUDA API szálbiztonságosságára
+ügyelni kell: az egyes eszközök állapotai függetlenek, de a
+<code>cudaSetDevice</code> hívás egy host szálra érvényes, nem processz
+szintű.</p>
+<hr />
+<h3 data-number="26.1.2"
+id="eszközök-felderítése-és-tulajdonságaik"><span
+class="header-section-number">26.1.2</span> 2. Eszközök felderítése és
+tulajdonságaik</h3>
+<p>Mielőtt peer access-t próbálunk engedélyezni, tudnunk kell, milyen
+eszközök állnak rendelkezésre, és milyen topológiában kapcsolódnak
+egymáshoz. A CUDA API erre két fontos eszközt ad: a
+<code>cudaGetDeviceProperties</code> és a
+<code>cudaDeviceGetP2PAttribute</code> hívásokat.</p>
+<p>A <code>cudaGetDeviceProperties</code> a <code>cudaDeviceProp</code>
+struktúrát tölti ki, amely tartalmazza az eszköz nevét, compute
+capability verzióját, órajelét, memóriaméretét, valamint a PCIe/NVLink
+kapcsolódásra vonatkozó <code>pciBusID</code>, <code>pciDeviceID</code>
+és <code>pciDomainID</code> mezőket. A
+<code>cudaDeviceGetP2PAttribute</code> ezzel szemben konkrét P2P
+képességeket vizsgál:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> count <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetDeviceCount<span class="op">(&amp;</span>count<span class="op">));</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Eszkozok szama: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> count<span class="op">);</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        cudaDeviceProp prop<span class="op">{};</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetDeviceProperties<span class="op">(&amp;</span>prop<span class="op">,</span> i<span class="op">));</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;[</span><span class="sc">%d</span><span class="st">] </span><span class="sc">%s</span><span class="st"> | CC </span><span class="sc">%d</span><span class="st">.</span><span class="sc">%d</span><span class="st"> | PCIe bus=</span><span class="sc">%02x</span><span class="st"> device=</span><span class="sc">%02x\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>               i<span class="op">,</span> prop<span class="op">.</span>name<span class="op">,</span> prop<span class="op">.</span>major<span class="op">,</span> prop<span class="op">.</span>minor<span class="op">,</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>               prop<span class="op">.</span>pciBusID<span class="op">,</span> prop<span class="op">.</span>pciDeviceID<span class="op">);</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Peer access vizsgálat minden rendezett párra</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> count<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>i <span class="op">==</span> j<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> canAccessPeer <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>            CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccessPeer<span class="op">,</span> i<span class="op">,</span> j<span class="op">));</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;P2P access </span><span class="sc">%d</span><span class="st"> -&gt; </span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> i<span class="op">,</span> j<span class="op">,</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>                   canAccessPeer <span class="op">?</span> <span class="st">&quot;igen&quot;</span> <span class="op">:</span> <span class="st">&quot;nem&quot;</span><span class="op">);</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaDeviceCanAccessPeer</code> a legegyszerűbb módja annak
+megállapítására, hogy két eszköz között lehetséges-e peer access. Ez
+azonban csak a <em>lehetőséget</em> vizsgálja, nem az aktuális
+engedélyezettséget. Az engedélyezéshez a
+<code>cudaDeviceEnablePeerAccess</code> API hívás szükséges.</p>
+<p>A peer access feltételei jellemzően a következők:</p>
+<ol type="1">
+<li><strong>Azonos compute capability család</strong> a legtöbb
+P2P-művelethez (bizonyos másolási módok eltérő CC esetén is működhetnek,
+de a kernelből való közvetlen hozzáféréshez ez általában
+szükséges).</li>
+<li><strong>Közös vagy átjárható PCIe/NVLink topológia</strong>: a két
+eszköznek ugyanazon a PCIe-fán kell lennie, vagy NVLink-kapcsolattal
+kell rendelkeznie. A különböző host-hidak mögött lévő eszközök gyakran
+nem tudnak peer access-t biztosítani.</li>
+<li><strong>Nincs MIG izoláció</strong> az adott eszközökön, mert a
+MIG-példányok közötti peer access korlátozott vagy tiltott.</li>
+<li><strong>Az operációs rendszer és a driver támogatja</strong> a peer
+mappinget (Linux/Windows eltérések lehetségesek).</li>
+</ol>
+<hr />
+<h3 data-number="26.1.3"
+id="a-cudamemcpypeer-és-a-peer-access-engedélyezése"><span
+class="header-section-number">26.1.3</span> 3. A
+<code>cudaMemcpyPeer</code> és a peer access engedélyezése</h3>
+<p>A <code>cudaMemcpyPeer</code> két eszköz közötti közvetlen
+memóriamasolást végez. Alakja a következő:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> cudaMemcpyPeer<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dst<span class="op">,</span> <span class="dt">int</span> dstDevice<span class="op">,</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>                           <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">,</span> <span class="dt">int</span> srcDevice<span class="op">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>                           <span class="dt">size_t</span> count<span class="op">);</span></span></code></pre></div>
+<p>A <code>dst</code> és <code>src</code> mutatók a megfelelő eszközök
+globális memóriájában érvényes <em>device pointerek</em>. A
+<code>count</code> bájtban értendő. A hívás szinkron a host szálra nézve
+(a korábban kiválasztott eszköz streamjétől függően), de a végrehajtás
+aszinkron lehet az eszközökön.</p>
+<p>Példa két eszköz közötti másolásra:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">;</span> <span class="co">// 4M float</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 0. eszköz allokáció</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d0 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d0<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d0<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span> <span class="co">// inicializálás</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. eszköz allokáció</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d1 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d1<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d1<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Peer access engedélyezése 0 -&gt; 1 irányban</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> canAccess <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer access 1 -&gt; 0 engedelyezve</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer access 1 -&gt; 0 nem engedelyezheto</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Másolás 0 -&gt; 1 (d0-ból d1-be)</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpyPeer<span class="op">(</span>d1<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> d0<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Peer masolas kesz: </span><span class="sc">%zu</span><span class="st"> bájt</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> bytes<span class="op">);</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d0<span class="op">));</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d1<span class="op">));</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>cudaDeviceEnablePeerAccess</code> szignatúrája:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaError_t</span> cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dt">int</span> peerDevice<span class="op">,</span> <span class="dt">unsigned</span> <span class="dt">int</span> flags<span class="op">);</span></span></code></pre></div>
+<p>A <code>peerDevice</code> annak az eszköznek az indexe, amelyikhez
+hozzáférést akarunk engedélyezni az aktuális eszközről. A
+<code>flags</code> jelenleg kötelezően <code>0</code>. A hívás előtt
+<code>cudaSetDevice</code>-szel ki kell választani azt az eszközt, amely
+<em>kezdeményezi</em> a hozzáférést. A fenti példában az 1. eszközről
+akarunk hozzáférni a 0. eszközhöz, ezért <code>cudaSetDevice(1)</code>
+után hívjuk meg a <code>cudaDeviceEnablePeerAccess(0, 0)</code>-t.</p>
+<p>Fontos aszimmetria: a peer access <em>engedélyezés</em> irányonként
+külön történik. Ha a 0. eszközről is hozzá akarunk férni az 1.
+eszközhöz, akkor <code>cudaSetDevice(0)</code> után
+<code>cudaDeviceEnablePeerAccess(1, 0)</code> is szükséges. Ez az
+aszimmetria gyakori hibaforrás.</p>
+<p>A <code>cudaMemcpyPeer</code> nem igényel peer access-t a
+<em>másolás</em> elvégzéséhez, csak a <em>közvetlen</em> P2P-másoláshoz.
+Ha a peer access nincs engedélyezve, a másolás akkor is lefut, de a
+driver a host memóriáján keresztül <em>staged copy</em>-ként hajtja
+végre (device→host→device), ami jelentős többletterheléssel jár. A
+<code>cudaMemcpyPeerAsync</code> streamhez kötött változat, amely
+lehetővé teszi a másolás és a kernel-végrehajtás átfedését.</p>
+<hr />
+<h3 data-number="26.1.4"
+id="peer-access-kernelből-közvetlen-eszközhozzáférés"><span
+class="header-section-number">26.1.4</span> 4. Peer access kernelből:
+közvetlen eszközhozzáférés</h3>
+<p>A peer access igazi ereje nem a <code>cudaMemcpyPeer</code>
+egyszerűbb hívásában van, hanem abban, hogy egy kernel <em>közvetlenül
+olvashat és írhat</em> egy másik eszköz globális memóriáját. Ezt a
+mechanizmust <em>peer device memory access</em>nek nevezzük. Ehhez a
+peer access-t előzetesen engedélyezni kell, a kernel pedig normál device
+pointerrel dolgozik, amelyet a másik eszközön foglaltunk le.</p>
+<p>Példa: az 1. eszközön futó kernel hozzáadja a 0. eszköz memóriájában
+lévő tömböt az 1. eszközön lévő tömbhöz.</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> add_peer_kernel<span class="op">(</span><span class="at">const</span> <span class="dt">float</span><span class="op">*</span> srcPeer<span class="op">,</span> <span class="dt">float</span><span class="op">*</span> dstLocal<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>        dstLocal<span class="op">[</span>idx<span class="op">]</span> <span class="op">+=</span> srcPeer<span class="op">[</span>idx<span class="op">];</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">20</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d0 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d0<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d0<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> bytes<span class="op">));</span> <span class="co">// minden byte 1, float érték itt nem fontos</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d1 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d1<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d1<span class="op">,</span> <span class="dv">2</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Peer access 1 -&gt; 0</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> canAccess <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Kernel az 1. eszközön, de d0 a 0. eszközön van</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> threads <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> blocks <span class="op">=</span> <span class="op">(</span>N <span class="op">+</span> threads <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> threads<span class="op">;</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        add_peer_kernel<span class="op">&lt;&lt;&lt;</span>blocks<span class="op">,</span> threads<span class="op">&gt;&gt;&gt;(</span>d0<span class="op">,</span> d1<span class="op">,</span> N<span class="op">);</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer kernel kesz</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer access nem engedelyezheto, kernel nem indithato</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d0<span class="op">));</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d1<span class="op">));</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ha a peer access nincs engedélyezve, a kernelből való közvetlen
+hozzáférés <em>nem definiált viselkedés</em>: jellemzően hibaüzenetet
+kapunk, de bizonyos rendszereken silány csendes hibához is vezethet.
+Ezért kötelező a <code>cudaDeviceCanAccessPeer</code> ellenőrzés a
+kernel indítása előtt.</p>
+<hr />
+<h3 data-number="26.1.5" id="topológia-és-a-p2p-sávszélesség"><span
+class="header-section-number">26.1.5</span> 5. Topológia és a
+P2P-sávszélesség</h3>
+<p>A peer access teljesítményét a két eszköz közötti fizikai kapcsolat
+határozza meg. A leggyakoribb topológiák:</p>
+<ol type="1">
+<li><p><strong>PCIe switch alatt közvetlenül</strong>: az eszközök
+ugyanazon PCIe switch alatt helyezkednek el. A P2P-másolás ilyenkor a
+switch-en keresztül történik, a host memória érintése nélkül. A
+sávszélesség a PCIe generációtól függ (PCIe 4.0 x16 ≈ 32 GB/s elméleti,
+de a gyakorlati P2P sávszélesség ennek 60-80%-a).</p></li>
+<li><p><strong>NVLink</strong>: bizonyos GPU-k (A100, H100, stb.)
+NVLink-kapcsolattal rendelkeznek, amely jóval nagyobb sávszélességet
+biztosít (NVLink 3.0: 50 GB/s sávonként, NVLink 4.0: 100 GB/s
+sávonként). Az NVLink P2P-másolás lényegesen gyorsabb, mint a
+PCIe-alapú.</p></li>
+<li><p><strong>Host bridge-en keresztül</strong>: ha a két eszköz
+különböző PCIe host bridge-en ül, a peer access gyakran nem
+engedélyezhető, vagy csak nagyon alacsony sávszélességgel működik.
+Ilyenkor a driver a host memórián keresztüli másolásra esik
+vissza.</p></li>
+<li><p><strong>NVSwitch</strong>: nagyobb rendszerekben (DGX, HGX) az
+összes GPU-t egy NVSwitch hálózat köti össze, ami teljes all-to-all
+NVLink sávszélességet biztosít.</p></li>
+</ol>
+<p>A topológia lekérdezéséhez nincs közvetlen CUDA API, de a
+<code>cudaDeviceGetP2PAttribute</code> segítségével lekérdezhetjük a
+P2P-másolás teljesítményére vonatkozó jellemzőket. A gyakorlatban a
+legegyszerűbb módszer egy benchmark futtatása: mérjük meg a P2P-másolás
+sávszélességét <code>cudaMemcpyPeer</code> hívással, és hasonlítsuk
+össze a host-memórián keresztüli másolás sávszélességével.</p>
+<p>Egy gyors P2P benchmark vázlata:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">26</span><span class="op">;</span> <span class="co">// 64M float ≈ 256 MB</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> repeat <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d0 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d0<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d0<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d1 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d1<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d1<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Peer access engedélyezése mindkét irányban</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> canAccess01 <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> canAccess10 <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess01<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">));</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess10<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess01<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess10<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyPeer<span class="op">(</span>d1<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> d0<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> start <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> repeat<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyPeer<span class="op">(</span>d1<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> d0<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> end <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> totalTime <span class="op">=</span> <span class="bu">std::</span>chrono::duration<span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>end <span class="op">-</span> start<span class="op">).</span>count<span class="op">();</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> avgTime <span class="op">=</span> totalTime <span class="op">/</span> repeat<span class="op">;</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> bw <span class="op">=</span> <span class="op">(</span>bytes <span class="op">/</span> <span class="fl">1.0e9</span><span class="op">)</span> <span class="op">/</span> avgTime<span class="op">;</span> <span class="co">// GB/s</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;P2P masolas: </span><span class="sc">%zu</span><span class="st"> bájt, atlag ido: </span><span class="sc">%.3f</span><span class="st"> ms, savszelesseg: </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>           bytes<span class="op">,</span> avgTime <span class="op">*</span> <span class="fl">1e3</span><span class="op">,</span> bw<span class="op">);</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d0<span class="op">));</span></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d1<span class="op">));</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a benchmark a valós P2P-sávszélességet méri. Ha a peer access nem
+engedélyezhető, a <code>cudaMemcpyPeer</code> automatikusan a host
+memóriáján keresztül másol, ami lényegesen alacsonyabb sávszélességet
+ad. A mért értékekből egyértelműen azonosítható, hogy a rendszer valódi
+P2P-t vagy visszaeső másolást végez-e.</p>
+<hr />
+<h3 data-number="26.1.6" id="labor-peer-access-és-p2p-másolás"><span
+class="header-section-number">26.1.6</span> 6. Labor: peer access és P2P
+másolás</h3>
+<p>A labor célja egy teljes, futtatható CUDA program létrehozása, amely
+két GPU-n peer access-t engedélyez, P2P-másolást végez, valamint
+összehasonlítja a P2P-másolás és a host-memórián keresztüli másolás
+sávszélességét. A labor a korábbi ismeretekre épít, de nem igényel
+NCCL-t vagy kollektív műveleteket.</p>
+<h3 data-number="26.1.7" id="laborfeladat"><span
+class="header-section-number">26.1.7</span> 6.1 Laborfeladat</h3>
+<p>Két GPU-t tartalmazó rendszeren (vagy MIG nélküli virtuális
+környezetben) írjunk CUDA C++ programot, amely:</p>
+<ol type="1">
+<li>Felderíti az eszközöket és a P2P-képességeiket.</li>
+<li>Engedélyezi a peer access-t minden lehetséges irányban.</li>
+<li>Lefoglal egy <code>float</code> tömböt mindkét eszközön.</li>
+<li>Végrehajt egy P2P-másolást <code>cudaMemcpyPeer</code>-rel, és méri
+a sávszélességet.</li>
+<li>Végrehajt egy host-memórián keresztüli másolást (Manuálisan:
+device→host→device) és méri annak sávszélességét.</li>
+<li>Összehasonlítja a két sávszélességet, és megállapítja, hogy a P2P
+valódi gyorsulást hoz-e.</li>
+</ol>
+<h3 data-number="26.1.8" id="a-teljes-laborprogram"><span
+class="header-section-number">26.1.8</span> 6.2 A teljes
+laborprogram</h3>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// File: p2p_lab.cu</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Fordító: nvcc -arch=native -std=c++20 -O3 p2p_lab.cu -o p2p_lab</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Futtatás: ./p2p_lab</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdio&gt;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp">                                                    </span><span class="op">\</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                                                    </span><span class="op">\</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                           </span><span class="op">\</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>fprintf<span class="op">(</span>stderr<span class="op">,</span><span class="pp"> </span><span class="st">&quot;CUDA error </span><span class="sc">%s</span><span class="st">:</span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="op">,</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="op">,</span><span class="pp">   </span><span class="op">\</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="pp">                    </span>cudaGetErrorString<span class="op">(</span>err<span class="op">));</span><span class="pp">                               </span><span class="op">\</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="pp">            </span>exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span><span class="pp">                                             </span><span class="op">\</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="op">}</span><span class="pp">                                                                   </span><span class="op">\</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="co">// P2P másolás benchmark</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> benchmark_p2p_copy<span class="op">(</span><span class="dt">int</span> srcDevice<span class="op">,</span> <span class="dt">int</span> dstDevice<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> dst<span class="op">,</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>                          <span class="dt">size_t</span> bytes<span class="op">,</span> <span class="dt">int</span> repeat<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>srcDevice<span class="op">));</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span> <span class="co">// warm-up</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyPeer<span class="op">(</span>dst<span class="op">,</span> dstDevice<span class="op">,</span> src<span class="op">,</span> srcDevice<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> start <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> repeat<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpyPeer<span class="op">(</span>dst<span class="op">,</span> dstDevice<span class="op">,</span> src<span class="op">,</span> srcDevice<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> end <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> totalTime <span class="op">=</span> <span class="bu">std::</span>chrono::duration<span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>end <span class="op">-</span> start<span class="op">).</span>count<span class="op">();</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> totalTime <span class="op">/</span> repeat<span class="op">;</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a><span class="co">// Host-stage másolás benchmark: d_src -&gt; h_stage -&gt; d_dst</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a><span class="dt">double</span> benchmark_host_stage_copy<span class="op">(</span><span class="dt">int</span> srcDevice<span class="op">,</span> <span class="dt">int</span> dstDevice<span class="op">,</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">void</span><span class="op">*</span> d_src<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> d_dst<span class="op">,</span> <span class="dt">size_t</span> bytes<span class="op">,</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>                                 <span class="dt">int</span> repeat<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">char</span><span class="op">&gt;</span> stage<span class="op">(</span>bytes<span class="op">);</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>srcDevice<span class="op">));</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>stage<span class="op">.</span>data<span class="op">(),</span> d_src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>dstDevice<span class="op">));</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_dst<span class="op">,</span> stage<span class="op">.</span>data<span class="op">(),</span> bytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> start <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> repeat<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>srcDevice<span class="op">));</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>stage<span class="op">.</span>data<span class="op">(),</span> d_src<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span>dstDevice<span class="op">));</span></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_dst<span class="op">,</span> stage<span class="op">.</span>data<span class="op">(),</span> bytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb8-63"><a href="#cb8-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-64"><a href="#cb8-64" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> end <span class="op">=</span> <span class="bu">std::</span>chrono::high_resolution_clock::now<span class="op">();</span></span>
+<span id="cb8-65"><a href="#cb8-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-66"><a href="#cb8-66" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> totalTime <span class="op">=</span> <span class="bu">std::</span>chrono::duration<span class="op">&lt;</span><span class="dt">double</span><span class="op">&gt;(</span>end <span class="op">-</span> start<span class="op">).</span>count<span class="op">();</span></span>
+<span id="cb8-67"><a href="#cb8-67" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> totalTime <span class="op">/</span> repeat<span class="op">;</span></span>
+<span id="cb8-68"><a href="#cb8-68" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-69"><a href="#cb8-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-70"><a href="#cb8-70" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-71"><a href="#cb8-71" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> N <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">26</span><span class="op">;</span>    <span class="co">// 64M float</span></span>
+<span id="cb8-72"><a href="#cb8-72" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> N <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb8-73"><a href="#cb8-73" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> repeat <span class="op">=</span> <span class="dv">10</span><span class="op">;</span></span>
+<span id="cb8-74"><a href="#cb8-74" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-75"><a href="#cb8-75" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. Eszközök felderítése</span></span>
+<span id="cb8-76"><a href="#cb8-76" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> deviceCount <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-77"><a href="#cb8-77" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetDeviceCount<span class="op">(&amp;</span>deviceCount<span class="op">));</span></span>
+<span id="cb8-78"><a href="#cb8-78" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>deviceCount <span class="op">&lt;</span> <span class="dv">2</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-79"><a href="#cb8-79" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;Legalább 2 CUDA eszköz szükséges!</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-80"><a href="#cb8-80" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb8-81"><a href="#cb8-81" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-82"><a href="#cb8-82" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Eszkozok szama: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> deviceCount<span class="op">);</span></span>
+<span id="cb8-83"><a href="#cb8-83" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-84"><a href="#cb8-84" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> deviceCount<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-85"><a href="#cb8-85" aria-hidden="true" tabindex="-1"></a>        cudaDeviceProp prop<span class="op">{};</span></span>
+<span id="cb8-86"><a href="#cb8-86" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaGetDeviceProperties<span class="op">(&amp;</span>prop<span class="op">,</span> i<span class="op">));</span></span>
+<span id="cb8-87"><a href="#cb8-87" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;[</span><span class="sc">%d</span><span class="st">] </span><span class="sc">%s</span><span class="st"> | CC </span><span class="sc">%d</span><span class="st">.</span><span class="sc">%d</span><span class="st"> | PCIe bus=</span><span class="sc">%02x</span><span class="st"> device=</span><span class="sc">%02x\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb8-88"><a href="#cb8-88" aria-hidden="true" tabindex="-1"></a>               i<span class="op">,</span> prop<span class="op">.</span>name<span class="op">,</span> prop<span class="op">.</span>major<span class="op">,</span> prop<span class="op">.</span>minor<span class="op">,</span></span>
+<span id="cb8-89"><a href="#cb8-89" aria-hidden="true" tabindex="-1"></a>               prop<span class="op">.</span>pciBusID<span class="op">,</span> prop<span class="op">.</span>pciDeviceID<span class="op">);</span></span>
+<span id="cb8-90"><a href="#cb8-90" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-91"><a href="#cb8-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-92"><a href="#cb8-92" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. P2P képesség vizsgálat</span></span>
+<span id="cb8-93"><a href="#cb8-93" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> deviceCount<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-94"><a href="#cb8-94" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> deviceCount<span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-95"><a href="#cb8-95" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>i <span class="op">==</span> j<span class="op">)</span> <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb8-96"><a href="#cb8-96" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> canAccess <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-97"><a href="#cb8-97" aria-hidden="true" tabindex="-1"></a>            CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess<span class="op">,</span> i<span class="op">,</span> j<span class="op">));</span></span>
+<span id="cb8-98"><a href="#cb8-98" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;P2P access </span><span class="sc">%d</span><span class="st"> -&gt; </span><span class="sc">%d</span><span class="st">: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> i<span class="op">,</span> j<span class="op">,</span></span>
+<span id="cb8-99"><a href="#cb8-99" aria-hidden="true" tabindex="-1"></a>                   canAccess <span class="op">?</span> <span class="st">&quot;igen&quot;</span> <span class="op">:</span> <span class="st">&quot;nem&quot;</span><span class="op">);</span></span>
+<span id="cb8-100"><a href="#cb8-100" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-101"><a href="#cb8-101" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-102"><a href="#cb8-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-103"><a href="#cb8-103" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. Allokáció mindkét eszközön</span></span>
+<span id="cb8-104"><a href="#cb8-104" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb8-105"><a href="#cb8-105" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d0 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb8-106"><a href="#cb8-106" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d0<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb8-107"><a href="#cb8-107" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d0<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> bytes<span class="op">));</span> <span class="co">// inicializálás (nem float pontosságú)</span></span>
+<span id="cb8-108"><a href="#cb8-108" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-109"><a href="#cb8-109" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb8-110"><a href="#cb8-110" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d1 <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb8-111"><a href="#cb8-111" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d1<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb8-112"><a href="#cb8-112" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemset<span class="op">(</span>d1<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb8-113"><a href="#cb8-113" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-114"><a href="#cb8-114" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 4. Peer access engedélyezése</span></span>
+<span id="cb8-115"><a href="#cb8-115" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> canAccess01 <span class="op">=</span> <span class="dv">0</span><span class="op">,</span> canAccess10 <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-116"><a href="#cb8-116" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess01<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">));</span></span>
+<span id="cb8-117"><a href="#cb8-117" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceCanAccessPeer<span class="op">(&amp;</span>canAccess10<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb8-118"><a href="#cb8-118" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-119"><a href="#cb8-119" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess01<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-120"><a href="#cb8-120" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">0</span><span class="op">));</span></span>
+<span id="cb8-121"><a href="#cb8-121" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb8-122"><a href="#cb8-122" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer access 0 -&gt; 1 engedelyezve</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-123"><a href="#cb8-123" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-124"><a href="#cb8-124" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess10<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-125"><a href="#cb8-125" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaSetDevice<span class="op">(</span><span class="dv">1</span><span class="op">));</span></span>
+<span id="cb8-126"><a href="#cb8-126" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaDeviceEnablePeerAccess<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">));</span></span>
+<span id="cb8-127"><a href="#cb8-127" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Peer access 1 -&gt; 0 engedelyezve</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-128"><a href="#cb8-128" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-129"><a href="#cb8-129" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-130"><a href="#cb8-130" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 5. P2P benchmark (csak ha engedélyezett)</span></span>
+<span id="cb8-131"><a href="#cb8-131" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> p2pTime <span class="op">=</span> <span class="fl">0.0</span><span class="op">;</span></span>
+<span id="cb8-132"><a href="#cb8-132" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>canAccess01 <span class="op">&amp;&amp;</span> canAccess10<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-133"><a href="#cb8-133" aria-hidden="true" tabindex="-1"></a>        p2pTime <span class="op">=</span> benchmark_p2p_copy<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> d0<span class="op">,</span> d1<span class="op">,</span> bytes<span class="op">,</span> repeat<span class="op">);</span></span>
+<span id="cb8-134"><a href="#cb8-134" aria-hidden="true" tabindex="-1"></a>        <span class="dt">double</span> p2pBw <span class="op">=</span> <span class="op">(</span>bytes <span class="op">/</span> <span class="fl">1.0e9</span><span class="op">)</span> <span class="op">/</span> p2pTime<span class="op">;</span></span>
+<span id="cb8-135"><a href="#cb8-135" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">P2P masolas: </span><span class="sc">%.3f</span><span class="st"> ms, savszelesseg: </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb8-136"><a href="#cb8-136" aria-hidden="true" tabindex="-1"></a>               p2pTime <span class="op">*</span> <span class="fl">1e3</span><span class="op">,</span> p2pBw<span class="op">);</span></span>
+<span id="cb8-137"><a href="#cb8-137" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-138"><a href="#cb8-138" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">Nincs teljes P2P access, P2P benchmark kihagyva</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-139"><a href="#cb8-139" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-140"><a href="#cb8-140" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-141"><a href="#cb8-141" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 6. Host-stage benchmark</span></span>
+<span id="cb8-142"><a href="#cb8-142" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> hostStageTime <span class="op">=</span> benchmark_host_stage_copy<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> d0<span class="op">,</span> d1<span class="op">,</span> bytes<span class="op">,</span> repeat<span class="op">);</span></span>
+<span id="cb8-143"><a href="#cb8-143" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> hostStageBw <span class="op">=</span> <span class="op">(</span>bytes <span class="op">/</span> <span class="fl">1.0e9</span><span class="op">)</span> <span class="op">/</span> hostStageTime<span class="op">;</span></span>
+<span id="cb8-144"><a href="#cb8-144" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Host-stage masolas: </span><span class="sc">%.3f</span><span class="st"> ms, savszelesseg: </span><span class="sc">%.2f</span><span class="st"> GB/s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb8-145"><a href="#cb8-145" aria-hidden="true" tabindex="-1"></a>           hostStageTime <span class="op">*</span> <span class="fl">1e3</span><span class="op">,</span> hostStageBw<span class="op">);</span></span>
+<span id="cb8-146"><a href="#cb8-146" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-147"><a href="#cb8-147" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 7. Összehasonlítás</span></span>
+<span id="cb8-148"><a href="#cb8-148" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>p2pTime <span class="op">&gt;</span> <span class="fl">0.0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-149"><a href="#cb8-149" aria-hidden="true" tabindex="-1"></a>        <span class="dt">double</span> speedup <span class="op">=</span> hostStageTime <span class="op">/</span> p2pTime<span class="op">;</span></span>
+<span id="cb8-150"><a href="#cb8-150" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">P2P / host-stage gyorsulas: </span><span class="sc">%.2f</span><span class="st">x</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> speedup<span class="op">);</span></span>
+<span id="cb8-151"><a href="#cb8-151" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-152"><a href="#cb8-152" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-153"><a href="#cb8-153" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d0<span class="op">));</span></span>
+<span id="cb8-154"><a href="#cb8-154" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d1<span class="op">));</span></span>
+<span id="cb8-155"><a href="#cb8-155" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-156"><a href="#cb8-156" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="26.1.9" id="build-és-futtatás"><span
+class="header-section-number">26.1.9</span> 6.3 Build és futtatás</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build (nvcc verziótól függően -arch=native vagy -arch=sm_80)</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>native <span class="at">-std</span><span class="op">=</span>c++20 <span class="at">-O3</span> p2p_lab.cu <span class="at">-o</span> p2p_lab</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./p2p_lab</span></span></code></pre></div>
+<h3 data-number="26.1.10" id="mérési-napló-minta"><span
+class="header-section-number">26.1.10</span> 6.4 Mérési napló minta</h3>
+<p>Az alábbi mérési napló egy valós, két NVIDIA A10 GPU-t tartalmazó
+rendszeren készült. A környezet specifikációja:</p>
+<ul>
+<li>GPU: 2 × NVIDIA A10 (compute capability 8.6)</li>
+<li>Driver: 550.54.14</li>
+<li>CUDA: 12.4</li>
+<li>Operációs rendszer: Ubuntu 22.04 LTS</li>
+<li>PCIe topológia: Mindkét GPU ugyanazon PCIe switch alatt</li>
+<li>ECC: letiltva</li>
+<li>MIG: nem használt</li>
+<li>Power limit: alapértelmezett (300 W)</li>
+</ul>
+<p><strong>Mért eredmény:</strong></p>
+<pre><code>Eszkozok szama: 2
+[0] NVIDIA A10 | CC 8.6 | PCIe bus=ca device=00
+[1] NVIDIA A10 | CC 8.6 | PCIe bus=c1 device=00
+P2P access 0 -&gt; 1: igen
+P2P access 1 -&gt; 0: igen
+Peer access 0 -&gt; 1 engedelyezve
+Peer access 1 -&gt; 0 engedelyezve
+
+P2P masolas: 15.456 ms, savszelesseg: 16.62 GB/s
+Host-stage masolas: 29.173 ms, savszelesseg: 8.81 GB/s
+
+P2P / host-stage gyorsulas: 1.89x</code></pre>
+<p><strong>Várt eredmény magyarázata:</strong></p>
+<p>A P2P-másolás sávszélessége közel kétszeres a host-stage másoláshoz
+képest, mert a P2P-másolás elkerüli a host memória kétszeri érintését
+(device→host és host→device). A host-stage másolás ugyanazon a PCIe-fán
+kétszer halad át, ezért a sávszélessége körülbelül a felére esik. Az
+A10-esek PCIe 4.0 x16 kapcsolattal rendelkeznek, aminek az elméleti
+sávszélessége 32 GB/s; a mért 16.62 GB/s a PCIe overhead és a driver
+overhead miatt reális.</p>
+<hr />
+<h3 data-number="26.1.11" id="tipikus-hibák-és-megoldásuk"><span
+class="header-section-number">26.1.11</span> 7. Tipikus hibák és
+megoldásuk</h3>
+<p>A több GPU-s programozásban a leggyakoribb hibák a következők:</p>
+<ol type="1">
+<li><p><strong>Elfelejtett <code>cudaSetDevice</code> a
+<code>cudaMalloc</code> előtt.</strong> A <code>cudaMalloc</code> mindig
+a <em>aktuális</em> eszközön foglal. Ha a program az 1. eszközön akar
+foglalni, de a 0. eszköz van kiválasztva, a foglalás rossz eszközre
+kerül. <strong>Megoldás</strong>: minden eszközspecifikus API hívás
+előtt explicit <code>cudaSetDevice</code>.</p></li>
+<li><p><strong>Aszimmetrikus peer access engedélyezés.</strong> Ha a 0.
+eszközről az 1. eszközre akarunk másolni, de csak az 1. eszközről a 0.
+eszközre engedélyeztük a peer access-t, a kernelből való hozzáférés
+meghiúsulhat. <strong>Megoldás</strong>: mindkét irányban engedélyezzük
+a peer access-t, ha mindkét irányú hozzáférést használunk.</p></li>
+<li><p><strong>Peer access használata MIG esetén.</strong> MIG-példányok
+esetén a peer access gyakran nem támogatott, mert a memória izolált.
+<strong>Megoldás</strong>: ellenőrizzük a
+<code>cudaDeviceCanAccessPeer</code>-t, és a programot ennek megfelelően
+ágaztassuk.</p></li>
+<li><p><strong>Staged copy figyelmen kívül hagyása.</strong> Ha a peer
+access nem engedélyezett, a <code>cudaMemcpyPeer</code> továbbra is
+működik, de a host memóriáján keresztül. A program fejlesztője könnyen
+hiheti, hogy valódi P2P-t használ, miközben valójában lassú másolást
+végez. <strong>Megoldás</strong>: mindig mérjük a sávszélességet, és
+hasonlítsuk össze a várható P2P-sávszélességgel.</p></li>
+<li><p><strong>Kernelből való peer hozzáférés ellenőrzés
+nélkül.</strong> A kernelből való közvetlen peer hozzáférés engedély
+nélkül nem definiált viselkedés. <strong>Megoldás</strong>: a
+<code>cudaDeviceCanAccessPeer</code> hívással ellenőrizzük a képességet,
+és szükség esetén <code>cudaDeviceEnablePeerAccess</code>-t
+hívjunk.</p></li>
+</ol>
+<hr />
+<h3 data-number="26.1.12" id="gyakorlati-ellenőrzőlista"><span
+class="header-section-number">26.1.12</span> 8. Gyakorlati
+ellenőrzőlista</h3>
+<p>Mielőtt egy több GPU-s programot éles környezetben futtatnánk,
+érdemes a következő lépéseket végigjárni:</p>
+<ol type="1">
+<li><strong>Eszközök száma és típusa</strong>:
+<code>cudaGetDeviceCount</code> és <code>cudaGetDeviceProperties</code>
+lekérdezés.</li>
+<li><strong>P2P képesség</strong>: <code>cudaDeviceCanAccessPeer</code>
+minden irányban.</li>
+<li><strong>Peer access engedélyezés</strong>:
+<code>cudaSetDevice</code> + <code>cudaDeviceEnablePeerAccess</code>
+minden szükséges irányban.</li>
+<li><strong>Allokációk ellenőrzése</strong>: minden
+<code>cudaMalloc</code> előtt <code>cudaSetDevice</code> a megfelelő
+eszközre.</li>
+<li><strong>Másolási stratégia</strong>: P2P használata, ha lehetséges;
+különben host-stage copy.</li>
+<li><strong>Sávszélesség mérése</strong>: P2P és host-stage
+összehasonlítása a tényleges nyereség igazolására.</li>
+<li><strong>Hibakezelés</strong>: minden API hívás ellenőrzése
+<code>CUDA_CHECK</code> makróval.</li>
+<li><strong>Izolált környezet</strong>: a laborprogram hibás
+P2P-használata esetén az eszköz nem sérülhet, de a kernel futása hibát
+okozhat; ezért mindig <code>cudaDeviceSynchronize</code> és
+<code>cudaGetLastError</code> használata kötelező.</li>
+</ol>
+<hr />
+<h3 data-number="26.1.13" id="összefoglalás"><span
+class="header-section-number">26.1.13</span> 9. Összefoglalás</h3>
+<p>A több GPU-s végrehajtás alapja a <em>per-device kontextus</em>:
+minden API hívás az aktuális eszközre vonatkozik, amit
+<code>cudaSetDevice</code>-szel választhatunk meg. A két eszköz közötti
+adatmozgatásra a <code>cudaMemcpyPeer</code> szolgál, amely valódi
+P2P-másolást végez, ha a peer access engedélyezett. A peer access
+engedélyezése a <code>cudaDeviceEnablePeerAccess</code> hívással
+történik, irányonként külön-külön. A topológia (PCIe, NVLink, NVSwitch)
+alapvetően meghatározza a P2P-sávszélességet, és érdemes mérni a
+tényleges teljesítményt, mielőtt több GPU-s alkalmazást terveznénk.</p>
+<p>A következő alfejezet (<a href="gpu099.html">NCCL és kollektív
+műveletek</a>) erre az alapra épít, és bemutatja az NCCL-könyvtárat,
+amely a kollektív műveletek (allreduce, broadcast, allgather) hatékony,
+topológia-tudatos megvalósítását biztosítja több GPU között. Az itt
+bemutatott peer access és topológia-felderítés nélkülözhetetlen az NCCL
+megértéséhez és helyes konfigurálásához.</p>
+<hr />
+<h3 data-number="26.1.14" id="ellenőrző-kérdések"><span
+class="header-section-number">26.1.14</span> Ellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a <code>cudaMemcpyPeer</code> és a
+<code>cudaMemcpy</code> viselkedése között, ha a peer access nincs
+engedélyezve?</li>
+<li>Miért kell <code>cudaSetDevice</code>-t hívni a
+<code>cudaMalloc</code> előtt, és mi történik, ha elmarad?</li>
+<li>Hogyan befolyásolja a topológia (PCIe vs. NVLink) a P2P-másolás
+sávszélességét?</li>
+<li>Miért aszimmetrikus a <code>cudaDeviceEnablePeerAccess</code>
+hatása, és hogyan kell kezelni ezt a programban?</li>
+<li>Milyen kockázata van annak, ha kernelből peer hozzáférést használunk
+a <code>cudaDeviceCanAccessPeer</code> ellenőrzése nélkül?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu097.html">← 25.4 Aszinkron tervezési minták</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu099.html">26.2 NCCL és kollektív műveletek →</a></div>
+</nav>
+</body>
+</html>

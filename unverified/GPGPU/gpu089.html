@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>23.4 Tensor Core optimalizálás – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch22">23 CUTLASS, tensor cores és mixed precision</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu088.html">← 23.3 Mixed precision</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu090.html">24.1 GEMM és a deep learning →</a></div>
+</nav>
+<h2 data-number="23.4" id="gpu089"><span
+class="header-section-number">23.4</span> Tensor Core optimalizálás</h2>
+<p>A Tensor Core kernel akkor hozza a hardveres lehetőségekhez közeli
+teljesítményt, ha a mátrix-tile-ok alakja, a memóriaelrendezés, a shared
+memory kihasználtság és az SM erőforrás-gazdálkodás összehangolt. A <a
+href="gpu088.html">Mixed precision</a> alfejezetben bevezetett WMMA és
+CUTLASS alapokra építve ez a fejezet azt vizsgálja, hogyan hangolható
+egy tensor core GEMM kernel a szűk keresztmetszetek feloldására. A cél
+nem a névleges csúcsérték hajszolása, hanem a kernel
+erőforrás-korlátjainak azonosítása és a legnagyobb hatású javítás
+bevezetése.</p>
+<p>A hangolási teret három fő dimenzióra bonthatjuk:</p>
+<ol type="1">
+<li><strong>Shape:</strong> a makro-tile és a mikro-tile dimenziói (M,
+N, K), valamint a K ciklus felbontása.</li>
+<li><strong>Layout:</strong> a mátrixok memóriaelrendezése, a leading
+dimension, a shared memory swizzle és a fragment layout.</li>
+<li><strong>Occupancy és shared memory:</strong> a regiszter- és shared
+memory korlátok, a double buffering és a warpok száma.</li>
+</ol>
+<p>Ezek a dimenziók erősen összefüggenek: a nagyobb tile több regisztert
+és shared memóriát igényel, ami csökkenti az occupancy-t, miközben
+csökkenti a globális memória forgalmat. A feladat az egyensúly
+megtalálása az adott hardveren.</p>
+<h3 data-number="23.4.1" id="shape-és-layout"><span
+class="header-section-number">23.4.1</span> Shape és layout</h3>
+<p>A GEMM kernelben a shape három szinten jelenik meg. A makro-tile
+(például 64×64) az a mátrixdarab, amelyet egy thread block számít ki; a
+mikro-tile (például 16×16×16) az a WMMA vagy <code>mma.sync</code>
+utasítás, amelyet egy warp hajt végre; a K-tile pedig az a közös
+dimenzió-darab, amelyet egy iterációban a shared memóriában tartunk. A
+makro-tile mérete határozza meg, hogy hány WMMA mikro-tile-t kell egy
+blocknak lefednie, és ezzel a regiszternyomást.</p>
+<p>A WMMA API-ban a mikro-tile alakja kötött: <code>m16n16k16</code>,
+<code>m16n16k8</code>, <code>m32n8k16</code> stb. A makro-tile
+dimenzióit ezek többszörösére érdemes választani. Például egy 64×64-es
+makro-tile 4×4=16 darab 16×16-os WMMA tile-t tartalmaz. Ha a block 256
+szálat indít (8 warp), akkor minden warp két 16×16-os tile-t is
+számolhat, ami növeli a regiszterek újrafelhasználását, de növeli a
+regiszterigényt is. A 128×128-as makro-tile 8×8=64 WMMA tile-t igényel,
+ami már nagy block mérettel vagy iterált warp munkával oldható meg.</p>
+<p>A K-tile mérete közvetlenül befolyásolja a shared memory méretét. Egy
+64×16-os A-tile és egy 16×64-es B-tile FP16-ban: A = 64×16×2 = 2048
+byte, B = 16×64×2 = 2048 byte, összesen 4096 byte. Dupla pufferezés
+esetén 8192 byte, ami elhanyagolható a 164 KB-os A100 shared memóriához
+képest. Ha a K-tile-t 32-re növeljük, a shared memória 8192 byte-ra nő,
+duplán 16384 byte; ez még mindig kicsi. A K-tile növelése csökkenti a K
+ciklus iterációinak számát, így a <code>__syncthreads()</code> és a
+<code>load_matrix_sync</code> hívások számát is, ami javíthatja a
+hatékonyságot. Ugyanakkor a nagyobb K-tile hosszabb
+<code>__syncthreads()</code> várakozást okozhat, mert a block minden
+szálának meg kell várnia, amíg a leglassabb betöltés véget ér.</p>
+<p>A layout a mátrixok memóriaelrendezését jelenti. A WMMA
+<code>load_matrix_sync</code> függvény <code>layout</code> paramétere
+(<code>row_major</code> vagy <code>col_major</code>) azt mondja meg,
+hogy a globális vagy shared memóriában a mátrix sor- vagy
+oszlopfolytonos. Ha a tényleges elrendezés és a megadott layout eltér, a
+hardver transzponálást végez, ami extra belső mozgást és sávszélességet
+fogyaszt. A GEMM esetén gyakori, hogy A sor-major, B pedig oszlop-major;
+ez megfelel a cuBLAS oszlop-major tárolási konvenciójának. A WMMA B
+fragment <code>col_major</code>-ként való betöltése ilyenkor
+természetes, mert a B mátrix transzponáltját képviseli a szorzásban.</p>
+<p>A leading dimension (<code>lda</code>, <code>ldb</code>,
+<code>ldc</code>) szintén a layout része. A tömbök sorainak kezdőcímeit
+nemcsak a dimenziók, hanem a padding is meghatározza. A
+<code>load_matrix_sync</code> stride paramétere elemekben adott; ha a
+mátrix sorai 128 bájtra igazítottak, a stride ennek megfelelő. Például
+FP16 esetén 128 bájt = 64 elem, ezért ha a sor hossza 60, érdemes 64-re
+párnázni. Az igazítás a vektorizált betöltést és az
+<code>ldmatrix</code> hatékonyságát javítja.</p>
+<p>A shared memory layout a bank conflictok elkerülésére szolgál. A
+shared memory 32 bankba szerveződik; ha egy warp tagjai egyszerre
+ugyanabba a bankba címződnek, a hozzáférés sorosodik. FP16 esetén két
+elem fér egy 32 bites bank-szóba. A WMMA <code>load_matrix_sync</code>
+shared memóriából történő betöltése a belső <code>ldmatrix</code>-szal
+8×8-as 128 bites szegmenseket olvas; a bank conflict elkerüléséhez a
+tile sorait megfelelően el kell tolni. Egy gyakori trükk a shared
+memória tömbök sorhosszának paddingje:</p>
+<pre class="cuda-cpp"><code>// CUDA C++17, NVCC 12.4, SM 8.0
+__shared__ half As[TILE_M][TILE_K + 4];
+__shared__ half Bs[TILE_K][TILE_N + 4];</code></pre>
+<p>A <code>+4</code> elem eltolja a sorok kezdetét, így a különböző
+sorok ugyanazon oszlopindexű elemei nem ugyanabba a bankba esnek. A
+padding méretét a bankek száma és az adattípus határozza meg; FP16
+esetén a <code>+4</code> vagy <code>+8</code> általában elegendő, de a
+konkrét mintát méréssel vagy bank conflict metrikával ellenőrizni
+kell.</p>
+<p>A CUTLASS keretrendszerben a shape és a layout explicit
+sablonparaméter. A <code>cutlass::gemm::GemmShape&lt;M, N, K&gt;</code>
+adja meg a makro-tile-t, a <code>LayoutA</code>, <code>LayoutB</code>,
+<code>LayoutC</code> típusok a memóriaelrendezést, a
+<code>Swizzle</code> pedig a shared memory swizzle-t. A CUTLASS az
+<code>ldmatrix</code> és a <code>mma.sync</code> utasításokat generálja,
+így a hangolás nagyrészt a megfelelő tile shape és swizzle kiválasztását
+jelenti. A WMMA API ezzel szemben kevésbé rugalmas, de a padding és a
+layout megfelelő megválasztásával hasonló hatás érhető el.</p>
+<h3 data-number="23.4.2" id="occupancy-és-shared-memory"><span
+class="header-section-number">23.4.2</span> Occupancy és shared
+memory</h3>
+<p>Az occupancy azt mutatja, hogy az SM aktív warpjainak száma hány
+százaléka az elméleti maximumnak. A Tensor Core kernel esetén az
+occupancy nem önmagában cél, hanem a latency hiding eszköze: ha kevés
+warp van, a shared memória betöltések és a tensor core utasítások
+közötti függőségek miatt az SM várakozni kényszerül. Ha túl sok warp
+van, a regiszter- és shared memory korlátok miatt a tile méretét
+csökkenteni kell, ami viszont a globális memória forgalmat növeli.</p>
+<p>A fő erőforrás-korlátok az A100 SM-ben: 2048 szál, 64 warp, 65536
+darab 32 bites regiszter, 164 KB shared memory (konfigurálható, de
+jellemzően 164 KB a maximum). Egy WMMA GEMM kernelben a regisztereket a
+fragmentek (accumulator C fragment, A és B fragmentek), a belső indexek
+és a compiler által generált ideiglenes értékek foglalják el. A shared
+memóriát a tile-ok, a double buffer és a padding foglalja.</p>
+<p>Tegyük fel, hogy a kernel 256 szálat indít blockonként, és a compiler
+jelentése szerint 96 regisztert használ szálanként. Ekkor egy block
+256×96 = 24576 regisztert foglal. A 65536 regiszteres limit mellett 2
+block fér el SM-enként, ami 512 szál, azaz 16 warp. Az A100 maximum 64
+warpja helyett ez 25% occupancy. Ha a regiszterhasználatot 64-re
+csökkentjük, 4 block fér el, 1024 szál, 32 warp, 50% occupancy. A shared
+memória ebben a példában 16 KB (dupla pufferezett 64×16 A és 16×64 B +
+padding), így nem korlátoz.</p>
+<p>A regisztercsökkentésnek ára van: ha a compiler nem tudja elhelyezni
+a fragmenteket regiszterekben, spill keletkezik, azaz a regiszter
+tartalmát a local memóriába (global memória L1/L2 mögött) írja ki. Ez
+drasztikusan rontja a teljesítményt. A <code>__launch_bounds__</code>
+qualifierrel a block méretet és a minimális blockok számát adhatjuk meg;
+a compiler ennek figyelembevételével optimalizálja a
+regiszterhasználatot. Az <code>-maxrregcount</code> kapcsolóval pedig
+felső korlátot adhatunk, de ezt óvatosan kell használni, mert spillhez
+vezethet.</p>
+<p>A shared memory méretének növelése – például nagyobb K-tile vagy
+double buffering – szintén csökkenti az occupancy-t, ha a shared memory
+eléri a korlátot. Az A100 164 KB-ja mellett egy 128×64×32-es makro-tile
+dupla pufferezéssel: A = 128×32×2 = 8192 B, B = 32×64×2 = 4096 B,
+összesen 12288 B, duplán 24576 B = 24 KB, ami még bőven elfér. Ha a
+K-tile 64-re nő, a dupla puffer 48 KB, ami még mindig kevesebb, mint 164
+KB, de a shared memory nagyobb része egy blokkhoz tartozik, így kevesebb
+block fér el. Az optimális általában az, ha a shared memory nem a szűk
+keresztmetszet, hanem a regiszterek korlátozzák az occupancy-t.</p>
+<p>A double buffering (kettős pufferezés) célja, hogy a K ciklusban a
+betöltés és a számítás átfedésben legyen. Az egyik pufferbe töltünk, míg
+a másikból számolunk. A CUDA 11.0-tól elérhető <code>cp.async</code>
+(aszinkron másolás) lehetővé teszi, hogy a globális memóriából a shared
+memóriába másolás a szálak szinkronizálása nélkül is folyamatban legyen,
+és a <code>commit_group</code>/<code>wait_group</code> műveletekkel
+szabályozható. A WMMA kernelben a double buffering a
+<code>__syncthreads()</code> várakozásokat is csökkenti. A növekvő
+shared memory igény és a foglalási overhead azonban az occupancy-t
+csökkentheti, ezért a double buffering bevezetése előtt érdemes az
+egyszerű, egy pufferes változatot megmérni.</p>
+<p>Egy <code>cp.async</code>-kel megvalósított double buffering
+vázlata:</p>
+<pre class="cuda-cpp"><code>// CUDA C++20, NVCC 12.4, SM 8.0
+// cp.async double buffering illusztráció
+__shared__ half As[2][TILE_M][TILE_K + 4];
+__shared__ half Bs[2][TILE_K][TILE_N + 4];
+int buf = 0;
+
+// előzetes betöltés az első pufferbe (itt cp.async hívások)
+// cp_async(&amp;As[buf][0][0], &amp;A_src[0], ...);
+// cp_async(&amp;Bs[buf][0][0], &amp;B_src[0], ...);
+commit_group();
+
+for (int k0 = TILE_K; k0 &lt; K; k0 += TILE_K) {
+    // következő puffer betöltése
+    // cp_async(&amp;As[1-buf][0][0], &amp;A_src[k0], ...);
+    // cp_async(&amp;Bs[1-buf][0][0], &amp;B_src[k0*N], ...);
+    commit_group();
+    wait_group(1); // várunk az előző betöltésre, a mostani még folyamatban
+
+    // számítás a buf pufferből
+    // ...
+    buf = 1 - buf;
+    __syncthreads();
+}</code></pre>
+<p>A <code>wait_group(1)</code> biztosítja, hogy a legutolsó
+<code>commit_group</code> előtti csoport befejeződött, miközben a
+legutolsó betöltés még folyamatban van. Így a betöltés és a számítás
+átfedésben marad.</p>
+<h3 data-number="23.4.3"
+id="gyakorlati-wmma-kernel-és-optimalizálás"><span
+class="header-section-number">23.4.3</span> Gyakorlati WMMA kernel és
+optimalizálás</h3>
+<p>Az alábbi példa egy FP16 WMMA GEMM kernel vázát mutatja, amely a
+fenti szempontokat alkalmazza. A kernel 64×64-es makro-tile-t számít,
+16×16×16-os WMMA mikro-tile-okkal, dupla pufferezett shared memóriával,
+paddinggel és a mátrix layoutokhoz igazított betöltéssel.</p>
+<pre class="cuda-cpp"><code>// CUDA C++17, NVCC 12.4, SM 8.0 (A100)
+#include &lt;mma.h&gt;
+using namespace nvcuda;
+
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+#define WARP_M 16
+#define WARP_N 16
+#define WARP_K 16
+
+__global__ void wmma_gemm_optimized(const half* __restrict__ A,
+                                    const half* __restrict__ B,
+                                    float* __restrict__ C,
+                                    int M, int N, int K) {
+    // Shared memory tile-ok, +4 padding a bank conflict elkerülésére
+    __shared__ half As[TILE_M][TILE_K + 4];
+    __shared__ half Bs[TILE_K][TILE_N + 4];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int warp_id = tx / 32;
+    int lane = tx % 32;
+
+    // A block 256 szál, 8 warp; minden warp két 16x16-os tile-t számol
+    int warp_row = (warp_id % 4) * WARP_M;   // 0,16,32,48
+    int warp_col = (warp_id / 4) * WARP_N;   // 0,16,32,48
+
+    // Accumulator fragmentek: 2x2 WMMA tile / warp
+    wmma::fragment&lt;wmma::accumulator, 16, 16, 16, float&gt; c_frag[2][2];
+    #pragma unroll
+    for (int i = 0; i &lt; 2; ++i)
+        for (int j = 0; j &lt; 2; ++j)
+            wmma::fill_fragment(c_frag[i][j], 0.0f);
+
+    // Globális memória mutatók a makro-tile kezdetére
+    const half* A_tile = A + (by * TILE_M) * K;
+    const half* B_tile = B + (bx * TILE_N);
+    float* C_tile = C + (by * TILE_M) * N + bx * TILE_N;
+
+    for (int k0 = 0; k0 &lt; K; k0 += TILE_K) {
+        // Betöltés globális -&gt; shared (coalesced)
+        // A mátrix: 64x16 elem; B mátrix: 16x64 elem
+        // Minden szál 4 elemet tölt be A-ból és 4 elemet B-ből
+        #pragma unroll
+        for (int t = 0; t &lt; 4; ++t) {
+            int row_a = tx / (TILE_K / 4);
+            int col_a = (tx * 4 + t) % TILE_K;
+            if (row_a &lt; TILE_M &amp;&amp; k0 + col_a &lt; K)
+                As[row_a][col_a] = A_tile[row_a * K + k0 + col_a];
+
+            int row_b = (tx * 4 + t) % TILE_K;
+            int col_b = tx / (TILE_K / 4);
+            if (row_b &lt; TILE_K &amp;&amp; col_b &lt; TILE_N)
+                Bs[row_b][col_b] = B_tile[(k0 + row_b) * N + col_b];
+        }
+        __syncthreads();
+
+        // Számítás a shared memóriából
+        #pragma unroll
+        for (int kk = 0; kk &lt; TILE_K / WARP_K; ++kk) {
+            wmma::fragment&lt;wmma::matrix_a, 16, 16, 16, half, wmma::row_major&gt; a_frag;
+            wmma::fragment&lt;wmma::matrix_b, 16, 16, 16, half, wmma::col_major&gt; b_frag;
+            wmma::load_matrix_sync(a_frag, &amp;As[warp_row][kk * WARP_K], TILE_K + 4);
+            wmma::load_matrix_sync(b_frag, &amp;Bs[kk * WARP_K][warp_col], TILE_N + 4);
+            #pragma unroll
+            for (int i = 0; i &lt; 2; ++i)
+                for (int j = 0; j &lt; 2; ++j)
+                    wmma::mma_sync(c_frag[i][j], a_frag, b_frag, c_frag[i][j]);
+        }
+        __syncthreads();
+    }
+
+    // C kiírása a globális memóriába
+    // Minden warp a saját 2x2 WMMA tile-ját írja ki
+    // Itt elhagyjuk a teljes indexelést; a labor kódban megtalálható.
+}</code></pre>
+<p>Ez a vázlat a hangolási pontokat illusztrálja, de a teljes labor kód
+ennél bővebb: tartalmazza a hibakezelést (<code>CUDA_CHECK</code>), a
+baseline naiv WMMA kernelt, a double buffering <code>cp.async</code>
+változatot és a mérési ciklust.</p>
+<p>A fenti kernelben a hangolási döntések:</p>
+<ul>
+<li>A makro-tile 64×64, ami 4×4 WMMA mikro-tile-t jelent. A 8 warp
+esetén minden warp 2×2-es almátrixot számít, ami növeli a regiszterek
+újrafelhasználását anélkül, hogy a block méretét 512-re növelnénk.</li>
+<li>A K-tile 16, ami egyetlen WMMA K-lépésnyi adatot tart a shared
+memóriában. A shared memória mérete dupla pufferezéssel 8 KB, ami
+alacsony, így az occupancy-t a regiszterek korlátozzák.</li>
+<li>Az A mátrix <code>row_major</code>, a B mátrix
+<code>col_major</code> layoutú betöltése illeszkedik a tipikus cuBLAS
+tároláshoz, és elkerüli a transzponálást.</li>
+<li>A shared memória tömbök sorhosszát <code>+4</code> paddinggel
+növeltük, ami a bank conflictokat csökkenti. A betöltési mintát a
+<code>tx</code> és <code>t</code> indexek úgy választják, hogy a
+globális memória hozzáférés coalesced legyen; a pontos mintát a labor
+kódban finomhangoljuk.</li>
+</ul>
+<h3 data-number="23.4.4" id="nsight-alapú-elemzés"><span
+class="header-section-number">23.4.4</span> Nsight-alapú elemzés</h3>
+<p>A hangolás nem alapulhat kizárólag futásidőre; a szűk
+keresztmetszetet profilkérre van szükség. Az NVIDIA Nsight Compute
+(<code>ncu</code>) a kernel alatt gyűjtött hardvermetrikákat jeleníti
+meg. A tensor core kernel elemzéséhez a következő metrikák a
+legfontosabbak:</p>
+<ul>
+<li><code>sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed</code>:
+a tensor core cső aktív ciklusainak aránya. Az alacsony érték azt jelzi,
+hogy a tensor core vár adatra vagy szinkronizációra.</li>
+<li><code>sm__inst_executed_pipe_tensor_op.avg</code>: a végrehajtott
+tensor core utasítások száma; a WMMA és <code>mma.sync</code> hívások
+száma.</li>
+<li><code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>:
+a shared memória olvasási bank conflictok száma. A cél a nullához közeli
+érték.</li>
+<li><code>launch__registers_per_thread</code>: a tényleges
+regiszterhasználat szálanként.</li>
+<li><code>launch__occupancy_limit_registers</code>: az occupancy-t
+korlátozó tényező (regiszter, shared memory, block méret).</li>
+<li><code>sm__warps_launched</code>: a launched warpok száma; az
+occupancy számításához.</li>
+<li><code>gpu__time_duration.sum</code>: a kernel futási ideje.</li>
+</ul>
+<p>Egy tipikus parancs:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--kernel-name</span> wmma_gemm_optimized <span class="at">--launch-count</span> 1 <span class="at">--export</span> report.csv ./wmma_gemm 4096 4096 4096</span></code></pre></div>
+<p>A <code>--set full</code> minden metrikát begyűjt, ami lassú lehet,
+de a teljes képhez hasznos. A gyakorlatban a
+<code>--section SpeedOfLight</code> és a
+<code>--section Occupancy</code> gyorsabb áttekintést ad.</p>
+<p>Az elemzés során először a <code>sm__pipe_tensor_cycles_active</code>
+értékét nézzük. Ha ez alacsony, a kernel nem számol eleget; a stall
+okokat a <code>smsp__average_warps_issue_stalled_*</code> metrikák
+részletezik. A gyakori stall okok: <code>wait</code>,
+<code>barrier</code>, <code>long_scoreboard</code> (globális memória
+betöltés), <code>math_pipe_throttle</code>, <code>mio_throttle</code>. A
+tensor core kernelnél a <code>long_scoreboard</code> arra utal, hogy a
+shared memóriából vagy globális memóriából történő betöltés késik;
+ilyenkor a double buffering vagy a prefetch segít. A
+<code>barrier</code> stall a <code>__syncthreads()</code> várakozásra
+utal; a double buffering és a <code>cp.async</code> csökkenti.</p>
+<p>A bank conflict metrika nullához közelinek kell lennie. Ha magas, a
+shared memory paddinget vagy a swizzle-t kell módosítani. Az
+<code>ncu</code> a forráskód soraihoz köthető bank conflictokat is
+megjeleníti, ami segít a pontos hely azonosításában.</p>
+<h3 data-number="23.4.5" id="tipikus-hibák-és-javítások"><span
+class="header-section-number">23.4.5</span> Tipikus hibák és
+javítások</h3>
+<p>A tensor core kernel hangolása során a következő hibák fordulnak elő
+leggyakrabban, és a javításuk is tanulságos:</p>
+<ol type="1">
+<li><p><strong>Nem megfelelő layout.</strong> Ha az A vagy B mátrixot
+<code>row_major</code> helyett <code>col_major</code>-ként adjuk át a
+<code>load_matrix_sync</code>-nek, a hardver transzponál, ami lassabb
+betöltést és extra regiszternyomást okoz. A javítás: a layout paramétert
+a tényleges memóriaelrendezéshez igazítani; ha szükséges, a mátrixot
+előzetesen transzponálni.</p></li>
+<li><p><strong>Nincs padding a shared memóriában.</strong> A
+<code>__shared__ half As[64][16]</code> esetén a sorok 16 elemből
+állnak, ami FP16-ban 32 bájt, pontosan 8 bank. Minden sor azonos
+bankokkal kezdődik, így a WMMA betöltés szisztematikus bank conflictot
+okoz. A <code>+4</code> padding megtöri ezt. A javítás: a shared memory
+tömbök sorhosszát a bankek számához képest páratlanra vagy eltoltra
+állítani.</p></li>
+<li><p><strong>Túl nagy makro-tile.</strong> Ha a makro-tile 128×128-ra
+nő, a C fragmentek 4×4=16 WMMA accumulator fragmentet jelentenek
+warponként, ami 16×8×32 = 4096 regisztert is elfoglalhat, nem is
+beszélve az A és B fragmentekről. A compiler spillhez folyamodik, és az
+occupancy drámaian csökken. A javítás: a makro-tile méretét a regiszter
+limithez igazítani, vagy a C fragmenteket részben kívül tartani, vagy
+CUTLASS-t használni, amely optimalizált fragment schedule-t
+generál.</p></li>
+<li><p><strong>Túl kicsi K-tile.</strong> Ha a K-tile 8, a K ciklus
+iterációinak száma nagy, és minden iterációban
+<code>__syncthreads()</code> és betöltés van. A tensor core cső sokat
+vár. A javítás: a K-tile-t 16-ra vagy 32-re növelni, miközben a shared
+memória még elfér.</p></li>
+<li><p><strong>Nincs double buffering.</strong> Az egy pufferes kernel
+minden K lépésben <code>__syncthreads()</code>-szel vár, amíg minden
+betöltés befejeződik, majd a számítás alatt a shared memória foglalt. A
+double buffering lehetővé teszi, hogy az egyik puffer betöltése a másik
+pufferből történő számítással párhuzamosan folyjon. A javítás: két
+puffer bevezetése és a <code>cp.async</code> használata; a
+<code>commit_group</code>/<code>wait_group</code> műveletekkel a
+megfelelő szinkronizáció.</p></li>
+<li><p><strong>Rossz granularitású betöltés.</strong> A globális
+memóriából a shared memóriába történő betöltésnél a szálak indexelése
+nem coalesced, vagy a betöltés nem használja ki a 128 bites vektorizált
+hozzáférést. A javítás: a betöltési mintát úgy alakítani, hogy a
+szomszédos szálak szomszédos címeket olvassanak, és a hozzáférés
+<code>half2</code> vagy <code>uint4</code> típusú legyen.</p></li>
+<li><p><strong>Hiányzó hibakezelés a laborban.</strong> A CUDA hívások
+után nincs <code>CUDA_CHECK</code>, így a hibás kernel nem derül ki
+időben. A javítás: minden API hívás után <code>cudaGetLastError</code>
+és <code>cudaDeviceSynchronize</code> ellenőrzése, ahogyan a fejezet
+laborja is előírja.</p></li>
+</ol>
+<h3 data-number="23.4.6" id="labor-és-mérési-napló"><span
+class="header-section-number">23.4.6</span> Labor és mérési napló</h3>
+<p>A labor célja, hogy a fenti hangolási szempontokat egy konkrét WMMA
+GEMM kernelen mérje. A kiindulópont egy baseline kernel, amely nem
+használ double bufferinget, nincs padding a shared memóriában, és a
+layout nem optimális. Az optimalizált kernel bevezeti a 64×64×16-os
+makro-tile-t, a <code>+4</code> paddinget, a dupla pufferezést
+<code>cp.async</code>-kel és a mátrix layoutokhoz igazított
+betöltést.</p>
+<h3 data-number="23.4.7" id="környezet-és-parancsok"><span
+class="header-section-number">23.4.7</span> Környezet és parancsok</h3>
+<p>A mérést az alábbi környezetben végezzük (a laborban rögzítendő
+értékek):</p>
+<ul>
+<li>GPU: NVIDIA A100-SXM4-40GB, compute capability 8.0</li>
+<li>CUDA: 12.4</li>
+<li>Driver: 550.54.14</li>
+<li>OS: Ubuntu 22.04 LTS</li>
+<li>ECC: bekapcsolva</li>
+<li>Power limit: 400 W</li>
+<li>nvidia-smi: 550.54.14</li>
+<li>Izolált labor, háttérterhelés nélkül</li>
+</ul>
+<p>Build és futtatás:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-I.</span> <span class="at">-o</span> wmma_gemm wmma_gemm.cu</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./wmma_gemm</span> 4096 4096 4096 5</span></code></pre></div>
+<p>A program a 4096³-as FP16 GEMM-et számítja, warm-up után 5 ismétlést
+mér, és kiírja az átlagot, a szórást és a TFLOPS-ot.</p>
+<p>A Nsight Compute futtatás:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--kernel-name</span> wmma_gemm_baseline <span class="at">--launch-count</span> 1 ./wmma_gemm 4096 4096 4096 1</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ncu</span> <span class="at">--set</span> full <span class="at">--kernel-name</span> wmma_gemm_optimized <span class="at">--launch-count</span> 1 ./wmma_gemm 4096 4096 4096 1</span></code></pre></div>
+<h3 data-number="23.4.8" id="várt-és-mért-eredmények"><span
+class="header-section-number">23.4.8</span> Várt és mért eredmények</h3>
+<p>A várt érték a roofline modellből és a kernel erőforrás-számításából
+adódik. A 4096³ GEMM 2×4096³ = 137.4 GFLOPS. Az A100 FP16 tensor core
+dense csúcsa 312 TFLOPS, a memória sávszélessége 1.5 TB/s. A kernel
+számítási intenzitása a K ciklusban a shared memóriából olvasott
+adatokra vetítve 21.3 FLOP/byte, ami bőven a compute bound tartományban
+van. A várható elért teljesítmény a tensor core kihasználtságtól függ:
+60%-os kihasználás 187 TFLOPS, 40% 124 TFLOPS. A baseline, amely
+szinkronizációs és bank conflict problémákkal küzd, várhatóan 60 TFLOPS
+alatt marad.</p>
+<p>Az alábbi táblázat a mérési napló szerkezetét mutatja. A „Mért
+(példa)” oszlop <strong>nem valós mérés</strong>, hanem a módszertan
+bemutatására szolgáló kitöltési minta; a laborban a hallgató az oszlopot
+a saját mérési eredményeivel tölti ki.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Változat</th>
+<th>M=N=K</th>
+<th>Átlag idő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Elért TFLOPS</th>
+<th>Várt TFLOPS (modell)</th>
+<th>Occupancy</th>
+<th>Regiszter/szál</th>
+<th>Shared memória/block</th>
+<th>Bank conflict (ld)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>baseline</td>
+<td>4096</td>
+<td>2.35</td>
+<td>0.08</td>
+<td>58.4</td>
+<td>60.0</td>
+<td>25%</td>
+<td>128</td>
+<td>8 KB</td>
+<td>12480</td>
+</tr>
+<tr class="even">
+<td>optimized (double buffer + swizzle + 64×64×16)</td>
+<td>4096</td>
+<td>1.10</td>
+<td>0.03</td>
+<td>124.8</td>
+<td>130.0</td>
+<td>50%</td>
+<td>96</td>
+<td>16 KB</td>
+<td>12</td>
+</tr>
+<tr class="odd">
+<td>optimized + cp.async double buffer</td>
+<td>4096</td>
+<td>0.95</td>
+<td>0.02</td>
+<td>144.6</td>
+<td>150.0</td>
+<td>50%</td>
+<td>96</td>
+<td>24 KB</td>
+<td>8</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban a „Várt TFLOPS (modell)” a roofline és a kihasználtság
+becsléséből származik. A mért érték a valós futásból, a
+<code>cudaEvent</code> időmérésből és a Nsight metrikákból adódik. A
+laborban a mért értékeket legalább 5 ismétlésből kell számítani, a
+szórással együtt. A bank conflict metrika a
+<code>l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum</code>
+értéke; a cél a nullához közeli.</p>
+<p>A Nsight jelentés értelmezése: a baseline kernelnél a
+<code>sm__pipe_tensor_cycles_active</code> alacsony, a
+<code>barrier</code> stall magas, a bank conflict nagy. Az optimalizált
+kernelnél a tensor pipe aktív aránya nő, a barrier stall csökken, a bank
+conflict közel nulla. Ha az occupancy 50%-on stagnál, a korlátozó
+tényező a regiszter; a <code>launch__occupancy_limit_registers</code>
+ezt mutatja. A következő lépés a regisztercsökkentés lenne, de csak
+akkor, ha a spill nem nő.</p>
+<h3 data-number="23.4.9" id="önellenőrző-kérdés"><span
+class="header-section-number">23.4.9</span> Önellenőrző kérdés</h3>
+<p>Miért csökken a shared memory bank conflict, ha a
+<code>__shared__ half As[TILE_M][TILE_K]</code> deklarációt
+<code>__shared__ half As[TILE_M][TILE_K + 4]</code>-re változtatjuk?
+Indokolja meg a választ a bank-szervezés és a WMMA betöltési minta
+alapján.</p>
+<h3 data-number="23.4.10" id="összegzés"><span
+class="header-section-number">23.4.10</span> Összegzés</h3>
+<p>A Tensor Core kernel hangolása három összefüggő döntésen múlik: a
+tile shape és a layout megválasztásán, a shared memory swizzle/padding
+kialakításán, valamint az occupancy és a double buffering egyensúlyán. A
+fejezetben bemutatott WMMA példa és a Nsight-alapú mérési folyamat
+ezeket a döntéseket konkrét metrikákkal teszi ellenőrizhetővé. A
+következő fejezet (<a href="gpu090.html">GEMM és a deep learning</a>)
+ezt a tudást a deep learning kernelekre – a GEMM, a konvolúció és a
+figyelem – alkalmazza, ahol a shape és a mixed precision választás még
+kritikusabb.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu088.html">← 23.3 Mixed precision</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu090.html">24.1 GEMM és a deep learning →</a></div>
+</nav>
+</body>
+</html>

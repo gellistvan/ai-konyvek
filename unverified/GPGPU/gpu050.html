@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>14.1 Shared memory tiling – GPGPU – általános célú számítások
+GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch13">14 Shared memory tiling, async copy és pipelining</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu049.html">← 13.4 Roofline-alapú optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu051.html">14.2 Aszinkron másolás (cp.async) →</a></div>
+</nav>
+<h2 data-number="14.1" id="gpu050"><span
+class="header-section-number">14.1</span> Shared memory tiling</h2>
+<figure>
+<img src="assets/gpu050-diagram-1.png"
+alt="Shared memory tiling mátrixszorzásnál - Az A és B mátrix egy-egy tile-ját shared memóriába töltjük, majd a C tile-ban lévő részösszegeket frissítjük; a globális memóriaforgalom így töredékére csökken." />
+<figcaption aria-hidden="true">Shared memory tiling mátrixszorzásnál -
+Az A és B mátrix egy-egy tile-ját shared memóriába töltjük, majd a C
+tile-ban lévő részösszegeket frissítjük; a globális memóriaforgalom így
+töredékére csökken.</figcaption>
+</figure>
+<h3 data-number="14.1.1"
+id="shared-memory-tiling-adatújrafelhasználás-az-sm-ben"><span
+class="header-section-number">14.1.1</span> Shared memory tiling:
+adatújrafelhasználás az SM-ben</h3>
+<p>Az előző fejezetben bevezetett Roofline-modell egyik legfontosabb
+tanulsága, hogy a GPU-k gyakran nem a lebegőpontos műveletek
+végrehajtásában, hanem a globális memória elérésében fulladnak el. A
+globális memória (HBM vagy GDDR) sávszélessége hatalmas, de a
+késleltetése több száz órajelciklus is lehet. Ha egy kernel minden egyes
+szorzás-összeadás művelethez közvetlenül a globális memóriából olvas,
+akkor a streaming multiprocesszorok (SM-ek) az idő nagy részében nem
+számolnak, hanem várakoznak az adatra.</p>
+<p>A GPU-gyártók erre a problémára kétféle megoldást kínálnak. Az egyik
+a hardveres gyorsítótár-hierarchia (L1/L2 cache), amely a hozzáférések
+térbeli és időbeli lokalitását próbálja kihasználni automatikusan. A
+másik, ennél sokkal determinisztikusabb és a teljesítménykritikus
+kernelekben leggyakrabban használt eszköz a <em>shared memory</em>, azaz
+az SM-en belüli, szoftverből közvetlenül vezérelt, alacsony késleltetésű
+memória.</p>
+<p>A <em>tiling</em> (csempézés) az a programozási minta, amely a
+számítást olyan adatblokkokra (<em>tile</em>) bontja, amelyek elférnek a
+shared memoryban. A blokk szálai kooperatívan betöltik a csempét a
+globális memóriából a shared memoryba, ott szinkronizálnak, majd a
+számítás során már csak a gyors shared memoryból olvasnak. Ennek a
+technikának az a célja, hogy a lassú globális memóriából történő
+olvasások számát minimálisra csökkentsük, miközben az adatokat többször
+is felhasználjuk.</p>
+<p>Ez a fejezet a mátrixszorzás példáján keresztül mélyíti el a tiling
+fogalmát. A mátrixszorzás azért ideális példa, mert természeténél fogva
+nagy adat-újrafelhasználást kínál: egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>-es
+mátrixszorzásnál minden egyes elemre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(N)</annotation></semantics></math>-szer
+hivatkozunk. A naiv globális memóriás kernel ezt az újrafelhasználást
+nem tudja kihasználni, mert minden hivatkozás egy lassú, tranzakcióalapú
+memóriaelérést jelent. A tiling ezt az adatmozgatást a gyors, chipen
+belüli memóriába tereli.</p>
+<h4 data-number="14.1.1.1"
+id="a-probléma-naiv-mátrixszorzás-és-a-memóriaforgalom"><span
+class="header-section-number">14.1.1.1</span> A probléma: naiv
+mátrixszorzás és a memóriaforgalom</h4>
+<p>Tekintsük a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mo>=</mo><mi>A</mi><mo>×</mo><mi>B</mi></mrow><annotation encoding="application/x-tex">C = A \times B</annotation></semantics></math>
+mátrixszorzást, ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>K</mi></mrow><annotation encoding="application/x-tex">M \times K</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>K</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">K \times N</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+pedig
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>M</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">M \times N</annotation></semantics></math>.
+A naiv, tiling nélküli CUDA-kernel minden kimeneti elemhez egy szálat
+rendel. A szál kiszámítja a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+mátrix <code>(row, col)</code> elemének pontszorzatát:</p>
+<pre class="cuda"><code>// Naiv, globális memóriát használó mátrixszorzás (illusztráció)
+__global__ void naiveMatMulKernel(const float* __restrict__ A,
+                                  const float* __restrict__ B,
+                                  float* __restrict__ C,
+                                  int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        float sum = 0.0f;
+        for (int k = 0; k &lt; K; ++k) {
+            // Minden iterációban két globális memóriaolvasás!
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}</code></pre>
+<p>Ebben a kódban a belső ciklus minden egyes iterációja két globális
+memóriaolvasást hajt végre: egyet az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrixból, egyet a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrixból. Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>-es
+mátrixszorzáshoz ez
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><msup><mi>N</mi><mn>3</mn></msup></mrow><annotation encoding="application/x-tex">2N^3</annotation></semantics></math>
+darab globális memóriaolvasást jelent. Bár a hardveres cache-ek
+valamennyit segítenek a térbeli lokalitáson, a nagy méretű mátrixoknál a
+cache kapacitása gyorsan kimerül, és a kernel a globális memória
+sávszélességének korlátjába ütközik.</p>
+<p>A kérdés az: hogyan tudjuk elkerülni, hogy minden egyes
+szorzás-összeadás művelethez a lassú globális memóriához nyúljunk?</p>
+<h4 data-number="14.1.1.2"
+id="a-megoldás-adat-újrafelhasználása-shared-memoryban"><span
+class="header-section-number">14.1.1.2</span> A megoldás: adat
+újrafelhasználása shared memoryban</h4>
+<p>A válasz a shared memory, más néven a szálak által közösen használt,
+felhasználó által menedzselt scratchpad memória használata. A shared
+memory az SM-en belül található, késleltetése nagyságrendekkel kisebb,
+mint a globális memóriáé, sávszélessége pedig lényegesen nagyobb. A
+CUDA-ban a <code>__shared__</code> kulcsszóval deklarálhatunk ilyen
+memóriát.</p>
+<p>A tiling lényege, hogy a mátrixszorzást kisebb, téglalap alakú
+részfeladatokra bontjuk. Ahelyett, hogy egy szál a teljes
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+dimenzió mentén a globális memóriából olvasna, a blokk összes szálának
+együttműködésével egyszerre csak egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mi>I</mi><mi>L</mi><mi>E</mi><mi>_</mi><mi>S</mi><mi>I</mi><mi>Z</mi><mi>E</mi><mo>×</mo><mi>T</mi><mi>I</mi><mi>L</mi><mi>E</mi><mi>_</mi><mi>S</mi><mi>I</mi><mi>Z</mi><mi>E</mi></mrow><annotation encoding="application/x-tex">TILE\_SIZE \times TILE\_SIZE</annotation></semantics></math>
+méretű csempét töltünk be a shared memoryba. Ezután a blokk szálai ebből
+a gyors csempéből dolgoznak, kiszámítják a részösszegeket, majd a
+következő csempére lépnek.</p>
+<p>A mátrixszorzás esetében a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+mátrix egy <code>(row, col)</code> elemének kiszámításához az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix <code>row</code> sorának és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrix <code>col</code> oszlopának pontszorzata szükséges. Ez a
+pontszorzat felbontható kisebb, <code>TILE_SIZE</code> hosszúságú
+szegmensek pontszorzatainak összegére. Ha a blokk betölti az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix egy <code>TILE_SIZE x TILE_SIZE</code> méretű részmátrixát és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrix egy <code>TILE_SIZE x TILE_SIZE</code> méretű részmátrixát a
+shared memoryba, akkor a blokk összes szála el tudja végezni a
+részösszeg kiszámítását anélkül, hogy a globális memóriát ismételten
+elérné.</p>
+<p>Vizsgáljuk meg a memóriaforgalom csökkenését. Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>-es
+mátrixszorzásnál a tiled kernelben minden egyes elemet nem
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-szer,
+hanem csak
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mi>/</mi><mi>T</mi><mi>I</mi><mi>L</mi><mi>E</mi><mi>_</mi><mi>S</mi><mi>I</mi><mi>Z</mi><mi>E</mi></mrow><annotation encoding="application/x-tex">N / TILE\_SIZE</annotation></semantics></math>-szor
+olvasunk be a globális memóriából. Ha
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mi>I</mi><mi>L</mi><mi>E</mi><mi>_</mi><mi>S</mi><mi>I</mi><mi>Z</mi><mi>E</mi><mo>=</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">TILE\_SIZE = 32</annotation></semantics></math>,
+akkor a globális memóriaolvasások száma a naiv kernelhez képest
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>32</mn><annotation encoding="application/x-tex">32</annotation></semantics></math>-ed
+részére csökken. Ez a nyereség az, ami miatt a tiling a
+teljesítményoptimalizálás egyik sarokköve.</p>
+<h4 data-number="14.1.1.3" id="tileméret-és-blokkméret"><span
+class="header-section-number">14.1.1.3</span> Tileméret és
+blokkméret</h4>
+<p>A tiling tervezésekor az egyik legfontosabb döntés a
+<code>TILE_SIZE</code> (csempeméret) megválasztása. Ez a paraméter
+szorosan összefügg a kernel launch konfigurációjával, vagyis a
+blokkmérettel.</p>
+<p>A szokásos minta az, hogy a blokk szálainak száma megegyezik a csempe
+elemeinek számával. Ha a csempe négyzet alakú, akkor
+<code>blockDim.x = blockDim.y = TILE_SIZE</code>, és a blokkban
+<code>TILE_SIZE * TILE_SIZE</code> szál van. Ennek a kialakításnak
+előnye, hogy a globális memóriából a shared memoryba történő betöltés
+során a szálak természetes módon, egyesével lefedik a csempe elemeit,
+ami koalens hozzáférést tesz lehetővé.</p>
+<p>A <code>TILE_SIZE</code> megválasztását több hardveres korlát is
+szabályozza:</p>
+<ol type="1">
+<li><strong>Maximális szálszám blokkonként.</strong> A jelenlegi NVIDIA
+architektúrák többségén ez az érték 1024. Ez azt jelenti, hogy egy
+négyzetes csempe esetén a <code>TILE_SIZE</code> legfeljebb 32 lehet
+(mert a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>32</mn><mo>×</mo><mn>32</mn><mo>=</mo><mn>1024</mn></mrow><annotation encoding="application/x-tex">32 \times 32 = 1024</annotation></semantics></math>
+szál).</li>
+<li><strong>Shared memory kapacitás.</strong> Az SM-en belül
+rendelkezésre álló shared memory mérete korlátozott (jellemzően 64 KB és
+164 KB között mozog, architektúrától függően). A mátrixszorzás tiled
+kerneljében két csempét kell tárolnunk (egyet az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>-hoz,
+egyet a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>-hez).
+Ha <code>TILE_SIZE = 32</code> és <code>float</code> típusú adatokkal
+dolgozunk, akkor a két csempe mérete
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>×</mo><mn>32</mn><mo>×</mo><mn>32</mn><mo>×</mo><mn>4</mn><mo>=</mo><mn>8192</mn></mrow><annotation encoding="application/x-tex">2 \times 32 \times 32 \times 4 = 8192</annotation></semantics></math>
+bájt, ami 8 KB. Ez könnyedén elfér a shared memoryban.</li>
+<li><strong>Occupancy és erőforrás-korlátok.</strong> A nagyobb
+<code>TILE_SIZE</code> nem feltétlenül jobb. Minél nagyobb egy blokk,
+annál több regiszterre és shared memoryra van szüksége, ami csökkenti az
+SM-en egyidejűleg futtatható blokkok számát. Az alacsony occupancy
+csökkenti a latency hiding képességét. A <code>TILE_SIZE = 16</code>
+(256 szál blokkonként) gyakran jobb választás lehet, ha az SM-en így
+több blokk fér el egyszerre.</li>
+</ol>
+<p>A gyakorlatban a <code>TILE_SIZE = 16</code> és
+<code>TILE_SIZE = 32</code> a leggyakoribb kiindulópontok a
+mátrixszorzáshoz, és a teljesítményt mérésekkel kell finomhangolni.</p>
+<h4 data-number="14.1.1.4" id="a-tiled-mátrixszorzó-kernel"><span
+class="header-section-number">14.1.1.4</span> A tiled mátrixszorzó
+kernel</h4>
+<p>Nézzük meg a tiled mátrixszorzás egy teljes, jól működő
+implementációját CUDA C++-ban. Ez a kód a fejezet laborjának alapját
+képezi.</p>
+<pre class="cuda"><code>// Tiled mátrixszorzás (illusztráció, nem futtatott benchmark)
+// A: M x K, B: K x N, C: M x N. Típus: float (FP32)
+#define TILE_SIZE 16 // Vagy 32, a hardveres korlátok függvényében
+
+__global__ void tiledMatMulKernel(const float* __restrict__ A,
+                                  const float* __restrict__ B,
+                                  float* __restrict__ C,
+                                  int M, int N, int K) {
+    // Statikus shared memory a két csempének
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+    // Blokk- és szálindexek
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // A kimeneti mátrix (row, col) elemének globális indexe
+    int row = by * TILE_SIZE + ty;
+    int col = bx * TILE_SIZE + tx;
+
+    float sum = 0.0f;
+
+    // Végighaladunk a K dimenzión a csempéken
+    for (int tile = 0; tile &lt; (K + TILE_SIZE - 1) / TILE_SIZE; ++tile) {
+        // Kooperatív betöltés: minden szál egy elemet olvas be
+        // A mátrix: row sor, tile*TILE_SIZE + tx oszlop
+        int aCol = tile * TILE_SIZE + tx;
+        if (row &lt; M &amp;&amp; aCol &lt; K) {
+            As[ty][tx] = A[row * K + aCol];
+        } else {
+            As[ty][tx] = 0.0f; // Határfeltétel kezelése
+        }
+
+        // B mátrix: tile*TILE_SIZE + ty sor, col oszlop
+        int bRow = tile * TILE_SIZE + ty;
+        if (bRow &lt; K &amp;&amp; col &lt; N) {
+            Bs[ty][tx] = B[bRow * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f; // Határfeltétel kezelése
+        }
+
+        // Szinkronizálás: minden szálnak látnia kell a teljes csempét
+        __syncthreads();
+
+        // Részösszeg kiszámítása a gyors shared memoryból
+        #pragma unroll
+        for (int k = 0; k &lt; TILE_SIZE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        // Szinkronizálás: ne írjuk felül a shared memóriát,
+        // amíg mindenki be nem fejezte az olvasást
+        __syncthreads();
+    }
+
+    // Eredmény kiírása a globális memóriába
+    if (row &lt; M &amp;&amp; col &lt; N) {
+        C[row * N + col] = sum;
+    }
+}</code></pre>
+<p>A kernel működése a következő lépésekből áll:</p>
+<ol type="1">
+<li><strong>Csempe betöltése.</strong> A külső ciklus a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>K</mi><annotation encoding="application/x-tex">K</annotation></semantics></math>
+dimenzió mentén lépked <code>TILE_SIZE</code>-os lépésekben. Minden
+iterációban a blokk összes szála kooperatívan betölti az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>A</mi><annotation encoding="application/x-tex">A</annotation></semantics></math>
+mátrix egy <code>TILE_SIZE x TILE_SIZE</code> méretű részmátrixát az
+<code>As</code> shared memoryba, és a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>B</mi><annotation encoding="application/x-tex">B</annotation></semantics></math>
+mátrix egy hasonló részmátrixát a <code>Bs</code> shared memoryba. A
+<code>(ty, tx)</code> szál az <code>As[ty][tx]</code> és
+<code>Bs[ty][tx]</code> elemeket tölti be.</li>
+<li><strong>Szinkronizáció betöltés után.</strong> A
+<code>__syncthreads()</code> hívás biztosítja, hogy a blokk minden szála
+befejezze a betöltést, mielőtt bármelyik szál elkezdené a számítást. E
+nélkül az egyik szál olyan shared memóriaelemet olvashatna, amelyet egy
+másik szál még nem írt be.</li>
+<li><strong>Számítás a shared memoryból.</strong> A belső ciklus a
+<code>TILE_SIZE</code> hosszúságú rész-pontszorzatot számítja ki a
+shared memoryban tárolt adatokból. Ez a rész már nem igényel globális
+memóriaelérést.</li>
+<li><strong>Szinkronizáció számítás után.</strong> Mielőtt a külső
+ciklus a következő iterációra lépne, egy újabb
+<code>__syncthreads()</code> hívás biztosítja, hogy minden szál
+befejezze az aktuális csempe olvasását, és senki ne írja felül a shared
+memóriát új adatokkal, amíg a régieket még használják.</li>
+<li><strong>Eredmény kiírása.</strong> Miután a ciklus végighaladt az
+összes csempén, a szál kiírja a kiszámított <code>sum</code> értéket a
+globális memóriában lévő
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+mátrixba.</li>
+</ol>
+<p>A kernel launch konfigurációja a következő:</p>
+<pre class="cuda"><code>// Launch konfiguráció
+dim3 blockDim(TILE_SIZE, TILE_SIZE); // Pl. 16x16 = 256 szál
+dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE,
+             (M + TILE_SIZE - 1) / TILE_SIZE); // Pl. 64x64 blokk 1024x1024-es mátrixhoz
+
+// Futtatás
+tiledMatMulKernel&lt;&lt;&lt;gridDim, blockDim&gt;&gt;&gt;(d_A, d_B, d_C, M, N, K);</code></pre>
+<h4 data-number="14.1.1.5" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">14.1.1.5</span> Tipikus hibák és helyes
+megoldások</h4>
+<p>A tiled kernelek implementálása során a fejlesztők gyakran elkövetnek
+néhány jellemző hibát:</p>
+<ol type="1">
+<li><p><strong>Elmaradt <code>__syncthreads()</code>.</strong> Ez a
+leggyakoribb hiba. A szinkronizáció elhagyása versenyhelyzetet (<em>race
+condition</em>) eredményez: egy szál olyan shared memóriaelemet
+olvashat, amelyet egy másik szál még nem írt be, vagy éppen felülír. A
+végeredmény nem determinisztikus, és a hiba gyakran csak nagy méretű
+futtatásoknál jelentkezik. A helyes megoldás az, hogy minden csempe
+betöltése után és a csempe elhagyása előtt kötelező a
+<code>__syncthreads()</code> hívás.</p></li>
+<li><p><strong><code>__syncthreads()</code> divergens ágban.</strong> Ha
+a <code>__syncthreads()</code> hívás egy <code>if</code>-feltételen
+belül van, amely a blokk szálainak csak egy részére igaz, a kernel
+holtpontra (<em>deadlock</em>) juthat, vagy a viselkedés nem definiált.
+A CUDA programozási modell szerint a <code>__syncthreads()</code>-t a
+blokk minden szálának el kell érnie. A helyes megoldás az, hogy a
+szinkronizációt feltétel nélküli kódrészben helyezzük el, vagy
+gondoskodjunk arról, hogy a feltétel a blokk minden szálára ugyanazt az
+eredményt adja.</p></li>
+<li><p><strong>Indexelési hibák a határokon.</strong> Amikor a mátrix
+mérete nem osztható <code>TILE_SIZE</code>-szal, a betöltés során
+ellenőriznünk kell, hogy a globális memória indexe érvényes-e. A fenti
+kódban a <code>row &lt; M &amp;&amp; aCol &lt; K</code> feltétel
+biztosítja, hogy a határon túli olvasás helyett nullát írjunk a shared
+memóriába. Ez a technika egyszerű és hatékony, mert a nullával való
+szorzás nem befolyásolja a részösszeget.</p></li>
+<li><p><strong>Shared memory bank conflict.</strong> A shared memory
+fizikailag bankokba van szervezve (jellemzően 32 bank). Ha egy warp
+szálai úgy férnek hozzá a shared memóriához, hogy többen is ugyanazt a
+bankot használják, a hozzáférés szerializálódik. A mátrixszorzás
+kerneleknél a <code>As[ty][k]</code> és <code>Bs[k][tx]</code>
+hozzáférések általában nem okoznak konfliktust, mert a warp szálai a
+<code>k</code> index mentén különböző bankokat érnek el. A bank
+conflictok elkerülése azonban egy fontos optimalizálási szempont, amit a
+következő fejezetek részletesen tárgyalnak.</p></li>
+</ol>
+<h4 data-number="14.1.1.6"
+id="labor-tiled-mátrixszorzás-megvalósítása-és-mérése"><span
+class="header-section-number">14.1.1.6</span> Labor: tiled mátrixszorzás
+megvalósítása és mérése</h4>
+<p>A labor célja a naiv, globális memóriás mátrixszorzás és a tiled,
+shared memóriát használó kernel teljesítményének összehasonlítása. A
+labor nemcsak a kernel implementálását, hanem a helyes mérési módszertan
+alkalmazását is gyakorolja.</p>
+<p><strong>Feladat</strong></p>
+<p>Implementáld a fenti <code>tiledMatMulKernel</code> kernelt, és
+futtass méréseket egy valós GPU-n. Hasonlítsd össze a futási időt a
+<code>naiveMatMulKernel</code> futási idejével azonos bemeneti méretek
+mellett. A méréshez kötelező a CUDA hibakezelés
+(<code>cudaGetLastError</code>, <code>cudaDeviceSynchronize</code>)
+használata.</p>
+<p><strong>Build parancs (példa)</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># CUDA C++ (C++17) fordítás</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-Xcompiler</span> <span class="at">-Wall</span> <span class="at">-o</span> matrix_mul_tiled matrix_mul_tiled.cu</span></code></pre></div>
+<p><strong>Futtatási parancs (példa)</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Izolált labor környezetben</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./matrix_mul_tiled</span></span></code></pre></div>
+<p><strong>GPU-konfiguráció és mérési napló</strong></p>
+<p>A mérés megkezdése előtt rögzítsd a környezet paramétereit:</p>
+<ul>
+<li><strong>GPU:</strong> <code>&lt;NVIDIA GeForce RTX 3060&gt;</code>
+(példa, helyettesítsd a valós modellel)</li>
+<li><strong>Driver verzió:</strong> <code>&lt;550.54.14&gt;</code>
+(példa)</li>
+<li><strong>CUDA verzió:</strong> <code>&lt;12.4&gt;</code> (példa)</li>
+<li><strong>Compute capability:</strong> <code>&lt;8.6&gt;</code>
+(példa)</li>
+<li><strong>Operációs rendszer:</strong>
+<code>&lt;Ubuntu 22.04 x86_64&gt;</code> (példa)</li>
+<li><strong>Mátrixméretek (M, N, K):</strong>
+<code>&lt;1024, 1024, 1024&gt;</code></li>
+<li><strong>Precision:</strong> FP32 (float)</li>
+<li><strong>Időmérés:</strong> <code>cudaEvent_t</code> vagy
+<code>std::chrono</code> + <code>cudaDeviceSynchronize</code></li>
+<li><strong>Ismétlések:</strong> 10 bemelegítő futtatás, majd 20 mért
+futtatás átlaga és szórása</li>
+<li><strong>Adatmozgatás:</strong> A mérés csak a kernel futási idejére
+vonatkozzon, a HtoD és DtoH másolás idejét külön kell mérni.</li>
+</ul>
+<p><strong>Mért eredmények (példa, nem ellenőrzött adat)</strong></p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Kernel</th>
+<th style="text-align: left;">Átlagos futási idő (ms)</th>
+<th style="text-align: left;">Szórás (ms)</th>
+<th style="text-align: left;">Elért sávszélesség (GB/s)</th>
+<th style="text-align: left;">Várt sávszélesség (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Naiv (global memory)</td>
+<td style="text-align: left;"><code>12.5</code></td>
+<td style="text-align: left;"><code>0.8</code></td>
+<td style="text-align: left;"><code>~200</code></td>
+<td style="text-align: left;"><code>100–250</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Tiled (shared memory)</td>
+<td style="text-align: left;"><code>4.2</code></td>
+<td style="text-align: left;"><code>0.3</code></td>
+<td style="text-align: left;"><code>~600</code></td>
+<td style="text-align: left;"><code>400–700</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>A várt és mért eredmények elkülönítése</strong></p>
+<p>A táblázatban a mért értékek a labor során rögzített nyers adatok, a
+várt értékek pedig a hardver specifikációja és a korábbi tapasztalatok
+alapján becsült tartományok. A tényleges mérési eredmények jelentősen
+eltérhetnek a fenti példaértékektől a CPU, a GPU, a memória-órajel, a
+power limit és a háttérterhelés függvényében. A fejezet célja nem egy
+konkrét szám reprodukálása, hanem a tiling hatásának kimutatása: a tiled
+kernelnek ugyanazon a hardveren, azonos input mellett legalább 2–3-szor
+gyorsabbnak kell lennie a naiv kernelnél.</p>
+<p><strong>Ellenőrzés</strong></p>
+<p>A kernel helyességét egy CPU-n futó referenciamegoldással ellenőrizd.
+A GPU és CPU eredmények közötti maximális abszolút hibaküszöb legyen
+<code>1e-4</code> (FP32 esetén). Ne feledkezz meg a hibakódok
+ellenőrzéséről a kernel indítása után:</p>
+<pre class="cuda"><code>// Kötelező ellenőrzés a kernel indítása után
+cudaError_t err = cudaGetLastError();
+if (err != cudaSuccess) {
+    fprintf(stderr, &quot;CUDA hiba: %s\n&quot;, cudaGetErrorString(err));
+    // Itt kezeljük a hibát, például kilépünk a programból
+}
+cudaDeviceSynchronize();</code></pre>
+<h4 data-number="14.1.1.7" id="önellenőrző-kérdések"><span
+class="header-section-number">14.1.1.7</span> Önellenőrző kérdések</h4>
+<ol type="1">
+<li>Miért csökkenti a tiling a globális memóriából történő olvasások
+számát a mátrixszorzásnál? Számszerűsítsd a csökkenést egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>×</mo><mi>N</mi></mrow><annotation encoding="application/x-tex">N \times N</annotation></semantics></math>-es
+mátrix és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mi>I</mi><mi>L</mi><mi>E</mi><mi>_</mi><mi>S</mi><mi>I</mi><mi>Z</mi><mi>E</mi></mrow><annotation encoding="application/x-tex">TILE\_SIZE</annotation></semantics></math>
+csempeméret esetén.</li>
+<li>Mi történik, ha a <code>__syncthreads()</code> hívást elhagyjuk a
+csempe betöltése után? Milyen típusú hibát okoz, és miért nem mindig
+jelentkezik?</li>
+<li>Miért nem választunk mindig maximális, 32x32-es csempét? Milyen
+korlátok szabályozzák a <code>TILE_SIZE</code> optimális értékét?</li>
+</ol>
+<h4 data-number="14.1.1.8" id="összefoglalás-és-kitekintés"><span
+class="header-section-number">14.1.1.8</span> Összefoglalás és
+kitekintés</h4>
+<p>A shared memory tiling a GPGPU programozás egyik legalapvetőbb és
+leghatékonyabb eszköze. Lehetővé teszi, hogy a fejlesztő explicit módon
+irányítsa az SM-erőforrást, és a globális memóriaforgalmat a minimálisra
+csökkentse. A mátrixszorzás példáján bemutatott minta – kooperatív
+betöltés, szinkronizáció, számítás, szinkronizáció – szinte minden olyan
+kernelben visszaköszön, amely többszörösen újrahasznosítja az adatokat
+(például konvolúciók, stencil műveletek, transzponálás).</p>
+<p>A tiling azonban csak az első lépés. A kernel jelenlegi változatában
+a szálak a globális memóriából történő betöltés idejére várakoznak: a
+<code>__syncthreads()</code> hívás megállítja őket, amíg az összes adat
+meg nem érkezik. A következő fejezetben ezt a várakozási időt fogjuk
+elrejteni aszinkron memóriaműveletekkel és adatmozgatási
+csővezetékekkel, amelyek a betöltést és a számítást párhuzamosítják.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu049.html">← 13.4 Roofline-alapú optimalizálás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu051.html">14.2 Aszinkron másolás (cp.async) →</a></div>
+</nav>
+</body>
+</html>

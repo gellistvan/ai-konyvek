@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>7.3 Local, constant és texture memória – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – CUDA programozási modell</a> › <a href="index.html#gpuch06">7 Memóriaterek: global, shared, local, constant és texture</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu023.html">← 7.2 Shared memory és élettartam</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu025.html">7.4 Memóriaterek kiválasztása →</a></div>
+</nav>
+<h2 data-number="7.3" id="gpu024"><span
+class="header-section-number">7.3</span> Local, constant és texture
+memória</h2>
+<p>A <code>gpu023</code> egységben a globális és a megosztott memóriát,
+valamint azok élettartamát és alapvető használatát tárgyaltuk. Ebben az
+alfejezetben a specializáltabb CUDA-memóriaterekre koncentrálunk: a
+lokális memóriára, a konstans memóriára, a read-only cache-re és a
+textúra-memóriára. Ezek a memóriaterek önmagukban nem új fizikai
+tárolók, hanem a globális memóriára épülő, eltérő hozzáférési útvonalak
+és hardveres gyorsítók, amelyeket célzottan használva jelentősen
+javíthatjuk a kernelünk teljesítményét és olvashatóságát.</p>
+<p>A cél az, hogy pontosan megértsd, mikor érdemes a lokális, konstans
+vagy textúra-memóriát választanod, hogyan ellenőrizheted a
+használatukat, és hogyan kerülheted el a tipikus buktatókat. A fejezet
+végén egy laborban konstans memóriát és textúraobjektumot használó
+CUDA-kernelt építünk, és elvégezzük a mérést.</p>
+<hr />
+<h3 data-number="7.3.1" id="a-specializált-memóriaterek-szerepe"><span
+class="header-section-number">7.3.1</span> 1. A specializált
+memóriaterek szerepe</h3>
+<p>A CUDA memóriahierarchiája a fizikai tárolókat (regiszter, shared,
+L1/L2, globális memória) és a hozzájuk kapcsolódó logikai memóriatereket
+különbözteti meg. A szakirodalomban gyakran <strong>memóriatér</strong>
+néven hivatkozunk azokra az absztrakciókra, amelyek meghatározzák, hogy
+a kernel hogyan érheti el az adatot, és milyen gyorsító egységek (cache,
+textúra hardver) állnak rendelkezésre.</p>
+<p>A specializált memóriaterek közé tartozik:</p>
+<ul>
+<li><strong>Lokális memória</strong> – a regiszterek kiegészítője,
+amikor a fordító nem tud minden változót regiszterben tartani.
+Fizikailag a globális memóriában helyezkedik el, de a kernel
+szempontjából privát, szálankénti tárterület.</li>
+<li><strong>Konstans memória</strong> – a globális memória egy
+írásvédett, gyorsítótárazott területe, amelyet a host oldalról
+inicializálhatunk, és a kernel a <code>__constant__</code> címtérrel
+olvashat.</li>
+<li><strong>Textúra-memória</strong> – a globális memóriához kapcsolódó,
+a textúra-hardver által kezelt írásvédett hozzáférési útvonal, amely
+hardveres interpolációt, címzési módokat és adatkonverziót
+biztosít.</li>
+<li><strong>Read-only data cache</strong> – az <code>__ldg</code>
+aktuálisan vagy a <code>const T* __restrict__</code> pointerrel elérhető
+gyorsítótár, amely a konstans és textúra cache-hez hasonlóan írásvédett
+adatokat szolgál ki.</li>
+</ul>
+<p>Ezek a memóriaterek nem függetlenek a globális memóriától: a lokális,
+konstans és textúra-memória mind a globális memóriából származó adatot
+használ, de más hozzáférési mintát, cache-politikát és hardveres
+támogatást kap. A helyes választáshoz ismernünk kell a korlátokat és a
+tipikus használati eseteket.</p>
+<hr />
+<h3 data-number="7.3.2" id="local-memory-és-regiszter-spill"><span
+class="header-section-number">7.3.2</span> 2. Local memory és
+regiszter-spill</h3>
+<p>A lokális memóriát a fordító akkor használja, ha egy változó nem fér
+el a rendelkezésre álló regiszterekben, vagy ha a forráskód olyan
+konstrukciót tartalmaz, amely megakadályozza a regiszterekben való
+tárolást. Ilyen esetek például:</p>
+<ul>
+<li>Nagy méretű, privát tömbök a kernelben, amelyek nem statikusan
+indexelhetők.</li>
+<li>Dinamikus indexelés egy tömbön (pl. <code>arr[i]</code>, ahol
+<code>i</code> futás közben változik).</li>
+<li>Túl sok élő változó, amely elfogyasztja a regisztereket.</li>
+</ul>
+<p>A lokális memória a globális memóriában van, de L1/L2 cache-ben
+gyorsítótárazódik. A hozzáférés lassabb, mint a regiszter vagy a shared
+memória, de gyors lehet, ha a hozzáférési minta cache-barát.</p>
+<p><strong>Példa:</strong> Tekintsük a következő kernelt, amely egy
+privát 256 elemű tömböt hoz létre:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> local_spill_demo<span class="op">(</span><span class="dt">float</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> a<span class="op">[</span><span class="dv">256</span><span class="op">];</span> <span class="co">// privát tömb; valószínűleg nem fér el regiszterben</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">256</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>        a<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> idx <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">256</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> a<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Fordítás során a <code>ptxas</code> eszköz megmutatja, hogy mennyi
+regisztert és mennyi lokális memóriát használ a kernel. A
+buildparancs:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-Xptxas</span> <span class="at">-v</span> local_spill.cu <span class="at">-o</span> local_spill</span></code></pre></div>
+<p>A kimenetben ilyesmi szerepelhet:</p>
+<pre><code>ptxas info    : Used 32 registers, 1024 bytes of local memory per thread</code></pre>
+<p>A <code>local memory per thread</code> méret jelzi, hogy a privát
+tömb a lokális memóriába került. Ez nem feltétlenül hibás, de
+teljesítményproblémát okozhat, mert a lokális memória hozzáférése a
+globális memória sávszélességét terheli. A spill jelentőségét az Nsight
+Compute <code>local_load</code> és <code>local_store</code> metrikái is
+mutatják.</p>
+<p><strong>Mikor számít a spill?</strong> Ha a kernel erősen
+számítás-korlátos, a lokális memória használata növeli a
+memóriaforgalmat, és csökkenti az effektív sávszélességet. Ilyenkor
+megoldás lehet:</p>
+<ul>
+<li>A privát tömb méretének csökkentése.</li>
+<li>Az adat megosztása shared memóriával, ha a szálak között átfedés
+van.</li>
+<li>A számítás átszervezése, hogy kevesebb élő változó legyen.</li>
+</ul>
+<p>A lokális memória használatát a <code>__launch_bounds__</code>
+qualifierrel is befolyásolhatjuk, mert a regiszterlimit növelésével
+csökkenthetjük a spillt.</p>
+<p><strong>Fontos:</strong> A lokális memória soha nem látható más
+szálakból; szálanként privát. Ezért a neve megtévesztő lehet, de a
+fizikai tárolás a globális memóriában van.</p>
+<hr />
+<h3 data-number="7.3.3" id="konstans-memória-__constant__"><span
+class="header-section-number">7.3.3</span> 3. Konstans memória
+(<code>__constant__</code>)</h3>
+<p>A konstans memória a globális memória egy írásvédett,
+gyorsítótárazott területe, amelyet kifejezetten a kernel által csak
+olvasott, gyakran broadcast-elt adatok tárolására terveztek. A CUDA C++
+nyelvben a <code>__constant__</code> szimbólummal deklarálunk ilyen
+változót:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_params<span class="op">[</span><span class="dv">4</span><span class="op">];</span></span></code></pre></div>
+<p>A konstans memória mérete korlátozott: a teljes konstans memória
+mérete a CUDA specifikáció szerint 64 KiB, és a kernel futása során nem
+módosítható. A host oldalról a <code>cudaMemcpyToSymbol</code>
+funkcióval tölthetjük fel az adatot:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> h_params<span class="op">[</span><span class="dv">4</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">0.5</span><span class="bu">f</span><span class="op">,</span> <span class="fl">0.25</span><span class="bu">f</span> <span class="op">};</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>cudaMemcpyToSymbol<span class="op">(</span>c_params<span class="op">,</span> h_params<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>h_params<span class="op">));</span></span></code></pre></div>
+<p>A kernelben a konstans memóriát ugyanúgy olvashatjuk, mint egy
+globális változót:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> use_constant_kernel<span class="op">(</span><span class="dt">float</span><span class="op">*</span> out<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> c_params<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">*</span> out<span class="op">[</span>idx<span class="op">]</span> <span class="op">+</span> c_params<span class="op">[</span><span class="dv">1</span><span class="op">];</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Miért gyors a konstans memória?</strong> Az SM-ek
+tartalmaznak egy kis, dedikált konstans cache-t. Ha egy warp összes
+szála ugyanazt a címet olvassa, a hardver egyetlen memóriatranzakcióval
+kiszolgálja az olvasást, és broadcast módban eljuttatja az adatot minden
+szálhoz. Ez akkor előnyös, ha az összes szál ugyanazt a
+paraméterkészletet, például súlyokat, dimenziókat vagy konverziós
+faktorokat használja. Ha azonban a szálak különböző címeket olvasnak, a
+konstans cache sorba rendezi a kéréseket, és a teljesítmény romlik.</p>
+<p><strong>Használati szabályok:</strong></p>
+<ul>
+<li>A konstans memória csak olvasható a kernelből; írni kizárólag a host
+oldalról lehet, a <code>cudaMemcpyToSymbol</code> segítségével.</li>
+<li>A méret nem haladhatja meg a 64 KiB-ot, de a gyakorlatban a konstans
+cache mérete ennél jóval kisebb (jellemzően 8 KiB–16 KiB SM-enként).
+Nagy konstans tömböknél a cache hatékonysága romlik.</li>
+<li>A <code>cudaMemcpyToSymbol</code> csak a kernel indítása előtt, vagy
+stream-szinkronizáció mellett használható biztonságosan.</li>
+</ul>
+<p><strong>Példa konverziós faktorokkal:</strong> Egy képfeldolgozó
+kernelben a kamera-kalibrációs mátrixot konstans memóriába tehetjük, ha
+minden szál ugyanazt a mátrixot használja.</p>
+<hr />
+<h3 data-number="7.3.4" id="read-only-cache-és-az-__ldg"><span
+class="header-section-number">7.3.4</span> 4. Read-only cache és az
+<code>__ldg</code></h3>
+<p>A modern CUDA-architektúrák rendelkeznek egy <strong>read-only data
+cache</strong>-sel, amelyet a textúra- és konstans cache-hez hasonlóan
+használhatunk. Az explicit read-only hozzáférést az <code>__ldg</code>
+beépített függvény biztosítja:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> ldg_kernel<span class="op">(</span><span class="dt">float</span><span class="op">*</span> out<span class="op">,</span> <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> in<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> x <span class="op">=</span> __ldg<span class="op">(&amp;</span>in<span class="op">[</span>idx<span class="op">]);</span>          <span class="co">// read-only cache-en keresztüli olvasás</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    out<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> x <span class="op">*</span> x<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>__ldg</code> arra utasítja a fordítót, hogy az adott címről a
+read-only cache-en keresztül olvasson. Ez akkor hasznos, ha a bemeneti
+adat garantáltan nem változik a kernel futása alatt, de a fordító ezt
+nem tudja bizonyítani. Ha a mutató
+<code>const float* __restrict__</code>, a fordító gyakran automatikusan
+is a read-only útvonalat választja, de az explicit <code>__ldg</code>
+egyértelművé teszi a szándékot.</p>
+<p>A read-only cache előnye, hogy a globális memória sávszélességét
+tehermentesíti, különösen akkor, ha a hozzáférési minta nem tökéletesen
+coalescing. A hatás mérhető Nsight Compute-ban a
+<code>l1tex__t_sectors_pipe_lsu_mem_global_op_ld</code> jellegű
+metrikákkal.</p>
+<p><strong>Fontos:</strong> Az <code>__ldg</code> csak olvasásra
+használható, írásra nem. Ha a kernel módosítja az adatot, a read-only
+feltételezés hibás, és a viselkedés nem definiált.</p>
+<hr />
+<h3 data-number="7.3.5" id="textúra-memória-és-textúraobjektumok"><span
+class="header-section-number">7.3.5</span> 5. Textúra-memória és
+textúraobjektumok</h3>
+<p>A textúra-memória a CUDA egyik legrégebbi specializált memóriatere,
+amelyet a grafikus renderelésből örökölt. A modern CUDA-ban a
+textúra-hozzáférés a globális memórián lévő adatokra irányul, de a
+textúra-hardver extra funkciókat biztosít:</p>
+<ul>
+<li><strong>Hardveres interpoláció</strong> – bilineáris, trilineáris
+interpoláció float típusokra.</li>
+<li><strong>Címzési módok</strong> – clamp, wrap, mirror a szélek
+kezelésére.</li>
+<li><strong>Normalizált koordináták</strong> – a textúra koordináták
+0..1 tartományba képezése.</li>
+<li><strong>Adatkonverzió</strong> – például 8 bites egész értékekből
+normalizált float értékek előállítása.</li>
+</ul>
+<p>A textúrákat kétféleképpen érhetjük el: textúra-referenciákkal
+(régebbi, globális szimbólum) és <strong>textúraobjektumok</strong>kal
+(újabb, a kernel függvényparaméterként adható át). A textúraobjektumok
+használata ajánlott, mert rugalmasabbak, és nem igényelnek globális
+deklarációt.</p>
+<p><strong>Textúraobjektum létrehozása:</strong></p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>cudaResourceDesc resDesc <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>resDesc<span class="op">.</span>resType <span class="op">=</span> cudaResourceTypeLinear<span class="op">;</span>   <span class="co">// 1D lineáris memória</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>devPtr <span class="op">=</span> d_input<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>desc <span class="op">=</span> cudaCreateChannelDesc<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;();</span> <span class="co">// float csatorna</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>sizeInBytes <span class="op">=</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>cudaTextureDesc texDesc <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>texDesc<span class="op">.</span>readMode <span class="op">=</span> cudaReadModeElementType<span class="op">;</span>  <span class="co">// elem típusú olvasás, nincs konverzió</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="dt">cudaTextureObject_t</span> tex <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>CUDA_CHECK<span class="op">(</span>cudaCreateTextureObject<span class="op">(&amp;</span>tex<span class="op">,</span> <span class="op">&amp;</span>resDesc<span class="op">,</span> <span class="op">&amp;</span>texDesc<span class="op">,</span> <span class="kw">nullptr</span><span class="op">));</span></span></code></pre></div>
+<p>A kernel függvényparaméterként kapja a textúraobjektumot:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> texture_kernel<span class="op">(</span><span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>                               <span class="dt">cudaTextureObject_t</span> tex<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> x <span class="op">=</span> tex1Dfetch<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>tex<span class="op">,</span> idx<span class="op">);</span>   <span class="co">// textúra-hardveres olvasás</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> x <span class="op">*</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>tex1Dfetch</code> a textúra-hardveren keresztül olvas.
+Fontos, hogy a <code>tex1Dfetch</code> csak
+<code>cudaTextureObject_t</code>-vel használható, textúra-referenciával
+a <code>tex1D</code> függvényt használjuk.</p>
+<p><strong>Mikor válasszunk textúrát?</strong> Ha nincs szükség
+interpolációra vagy speciális címzésre, a <code>__ldg</code> vagy a
+<code>const __restrict__</code> pointer gyakran ugyanolyan gyors, és
+egyszerűbb. A textúra akkor előnyös, ha:</p>
+<ul>
+<li>Bilineáris interpolációra van szükség (pl. képfelfelbontás).</li>
+<li>A koordináták szélsőségesek, és clamp/wrap viselkedést akarunk.</li>
+<li>Az adat típusa 8 vagy 16 bites, és normalizált float értékké
+konvertálnánk.</li>
+</ul>
+<p>A textúra cache a modern architektúrákon gyakran egyesített a
+read-only data cache-sel, így a teljesítménykülönbség a
+<code>__ldg</code> és a textúra között kicsi. A régebbi hardvereken
+külön textúra cache volt, ami bizonyos mintáknál előnyös lehetett.</p>
+<hr />
+<h3 data-number="7.3.6"
+id="labor-konstans-memória-és-textúraobjektum-használata"><span
+class="header-section-number">7.3.6</span> 6. Labor: konstans memória és
+textúraobjektum használata</h3>
+<p>Ebben a laborban egy olyan CUDA C++ programot készítünk, amely a
+konstans memóriából veszi a skálázási paramétereket, a bemeneti adatot
+pedig textúraobjektumon keresztül olvassa. A kernel minden elemet
+<code>scale * x + offset</code> módon transzformál. A labor célja a
+konstans és textúra-hozzáférés működésének ellenőrzése, a helyes
+eredmény előállítása, valamint a futásidő és sávszélesség mérése.</p>
+<p><strong>Környezet (példa bejegyzés, saját mérés előtt
+ellenőrizendő):</strong> - GPU: NVIDIA A100 40 GB (compute capability
+8.0) - Driver: 545.23.08 (Windows) / 545.29.06 (Linux) - CUDA Toolkit:
+12.3 - OS: Ubuntu 22.04 / Windows 11 - Fordító: nvcc (12.3), host: g++
+11.4</p>
+<p><strong>Kód:</strong> A teljes program alább látható. A hibakezelést
+a <code>CUDA_CHECK</code> makró biztosítja, a kernel indítás után
+<code>cudaGetLastError</code> és <code>cudaDeviceSynchronize</code>
+szerepel.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_runtime.h&gt;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cmath&gt;</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdlib&gt;</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#define CUDA_CHECK</span><span class="op">(</span>call<span class="op">)</span><span class="pp"> </span><span class="cf">do</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                    </span><span class="op">\</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="dt">cudaError_t</span><span class="pp"> </span>err<span class="pp"> </span><span class="op">=</span><span class="pp"> </span><span class="op">(</span>call<span class="op">);</span><span class="pp">                                    </span><span class="op">\</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="cf">if</span><span class="pp"> </span><span class="op">(</span>err<span class="pp"> </span><span class="op">!=</span><span class="pp"> </span>cudaSuccess<span class="op">)</span><span class="pp"> </span><span class="op">{</span><span class="pp">                                    </span><span class="op">\</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>cerr<span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;CUDA error at &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__FILE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;:&quot;</span><span class="pp">         </span><span class="op">\</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="pp">                  </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="ot">__LINE__</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="st">&quot;: &quot;</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span>cudaGetErrorString<span class="op">(</span>err<span class="op">)</span><span class="pp"> </span><span class="op">\</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="pp">                  </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="bu">std::</span>endl<span class="op">;</span><span class="pp">                                  </span><span class="op">\</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="pp">        </span><span class="bu">std::</span>abort<span class="op">();</span><span class="pp">                                            </span><span class="op">\</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a><span class="pp">    </span><span class="op">}</span><span class="pp">                                                            </span><span class="op">\</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span><span class="pp"> </span><span class="cf">while</span><span class="pp"> </span><span class="op">(</span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_params<span class="op">[</span><span class="dv">2</span><span class="op">];</span> <span class="co">// c_params[0] = skála, c_params[1] = eltolás</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> constant_texture_kernel<span class="op">(</span><span class="dt">float</span><span class="op">*</span> <span class="ex">__restrict__</span> output<span class="op">,</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>                                        <span class="dt">int</span> n<span class="op">,</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>                                        <span class="dt">cudaTextureObject_t</span> tex<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> idx <span class="op">=</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x <span class="op">+</span> threadIdx<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>idx <span class="op">&gt;=</span> n<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> x <span class="op">=</span> tex1Dfetch<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>tex<span class="op">,</span> idx<span class="op">);</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>    output<span class="op">[</span>idx<span class="op">]</span> <span class="op">=</span> c_params<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">*</span> x <span class="op">+</span> c_params<span class="op">[</span><span class="dv">1</span><span class="op">];</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">int</span> n <span class="op">=</span> <span class="dv">1</span> <span class="op">&lt;&lt;</span> <span class="dv">22</span><span class="op">;</span>  <span class="co">// 4 M elem</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">size_t</span> bytes <span class="op">=</span> n <span class="op">*</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">);</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> h_input<span class="op">(</span>n<span class="op">),</span> h_output<span class="op">(</span>n<span class="op">),</span> h_expected<span class="op">(</span>n<span class="op">);</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemeneti adat inicializálása</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>        h_input<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>i <span class="op">%</span> <span class="dv">1000</span><span class="op">)</span> <span class="op">/</span> <span class="fl">100.0</span><span class="bu">f</span><span class="op">;</span> <span class="co">// 0.00 .. 9.99</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-38"><a href="#cb10-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-39"><a href="#cb10-39" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Konstans paraméterek</span></span>
+<span id="cb10-40"><a href="#cb10-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> h_params<span class="op">[</span><span class="dv">2</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">1.5</span><span class="bu">f</span> <span class="op">};</span></span>
+<span id="cb10-41"><a href="#cb10-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-42"><a href="#cb10-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Várt eredmény (CPU oldali referencia)</span></span>
+<span id="cb10-43"><a href="#cb10-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-44"><a href="#cb10-44" aria-hidden="true" tabindex="-1"></a>        h_expected<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> h_params<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">*</span> h_input<span class="op">[</span>i<span class="op">]</span> <span class="op">+</span> h_params<span class="op">[</span><span class="dv">1</span><span class="op">];</span></span>
+<span id="cb10-45"><a href="#cb10-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-46"><a href="#cb10-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-47"><a href="#cb10-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eszközmemória allokálása</span></span>
+<span id="cb10-48"><a href="#cb10-48" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_input<span class="op">;</span></span>
+<span id="cb10-49"><a href="#cb10-49" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> d_output<span class="op">;</span></span>
+<span id="cb10-50"><a href="#cb10-50" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_input<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb10-51"><a href="#cb10-51" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMalloc<span class="op">(&amp;</span>d_output<span class="op">,</span> bytes<span class="op">));</span></span>
+<span id="cb10-52"><a href="#cb10-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-53"><a href="#cb10-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Bemenet másolása global memory-ba</span></span>
+<span id="cb10-54"><a href="#cb10-54" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>d_input<span class="op">,</span> h_input<span class="op">.</span>data<span class="op">(),</span> bytes<span class="op">,</span> cudaMemcpyHostToDevice<span class="op">));</span></span>
+<span id="cb10-55"><a href="#cb10-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-56"><a href="#cb10-56" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Konstans memória feltöltése</span></span>
+<span id="cb10-57"><a href="#cb10-57" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpyToSymbol<span class="op">(</span>c_params<span class="op">,</span> h_params<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>h_params<span class="op">)));</span></span>
+<span id="cb10-58"><a href="#cb10-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-59"><a href="#cb10-59" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Textúraobjektum létrehozása</span></span>
+<span id="cb10-60"><a href="#cb10-60" aria-hidden="true" tabindex="-1"></a>    cudaResourceDesc resDesc <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb10-61"><a href="#cb10-61" aria-hidden="true" tabindex="-1"></a>    resDesc<span class="op">.</span>resType <span class="op">=</span> cudaResourceTypeLinear<span class="op">;</span></span>
+<span id="cb10-62"><a href="#cb10-62" aria-hidden="true" tabindex="-1"></a>    resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>devPtr <span class="op">=</span> d_input<span class="op">;</span></span>
+<span id="cb10-63"><a href="#cb10-63" aria-hidden="true" tabindex="-1"></a>    resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>desc <span class="op">=</span> cudaCreateChannelDesc<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;();</span></span>
+<span id="cb10-64"><a href="#cb10-64" aria-hidden="true" tabindex="-1"></a>    resDesc<span class="op">.</span>res<span class="op">.</span>linear<span class="op">.</span>sizeInBytes <span class="op">=</span> bytes<span class="op">;</span></span>
+<span id="cb10-65"><a href="#cb10-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-66"><a href="#cb10-66" aria-hidden="true" tabindex="-1"></a>    cudaTextureDesc texDesc <span class="op">=</span> <span class="op">{};</span></span>
+<span id="cb10-67"><a href="#cb10-67" aria-hidden="true" tabindex="-1"></a>    texDesc<span class="op">.</span>readMode <span class="op">=</span> cudaReadModeElementType<span class="op">;</span></span>
+<span id="cb10-68"><a href="#cb10-68" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-69"><a href="#cb10-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaTextureObject_t</span> tex <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-70"><a href="#cb10-70" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaCreateTextureObject<span class="op">(&amp;</span>tex<span class="op">,</span> <span class="op">&amp;</span>resDesc<span class="op">,</span> <span class="op">&amp;</span>texDesc<span class="op">,</span> <span class="kw">nullptr</span><span class="op">));</span></span>
+<span id="cb10-71"><a href="#cb10-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-72"><a href="#cb10-72" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kernel indítási konfiguráció</span></span>
+<span id="cb10-73"><a href="#cb10-73" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> blockSize <span class="op">=</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb10-74"><a href="#cb10-74" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> gridSize <span class="op">=</span> <span class="op">(</span>n <span class="op">+</span> blockSize <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">/</span> blockSize<span class="op">;</span></span>
+<span id="cb10-75"><a href="#cb10-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-76"><a href="#cb10-76" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Időmérés CUDA eventekkel</span></span>
+<span id="cb10-77"><a href="#cb10-77" aria-hidden="true" tabindex="-1"></a>    <span class="dt">cudaEvent_t</span> start<span class="op">,</span> stop<span class="op">;</span></span>
+<span id="cb10-78"><a href="#cb10-78" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>start<span class="op">));</span></span>
+<span id="cb10-79"><a href="#cb10-79" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventCreate<span class="op">(&amp;</span>stop<span class="op">));</span></span>
+<span id="cb10-80"><a href="#cb10-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-81"><a href="#cb10-81" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Warm-up</span></span>
+<span id="cb10-82"><a href="#cb10-82" aria-hidden="true" tabindex="-1"></a>    constant_texture_kernel<span class="op">&lt;&lt;&lt;</span>gridSize<span class="op">,</span> blockSize<span class="op">&gt;&gt;&gt;(</span>d_output<span class="op">,</span> n<span class="op">,</span> tex<span class="op">);</span></span>
+<span id="cb10-83"><a href="#cb10-83" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaGetLastError<span class="op">());</span></span>
+<span id="cb10-84"><a href="#cb10-84" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDeviceSynchronize<span class="op">());</span></span>
+<span id="cb10-85"><a href="#cb10-85" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-86"><a href="#cb10-86" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Mérés: 10 ismétlés</span></span>
+<span id="cb10-87"><a href="#cb10-87" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;</span> times<span class="op">;</span></span>
+<span id="cb10-88"><a href="#cb10-88" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> iter <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> iter <span class="op">&lt;</span> <span class="dv">10</span><span class="op">;</span> <span class="op">++</span>iter<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-89"><a href="#cb10-89" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb10-90"><a href="#cb10-90" aria-hidden="true" tabindex="-1"></a>        constant_texture_kernel<span class="op">&lt;&lt;&lt;</span>gridSize<span class="op">,</span> blockSize<span class="op">&gt;&gt;&gt;(</span>d_output<span class="op">,</span> n<span class="op">,</span> tex<span class="op">);</span></span>
+<span id="cb10-91"><a href="#cb10-91" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventRecord<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb10-92"><a href="#cb10-92" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventSynchronize<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb10-93"><a href="#cb10-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-94"><a href="#cb10-94" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> ms <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb10-95"><a href="#cb10-95" aria-hidden="true" tabindex="-1"></a>        CUDA_CHECK<span class="op">(</span>cudaEventElapsedTime<span class="op">(&amp;</span>ms<span class="op">,</span> start<span class="op">,</span> stop<span class="op">));</span></span>
+<span id="cb10-96"><a href="#cb10-96" aria-hidden="true" tabindex="-1"></a>        times<span class="op">.</span>push_back<span class="op">(</span>ms<span class="op">);</span></span>
+<span id="cb10-97"><a href="#cb10-97" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-98"><a href="#cb10-98" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-99"><a href="#cb10-99" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmény visszamásolása és ellenőrzése</span></span>
+<span id="cb10-100"><a href="#cb10-100" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaMemcpy<span class="op">(</span>h_output<span class="op">.</span>data<span class="op">(),</span> d_output<span class="op">,</span> bytes<span class="op">,</span> cudaMemcpyDeviceToHost<span class="op">));</span></span>
+<span id="cb10-101"><a href="#cb10-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-102"><a href="#cb10-102" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb10-103"><a href="#cb10-103" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> max_abs_err <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb10-104"><a href="#cb10-104" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-105"><a href="#cb10-105" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> err <span class="op">=</span> <span class="bu">std::</span>fabs<span class="op">(</span>h_output<span class="op">[</span>i<span class="op">]</span> <span class="op">-</span> h_expected<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb10-106"><a href="#cb10-106" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>err <span class="op">&gt;</span> max_abs_err<span class="op">)</span> max_abs_err <span class="op">=</span> err<span class="op">;</span></span>
+<span id="cb10-107"><a href="#cb10-107" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>err <span class="op">&gt;</span> <span class="fl">1e-5</span><span class="bu">f</span><span class="op">)</span> <span class="op">{</span> ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span> <span class="cf">break</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb10-108"><a href="#cb10-108" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-109"><a href="#cb10-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-110"><a href="#cb10-110" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Helyes eredmény: &quot;</span> <span class="op">&lt;&lt;</span> <span class="op">(</span>ok <span class="op">?</span> <span class="st">&quot;igen&quot;</span> <span class="op">:</span> <span class="st">&quot;nem&quot;</span><span class="op">)</span> <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb10-111"><a href="#cb10-111" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Maximális abszolút hiba: &quot;</span> <span class="op">&lt;&lt;</span> max_abs_err <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb10-112"><a href="#cb10-112" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-113"><a href="#cb10-113" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Átlag és szórás számítása</span></span>
+<span id="cb10-114"><a href="#cb10-114" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> sq_sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb10-115"><a href="#cb10-115" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">float</span> t <span class="op">:</span> times<span class="op">)</span> <span class="op">{</span> sum <span class="op">+=</span> t<span class="op">;</span> sq_sum <span class="op">+=</span> t <span class="op">*</span> t<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb10-116"><a href="#cb10-116" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> mean <span class="op">=</span> sum <span class="op">/</span> times<span class="op">.</span>size<span class="op">();</span></span>
+<span id="cb10-117"><a href="#cb10-117" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> variance <span class="op">=</span> <span class="op">(</span>sq_sum <span class="op">/</span> times<span class="op">.</span>size<span class="op">())</span> <span class="op">-</span> <span class="op">(</span>mean <span class="op">*</span> mean<span class="op">);</span></span>
+<span id="cb10-118"><a href="#cb10-118" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> stddev <span class="op">=</span> <span class="bu">std::</span>sqrt<span class="op">(</span><span class="bu">std::</span>max<span class="op">(</span><span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> variance<span class="op">));</span></span>
+<span id="cb10-119"><a href="#cb10-119" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-120"><a href="#cb10-120" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Futásidő (ms): átlag = &quot;</span> <span class="op">&lt;&lt;</span> mean</span>
+<span id="cb10-121"><a href="#cb10-121" aria-hidden="true" tabindex="-1"></a>              <span class="op">&lt;&lt;</span> <span class="st">&quot;, szórás = &quot;</span> <span class="op">&lt;&lt;</span> stddev <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb10-122"><a href="#cb10-122" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> achieved_bandwidth_GBs <span class="op">=</span> <span class="op">(</span>bytes <span class="op">*</span> <span class="dv">2</span><span class="op">)</span> <span class="op">/</span> <span class="op">(</span>mean <span class="op">*</span> <span class="fl">1e-3</span><span class="op">)</span> <span class="op">/</span> <span class="fl">1e9</span><span class="op">;</span></span>
+<span id="cb10-123"><a href="#cb10-123" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Effektív sávszélesség (GB/s): &quot;</span> <span class="op">&lt;&lt;</span> achieved_bandwidth_GBs <span class="op">&lt;&lt;</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb10-124"><a href="#cb10-124" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-125"><a href="#cb10-125" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Takarítás</span></span>
+<span id="cb10-126"><a href="#cb10-126" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaDestroyTextureObject<span class="op">(</span>tex<span class="op">));</span></span>
+<span id="cb10-127"><a href="#cb10-127" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_input<span class="op">));</span></span>
+<span id="cb10-128"><a href="#cb10-128" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaFree<span class="op">(</span>d_output<span class="op">));</span></span>
+<span id="cb10-129"><a href="#cb10-129" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>start<span class="op">));</span></span>
+<span id="cb10-130"><a href="#cb10-130" aria-hidden="true" tabindex="-1"></a>    CUDA_CHECK<span class="op">(</span>cudaEventDestroy<span class="op">(</span>stop<span class="op">));</span></span>
+<span id="cb10-131"><a href="#cb10-131" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-132"><a href="#cb10-132" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb10-133"><a href="#cb10-133" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Buildparancs:</strong></p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-O3</span> <span class="at">-std</span><span class="op">=</span>c++17 constant_texture_lab.cu <span class="at">-o</span> constant_texture_lab</span></code></pre></div>
+<p><strong>Futtatási parancs:</strong></p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./constant_texture_lab</span></span></code></pre></div>
+<p><strong>Várt eredmény:</strong> A kimenet minden elemének meg kell
+egyeznie a CPU-oldali referenciaértékkel, a maximális abszolút hiba FP32
+esetén legfeljebb ~1e-5. A kernel futásidejét a memória-hozzáférés
+sávszélessége határozza meg; az A100-on a globális memória elvi
+sávszélessége 1,55 TB/s körül van, de a gyakorlatban a kernelünk a
+bemeneti (4 MiB) és kimeneti (4 MiB) adat mozgatásával 8 MiB-ot
+olvas/ír. A várt sávszélesség 500–900 GB/s lehet, a pontos érték a
+hozzáférési mintától és a cache-től függ.</p>
+<p><strong>Mérési napló (példaértékű, nem ellenőrzött mérés):</strong>
+Az alábbi adatok egy reprodukálható jegyzőkönyv sablonját adják; a saját
+környezetben mért értékeket kell rögzíteni.</p>
+<table>
+<thead>
+<tr class="header">
+<th>Iteráció</th>
+<th>Futásidő (ms)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>0,0182</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>0,0178</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>0,0179</td>
+</tr>
+<tr class="even">
+<td>4</td>
+<td>0,0180</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>0,0181</td>
+</tr>
+<tr class="even">
+<td>6</td>
+<td>0,0177</td>
+</tr>
+<tr class="odd">
+<td>7</td>
+<td>0,0182</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>0,0180</td>
+</tr>
+<tr class="odd">
+<td>9</td>
+<td>0,0179</td>
+</tr>
+<tr class="even">
+<td>10</td>
+<td>0,0178</td>
+</tr>
+</tbody>
+</table>
+<p>Ebből átlag = 0,0180 ms, szórás = 0,0002 ms. A számolt effektív
+sávszélesség körülbelül 8 MiB / 0,0180 ms = 444 GB/s. Ez alacsonyabb,
+mint az A100 csúcsa, mert a kernel egyetlen elemre dolgoz, és a
+memória-hozzáférés nem teljesen optimalizált. A mérési naplót mindig a
+tényleges környezetben kell elvégezni, a fenti értékek csak
+illusztrációk.</p>
+<p><strong>Értelmezés:</strong> A konstans memória itt csak két
+lebegőpontos paramétert tárol, így a broadcast előnye nem mérhető
+látványosan. A textúra használata a lineáris olvasásnál hasonló
+teljesítményt nyújt, mint a <code>__ldg</code> vagy a
+<code>const __restrict__</code> pointer. A labor elsősorban a helyes
+működést és az API-használatot ellenőrzi.</p>
+<hr />
+<h3 data-number="7.3.7" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">7.3.7</span> 7. Tipikus hibák és helyes
+megoldások</h3>
+<p><strong>Hiba 1:</strong> A konstans memóriába kernelből próbálunk
+írni.</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_data<span class="op">[</span><span class="dv">4</span><span class="op">];</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> bad_kernel<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    c_data<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">;</span> <span class="co">// Fordítási hiba vagy nem definiált viselkedés</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><em>Megoldás:</em> A konstans memóriát csak host oldalról,
+<code>cudaMemcpyToSymbol</code> segítségével töltsük fel. A kernelben
+csak olvasható.</p>
+<p><strong>Hiba 2:</strong> A <code>cudaMemcpyToSymbol</code> mérete nem
+egyezik a deklarált konstans tömb méretével.</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>__constant__ <span class="dt">float</span> c_params<span class="op">[</span><span class="dv">3</span><span class="op">];</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> h_params<span class="op">[</span><span class="dv">2</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span> <span class="fl">1.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">2.0</span><span class="bu">f</span> <span class="op">};</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>cudaMemcpyToSymbol<span class="op">(</span>c_params<span class="op">,</span> h_params<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>h_params<span class="op">));</span> <span class="co">// 8 bájtot másol, pedig 12 kell</span></span></code></pre></div>
+<p><em>Megoldás:</em> Mindig a deklarált konstans szimbólum méretét
+használjuk, pl. <code>sizeof(c_params)</code> a host oldalon nem
+használható, mert az a kernel szimbólum. Ilyenkor a kódban explicit
+megadjuk a méretet: <code>sizeof(float) * 3</code>.</p>
+<p><strong>Hiba 3:</strong> Textúraobjektum létrehozása után elfelejtjük
+ellenőrizni a visszatérési értéket, és érvénytelen <code>tex</code>-et
+adunk át.</p>
+<p><em>Megoldás:</em> A <code>cudaCreateTextureObject</code> hibakódját
+a <code>CUDA_CHECK</code> makróval ellenőrizzük.</p>
+<p><strong>Hiba 4:</strong> A <code>tex1Dfetch</code>-et
+textúra-referenciával próbáljuk használni.</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>texture<span class="op">&lt;</span><span class="dt">float</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> cudaReadModeElementType<span class="op">&gt;</span> texRef<span class="op">;</span> <span class="co">// régebbi</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="dt">float</span> x <span class="op">=</span> tex1Dfetch<span class="op">&lt;</span><span class="dt">float</span><span class="op">&gt;(</span>texRef<span class="op">,</span> idx<span class="op">);</span> <span class="co">// fordítási hiba; tex1D kell</span></span></code></pre></div>
+<p><em>Megoldás:</em> Textúra-referencia esetén a
+<code>tex1D(texRef, x)</code> függvényt használjuk, vagy térjünk át
+textúraobjektumokra, ahol a <code>tex1Dfetch</code> a megfelelő.</p>
+<p><strong>Hiba 5:</strong> A <code>__ldg</code>-vel történő olvasás
+után a memóriát írjuk is, ami a read-only feltételezést megsérti.</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>__global__ <span class="dt">void</span> bad_ldg<span class="op">(</span><span class="dt">float</span><span class="op">*</span> a<span class="op">,</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> threadIdx<span class="op">.</span>x <span class="op">+</span> blockIdx<span class="op">.</span>x <span class="op">*</span> blockDim<span class="op">.</span>x<span class="op">;</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>i <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>        <span class="dt">float</span> v <span class="op">=</span> __ldg<span class="op">(&amp;</span>a<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>        a<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> v <span class="op">*</span> <span class="fl">2.0</span><span class="bu">f</span><span class="op">;</span> <span class="co">// ez írás; ha a pointer nem const __restrict__, a fordító hibát jelezhet</span></span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><em>Megoldás:</em> A <code>__ldg</code> csak akkor használható, ha az
+adathoz nem írunk. Ha írás is történik, használjunk írható globális
+mutatót, és ne erőltessük a read-only cache-t.</p>
+<p><strong>Hiba 6:</strong> A lokális memória méretének ellenőrzése
+nélkül nagy privát tömböket deklarálunk, ami spillhez vezet.</p>
+<p><em>Megoldás:</em> Fordítás közben <code>-Xptxas -v</code> opcióval
+nézzük meg a lokális memória használatot, és az Nsight Compute
+<code>local_load</code> metrikáit is figyeljük. Ha nagy a spill,
+csökkentsük a privát tömböt, vagy használjunk shared memóriát.</p>
+<hr />
+<h3 data-number="7.3.8" id="összefoglalás-és-önellenőrző-kérdés"><span
+class="header-section-number">7.3.8</span> 8. Összefoglalás és
+önellenőrző kérdés</h3>
+<p>Ebben az alfejezetben a specializált CUDA-memóriatereket tárgyaltuk.
+A lokális memória a regiszter-spillhez kapcsolódik, és a globális
+memóriában tárolódik; használata nem katasztrófa, de figyelni kell a
+memóriaforgalomra. A konstans memória egy írásvédett, gyorsítótárazott
+terület, amely akkor hatékony, ha a warp minden szála ugyanazt az adatot
+olvassa. A <code>__ldg</code> és a read-only cache hasonló gyorsítást
+kínál, de globális memóriából olvas. A textúra-memória hardveres
+interpolációt, címzési módokat és adatkonverziót biztosít, és
+textúraobjektumokkal rugalmasan kezelhető.</p>
+<p>A laborban konstans memóriát és textúraobjektumot használtunk, majd
+ellenőriztük a helyességet és mértük a futásidőt. A mért és várt
+eredményeket elkülönítettük, hangsúlyozva, hogy a teljesítményadatok
+mindig a tényleges környezetben érvényesek.</p>
+<p><strong>Önellenőrző kérdés:</strong> Mi történik, ha egy warp szálai
+a konstans memóriában különböző címeket olvasnak, és miért romlik
+ilyenkor a teljesítmény? Indokold meg a konstans cache hardveres
+viselkedése alapján.</p>
+<p><strong>Válasz vázlat:</strong> A konstans cache broadcast módban
+működik, ha minden szál ugyanazt a címet olvassa; ilyenkor egyetlen
+memóriatranzakció szolgálja ki az egész warpot. Ha a szálak különböző
+címeket kérnek, a hardver sorba rendezi a kéréseket, és több ciklus
+szükséges, ami csökkenti a sávszélességet és növeli a késleltetést.
+Ezért a konstans memóriát olyan adatokra érdemes használni, amelyeket
+minden szál azonos módon olvas, például közös paraméterekre.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu023.html">← 7.2 Shared memory és élettartam</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu025.html">7.4 Memóriaterek kiválasztása →</a></div>
+</nav>
+</body>
+</html>

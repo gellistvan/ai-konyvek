@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>12.2 Regiszterhasználat és spill – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Teljesítmény és memória</a> › <a href="index.html#gpuch11">12 Occupancy, register pressure és latency hiding</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu042.html">← 12.1 Occupancy és erőforrás-korlátok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu044.html">12.3 Latency hiding →</a></div>
+</nav>
+<h2 data-number="12.2" id="gpu043"><span
+class="header-section-number">12.2</span> Regiszterhasználat és
+spill</h2>
+<p>A regiszterek a GPU leggyorsabb, de egyben legszűkösebb erőforrásai
+közé tartoznak. Az előző alfejezetben láttuk, hogy az occupancy – vagyis
+az egy streaming multiprocesszorra (SM) jutó aktív warpok száma –
+közvetlenül függ attól, hogy egy szál hány regisztert foglal le. Ebben
+az alfejezetben azt vizsgáljuk meg, mi történik, ha a kernel több
+regisztert igényel, mint amennyit egy szál maximálisan megkaphat:
+megjelenik a <em>local memory spill</em>, amely a regiszterek tartalmát
+a globális memóriába (pontosabban a local memory háttértárba)
+kényszeríti. A spill nem csupán egy fordítói statisztika, hanem gyakran
+az egyik legfontosabb rejtett teljesítménycsapda. Megtanuljuk, hogyan
+mérhető a regiszterhasználat, hogyan szabályozható a
+<code>maxrregcount</code> és a <code>__launch_bounds__</code>
+eszközökkel, és hogyan különíthető el a mért eredmény a modell alapján
+várható viselkedéstől.</p>
+<hr />
+<h3 data-number="12.2.1" id="regiszterek-és-a-regiszterfájl"><span
+class="header-section-number">12.2.1</span> Regiszterek és a
+regiszterfájl</h3>
+<p>Minden SM rendelkezik egy nagy, nagysebességű, de véges méretű
+regiszterfájllal. A regiszterek a szálak privát állapotát tárolják:
+skalár változókat, részkifejezéseket, ciklusváltozókat és a fordító
+által generált ideiglenes értékeket. A regiszterekhez való hozzáférés
+egyetlen órajel alatt, teljes sávszélességgel történik; nincs cache
+késleltetés, nincs memória-címzés. A szálak közötti adatcsere csak akkor
+lehetséges, ha az adatot explicit módon átmásoljuk egy megosztott vagy
+globális memóriába; a regiszterek soha nem láthatók más szál
+számára.</p>
+<p>A regiszterfájl mérete SM-enként architektúrafüggő. Például az NVIDIA
+Ampere (sm_80) architektúrában egy SM 64 768 db 32 bites regiszterrel
+rendelkezik, ami 256 KiB-nek felel meg. Ha egy kernel szálanként 64
+regisztert használ, és egy blokk 256 szálat tartalmaz, akkor egy blokk
+64 × 256 = 16 384 regisztert foglal le. Egy ilyen SM-en legfeljebb 64
+768 / 16 384 = 3 blokk lehet egyszerre aktív, ami 768 szálnak felel meg.
+Ha a maximális szálszám SM-enként 2048, akkor az occupancy ebben az
+esetben 768 / 2048 = 37,5%. A regiszterhasználat tehát közvetlenül
+korlátozza az occupancy-t, ahogyan azt az <a
+href="gpu042.html">Occupancy és erőforrás-korlátok</a> alfejezetben
+részletesen tárgyaltuk.</p>
+<p>A fordító a kernel fordításakor dönt arról, hogy az egyes változókat
+regiszterben tartja-e, vagy a <em>local memory</em> nevű, valójában a
+globális memória egy szálanként elkülönített szeletébe helyezi. A
+döntést két tényező befolyásolja: a kernelben ténylegesen használt
+változók száma és azok élettartama, valamint a szálankénti
+regiszterkorlát, amelyet a fejlesztő közvetve befolyásolhat.</p>
+<h3 data-number="12.2.2" id="mi-a-local-memory-spill"><span
+class="header-section-number">12.2.2</span> Mi a local memory
+spill?</h3>
+<p>A <em>local memory</em> a GPU memóriamodelljében az a memóriatér,
+amely a szál privát adatait tárolja, ha azok nem férnek el a
+regiszterekben. Fontos hangsúlyozni, hogy a local memory fizikailag a
+globális memóriában (DRAM) van, ugyanazon a memóriavezérlőn keresztül
+érhető el, mint a <code>__global__</code> változók. Az egyetlen
+különbség, hogy a local memory címe szálanként és blokkonként el van
+szeparálva, és a hozzáférés a szál privát címzési tartományán belül
+történik. A local memory hozzáférések ugyanúgy átmennek az L1 és L2
+cache-en, mint a globális memóriahozzáférések, de a késleltetésük több
+száz órajel is lehet, összehasonlítva a regiszterek egy órajeles
+hozzáférésével.</p>
+<p>A <em>spill</em> az a folyamat, amikor a fordító egy regiszterben élő
+változót kénytelen a local memoryba kiírni (spill store), majd később
+onnan visszaolvasni (spill load). Ez akkor következik be, ha a kernel
+regiszterigénye meghaladja a szálanként elérhető regiszterek számát. A
+fordító ilyenkor a legkevésbé gyakran használt változókat helyezi ki a
+regiszterfájlból, hogy a legforróbb értékek regiszterben
+maradhassanak.</p>
+<p>A spill-t a ptxas (a CUDA PTX assembler és optimalizáló) a fordítás
+során jelzi. A <code>nvcc</code> <code>-Xptxas -v</code> kapcsolójával
+megjeleníthető a regiszterhasználat, a spill store/load bájtok
+mennyisége, valamint a stack frame mérete. Egy tipikus kimenet:</p>
+<pre><code>ptxas info    : Compiling entry function &#39;_Z13kernel_spillPfS_&#39; for &#39;sm_80&#39;
+ptxas info    : Function properties for _Z13kernel_spillPfS_
+ptxas         .reg     .f32    64
+ptxas         .reg     .b32    16
+ptxas info    : Used 80 registers, 128 bytes spill stores, 256 bytes spill loads</code></pre>
+<p>Ez a kimenet azt jelenti, hogy a kernel szálanként 80 regisztert
+használ, 128 bájtot ír ki a local memoryba (spill store), és 256 bájtot
+olvas be onnan (spill load). A spill mennyiségét bájtban adjuk meg, mert
+egy-egy kiírás vagy beolvasás több 32 bites szót is érinthet.</p>
+<p>A spill nem feltétlenül katasztrófa. Ha a kiírt és visszaolvasott
+változók ritkán használtak, és a kernel egyébként sok számítást végez, a
+teljesítményhatás elhanyagolható lehet. A gyakorlatban azonban a spill
+gyakran a regiszterhiány tünete, és a teljesítmény romlásához vezet:
+több utasítás, nagyobb memóriaforgalom, alacsonyabb occupancy.</p>
+<h3 data-number="12.2.3" id="regiszterhasználat-mérése"><span
+class="header-section-number">12.2.3</span> Regiszterhasználat
+mérése</h3>
+<p>A regiszterhasználat és a spill mértékét több módon is meg lehet
+határozni:</p>
+<ol type="1">
+<li><p><strong>Fordítói statisztika:</strong> A fent bemutatott
+<code>nvcc -Xptxas -v</code> a legegyszerűbb eszköz. Nem igényel
+futtatást, csak fordítást, és megadja a regiszterek számát, a spill
+bájtokat és a stack frame méretét.</p></li>
+<li><p><strong>Nsight Compute:</strong> Az NVIDIA profilerének
+kernel-szintű metrikái – például
+<code>launch__registers_per_thread</code>,
+<code>l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum</code>,
+<code>l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum</code>,
+<code>smsp__sass_inst_executed_op_local_ld.sum</code> – részletesen
+mutatják a regiszterhasználatot és a tényleges local memory forgalmat a
+futás során. Az Nsight Compute a legmegbízhatóbb forrás, mert a
+hardveres számlálókból dolgozik, és figyelembe veszi a tényleges
+végrehajtási útvonalat is.</p></li>
+<li><p><strong>Occupancy kalkulátor:</strong> Az NVIDIA által
+biztosított Excel-alapú kalkulátor vagy a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API
+segítségével a regiszterhasználat és a blokkméret alapján kiszámítható
+az elméleti occupancy. Ez a tervezési fázisban hasznos, mielőtt a
+kernelt lefuttatnánk.</p></li>
+</ol>
+<p>A mérés során fontos különbséget tenni a <em>statikus
+regiszterhasználat</em> (amit a ptxas jelent) és a <em>ténylegesen
+lefoglalt regiszterek</em> között. A statikus érték a maximális
+regiszterigényt mutatja, de ha a kernelben vannak ritkán végrehajtott
+ágak, előfordulhat, hogy a hardver a teljes regiszterfájl-szeletet
+lefoglalja, függetlenül attól, hogy az adott ág fut-e. A tényleges
+regiszterhasználat azonban nem csökken attól, hogy egy ág nem fut, mert
+a hardver a legrosszabb esetre méretezi a szál állapotát.</p>
+<h3 data-number="12.2.4" id="a-spill-hatása-a-teljesítményre"><span
+class="header-section-number">12.2.4</span> A spill hatása a
+teljesítményre</h3>
+<p>A spill-nek három fő negatív hatása van:</p>
+<ol type="1">
+<li><p><strong>Többlet utasítások:</strong> Minden kiírás és
+visszaolvasás egy-egy extra memória-utasítást jelent (STL, LDL a SASS
+szinten). Ha a spill egy forró ciklusban történik, az utasításszám
+jelentősen megnőhet.</p></li>
+<li><p><strong>Memóriaforgalom és késleltetés:</strong> A local memory
+hozzáférések a globális memórián keresztül mennek, tehát a késleltetésük
+több száz órajel. Ha a spill változó egy szorosan egymás utáni kódban
+szerepel, a szál várakozni kényszerül, hacsak a warp ütemező nem tud
+másik warpot futtatni.</p></li>
+<li><p><strong>Occupancy csökkenés:</strong> A spill nem közvetlenül
+csökkenti az occupancy-t, de a magas regiszterhasználat – amely a spill
+kiváltó oka – már önmagában korlátozza az aktív warpok számát. Ha a
+regiszterhasználatot csökkentjük, több warp válhat aktívvá, ami segíthet
+elrejteni a memória-késleltetést. Ezért a spill és az occupancy gyakran
+együtt jár, és a megoldás is közös.</p></li>
+</ol>
+<p>A spill hatásának számszerűsítésére a legjobb módszer egy kontrollált
+kísérlet: ugyanazt a számítást végezzük el olyan kernelverzióval, amely
+spill-t okoz, és olyannal, amely nem. A két verzió közötti
+futásidő-különbség, valamint a ptxas és Nsight Compute metrikák
+együttesen megmutatják a spill valódi költségét.</p>
+<h3 data-number="12.2.5"
+id="szabályozás-maxrregcount-és-__launch_bounds__"><span
+class="header-section-number">12.2.5</span> Szabályozás:
+<code>maxrregcount</code> és <code>__launch_bounds__</code></h3>
+<p>A CUDA két fő eszközt kínál a regiszterhasználat befolyásolására: a
+<code>maxrregcount</code> fordítói opciót és a
+<code>__launch_bounds__</code> kernel-attribútumot. Mindkettő azt a célt
+szolgálja, hogy a fejlesztő korlátozza a szálankénti regiszterek számát,
+ezáltal növelve az occupancy-t – de mindkettőnek ára lehet: ha a korlát
+túl szigorú, a fordító több spill-t generál, ami lassíthatja a
+kernelt.</p>
+<h3 data-number="12.2.6" id="maxrregcount"><span
+class="header-section-number">12.2.6</span>
+<code>maxrregcount</code></h3>
+<p>Az <code>nvcc</code> <code>--maxrregcount N</code> opciója
+globálisan, az egész fordítási egységre érvényesen korlátozza a
+regiszterek számát <code>N</code>-re. Például:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">--maxrregcount</span> 32 <span class="at">-o</span> kernel kernel.cu</span></code></pre></div>
+<p>Ez a kapcsoló minden kernelre ugyanazt a korlátot alkalmazza.
+Hátránya, hogy nem tudunk különbséget tenni kernelek között: egy nagy
+regiszterigényű kernel esetén a korlát drasztikus spill-t okozhat, míg
+egy kisebb kernelnél nincs hatása. A <code>maxrregcount</code> ezért
+inkább gyors kísérletezésre, nem pedig finomhangolásra való.</p>
+<h3 data-number="12.2.7" id="launch_bounds__"><span
+class="header-section-number">12.2.7</span>
+<code>__launch_bounds__</code></h3>
+<p>A <code>__launch_bounds__</code> kernel-attribútum a kernel
+definíciójában adható meg, és két paramétere van: a maximális blokkméret
+(<code>maxThreadsPerBlock</code>) és opcionálisan a minimális blokkok
+száma SM-enként (<code>minBlocksPerMultiprocessor</code>). A
+szintaxis:</p>
+<pre class="cuda"><code>__global__ void __launch_bounds__(256, 4)
+myKernel(float *out) {
+    // ...
+}</code></pre>
+<p>A <code>maxThreadsPerBlock</code> megadja, hogy a kernelt legfeljebb
+mekkora blokkmérettel fogjuk indítani. A
+<code>minBlocksPerMultiprocessor</code> azt közli a fordítóval, hogy
+legalább hány blokkot szeretnénk egyszerre aktívan tartani egy SM-en. Ez
+utóbbi alapján a fordító kiszámítja a maximálisan megengedett
+regiszterhasználatot a következő képlet szerint:</p>
+<pre><code>maxRegsPerThread = regsPerSM / (maxThreadsPerBlock * minBlocksPerMultiprocessor)</code></pre>
+<p>Ahol <code>regsPerSM</code> az SM regiszterfájljának mérete (pl. 64
+768 az sm_80 esetén). Ha a kernel természetes regiszterigénye ezt a
+korlátot meghaladja, a fordító megpróbálja a regiszterhasználatot
+lecsökkenteni, akár spill árán is. Ha a kernel természetes igénye a
+korlát alatt van, a <code>__launch_bounds__</code>-nak nincs hatása a
+regiszterekre.</p>
+<p>A <code>__launch_bounds__</code> előnye a
+<code>maxrregcount</code>-tal szemben, hogy kernel-szinten
+szabályozható, és figyelembe veszi a tényleges blokkméretet. Hátránya,
+hogy a <code>minBlocksPerMultiprocessor</code> túl magasra állítása
+indokolatlanul sok spill-t okozhat, mert a fordító a
+regiszterhasználatot a megadott korlát alá próbálja szorítani, még akkor
+is, ha az adott kernel számára az alacsonyabb occupancy és a kevesebb
+spill lenne az optimális.</p>
+<h3 data-number="12.2.8"
+id="gyakorlati-példa-regiszter-nyomás-és-spill"><span
+class="header-section-number">12.2.8</span> Gyakorlati példa:
+regiszter-nyomás és spill</h3>
+<p>A következő kód egy szándékosan regiszter-éhes kernelt mutat be. A
+kernel egy 64 elemű, privát float tömböt hoz létre minden szálban,
+feltölti a bemeneti adatokból, majd összegzi. A
+<code>#pragma unroll</code> teljesen kifejti a ciklust, így a fordító 64
+külön élő float változót próbál regiszterben tartani, ami messze
+meghaladja a tipikus regiszterkeretet.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), NVCC
+// Fájl: reg_spill.cu
+
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cstdio&gt;
+
+#define N (1 &lt;&lt; 20)          // 1M szál
+#define ARRAY_SIZE 64        // 64 float privát tömb
+
+// Hibaellenőrző makró – a labor-szerződés szerint kötelező
+#define CUDA_CHECK(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = call;                                             \
+        if (err != cudaSuccess) {                                           \
+            std::fprintf(stderr, &quot;CUDA hiba: %s, %s:%d\n&quot;,                 \
+                         cudaGetErrorString(err), __FILE__, __LINE__);      \
+            std::exit(EXIT_FAILURE);                                        \
+        }                                                                   \
+    } while (0)
+
+__global__ void kernel_spill(const float* __restrict__ in,
+                             float* __restrict__ out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Privát tömb: a fordító megpróbálja regiszterben tartani,
+    // de 64 float + egyéb változók valószínűleg spill-t okoznak.
+    float a[ARRAY_SIZE];
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i &lt; ARRAY_SIZE; ++i) {
+        // A beolvasás indexelése úgy van kialakítva, hogy minden
+        // szál más-más, de a tömb elemei a szálon belül összefüggőek.
+        a[i] = in[idx + i * blockDim.x];
+        sum += a[i];
+    }
+    out[idx] = sum;
+}
+
+int main() {
+    float *d_in, *d_out;
+    float *h_in = new float[N];
+    float *h_out = new float[N];
+
+    for (int i = 0; i &lt; N; ++i) h_in[i] = 1.0f;
+
+    CUDA_CHECK(cudaMalloc(&amp;d_in, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_out, N * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, N * sizeof(float),
+                          cudaMemcpyHostToDevice));
+
+    int block = 256;
+    int grid = (N + block - 1) / block;
+
+    kernel_spill&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_out);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(h_out, d_out, N * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    std::printf(&quot;Első elem: %f\n&quot;, h_out[0]);
+
+    cudaFree(d_in);
+    cudaFree(d_out);
+    delete[] h_in;
+    delete[] h_out;
+    return 0;
+}</code></pre>
+<p>A fenti kernel fordítása
+<code>nvcc -arch=sm_80 -Xptxas -v -o reg_spill reg_spill.cu</code>
+paranccsal. A ptxas kimenetében várhatóan 80–100 regiszter és több száz
+bájt spill store/load jelenik meg. A pontos számok a CUDA verziójától és
+a fordító optimalizálási szintjétől függenek, ezért a mérési naplóban
+mindig rögzíteni kell a fordítási körülményeket.</p>
+<p>Készítsünk egy második verziót, amely
+<code>__launch_bounds__</code>-szal korlátozza a regiszterhasználatot,
+és egy harmadikat, amelyben a privát tömb méretét 16-ra csökkentjük, így
+a regiszterigény természetesen alacsonyabb.</p>
+<pre class="cuda"><code>// CUDA C++ (C++17), NVCC
+// Fájl: reg_launch_bounds.cu
+
+__global__ void __launch_bounds__(256, 4)
+kernel_lb(const float* __restrict__ in, float* __restrict__ out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float a[ARRAY_SIZE];
+    // ... ugyanaz a törzs, mint fent
+}</code></pre>
+<p>A <code>__launch_bounds__(256, 4)</code> azt mondja: 256 szálas
+blokkokat indítunk, és legalább 4 blokkot szeretnénk SM-enként. sm_80
+esetén ez <code>64 768 / (256 * 4) = 63</code> regiszter szálanként. A
+fordító tehát legfeljebb 63 regisztert használhat, ami a 64 elemű tömb
+esetén valószínűleg jelentős spill-t eredményez, de az occupancy 4
+blokkra nő.</p>
+<p>A harmadik verzió, ahol a tömb mérete 16:</p>
+<pre class="cuda"><code>__global__ void kernel_small(const float* __restrict__ in,
+                             float* __restrict__ out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float a[16];
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i &lt; 16; ++i) {
+        a[i] = in[idx + i * blockDim.x];
+        sum += a[i];
+    }
+    out[idx] = sum;
+}</code></pre>
+<p>Ez a kernel várhatóan 32–40 regisztert használ, nincs spill, és az
+occupancy-t már nem a regiszterek korlátozzák, hanem más tényezők (pl.
+blokkméret, szálszám limit).</p>
+<h3 data-number="12.2.9" id="labor-regiszter-nyomás-mérése"><span
+class="header-section-number">12.2.9</span> Labor: regiszter-nyomás
+mérése</h3>
+<p>A labor célja, hogy saját környezetben megmérje a
+regiszterhasználatot, a spill mértékét és a teljesítményre gyakorolt
+hatást. Az alábbiakban megadjuk a szükséges lépéseket, a mérési napló
+sablonját és az elválasztott várt eredményeket.</p>
+<h3 data-number="12.2.10" id="környezet-rögzítése"><span
+class="header-section-number">12.2.10</span> Környezet rögzítése</h3>
+<p>A mérés megkezdése előtt rögzíteni kell a hardver- és
+szoftverkörnyezetet:</p>
+<ul>
+<li>GPU modell (pl. NVIDIA A100, RTX 3090, V100)</li>
+<li>Compute capability (pl. 8.0, 8.6, 7.0)</li>
+<li>CUDA Toolkit verzió (pl. 12.2)</li>
+<li>GPU driver verzió</li>
+<li>Operációs rendszer</li>
+<li>Fordító parancs és optimalizálási szint</li>
+<li>ECC, MIG, power limit, háttérterhelés (ha releváns)</li>
+</ul>
+<p>Minden mérés előtt melegítsük fel a GPU-t (warm-up futtatás), majd
+legalább 10 ismétlést végezzünk. Az átlag mellett a szórást is közöljük.
+A mérést izolált környezetben végezzük, és gondoskodjunk arról, hogy a
+túl hosszú futású kernel ne okozzon eszközleállást; állítsunk be
+timeout-ot, ha szükséges.</p>
+<h3 data-number="12.2.11" id="mérési-lépések"><span
+class="header-section-number">12.2.11</span> Mérési lépések</h3>
+<ol type="1">
+<li><p>Fordítsa le mindhárom kernelt a <code>-Xptxas -v</code>
+kapcsolóval, és jegyezze fel a regiszterhasználatot, a spill store/load
+bájtokat és a stack frame méretét.</p></li>
+<li><p>Futtassa mindhárom kernelt <code>N = 1&lt;&lt;20</code> elemmel,
+256 szálas blokkokkal. Mérje a futási időt CUDA eventekkel vagy
+<code>std::chrono</code>-val (a labor-szerződés szerint CUDA event
+ajánlott). Végezzen 10 ismétlést, számítson átlagot és szórást.</p></li>
+<li><p>Használja az Nsight Compute-et a következő metrikák lekérésére (a
+pontos metrikanevek architektúrafüggők, ezért a
+<code>--query-metrics</code> kapcsolóval ellenőrizze az elérhető
+neveket):</p>
+<ul>
+<li><code>launch__registers_per_thread</code> – tényleges
+regiszterhasználat</li>
+<li><code>l1tex__t_bytes_pipe_lsu_mem_local_op_ld.sum</code> – local
+memory olvasás bájtban</li>
+<li><code>l1tex__t_bytes_pipe_lsu_mem_local_op_st.sum</code> – local
+memory írás bájtban</li>
+<li><code>sm__warps_active.avg.pct_of_peak_sustained_active</code> –
+occupancy</li>
+<li><code>gpu__time_duration.sum</code> – futási idő</li>
+</ul></li>
+<li><p>Ha lehetséges, használja a
+<code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API-t a
+foglaltság kiszámításához a ptxas által jelentett regiszterek és a
+blokkméret alapján.</p></li>
+</ol>
+<h3 data-number="12.2.12" id="mérési-napló-sablon"><span
+class="header-section-number">12.2.12</span> Mérési napló sablon</h3>
+<p>A következő táblázatot töltse ki minden kernelre. A sorok a három
+verziót tartalmazzák, az oszlopok a mért értékeket:</p>
+<table>
+<colgroup>
+<col style="width: 6%" />
+<col style="width: 17%" />
+<col style="width: 16%" />
+<col style="width: 16%" />
+<col style="width: 12%" />
+<col style="width: 28%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kernel</th>
+<th>Regiszterek (ptxas)</th>
+<th>Spill store (byte)</th>
+<th>Spill load (byte)</th>
+<th>Occupancy (%)</th>
+<th>Futási idő (ms, átlag ± szórás)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>kernel_spill</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="even">
+<td>kernel_lb</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>kernel_small</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>A táblázat celláit a mérés során kitöltjük. A “várt eredmény”
+oszlopot nem a táblázatban, hanem külön szövegben adjuk meg.</p>
+<h3 data-number="12.2.13" id="várt-eredmény"><span
+class="header-section-number">12.2.13</span> Várt eredmény</h3>
+<p>A modell alapján a következő tendenciákat várjuk:</p>
+<ul>
+<li><p>A <code>kernel_spill</code> regiszterhasználata a legmagasabb,
+mert a 64 elemű, teljesen kigöngyölt privát tömb minden eleme élő kell,
+hogy maradjon a ciklusmagban. Ez valószínűleg meghaladja a 64
+regisztert, és spill-t okoz.</p></li>
+<li><p>A <code>kernel_lb</code> a <code>__launch_bounds__(256, 4)</code>
+miatt legfeljebb 63 regisztert használhat, ezért a regiszterhasználata
+alacsonyabb, mint a <code>kernel_spill</code>-é, de a spill mennyisége
+nagyobb lehet, mert a fordító a korlát betartása érdekében kénytelen
+több változót a local memoryba tenni.</p></li>
+<li><p>A <code>kernel_small</code> regiszterhasználata a legalacsonyabb,
+és várhatóan nincs spill, mert a 16 elemű tömb kényelmesen elfér a
+regiszterekben. Ennek következtében a futási idő várhatóan a
+legrövidebb.</p></li>
+</ul>
+<p>A tényleges mérések ezeket a tendenciákat erősíthetik meg, de a
+pontos számok a hardvertől, a CUDA verziótól és a fordító optimalizálási
+döntéseitől függenek. Ezért a mért és a várt eredményt mindig külön kell
+dokumentálni, ahogyan azt a labor-szerződés előírja.</p>
+<h3 data-number="12.2.14" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">12.2.14</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A regiszter-nyomás és a spill kezelése során több gyakori hiba fordul
+elő:</p>
+<ol type="1">
+<li><p><strong>A spill figyelmen kívül hagyása:</strong> Sok fejlesztő
+csak a futási időt nézi, és nem ellenőrzi a ptxas kimenetét. Ha a kernel
+lassú, és a regiszterhasználat magas, érdemes megnézni a spill-t, mert a
+local memory forgalom rejtett szűk keresztmetszet lehet.</p></li>
+<li><p><strong>Túl agresszív <code>maxrregcount</code>:</strong> A
+<code>--maxrregcount</code> erőltetett használata minden kernelre
+ugyanazt a korlátot alkalmazza, ami egyes kerneleknél indokolatlanul sok
+spill-t okozhat. Jobb megoldás a <code>__launch_bounds__</code>
+kernel-szintű alkalmazása, vagy a kód átstrukturálása, hogy kevesebb élő
+változó legyen.</p></li>
+<li><p><strong>A private tömbök rossz használata:</strong> A nagy,
+privát tömbök (például <code>float a[100]</code>) a szál regisztereit
+terhelik, és gyakran spill-hez vezetnek. Ha a tömb mérete fordítási
+időben ismert, és az indexelés konstans, a fordító regiszterekre képezi;
+ha az indexelés dinamikus, a tömb mindig local memoryba kerül. Ilyen
+esetekben érdemes megfontolni a shared memory használatát, vagy a tömb
+méretének csökkentését.</p></li>
+<li><p><strong>Az occupancy egyoldalú növelése:</strong> A magasabb
+occupancy nem mindig jobb. Ha a regiszterhasználat csökkentése miatt a
+spill megnő, a kernel lehet, hogy lassabb lesz, mint alacsonyabb
+occupancy mellett, de spill nélkül. Az optimális megoldást csak méréssel
+lehet megtalálni, például a <code>__launch_bounds__</code> különböző
+paramétereinek kipróbálásával.</p></li>
+<li><p><strong>A mérési környezet elhanyagolása:</strong> A
+regiszterhasználat függ a fordító verziójától, az optimalizálási
+szinttől és a compute capability-től. Ezért minden mérésnél rögzíteni
+kell ezeket a paramétereket, és a mérési naplóban fel kell tüntetni a
+pontos környezetet.</p></li>
+</ol>
+<h3 data-number="12.2.15" id="összefoglalás-és-továbbvezetés"><span
+class="header-section-number">12.2.15</span> Összefoglalás és
+továbbvezetés</h3>
+<p>A regiszterhasználat és a local memory spill a GPU kernel
+teljesítményének kulcstényezői. A regiszterek a leggyorsabb tárolók, de
+véges számuk miatt a nagy regiszterigényű kernelek kénytelenek spill-t
+generálni, ami extra memóriaforgalmat és késleltetést okoz. A fejlesztő
+eszköztárában ott van a <code>maxrregcount</code> és a
+<code>__launch_bounds__</code>, amelyekkel a regiszterhasználat
+korlátozható, de mindkettő ára a megnövekedett spill lehet.</p>
+<p>A következő alfejezetben (<a href="gpu044.html">Latency hiding</a> –
+Latency hiding) azt vizsgáljuk meg, hogyan képes a GPU elrejteni a
+memória- és utasítás-késleltetést a warpok közötti ütemezéssel. A
+regiszterhasználat és az occupancy itt tárgyalt fogalmai közvetlenül
+kapcsolódnak ehhez: minél több aktív warp van, annál jobban elrejthető a
+késleltetés, de csak akkor, ha a regiszterek lehetővé teszik a megfelelő
+occupancit. A spill és a latency hiding együttes kezelése az egyik
+legfontosabb optimalizálási készség a gyakorló CUDA-fejlesztő
+számára.</p>
+<p>A fejezet laborfeladata során mért eredményeket vessük össze a fenti
+várt tendenciákkal, és dokumentáljuk az eltéréseket. Csak a saját,
+ellenőrzött mérési adatok alapján vonjunk le következtetéseket; a ptxas
+kimenetét mindig rögzítsük, mert az a regiszter-nyomás elsődleges
+bizonyítéka.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu042.html">← 12.1 Occupancy és erőforrás-korlátok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu044.html">12.3 Latency hiding →</a></div>
+</nav>
+</body>
+</html>

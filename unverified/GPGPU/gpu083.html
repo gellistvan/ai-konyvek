@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>22.2 cuBLAS és cuSPARSE használata – GPGPU – általános célú
+számítások GPU-n</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – CUDA-ökoszisztéma és mélytanulás</a> › <a href="index.html#gpuch21">22 Könyvtárak: cuBLAS, cuSPARSE, cuFFT, cuRAND, Thrust, CUB</a></p>
+<div class="links"><a class="prev" rel="prev" href="gpu082.html">← 22.1 Könyvtártérkép és döntési szempontok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu084.html">22.3 Thrust és CUB →</a></div>
+</nav>
+<h2 data-number="22.2" id="gpu083"><span
+class="header-section-number">22.2</span> cuBLAS és cuSPARSE
+használata</h2>
+<p>A cuBLAS és a cuSPARSE a CUDA ökoszisztéma két, lineáris algebrára
+szakosodott alapkönyvtára. A cuBLAS a sűrű (dense) mátrix- és
+vektorműveletek szabványos BLAS-felületét adja, a cuSPARSE pedig a ritka
+(sparse) mátrixok hatékony reprezentációját és műveleteit valósítja meg.
+A gyakorlatban ritkán érdemes saját GEMM-et vagy SpMV-t írni, hacsak nem
+speciális szerkezetet vagy kutatási prototípust készítünk: a könyvtárak
+évek óta hangolt kerneljei, csomagolási és ütemezési heurisztikái
+általában felülmúlják az egyszerű, saját megvalósítást. Ugyanakkor a
+könyvtárak helyes használata sem triviális: ismerni kell a handle-ök,
+streamek, workspace-ek és hibakezelés szabályait. Ebben az alfejezetben
+ezeket járjuk körbe egy-egy ellenőrizhető GEMM- és SpMV-példán
+keresztül.</p>
+<h3 data-number="22.2.1"
+id="a-cublas-és-a-cusparse-helye-a-fejlesztői-munkában"><span
+class="header-section-number">22.2.1</span> A cuBLAS és a cuSPARSE helye
+a fejlesztői munkában</h3>
+<p>A cuBLAS a BLAS (Basic Linear Algebra Subprograms) GPU-s
+megvalósítása. A könyvtár három szinten ad műveleteket: vektor-vektor
+(Level 1), mátrix-vektor (Level 2) és mátrix-mátrix (Level 3). A mérnöki
+munkában leggyakrabban a Level 3-as rutinok, elsősorban a GEMM
+(általános mátrixszorzás) kerülnek elő, mert ezek adják a legjobb
+számítás/memória arányt, és ezekre épül a mélytanulási rétegek zöme is.
+A cuSPARSE ezzel szemben a ritka mátrixok tárolására és műveleteire
+koncentrál: a leggyakoribb formátum a CSR (Compressed Sparse Row), amely
+a ritka mátrixot három tömbben – értékek, oszlopindexek, sorpointerek –
+tárolja. A cuSPARSE-ban az SpMV (sparse matrix-vector multiplication) a
+leggyakrabban hívott rutin, de a könyvtár támogatja a sparse mátrix-sűrű
+mátrix szorzást (SpMM), a ritka megoldókat és a formátumkonverziókat
+is.</p>
+<p>Mindkét könyvtárnak van egy fontos alapelve: a műveleteket nem
+globális állapot, hanem explicit kontextusobjektumok, úgynevezett
+handle-ök vezérlik. A handle tárolja a könyvtár belső erőforrásait, a
+streamet, a memória-allokátorokat és a hibakezeléshez szükséges
+állapotot. A handle életciklusa meghatározza a könyvtárhívások
+érvényességét: előbb létre kell hozni, majd minden hívásban átadni,
+végül a program végén fel kell szabadítani.</p>
+<p>A második központi fogalom a stream. A CUDA stream a GPU-n
+végrehajtott műveletek sorrendjét és párhuzamosságát szabályozza. A
+cuBLAS és a cuSPARSE hívások alapértelmezés szerint a default streamen
+futnak, de a handle-hez rendelt streammel explicit módon irányíthatjuk
+az aszinkron végrehajtást. Ez elengedhetetlen a CPU és GPU közötti
+átfedéshez, az egyidejű kernelindításokhoz és a több handle-es
+alkalmazásokhoz.</p>
+<p>A harmadik fogalom a workspace. Az újabb cuBLAS- és cuSPARSE-API-k
+számos rutinja átmeneti puffert igényel a hatékony végrehajtáshoz. A
+workspace méretét külön lekérdezhetjük, majd a kapott méretnek
+megfelelően saját magunk allokálhatunk device memóriát. Ez a modell
+lehetővé teszi, hogy a workspace-t egyszer allokáljuk, és több híváson
+át újrahasznosítsuk, elkerülve a könyvtár belső, rejtett
+allokációit.</p>
+<h3 data-number="22.2.2"
+id="cublas-alapok-handle-layout-és-hibakezelés"><span
+class="header-section-number">22.2.2</span> cuBLAS alapok: handle,
+layout és hibakezelés</h3>
+<p>A cuBLAS első lépése a handle létrehozása. A
+<code>cublasCreate</code> függvény egy <code>cublasHandle_t</code>
+típusú handle-t ad vissza, a <code>cublasDestroy</code> pedig
+felszabadítja azt. A handle-hez tartozó streamet a
+<code>cublasSetStream</code> állítja be. A hibakezelés alapja a
+<code>cublasStatus_t</code> visszatérési érték: ha nem
+<code>CUBLAS_STATUS_SUCCESS</code>, akkor a hívás hibát jelzett, és a
+programot le kell állítani. A hibakódok közül a leggyakoribbak a
+<code>CUBLAS_STATUS_NOT_INITIALIZED</code> (nem inicializált handle), a
+<code>CUBLAS_STATUS_ALLOC_FAILED</code> (memóriafoglalási hiba a GPU-n),
+az <code>CUBLAS_STATUS_INVALID_VALUE</code> (érvénytelen paraméter,
+például negatív dimenzió) és a
+<code>CUBLAS_STATUS_EXECUTION_FAILED</code> (végrehajtási hiba, például
+érvénytelen device pointer).</p>
+<p>A cuBLAS – a klasszikus BLAS-hoz hasonlóan –
+<strong>column-major</strong> elrendezést használ. Ez azt jelenti, hogy
+egy <code>m × n</code> mátrix első oszlopa folytonosan helyezkedik el a
+memóriában, majd a második, és így tovább. A memóriacímet a
+<code>(i, j)</code> elemre a <code>&amp;A[i + j * lda]</code> képlet
+adja, ahol <code>lda</code> a <strong>leading dimension</strong> – azaz
+az oszlopok közötti memóriabeli távolság elemszámban. Ha a mátrixot
+folytonosan tároljuk, akkor <code>lda = m</code>, de ha egy nagyobb
+tömbbe ágyazzuk, vagy paddinget használunk, az <code>lda</code> nagyobb
+is lehet. A leading dimension ezért külön paraméter, és gyakori hiba,
+hogy a felhasználó <code>m</code> helyett <code>n</code>-t ad meg, vagy
+elfelejti a paddinget.</p>
+<p>A GEMM általános alakja:</p>
+<pre><code>C = alpha * op(A) * op(B) + beta * C</code></pre>
+<p>ahol <code>op(X)</code> lehet transzponálatlan (N), transzponált (T)
+vagy konjugált transzponált (C). A dimenziók:</p>
+<ul>
+<li><code>A</code> mérete: ha <code>op(A)</code> = N, akkor
+<code>m × k</code>; ha T vagy C, akkor <code>k × m</code>.</li>
+<li><code>B</code> mérete: ha <code>op(B)</code> = N, akkor
+<code>k × n</code>; ha T vagy C, akkor <code>n × k</code>.</li>
+<li><code>C</code> mérete: <code>m × n</code>.</li>
+</ul>
+<p>A cuBLAS klasszikus API-ja a <code>cublasSgemm</code> (single
+precision), <code>cublasDgemm</code> (double precision),
+<code>cublasCgemm</code> (complex single) és <code>cublasZgemm</code>
+(complex double) függvényeket kínálja. Az aláírás a
+<code>cublasSgemm</code>-re:</p>
+<p><code>cuda cpp cublasStatus_t cublasSgemm(cublasHandle_t handle,                            cublasOperation_t transa, cublasOperation_t transb,                            int m, int n, int k,                            const float* alpha,                            const float* A, int lda,                            const float* B, int ldb,                            const float* beta,                            float* C, int ldc);</code></p>
+<p>Az újabb API-k, például a <code>cublasGemmEx</code> vagy a
+<code>cublasLtMatmul</code>, több pontosságot és több lehetőséget
+támogatnak, de a tanulási célhoz a klasszikus API is elég.</p>
+<p>A hibakezelést tipikusan egy makróval tesszük robusztussá:</p>
+<p><code>cuda cpp #define CUBLAS_CHECK(call)                                                     \   do {                                                                         \     cublasStatus_t status = (call);                                            \     if (status != CUBLAS_STATUS_SUCCESS) {                                     \       std::cerr &lt;&lt; "cuBLAS error at " &lt;&lt; __FILE__ &lt;&lt; ":" &lt;&lt; __LINE__           \                 &lt;&lt; " status=" &lt;&lt; status &lt;&lt; std::endl;                          \       std::abort();                                                            \     }                                                                          \   } while (0)</code></p>
+<p>Ez a makró minden API-hívás után ellenőrzi a visszatérési kódot, és
+hiba esetén leállítja a programot. A valós kódban érdemes a hibát
+továbbítani, de a laborokban az abort elegendő.</p>
+<p>A következő példa egy 4×4-es mátrixokkal végrehajtott SGEMM-et mutat.
+A mátrixok column-major sorrendben vannak a device memóriában.</p>
+<p>```cuda cpp #include &lt;cuda_runtime.h&gt; #include
+&lt;cublas_v2.h&gt; #include &lt;iostream&gt; #include &lt;vector&gt;
+#include &lt;cmath&gt;</p>
+<p>#define CUBLAS_CHECK(call)<br />
+do {<br />
+cublasStatus_t st = (call);<br />
+if (st != CUBLAS_STATUS_SUCCESS) {<br />
+std::cerr &lt;&lt; “cuBLAS error:” &lt;&lt; st &lt;&lt; ” at ” &lt;&lt;
+<strong>FILE</strong> &lt;&lt; “:”<br />
+&lt;&lt; <strong>LINE</strong> &lt;&lt; std::endl;<br />
+std::abort();<br />
+}<br />
+} while (0)</p>
+<p>int main() { const int m = 4, n = 4, k = 4; const float alpha = 1.0f,
+beta = 0.0f;</p>
+<pre><code>// Host mátrixok (column-major)
+std::vector&lt;float&gt; h_A = {
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1
+};
+std::vector&lt;float&gt; h_B = {
+    2, 0, 0, 0,
+    0, 3, 0, 0,
+    0, 0, 4, 0,
+    0, 0, 0, 5
+};
+std::vector&lt;float&gt; h_C(m * n, 0.0f);
+
+// Device foglalások
+float *d_A, *d_B, *d_C;
+cudaMalloc(&amp;d_A, m * k * sizeof(float));
+cudaMalloc(&amp;d_B, k * n * sizeof(float));
+cudaMalloc(&amp;d_C, m * n * sizeof(float));
+
+cudaMemcpy(d_A, h_A.data(), m * k * sizeof(float), cudaMemcpyHostToDevice);
+cudaMemcpy(d_B, h_B.data(), k * n * sizeof(float), cudaMemcpyHostToDevice);
+
+cublasHandle_t handle;
+CUBLAS_CHECK(cublasCreate(&amp;handle));
+
+CUBLAS_CHECK(cublasSgemm(handle,
+                         CUBLAS_OP_N, CUBLAS_OP_N,
+                         m, n, k,
+                         &amp;alpha,
+                         d_A, m,
+                         d_B, k,
+                         &amp;beta,
+                         d_C, m));
+
+CUBLAS_CHECK(cudaDeviceSynchronize());
+
+cudaMemcpy(h_C.data(), d_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+
+// Ellenőrzés: A = I, B = diag(2,3,4,5), C = B
+bool ok = true;
+for (int j = 0; j &lt; n; ++j) {
+    for (int i = 0; i &lt; m; ++i) {
+        float expected = 0.0f;
+        for (int p = 0; p &lt; k; ++p) {
+            expected += h_A[i + p * m] * h_B[p + j * k];
+        }
+        if (std::fabs(h_C[i + j * m] - expected) &gt; 1e-5f) {
+            ok = false;
+            std::cerr &lt;&lt; &quot;Mismatch at (&quot; &lt;&lt; i &lt;&lt; &quot;,&quot; &lt;&lt; j &lt;&lt; &quot;): &quot;
+                      &lt;&lt; h_C[i + j * m] &lt;&lt; &quot; vs &quot; &lt;&lt; expected &lt;&lt; std::endl;
+        }
+    }
+}
+std::cout &lt;&lt; (ok ? &quot;GEMM OK&quot; : &quot;GEMM FAILED&quot;) &lt;&lt; std::endl;
+
+CUBLAS_CHECK(cublasDestroy(handle));
+cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+return ok ? 0 : 1;</code></pre>
+<p>}</p>
+<pre><code>
+A példában `A` az identitás, `B` diagonális, így a szorzás eredménye maga `B`. A vezető dimenzió mindhárom mátrix esetében megegyezik a sorok számával (`m`, illetve `k` a `B` esetében, mert `B` oszlopainak hossza `k`). Az `alpha = 1` és `beta = 0` hagyományos szorzást jelent. A `cudaDeviceSynchronize` biztosítja, hogy a host ne olvassa be az eredményt, amíg a GPU nem végzett.
+
+### cuSPARSE alapok: CSR formátum és SpMV
+
+A cuSPARSE használatakor először a ritka mátrixot kell leírnunk. A legelterjedtebb tárolási forma a CSR: három tömb, az `values`, a `col_indices` és a `row_ptr`. A `row_ptr` hossza `num_rows + 1`, ahol `row_ptr[i]` az `i`-edik sor kezdő indexe a `values` és `col_indices` tömbökben, `row_ptr[i+1]` pedig a sor vége (kizáró). Például a
+</code></pre>
+<p>A = [ 10 0 0 ] [ 0 20 30 ] [ 0 0 40 ]</p>
+<pre><code>
+mátrix CSR-reprezentációja:
+</code></pre>
+<p>values = [10, 20, 30, 40] col_indices = [0, 1, 2, 2] row_ptr = [0, 1,
+3, 4]</p>
+<pre><code>
+A cuSPARSE handle létrehozása hasonló a cuBLAS-hoz: `cusparseCreate` és `cusparseDestroy`. Emellett szükség van egy **mátrixdeskriptorra** (`cusparseMatDescr_t`), amely a mátrix általános tulajdonságait írja le, például, hogy általános (nem szimmetrikus, nem felső/alsó háromszög) mátrixról van-e szó. A deskriptort a `cusparseCreateMatDescr` hozza létre, a `cusparseSetMatType` és `cusparseSetMatIndexBase` állítja be a típust és az indexelés kezdetét. A CUDA-konvenció szerint az indexelés általában 0-alapú (`CUSPARSE_INDEX_BASE_ZERO`), de a cuSPARSE néhány régebbi rutinja 1-alapot is támogat (`CUSPARSE_INDEX_BASE_ONE`). Gyakori hiba, hogy a felhasználó 0-alapú tömböket ad meg, de a deskriptor továbbra is 1-alapú marad, vagy fordítva.
+
+Az SpMV az újabb cuSPARSE API-ban `cusparseSpMV` néven érhető el. A hívás előtt le kell kérdezni a szükséges workspace méretét a `cusparseSpMV_bufferSize` segítségével, majd a `cusparseSpMV` végrehajtja a műveletet. Az aláírások:
+
+```cuda cpp
+cusparseStatus_t cusparseSpMV_bufferSize(
+    cusparseHandle_t handle,
+    cusparseOperation_t opA,
+    const void* alpha,
+    cusparseSpMatDescr_t matA,
+    cusparseDnVecDescr_t vecX,
+    const void* beta,
+    cusparseDnVecDescr_t vecY,
+    cudaDataType computeType,
+    cusparseSpMVAlg_t alg,
+    size_t* bufferSize);
+
+cusparseStatus_t cusparseSpMV(
+    cusparseHandle_t handle,
+    cusparseOperation_t opA,
+    const void* alpha,
+    cusparseSpMatDescr_t matA,
+    cusparseDnVecDescr_t vecX,
+    const void* beta,
+    cusparseDnVecDescr_t vecY,
+    cudaDataType computeType,
+    cusparseSpMVAlg_t alg,
+    void* externalBuffer);</code></pre>
+<p>A régebbi API (<code>cusparseScsrmv</code>) egyszerűbb, de kevésbé
+rugalmas. Az új API a mátrixot és a vektorokat is
+deskriptor-objetumokkal írja le: a ritka mátrix leírója
+<code>cusparseSpMatDescr_t</code>, a sűrű vektoré
+<code>cusparseDnVecDescr_t</code>. A <code>computeType</code> általában
+megegyezik a tárolt típussal (<code>CUDA_R_32F</code> a float esetén).
+Az algoritmus többnyire <code>CUSPARSE_SPMV_CSR_ALG1</code> vagy
+<code>CUSPARSE_SPMV_CSR_ALG2</code>; az ALG1 az általános, ALG2 a
+nagyobb párhuzamosságra optimalizált, de csak bizonyos mátrixokra
+előnyös.</p>
+<p>A következő példa egy 3×3-as ritka mátrixszal hajt végre SpMV-t, ahol
+<code>y = alpha * A * x + beta * y</code>. A mátrix CSR reprezentációja
+a fenti példa.</p>
+<p>```cuda cpp #include &lt;cuda_runtime.h&gt; #include
+&lt;cusparse.h&gt; #include &lt;iostream&gt; #include &lt;vector&gt;
+#include &lt;cmath&gt;</p>
+<p>#define CUSPARSE_CHECK(call)<br />
+do {<br />
+cusparseStatus_t st = (call);<br />
+if (st != CUSPARSE_STATUS_SUCCESS) {<br />
+std::cerr &lt;&lt; “cuSPARSE error:” &lt;&lt; st &lt;&lt; ” at ”
+&lt;&lt; <strong>FILE</strong> &lt;&lt; “:”<br />
+&lt;&lt; <strong>LINE</strong> &lt;&lt; std::endl;<br />
+std::abort();<br />
+}<br />
+} while (0)</p>
+<p>int main() { const int nrows = 3, ncols = 3; const float alpha =
+1.0f, beta = 0.0f;</p>
+<pre><code>// Helyőrző CSR adatok (nem valós felhasználói adat)
+std::vector&lt;float&gt; h_values = {10.0f, 20.0f, 30.0f, 40.0f};
+std::vector&lt;int&gt;   h_col_ind = {0, 1, 2, 2};
+std::vector&lt;int&gt;   h_row_ptr = {0, 1, 3, 4};
+std::vector&lt;float&gt; h_x = {1.0f, 2.0f, 3.0f};
+std::vector&lt;float&gt; h_y(nrows, 0.0f);
+
+float *d_values, *d_x, *d_y;
+int *d_col_ind, *d_row_ptr;
+cudaMalloc(&amp;d_values, h_values.size() * sizeof(float));
+cudaMalloc(&amp;d_col_ind, h_col_ind.size() * sizeof(int));
+cudaMalloc(&amp;d_row_ptr, h_row_ptr.size() * sizeof(int));
+cudaMalloc(&amp;d_x, h_x.size() * sizeof(float));
+cudaMalloc(&amp;d_y, h_y.size() * sizeof(float));
+
+cudaMemcpy(d_values, h_values.data(), h_values.size() * sizeof(float), cudaMemcpyHostToDevice);
+cudaMemcpy(d_col_ind, h_col_ind.data(), h_col_ind.size() * sizeof(int), cudaMemcpyHostToDevice);
+cudaMemcpy(d_row_ptr, h_row_ptr.data(), h_row_ptr.size() * sizeof(int), cudaMemcpyHostToDevice);
+cudaMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+cusparseHandle_t handle;
+CUSPARSE_CHECK(cusparseCreate(&amp;handle));
+
+cusparseMatDescr_t descr;
+CUSPARSE_CHECK(cusparseCreateMatDescr(&amp;descr));
+CUSPARSE_CHECK(cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL));
+CUSPARSE_CHECK(cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO));
+
+// Új API: ritka mátrix és sűrű vektor deskriptorok
+cusparseSpMatDescr_t matA;
+cusparseDnVecDescr_t vecX, vecY;
+
+CUSPARSE_CHECK(cusparseCreateCsr(&amp;matA,
+                                 nrows, ncols, h_row_ptr.size()-1,
+                                 d_row_ptr, d_col_ind, d_values,
+                                 CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                 CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+
+CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecX, ncols, d_x, CUDA_R_32F));
+CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecY, nrows, d_y, CUDA_R_32F));
+
+// Workspace méret lekérdezése
+size_t bufferSize = 0;
+CUSPARSE_CHECK(cusparseSpMV_bufferSize(handle,
+                                       CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                       &amp;alpha,
+                                       matA,
+                                       vecX,
+                                       &amp;beta,
+                                       vecY,
+                                       CUDA_R_32F,
+                                       CUSPARSE_SPMV_CSR_ALG1,
+                                       &amp;bufferSize));
+
+void* d_buffer = nullptr;
+if (bufferSize &gt; 0) {
+    cudaMalloc(&amp;d_buffer, bufferSize);
+}
+
+// SpMV végrehajtása
+CUSPARSE_CHECK(cusparseSpMV(handle,
+                            CUSPARSE_OPERATION_NON_TRANSPOSE,
+                            &amp;alpha,
+                            matA,
+                            vecX,
+                            &amp;beta,
+                            vecY,
+                            CUDA_R_32F,
+                            CUSPARSE_SPMV_CSR_ALG1,
+                            d_buffer));
+
+CUSPARSE_CHECK(cudaDeviceSynchronize());
+
+cudaMemcpy(h_y.data(), d_y, nrows * sizeof(float), cudaMemcpyDeviceToHost);
+
+// Várt eredmény: y = [10, 20*2+30*3, 40*3] = [10, 130, 120]
+std::vector&lt;float&gt; expected = {10.0f, 130.0f, 120.0f};
+bool ok = true;
+for (int i = 0; i &lt; nrows; ++i) {
+    if (std::fabs(h_y[i] - expected[i]) &gt; 1e-5f) {
+        ok = false;
+        std::cerr &lt;&lt; &quot;Mismatch at &quot; &lt;&lt; i &lt;&lt; &quot;: &quot; &lt;&lt; h_y[i]
+                  &lt;&lt; &quot; vs &quot; &lt;&lt; expected[i] &lt;&lt; std::endl;
+    }
+}
+std::cout &lt;&lt; (ok ? &quot;SpMV OK&quot; : &quot;SpMV FAILED&quot;) &lt;&lt; std::endl;
+
+// Takarítás
+CUSPARSE_CHECK(cusparseDestroySpMat(matA));
+CUSPARSE_CHECK(cusparseDestroyDnVec(vecX));
+CUSPARSE_CHECK(cusparseDestroyDnVec(vecY));
+CUSPARSE_CHECK(cusparseDestroyMatDescr(descr));
+CUSPARSE_CHECK(cusparseDestroy(handle));
+if (d_buffer) cudaFree(d_buffer);
+cudaFree(d_values); cudaFree(d_col_ind); cudaFree(d_row_ptr);
+cudaFree(d_x); cudaFree(d_y);
+return ok ? 0 : 1;</code></pre>
+<p>}</p>
+<pre><code>
+A példában a `cusparseCreateCsr` létrehozza a ritka mátrix deskriptort a device-on lévő CSR tömbökből. A `CUSPARSE_INDEX_32I` 32 bites egész indexeket jelent; ha a mátrix mérete meghaladná a 2^31 – 1-et, 64 bites indexkódot kell használni. A `CUSPARSE_INDEX_BASE_ZERO` azt jelzi, hogy a `row_ptr` és `col_ind` 0-tól kezdődően indexel. A sűrű vektor deskriptorok a `cusparseCreateDnVec` hívással készülnek. A workspace méretét a `cusparseSpMV_bufferSize` adja meg; ha nulla, akkor nincs szükség pufferre, de a legtöbb valós méretnél pozitív lesz. A művelet végrehajtása után az eredmény ellenőrzése a várt értékekkel történik.
+
+### Handle, stream és workspace a gyakorlatban
+
+A handle-ök, streamek és workspace-ek együttes kezelése a könyvtárak hatékony használatának kulcsa. A handle-ben tárolt streamet a `cublasSetStream` vagy `cusparseSetStream` hívással állítjuk be. A stream lehet a `cudaStreamPerThread`, a default stream, vagy egy explicit `cudaStream_t`. Az explicit stream használata ajánlott, mert így a hívások nem blokkolják a hostot, és az átfedés lehetősége is megmarad.
+
+A workspace kezelése két lépésből áll: először lekérjük a szükséges méretet, majd a `cudaMalloc` hívással lefoglaljuk a puffert. A puffer tartalma a hívás után érvénytelen, tehát nem szabad azt feltételezni, hogy a workspace bármilyen adatot megőriz. Ugyanaz a workspace több, azonos méretű igényű hívás között újrahasznosítható, de ha a dimenziók vagy a paraméterek megváltoznak, a méretet újra le kell kérdezni, és szükség esetén újra kell allokálni.
+
+A `cublasSetWorkspace` és a `cusparseSetWorkspace` néhány API esetén lehetővé teszi, hogy a workspace-t a handle-hez rendeljük, így a könyvtár belső hívásai is használhatják. Ez különösen a cuBLAS új, `cublasGemmEx` és `cublasLtMatmul` rutinjainál fontos. A klasszikus `cublasSgemm` esetén a workspace általában nulla, de az újabb rutinoknál már elengedhetetlen.
+
+Fontos megjegyezni, hogy a handle és a stream közötti kapcsolat nem automatikus. Ha a handle-t létrehozzuk, az alapértelmezett streamet használja, amíg a `cublasSetStream`-et nem hívjuk. Ha a handle-t több streamhez is akarjuk használni, akkor vagy külön handle-t hozunk létre minden streamhez, vagy minden hívás előtt beállítjuk a streamet. Az utóbbi megoldás extra overheadet visz be, ezért a gyakorlatban streamenként külön handle ajánlott.
+
+### Gyakori hibák és elhárításuk
+
+A cuBLAS és cuSPARSE használata során a következő hibák fordulnak elő leggyakrabban:
+
+1. **Helytelen leading dimension.** A `cublasSgemm` hívásban az `lda`, `ldb`, `ldc` értékeket gyakran cserélik fel vagy felejtik el frissíteni. Ha a mátrixot folytonosan, padding nélkül tároljuk, akkor `lda = m`, `ldb = k`, `ldc = m`. Ha a mátrix egy nagyobb, `pitch`-elt tömb része, a leading dimension a soron belüli tényleges távolság elemszámban.
+
+2. **Index base mismatch.** A cuSPARSE deskriptorban az index base (`CUSPARSE_INDEX_BASE_ZERO` vagy `ONE`) nem egyezik a tömbök tényleges indexelésével. Ha 0-alapú tömböket adunk meg, de a deskriptor 1-alapú marad, a kernel hibás memóriacímeket olvas, ami gyakran `CUSPARSE_STATUS_EXECUTION_FAILED` hibát eredményez.
+
+3. **A mátrix deskriptor hiánya vagy rossz beállítása.** A `cusparseSetMatType` elhagyása vagy a `CUSPARSE_MATRIX_TYPE_GENERAL` helyett más típus használata hibához vezethet. Általános mátrix esetén mindig `GENERAL`-t kell beállítani.
+
+4. **A workspace méretének lekérdezése nélküli hívás.** Az újabb API-k esetén a `bufferSize` lekérdezése kötelező; ha a puffer túl kicsi, a hívás `CUSPARSE_STATUS_INVALID_VALUE` vagy memóriahibát ad.
+
+5. **Stream-szinkronizáció hiánya.** Az aszinkron hívások után a host csak `cudaDeviceSynchronize` vagy egy esemény megvárása után olvashatja az eredményt. A hiányzó szinkronizáció miatt a host oldali eredmény véletlenszerűen elavult lehet.
+
+6. **A handle élettartamának megsértése.** Ha a handle-t megsemmisítjük, miközben egy kernel még fut, nem definiált viselkedést kapunk. A handle-t csak a szinkronizáció után szabad felszabadítani.
+
+A hibakereséshez hasznos a `cudaGetLastError` és a `cudaDeviceSynchronize` ellenőrzése a könyvtárhívás után. A `cudaGetLastError` a legutóbbi CUDA-hibát adja vissza, míg a könyvtár saját `cublasStatus_t` vagy `cusparseStatus_t` értéke a könyvtár szintű hibát jelzi. Sokszor a kettő együtt utal a pontos okra.
+
+### Labor: GEMM és SpMV mérése
+
+A labor célja, hogy a fenti mintákat valós környezetben futtassuk, és összehasonlítsuk a mért teljesítményt a várt értékkel. A laborban két műveletet végzünk:
+
+1. **GEMM** egy `n × n`-es mátrixszal, `A` és `B` véletlenszerűen generált, `C` nulla. A pontosság FP32.
+2. **SpMV** egy ritka mátrixszal, például egy véletlenszerűen kitöltött `n × n` mátrixszal, ahol a nemnullák aránya ~1%. A vektor `x` véletlenszerű, `y` nulla. A pontosság FP32.
+
+A mérési környezetet rögzíteni kell: GPU típus, driver verzió, CUDA verzió, operációs rendszer, órajel, power limit, ECC, MIG, virtualizáció, háttérterhelés. A könyv szabályai szerint a mérés előtt 5–10 warm-up hívás, majd legalább 10 ismétlés, az átlag és a szórás közlése kötelező.
+
+A következő kód egy olyan benchmark vázlat, amely mindkét műveletet méri. A kód nem teljes, mert a mérési környezet és a GPU típusa változó, de a minta jól mutatja a szükséges lépéseket.
+
+```cuda cpp
+// Labor: cuBLAS SGEMM és cuSPARSE SpMV benchmark vázlat
+// Fordítás: nvcc -O3 -arch=sm_80 -lcublas -lcusparse -o lab_gemm_spmv lab_gemm_spmv.cu
+// Futtatás: ./lab_gemm_spmv
+// Megjegyzés: az arch-ot a tényleges GPU compute capability-jéhez kell igazítani.
+
+#include &lt;cuda_runtime.h&gt;
+#include &lt;cublas_v2.h&gt;
+#include &lt;cusparse.h&gt;
+#include &lt;curand.h&gt;
+#include &lt;chrono&gt;
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+#include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+
+// Hibamakrók (CUBLAS_CHECK, CUSPARSE_CHECK, CUDA_CHECK)
+
+int main() {
+    const int n = 4096;          // Mátrix méret GEMM-hez
+    const int nnz_ratio = 0.01;  // SpMV nemnulla arány
+    const float alpha = 1.0f, beta = 0.0f;
+
+    // --- GEMM ---
+    // Host mátrixok allokálása és feltöltése
+    std::vector&lt;float&gt; h_A(n * n), h_B(n * n), h_C(n * n, 0.0f);
+    for (int i = 0; i &lt; n * n; ++i) {
+        h_A[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+        h_B[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+    }
+    // Device foglalás
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&amp;d_A, n * n * sizeof(float));
+    cudaMalloc(&amp;d_B, n * n * sizeof(float));
+    cudaMalloc(&amp;d_C, n * n * sizeof(float));
+    cudaMemcpy(d_A, h_A.data(), n * n * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B.data(), n * n * sizeof(float), cudaMemcpyHostToDevice);
+
+    cublasHandle_t cublas_handle;
+    CUBLAS_CHECK(cublasCreate(&amp;cublas_handle));
+
+    // Warm-up
+    for (int i = 0; i &lt; 5; ++i) {
+        CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                 n, n, n, &amp;alpha, d_A, n, d_B, n, &amp;beta, d_C, n));
+    }
+    CUBLAS_CHECK(cudaDeviceSynchronize());
+
+    // Mérés
+    const int iters = 10;
+    double total_time = 0.0;
+    for (int it = 0; it &lt; iters; ++it) {
+        auto start = std::chrono::high_resolution_clock::now();
+        CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                 n, n, n, &amp;alpha, d_A, n, d_B, n, &amp;beta, d_C, n));
+        CUBLAS_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration&lt;double&gt; diff = end - start;
+        total_time += diff.count();
+    }
+    double mean_time = total_time / iters;
+    // Szórást is lehet számolni
+    // ...
+
+    // Elméleti FLOPs: 2 * n^3 (szorzás + összeadás)
+    double gflops = (2.0 * n * n * n) / (mean_time * 1e9);
+    std::cout &lt;&lt; &quot;GEMM n=&quot; &lt;&lt; n &lt;&lt; &quot; mean_time=&quot; &lt;&lt; mean_time
+              &lt;&lt; &quot; s, throughput=&quot; &lt;&lt; gflops &lt;&lt; &quot; GFLOP/s&quot; &lt;&lt; std::endl;
+
+    // --- SpMV ---
+    // Ritka mátrix generálása (pl. átlós domináns sáv)
+    int nnz = static_cast&lt;int&gt;(n * n * nnz_ratio);
+    std::vector&lt;float&gt; h_values(nnz);
+    std::vector&lt;int&gt; h_col_ind(nnz);
+    std::vector&lt;int&gt; h_row_ptr(n + 1, 0);
+    // Egyszerű sávos mintázat: minden sorba 1% nemnulla elem
+    int nz_per_row = nnz / n;
+    int idx = 0;
+    for (int row = 0; row &lt; n; ++row) {
+        h_row_ptr[row] = idx;
+        for (int j = 0; j &lt; nz_per_row; ++j) {
+            int col = (row + j * 3) % n;  // Példa pattern, nem valós adat
+            h_values[idx] = 0.01f + 0.01f * (row + j);
+            h_col_ind[idx] = col;
+            ++idx;
+        }
+    }
+    h_row_ptr[n] = nnz;
+
+    // Host vektor
+    std::vector&lt;float&gt; h_x(n, 1.0f);
+    std::vector&lt;float&gt; h_y(n, 0.0f);
+
+    // Device
+    float *d_values, *d_x, *d_y;
+    int *d_col_ind, *d_row_ptr;
+    cudaMalloc(&amp;d_values, nnz * sizeof(float));
+    cudaMalloc(&amp;d_col_ind, nnz * sizeof(int));
+    cudaMalloc(&amp;d_row_ptr, (n + 1) * sizeof(int));
+    cudaMalloc(&amp;d_x, n * sizeof(float));
+    cudaMalloc(&amp;d_y, n * sizeof(float));
+    cudaMemcpy(d_values, h_values.data(), nnz * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_col_ind, h_col_ind.data(), nnz * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_row_ptr, h_row_ptr.data(), (n + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x, h_x.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    cusparseHandle_t cusparse_handle;
+    CUSPARSE_CHECK(cusparseCreate(&amp;cusparse_handle));
+
+    cusparseMatDescr_t descr;
+    CUSPARSE_CHECK(cusparseCreateMatDescr(&amp;descr));
+    CUSPARSE_CHECK(cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL));
+    CUSPARSE_CHECK(cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ZERO));
+
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    CUSPARSE_CHECK(cusparseCreateCsr(&amp;matA, n, n, nnz,
+                                     d_row_ptr, d_col_ind, d_values,
+                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecX, n, d_x, CUDA_R_32F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&amp;vecY, n, d_y, CUDA_R_32F));
+
+    size_t bufferSize = 0;
+    CUSPARSE_CHECK(cusparseSpMV_bufferSize(cusparse_handle,
+                                           CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                           CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1,
+                                           &amp;bufferSize));
+    void* d_buffer = nullptr;
+    if (bufferSize &gt; 0) cudaMalloc(&amp;d_buffer, bufferSize);
+
+    // Warm-up
+    for (int i = 0; i &lt; 5; ++i) {
+        CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                    CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1, d_buffer));
+    }
+    CUSPARSE_CHECK(cudaDeviceSynchronize());
+
+    // Mérés
+    total_time = 0.0;
+    for (int it = 0; it &lt; iters; ++it) {
+        auto start = std::chrono::high_resolution_clock::now();
+        CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &amp;alpha, matA, vecX, &amp;beta, vecY,
+                                    CUDA_R_32F, CUSPARSE_SPMV_CSR_ALG1, d_buffer));
+        CUSPARSE_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration&lt;double&gt; diff = end - start;
+        total_time += diff.count();
+    }
+    mean_time = total_time / iters;
+    double bytes_read = (nnz * (sizeof(float) + sizeof(int)) + (n+1)*sizeof(int) + n*sizeof(float));
+    double bandwidth = bytes_read / (mean_time * 1e9); // GB/s
+    std::cout &lt;&lt; &quot;SpMV n=&quot; &lt;&lt; n &lt;&lt; &quot; nnz=&quot; &lt;&lt; nnz &lt;&lt; &quot; mean_time=&quot; &lt;&lt; mean_time
+              &lt;&lt; &quot; s, effective bandwidth=&quot; &lt;&lt; bandwidth &lt;&lt; &quot; GB/s&quot; &lt;&lt; std::endl;
+
+    // Takarítás
+    // ...
+    return 0;
+}</code></pre>
+<p>A fenti kód vázlat: a mérési naplót nem tartalmazza, de a szükséges
+elemeket (warm-up, ismétlések, átlag, elméleti FLOPs / sávszélesség)
+bemutatja. A tényleges mérésnél a szórást és a percentiliseket is
+közölni kell. A <code>rand()</code> használata helyett jobb a
+<code>curand</code> a GPU-oldali generáláshoz, de ez a labor
+szempontjából nem kritikus; a mátrixok lehetnek host oldalon generáltak
+is, ha a méret nem túl nagy.</p>
+<p>A mérési eredményt a valós környezetben kell rögzíteni. Például:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Paraméter</th>
+<th>Érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>GPU</td>
+<td>NVIDIA A100 40 GB</td>
+</tr>
+<tr class="even">
+<td>Driver</td>
+<td>535.86.05 (ellenőrizendő)</td>
+</tr>
+<tr class="odd">
+<td>CUDA</td>
+<td>12.2 (ellenőrizendő)</td>
+</tr>
+<tr class="even">
+<td>OS</td>
+<td>Ubuntu 22.04 LTS</td>
+</tr>
+<tr class="odd">
+<td>Compute capability</td>
+<td>8.0</td>
+</tr>
+<tr class="even">
+<td>Órajel</td>
+<td>base 1410 MHz, boost 1740 MHz</td>
+</tr>
+<tr class="odd">
+<td>Power limit</td>
+<td>400 W</td>
+</tr>
+<tr class="even">
+<td>ECC</td>
+<td>engedélyezve</td>
+</tr>
+<tr class="odd">
+<td>MIG</td>
+<td>kikapcsolva</td>
+</tr>
+<tr class="even">
+<td>Háttérterhelés</td>
+<td>nincs</td>
+</tr>
+</tbody>
+</table>
+<p>A mérési napló a GEMM-re:</p>
+<table>
+<colgroup>
+<col style="width: 10%" />
+<col style="width: 9%" />
+<col style="width: 11%" />
+<col style="width: 15%" />
+<col style="width: 12%" />
+<col style="width: 18%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Méret (n)</th>
+<th>Precízió</th>
+<th>Ismétlések</th>
+<th>Átlag idő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Számított GFLOP/s</th>
+<th>Várt GFLOP/s (névleges)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4096</td>
+<td>FP32</td>
+<td>10</td>
+<td>pl. 12.4</td>
+<td>0.3</td>
+<td>11.1</td>
+<td>19.5 (A100 FP32)</td>
+</tr>
+</tbody>
+</table>
+<p>A várt GFLOP/s a GPU névleges FP32 teljesítményéből adódik. A mért
+érték rendszerint alacsonyabb, mert a memória-sávszélesség és az
+occupancy korlátoz.</p>
+<p>Az SpMV mérési napló:</p>
+<table>
+<colgroup>
+<col style="width: 11%" />
+<col style="width: 5%" />
+<col style="width: 10%" />
+<col style="width: 12%" />
+<col style="width: 16%" />
+<col style="width: 13%" />
+<col style="width: 30%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Méret (n)</th>
+<th>nnz</th>
+<th>Precízió</th>
+<th>Ismétlések</th>
+<th>Átlag idő (ms)</th>
+<th>Szórás (ms)</th>
+<th>Effektív sávszélesség (GB/s)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>4096</td>
+<td>~168k</td>
+<td>FP32</td>
+<td>10</td>
+<td>pl. 0.45</td>
+<td>0.02</td>
+<td>pl. 95</td>
+</tr>
+</tbody>
+</table>
+<p>Itt az effektív sávszélesség az olvasott adatmennyiségből számított
+érték. A ritka mátrix esetén a tényleges sávszélesség gyakran messze
+elmarad a csúcs sávszélességtől, mert az indirekt memóriaelérések és a
+rossz cache-kihasználtság dominálnak.</p>
+<p>A labor során a <strong>várt és a mért eredményt</strong> mindig
+külön kell választani. A várt érték lehet analitikus (pl. a fenti kis
+mátrixok esetén az ismert szorzás) vagy egy CPU-referencia
+implementáció. A mérési naplóban fel kell tüntetni a CPU referencia
+számítási módját és a hibakorlátot. Például FP32 esetén a relatív hiba
+1e-5 alatt elfogadható, de a nagyobb dimenzióknál a lebegőpontos
+kerekítés miatt növekedhet.</p>
+<h3 data-number="22.2.3" id="összefoglalás-és-továbbvezetés"><span
+class="header-section-number">22.2.3</span> Összefoglalás és
+továbbvezetés</h3>
+<p>Ebben az alfejezetben bemutattuk a cuBLAS és a cuSPARSE alapvető
+használatát: a handle-ök, streamek, workspace-ek és hibakezelés
+szerepét, valamint egy-egy GEMM- és SpMV-példát. A legfontosabb
+tanulság, hogy a könyvtárak hatékonyak, de a helyes híváshoz pontosan
+ismerni kell a memórialayoutot, az indexelési konvenciókat és a
+szinkronizáció szabályait. A laborban a mérési módszertan szerint
+rögzítettük a környezetet, a melegítést, az ismétléseket és a várt
+értékeket.</p>
+<p>A következő alfejezetben a Thrust és a CUB kerül sorra: ezek a
+template-alapú, magasabb szintű párhuzamos algoritmus-könyvtárak sokszor
+egyszerűbbé teszik a redukciót, a scannelést és a rendezést, mint a
+nyers CUDA C. Az itt bevezetett handle- és hibakezelési minták
+analógiájaként ott is hasonló kontextusobjektumokkal fogunk találkozni,
+de a fókusz az általános párhuzamos primitívek újrafelhasználásán
+lesz.</p>
+<p><strong>Önellenőrző kérdés:</strong> Miért kell a cuBLAS
+<code>cublasSgemm</code> hívásában külön megadni a leading
+dimension-öket (<code>lda</code>, <code>ldb</code>, <code>ldc</code>),
+ha a mátrixot folytonosan tároljuk? Mi történik, ha a cuSPARSE
+<code>cusparseCreateCsr</code> hívásában az index base nem egyezik a
+tömbök tényleges indexelésével? Hogyan ellenőriznéd a cuBLAS és cuSPARSE
+hívások hibáját egy összetett alkalmazásban?</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="gpu082.html">← 22.1 Könyvtártérkép és döntési szempontok</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu084.html">22.3 Thrust és CUB →</a></div>
+</nav>
+</body>
+</html>
