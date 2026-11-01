@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>26.2 Konzisztencia, bizonytalanság és kalibráció – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – LLMOps és produkciós rendszerek</a> › <a href="index.html#lmch25">26 Megbízhatóság és hibamódok</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm097.html">← 26.1 Hallucination taxonómia és mérés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm099.html">26.3 Fallback, ensemble és emberi kontroll →</a></div>
+</nav>
+<h2 data-number="26.2" id="lm098"><span
+class="header-section-number">26.2</span> Konzisztencia, bizonytalanság
+és kalibráció</h2>
+<p>A megbízható LLM-rendszerek egyik alapkérdése, hogy a modell által
+kiadott magabiztosság mennyire tükrözi a tényleges hibavalószínűséget. A
+hallucinációkról szóló fejezetben láttuk, hogy a generált szöveg gyakran
+folyékony, mégis hamis. A most tárgyalt problémakör ennél általánosabb:
+még akkor is baj van, ha a modell nem hallucinál, de a kimenethez
+rendelt valószínűséget rosszul becsüli. Ha egy rendszer 95 százalékos
+megbízhatóságot jelent, miközben a hibák 20 százalékban fordulnak elő,
+akkor a downstream döntések – például automatikus jóváhagyás,
+kockázatbesorolás vagy emberi felülvizsgálat elhagyása – téves alapokra
+épülnek. Ebben a fejezetben a modell önbizalmának mérését, kalibrálását
+és a bizonytalanság kezelésére szolgáló konformális predikciót
+vizsgáljuk.</p>
+<h3 data-number="26.2.1"
+id="bizonytalanság-confidence-és-entrópia"><span
+class="header-section-number">26.2.1</span> 1. Bizonytalanság,
+confidence és entrópia</h3>
+<p>Az LLM-ek tokenekre bontják a szöveget, és minden lépésben egy
+feltételes valószínűségeloszlást adnak a következő tokenre. Legyen a
+kontextus
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">x_{&lt;t}</annotation></semantics></math>,
+a következő token
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mi>t</mi></msub><annotation encoding="application/x-tex">x_t</annotation></semantics></math>.
+A modell
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">p_\theta(x_t \mid x_{&lt;t})</annotation></semantics></math>
+eloszlást számol, amelynek összege 1. Ebből két gyakran használt
+mérőszám származtatható:</p>
+<ul>
+<li><strong>Confidence</strong> (magabiztosság): a legnagyobb
+valószínűségű token valószínűsége, azaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mo>max</mo><mi>i</mi></msub><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>=</mo><mi>i</mi><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\max_i p_\theta(x_t=i \mid x_{&lt;t})</annotation></semantics></math>.</li>
+<li><strong>Entrópia</strong>: a teljes eloszlás bizonytalansága,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>H</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>p</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo>−</mo><msub><mo>∑</mo><mi>i</mi></msub><msub><mi>p</mi><mi>i</mi></msub><mo>log</mo><msub><mi>p</mi><mi>i</mi></msub></mrow><annotation encoding="application/x-tex">H(p) = -\sum_i p_i \log p_i</annotation></semantics></math>.
+Az entrópia magas, ha a modell sok tokennek ad hasonlóan nagy
+valószínűséget; alacsony, ha egy token dominál.</li>
+</ul>
+<p>Egyetlen token szintjén a confidence és az entrópia gyakran
+ellentétes irányban mozog, de nem ekvivalensek: a confidence csak a
+maximális valószínűséget nézi, az entrópia az egész eloszlást. Például
+ha a modell 0,6 valószínűséget ad az „igen” tokennek, és a maradék
+0,4-et sok kis valószínűségű token között osztja el, a confidence 0,6,
+az entrópia viszonylag magas lehet. Ha viszont csak két token van 0,6 és
+0,4 valószínűséggel, az entrópia alacsonyabb.</p>
+<p>Generált szekvencia esetén a token-szintű mérőszámokat aggregálni
+kell. A leggyakoribb eljárások:</p>
+<ul>
+<li><strong>Átlagos token confidence</strong>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mfrac><mn>1</mn><mi>N</mi></mfrac><msubsup><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></msubsup><msub><mo>max</mo><mi>i</mi></msub><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>=</mo><mi>i</mi><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\frac{1}{N}\sum_{t=1}^{N} \max_i p_\theta(x_t=i \mid x_{&lt;t})</annotation></semantics></math>.</li>
+<li><strong>Szekvencia-loglikelihood</strong>:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msubsup><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></msubsup><mo>log</mo><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\sum_{t=1}^{N} \log p_\theta(x_t \mid x_{&lt;t})</annotation></semantics></math>,
+amelyből a normalizált perplexity
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>e</mi><mrow><mo>−</mo><mfrac><mn>1</mn><mi>N</mi></mfrac><msubsup><mo>∑</mo><mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></msubsup><mo>log</mo><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>t</mi></msub><mo>∣</mo><msub><mi>x</mi><mrow><mo>&lt;</mo><mi>t</mi></mrow></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow></msup><annotation encoding="application/x-tex">e^{-\frac{1}{N}\sum_{t=1}^{N} \log p_\theta(x_t \mid x_{&lt;t})}</annotation></semantics></math>
+számítható.</li>
+<li><strong>Hossz-normalizált loglikelihood</strong>: a fenti összeg
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>-nel
+osztva, hogy a hosszabb válaszok ne kapjanak indokolatlanul alacsonyabb
+valószínűséget.</li>
+</ul>
+<p>Fontos megjegyezni, hogy a generálás során a kiválasztott tokenek
+valószínűsége nem feltétlenül tükrözi a teljes szekvencia
+valószínűségét, mert a modell általában a legnagyobb valószínűségű vagy
+mintavételezett tokeneket követi. A tényleges generálási valószínűség a
+beam search vagy a mintavételezés útvonalától függ. Ebből következik,
+hogy a szekvencia-szintű confidence nem egyenlő a token-szintű
+confidence-ek szorzatával, hacsak nem greedy dekódolást használunk, és a
+teljes útvonalat rögzítjük.</p>
+<h3 data-number="26.2.2" id="kalibráció-fogalma-és-mérése"><span
+class="header-section-number">26.2.2</span> 2. Kalibráció fogalma és
+mérése</h3>
+<p>A kalibráció azt jelenti, hogy a modell által adott valószínűség
+közel van a megfigyelt gyakorisághoz. Például ha egy modell az esetek 10
+százalékában 0,8-as confidence-et ad, akkor ideális esetben ezeknek az
+eseteknek körülbelül 80 százalékában lesz igaza. A klasszikus
+definíció:</p>
+<p>Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>f</mi><annotation encoding="application/x-tex">f</annotation></semantics></math>
+prediktor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">(x, y)</annotation></semantics></math>
+párokra akkor kalibrált, ha minden
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mo>∈</mo><mrow><mo stretchy="true" form="prefix">[</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="true" form="postfix">]</mo></mrow></mrow><annotation encoding="application/x-tex">c \in [0,1]</annotation></semantics></math>
+esetén
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>=</mo><mover><mi>y</mi><mo accent="true">̂</mo></mover><mo>∣</mo><mi>f</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mi>c</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mi>c</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">P(y = \hat{y} \mid f(x) = c) = c.</annotation></semantics></math></p>
+<p>Az LLM-eknél ezt a definíciót több szinten értelmezhetjük:</p>
+<ol type="1">
+<li><strong>Token-szintű kalibráció</strong>: a következő token
+predikció valószínűsége. Ez a nyelvi modellezési feladatban mérhető, de
+a gyakorlati alkalmazásokban ritkán közvetlen cél.</li>
+<li><strong>Szekvencia-szintű kalibráció</strong>: a generált válasz
+helyességének valószínűsége. Ehhez meg kell határozni, hogy mi a helyes
+válasz (például QA vagy osztályozás esetén), és a modell által a teljes
+válaszhoz rendelt valószínűséget kell összehasonlítani a helyesség
+arányával.</li>
+<li><strong>Feladat-szintű kalibráció</strong>: ha a modell többszörös
+választásos kérdésben a lehetőségek feletti eloszlást ad, akkor az egyes
+opciók valószínűsége. Ez a legkönnyebben mérhető és kalibrálható.</li>
+</ol>
+<p>A kalibráció leggyakoribb vizualizációja a <strong>reliability
+diagram</strong> (megbízhatósági görbe). Az eljárás:</p>
+<ul>
+<li>Osszuk a modell confidence-eit
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>M</mi><annotation encoding="application/x-tex">M</annotation></semantics></math>
+egyenlő szélességű intervallumba (binbe), például 0–0,1, 0,1–0,2, …,
+0,9–1,0.</li>
+<li>Minden binben számítsuk ki a predikciók átlagos confidence-ét
+(x-tengely) és a tényleges pontosságot (y-tengely).</li>
+<li>A tökéletesen kalibrált modell az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>=</mo><mi>x</mi></mrow><annotation encoding="application/x-tex">y = x</annotation></semantics></math>
+átlón fekszik. Ha a pontok az átló alatt vannak, a modell <strong>túl
+magabiztos</strong> (overconfident); ha felette, <strong>túl
+óvatos</strong> (underconfident).</li>
+</ul>
+<p>A kalibrációs hiba számszerűsítésére a <strong>Expected Calibration
+Error (ECE)</strong> használatos:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">ECE</mtext><mo>=</mo><munderover><mo>∑</mo><mrow><mi>b</mi><mo>=</mo><mn>1</mn></mrow><mi>M</mi></munderover><mfrac><msub><mi>N</mi><mi>b</mi></msub><mi>N</mi></mfrac><mrow><mo stretchy="true" form="prefix">|</mo><msub><mtext mathvariant="normal">accuracy</mtext><mi>b</mi></msub><mo>−</mo><msub><mtext mathvariant="normal">confidence</mtext><mi>b</mi></msub><mo stretchy="true" form="postfix">|</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">\text{ECE} = \sum_{b=1}^{M} \frac{N_b}{N} \left| \text{accuracy}_b - \text{confidence}_b \right|,</annotation></semantics></math>
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>N</mi><mi>b</mi></msub><annotation encoding="application/x-tex">N_b</annotation></semantics></math>
+a bin elemszáma,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+az összes minta,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mtext mathvariant="normal">accuracy</mtext><mi>b</mi></msub><annotation encoding="application/x-tex">\text{accuracy}_b</annotation></semantics></math>
+a binben mért pontosság,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mtext mathvariant="normal">confidence</mtext><mi>b</mi></msub><annotation encoding="application/x-tex">\text{confidence}_b</annotation></semantics></math>
+a binben mért átlagos confidence. Az ECE értéke 0 és 1 között van; minél
+kisebb, annál jobb.</p>
+<p>A Brier score egy másik gyakori mérőszám bináris osztályozásra:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mtext mathvariant="normal">Brier</mtext><mo>=</mo><mfrac><mn>1</mn><mi>N</mi></mfrac><munderover><mo>∑</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi>N</mi></munderover><msup><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>p</mi><mi>i</mi></msub><mo>−</mo><msub><mi>y</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mn>2</mn></msup><mo>,</mo></mrow><annotation encoding="application/x-tex">\text{Brier} = \frac{1}{N}\sum_{i=1}^{N} (p_i - y_i)^2,</annotation></semantics></math>
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>p</mi><mi>i</mi></msub><annotation encoding="application/x-tex">p_i</annotation></semantics></math>
+a modell pozitív osztályra adott valószínűsége,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>y</mi><mi>i</mi></msub><mo>∈</mo><mo stretchy="false" form="prefix">{</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">}</mo></mrow><annotation encoding="application/x-tex">y_i \in \{0,1\}</annotation></semantics></math>
+a tényleges címke. A Brier score a négyzetes hiba, így alacsonyabb érték
+jobb; ez egyszerre méri a diszkriminációt és a kalibrációt.</p>
+<p>A gyakorlatban az LLM-ek – különösen a modern, utasításra hangolt
+modellek – gyakran rosszul kalibráltak. A softmax valószínűségek
+hajlamosak a túlzott magabiztosságra, különösen nagy kapacitású
+modelleknél, amelyek a tanítóeloszláson túl is magas konfidenciát adnak.
+A kalibrációs hibát súlyosbítja, ha a modellt RLHF-fel vagy más
+igazítási eljárással hangolják, mert ezek a célok nem feltétlenül
+optimalizálják a valószínűségi kalibrációt.</p>
+<h3 data-number="26.2.3" id="kalibrálási-technikák"><span
+class="header-section-number">26.2.3</span> 3. Kalibrálási
+technikák</h3>
+<p>A legegyszerűbb és legszélesebb körben használt poszt-hoc kalibrációs
+módszer a <strong>hőmérséklet-skálázás</strong> (temperature scaling). A
+logitokra egyetlen skalárt alkalmazunk:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>p</mi><mi>i</mi></msub><mo>=</mo><mfrac><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>i</mi></msub><mi>/</mi><mi>T</mi></mrow></msup><mrow><munder><mo>∑</mo><mi>j</mi></munder><msup><mi>e</mi><mrow><msub><mi>z</mi><mi>j</mi></msub><mi>/</mi><mi>T</mi></mrow></msup></mrow></mfrac><mo>,</mo></mrow><annotation encoding="application/x-tex">p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}},</annotation></semantics></math>
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>z</mi><mi>i</mi></msub><annotation encoding="application/x-tex">z_i</annotation></semantics></math>
+a logit,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+a hőmérséklet. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>&gt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T &gt; 1</annotation></semantics></math>
+érték „lágyítja” az eloszlást, csökkenti a túlzott confidence-et; a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>T</mi><mo>&lt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">T &lt; 1</annotation></semantics></math>
+élesíti. A
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>T</mi><annotation encoding="application/x-tex">T</annotation></semantics></math>
+paramétert egy kalibrációs halmazon kell megtanulni, általában a negatív
+log-likelihood minimalizálásával, miközben a modell paraméterei
+befagyasztva maradnak.</p>
+<p>Fontos, hogy a generálási hőmérséklet és a kalibrációs hőmérséklet
+nem ugyanaz. A generálási hőmérséklet a mintavételezés diverzitását
+szabályozza, és nem feltétlenül javítja a kalibrációt. A kalibrációs
+hőmérsékletet egy külön, reprezentatív halmazon tanítjuk, és csak a
+confidence becslésére használjuk. Sajnos az LLM-eknél a
+hőmérséklet-skálázás önmagában gyakran nem elegendő, mert a hiba nem
+egyszerűen szisztematikus túl- vagy alulbecslés, hanem a kontextustól
+függően változó. Emellett a generált szövegek hossza és szemantikai
+tartalma befolyásolja a helyességet, amit egyetlen skalár nem képes
+korrigálni.</p>
+<p>Alternatív kalibrálási megközelítések:</p>
+<ul>
+<li><strong>Logprob-alapú szelekció és visszautasítás</strong>: a modell
+confidence-e alapján eldöntjük, hogy a választ elfogadjuk-e. Ehhez egy
+küszöböt állítunk be a kalibrációs halmazon, hogy elérjük a kívánt
+pontosságot. Például ha a cél 90% pontosság, akkor azt a confidence
+küszöböt választjuk, amely felett a kalibrációs halmazon a pontosság
+eléri a 90%-ot.</li>
+<li><strong>Többszöri mintavételezés és konzisztencia</strong>: ha
+ugyanarra a bemenetre többször futtatjuk a modellt (esetleg magasabb
+hőmérséklettel a diverzitásért), akkor a válaszok egyezése erős jelzés a
+megbízhatóságra. Ezt a következő alfejezetben tárgyaljuk.</li>
+<li><strong>Feature-alapú kalibráció</strong>: ha rendelkezésre állnak
+metainformációk (például a bemenet hossza, domain azonosító, a modell
+belső állapotai), akkor egy tanított kalibrátor (pl. logisztikus
+regresszió) jobb eredményt adhat.</li>
+</ul>
+<h3 data-number="26.2.4" id="konzisztencia-és-önbizalom"><span
+class="header-section-number">26.2.4</span> 4. Konzisztencia és
+önbizalom</h3>
+<p>A konzisztencia-alapú magabiztosság azon a megfigyelésen alapul, hogy
+ha egy modell ugyanarra a kérdésre többször, különböző mintavételezéssel
+ugyanazt a választ adja, akkor nagyobb valószínűséggel helyes. A
+<strong>self-consistency</strong> módszer (Wang et al., 2022) azáltal
+javítja a láncolatos gondolkodást, hogy több különböző érvelési utat
+generál, majd a végső válaszok többségi szavazatát veszi. Az egyes
+válaszok gyakorisága egyfajta confidence becslésként is használható.</p>
+<p>Legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+független generált válasz ugyanarra a promptra. A válaszok közötti
+eloszlás entrópiája:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>H</mi><mtext mathvariant="normal">ans</mtext></msub><mo>=</mo><mo>−</mo><munder><mo>∑</mo><mrow><mi>a</mi><mo>∈</mo><mi>𝒜</mi></mrow></munder><mover><mi>p</mi><mo accent="true">̂</mo></mover><mrow><mo stretchy="true" form="prefix">(</mo><mi>a</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>log</mo><mover><mi>p</mi><mo accent="true">̂</mo></mover><mrow><mo stretchy="true" form="prefix">(</mo><mi>a</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo></mrow><annotation encoding="application/x-tex">H_{\text{ans}} = -\sum_{a \in \mathcal{A}} \hat{p}(a) \log \hat{p}(a),</annotation></semantics></math>
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>p</mi><mo accent="true">̂</mo></mover><mrow><mo stretchy="true" form="prefix">(</mo><mi>a</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\hat{p}(a)</annotation></semantics></math>
+a válasz relatív gyakorisága a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+mintában. Az alacsony entrópia magas konzisztenciát, tehát nagyobb
+önbizalmat jelez. A konzisztencia-alapú confidence nem igényli a modell
+logitjait, ezért akár API-n keresztül is számítható, feltéve, hogy a
+szolgáltató engedélyezi a többszöri mintavételezést.</p>
+<p>A konzisztencia azonban nem azonos a kalibrációval: előfordulhat,
+hogy a modell következetesen ugyanazt a hibás választ adja, így a
+konzisztencia magas, a helyesség alacsony. Ezért a konzisztenciát inkább
+kiegészítő jelzésként érdemes használni, nem pedig a kalibráció
+helyettesítőjeként. A két mérőszám kombinálható: például a végső
+confidence legyen a token-alapú confidence és a válasz-konzisztencia
+súlyozott kombinációja, a súlyokat egy kalibrációs halmazon
+optimalizálva.</p>
+<h3 data-number="26.2.5" id="konformális-predikció"><span
+class="header-section-number">26.2.5</span> 5. Konformális
+predikció</h3>
+<p>A konformális predikció (conformal prediction) egy eloszlásfüggetlen
+keretrendszer, amely a modell predikcióihoz garantált lefedettségű
+predikciós halmazt rendel. Az eljárás a következő:</p>
+<ol type="1">
+<li><strong>Kalibrációs halmaz</strong>: legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>𝒟</mi><mtext mathvariant="normal">cal</mtext></msub><mo>=</mo><mo stretchy="false" form="prefix">{</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mn>1</mn></msub><mo>,</mo><msub><mi>y</mi><mn>1</mn></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo>,</mo><mi>…</mi><mo>,</mo><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>n</mi></msub><mo>,</mo><msub><mi>y</mi><mi>n</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="false" form="postfix">}</mo></mrow><annotation encoding="application/x-tex">\mathcal{D}_{\text{cal}} = \{(x_1, y_1), \ldots, (x_n, y_n)\}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>y</mi><mi>i</mi></msub><annotation encoding="application/x-tex">y_i</annotation></semantics></math>
+a helyes válasz (címke, token vagy szövegrészlet). Feltételezzük, hogy a
+kalibrációs és a tesztpontok felcserélhetők (exchangeable), ami i.i.d.
+mintavételezés esetén teljesül.</li>
+<li><strong>Score függvény</strong>: definiálunk egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">s(x, y)</annotation></semantics></math>
+nemnegatív score-t, amely azt méri, hogy a modell mennyire tartja
+valószínűnek az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+választ az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>x</mi><annotation encoding="application/x-tex">x</annotation></semantics></math>
+bemenetre. Minél kisebb a score, annál jobb a predikció. Például:
+<ul>
+<li>token-szintű:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mn>1</mn><mo>−</mo><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><mi>y</mi><mo>∣</mo><mi>x</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">s(x, y) = 1 - p_\theta(y \mid x)</annotation></semantics></math>,</li>
+<li>entrópia-alapú:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mi>H</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>p</mi><mi>θ</mi></msub><mrow><mo stretchy="true" form="prefix">(</mo><mo>⋅</mo><mo>∣</mo><mi>x</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">s(x, y) = H(p_\theta(\cdot \mid x))</annotation></semantics></math>,</li>
+<li>logit-különbség:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>x</mi><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><msub><mo>max</mo><mrow><mi>i</mi><mo>≠</mo><mi>y</mi></mrow></msub><msub><mi>z</mi><mi>i</mi></msub><mo>−</mo><msub><mi>z</mi><mi>y</mi></msub></mrow><annotation encoding="application/x-tex">s(x, y) = \max_{i \neq y} z_i - z_y</annotation></semantics></math>
+(a legnagyobb rivális logit és a helyes válasz logitjának
+különbsége).</li>
+</ul></li>
+<li><strong>Kvantilis</strong>: a kalibrációs halmazon kiszámítjuk az
+összes
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>s</mi><mi>i</mi></msub><mo>=</mo><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mi>i</mi></msub><mo>,</mo><msub><mi>y</mi><mi>i</mi></msub><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">s_i = s(x_i, y_i)</annotation></semantics></math>
+score-t, és vesszük a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>q</mi><mo accent="true">̂</mo></mover><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>α</mi><mo stretchy="true" form="postfix">)</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mi>n</mi><mo>+</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="false" form="postfix">⌉</mo><mi>/</mi><mi>n</mi></mrow><annotation encoding="application/x-tex">\hat{q} = \lceil (1-\alpha)(n+1) \rceil / n</annotation></semantics></math>
+kvantilist (az ún. konformális kvantilis). Pontosabban, az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mi>α</mi></mrow><annotation encoding="application/x-tex">1-\alpha</annotation></semantics></math>
+szintű empirikus kvantilis:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mover><mi>q</mi><mo accent="true">̂</mo></mover><mo>=</mo><mtext mathvariant="normal">quantile</mtext><mrow><mo stretchy="true" form="prefix">(</mo><mo stretchy="false" form="prefix">{</mo><msub><mi>s</mi><mn>1</mn></msub><mo>,</mo><mi>.</mi><mi>.</mi><mi>.</mi><mo>,</mo><msub><mi>s</mi><mi>n</mi></msub><mo stretchy="false" form="postfix">}</mo><mo>,</mo><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>−</mo><mi>α</mi><mo stretchy="true" form="postfix">)</mo></mrow><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo>+</mo><mn>1</mn><mi>/</mi><mi>n</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\hat{q} = \text{quantile}(\{s_1, ..., s_n\}, (1-\alpha)(1+1/n))</annotation></semantics></math>.</li>
+<li><strong>Predikciós halmaz</strong>: egy új
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>x</mi><mtext mathvariant="normal">test</mtext></msub><annotation encoding="application/x-tex">x_{\text{test}}</annotation></semantics></math>
+bemenetre a predikciós halmazt az összes olyan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>y</mi><annotation encoding="application/x-tex">y</annotation></semantics></math>
+jelölt alkotja, amelyre
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mtext mathvariant="normal">test</mtext></msub><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>≤</mo><mover><mi>q</mi><mo accent="true">̂</mo></mover></mrow><annotation encoding="application/x-tex">s(x_{\text{test}}, y) \le \hat{q}</annotation></semantics></math>:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>C</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mtext mathvariant="normal">test</mtext></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo stretchy="false" form="prefix">{</mo><mi>y</mi><mo>∈</mo><mi>𝒴</mi><mo>:</mo><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mtext mathvariant="normal">test</mtext></msub><mo>,</mo><mi>y</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>≤</mo><mover><mi>q</mi><mo accent="true">̂</mo></mover><mo stretchy="false" form="postfix">}</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">C(x_{\text{test}}) = \{ y \in \mathcal{Y} : s(x_{\text{test}}, y) \le \hat{q} \}.</annotation></semantics></math>
+A konformális garancia szerint a helyes válasz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>−</mo><mi>α</mi></mrow><annotation encoding="application/x-tex">1-\alpha</annotation></semantics></math>
+valószínűséggel benne van a halmazban:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>P</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>y</mi><mtext mathvariant="normal">test</mtext></msub><mo>∈</mo><mi>C</mi><mrow><mo stretchy="true" form="prefix">(</mo><msub><mi>x</mi><mtext mathvariant="normal">test</mtext></msub><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow><mo>≥</mo><mn>1</mn><mo>−</mo><mi>α</mi><mi>.</mi></mrow><annotation encoding="application/x-tex">P(y_{\text{test}} \in C(x_{\text{test}})) \ge 1-\alpha.</annotation></semantics></math>
+Ez a garancia marginális, azaz a teszteloszlásra átlagosan teljesül, nem
+feltétlenül minden egyes pontra.</li>
+</ol>
+<p>Az LLM-eknél a jelöltek halmaza
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>𝒴</mi><annotation encoding="application/x-tex">\mathcal{Y}</annotation></semantics></math>)
+lehet:</p>
+<ul>
+<li>Többszörös választásos kérdés opciói,</li>
+<li>A szókincs összes tokenje (ez túl nagy, de a top-k tokenre
+szűkíthető),</li>
+<li>Generált válaszok halmaza (pl. self-consistency minták),</li>
+<li>Szemantikus klaszterek a válaszok között.</li>
+</ul>
+<p>A gyakorlatban a token-szintű konformális predikció a szókincs mérete
+miatt nehéz, ezért gyakran a feladat-szintű predikcióra alkalmazzák: a
+modell kimenete egy diszkrét osztály (pl. szándékfelismerés,
+érzelemelemzés), és a score a softmax valószínűség vagy a logit margin.
+Ilyenkor a predikciós halmaz azokból az osztályokból áll, amelyek
+score-ja a kvantilis alatt van. Ha a halmaz üres vagy túl nagy, a
+rendszer visszautasíthatja a választ, vagy emberi felülvizsgálatot
+kérhet.</p>
+<p>A konformális predikció előnye, hogy nem igényel feltételezést a
+score eloszlásáról, és a garantált lefedettség akkor is érvényes, ha a
+modell kalibrálatlan. Hátránya, hogy a garancia csak a kalibrációs
+halmazzal megegyező eloszlású adatokra érvényes; domain shift esetén a
+lefedettség romolhat. Emellett a halmaz mérete a score függvény
+minőségétől függ: rossz score esetén a predikciós halmaz szükségtelenül
+nagy lehet, ami csökkenti az informatív értéket.</p>
+<h3 data-number="26.2.6"
+id="mérnöki-minták-a-bizonytalanság-kezelésére"><span
+class="header-section-number">26.2.6</span> 6. Mérnöki minták a
+bizonytalanság kezelésére</h3>
+<p>A fenti eszközöket a produkciós rendszerben tipikusan így
+kombinálják:</p>
+<ul>
+<li><strong>Confidence becslés réteg</strong>: a modell kimenetéből
+kiszámítjuk a confidence-et (token-szintű vagy konzisztencia-alapú). Ez
+lehet egy egyszerű softmax maximum vagy egy betanított kalibrátor.</li>
+<li><strong>Visszautasítási küszöb</strong>: ha a confidence egy előre
+meghatározott küszöb alatt van, a rendszer nem ad automatikus választ,
+hanem fallback mechanizmust indít (lásd a következő fejezetet). A
+küszöböt a kalibrációs halmazon a kívánt pontosság eléréséhez állítjuk
+be.</li>
+<li><strong>Konformális halmaz</strong>: ha a feladat lehetővé teszi, a
+konformális predikcióval megadunk egy predikciós halmazt, és ha az túl
+nagy, visszautasítunk. Ez különösen hasznos olyan döntéseknél, ahol a
+téves válasz költsége magas (pl. orvosi, jogi, pénzügyi).</li>
+<li><strong>Kalibrációs monitorozás</strong>: a produkcióban időszakosan
+újraértékeljük a kalibrációt, mert a bemenő adatok eloszlása változhat.
+A drift detektálása után újra kell tanítani a kalibrátort vagy
+frissíteni a konformális kvantilist.</li>
+<li><strong>Többszöri mintavételezés</strong>: ha a költségkeret engedi,
+egy bemenetre több generálást futtatunk, és a válaszok közötti egyezést
+használjuk confidence-ként. Ez növeli a latenciát és a tokencost, de
+gyakran jelentősen javítja a megbízhatóságot.</li>
+</ul>
+<p>Fontos elkerülni a gyakori hibákat:</p>
+<ul>
+<li><strong>A softmax valószínűség naiv értelmezése</strong>: a modern
+LLM-eknél a softmax kimenet nem feltétlenül kalibrált, ezért a 0,9-es
+confidence nem jelenti azt, hogy 10% eséllyel téved.</li>
+<li><strong>A konzisztencia túlértékelése</strong>: a modell lehet
+következetesen téves, így a magas konzisztencia nem garancia a
+helyességre.</li>
+<li><strong>A kalibrációs halmaz helytelen megválasztása</strong>: a
+kalibrátort ugyanazon az adaton tanítani, amelyen teszteljük, optimista
+torzítást okoz. A kalibrációs, validációs és teszt halmazokat szigorúan
+el kell választani.</li>
+<li><strong>A garancia túlterjesztése</strong>: a konformális predikció
+marginális lefedettséget garantál, de ez nem azonos a feltételes
+lefedettséggel. Egyes alcsoportokban (pl. ritka domainek) a lefedettség
+alacsonyabb lehet.</li>
+</ul>
+<h3 data-number="26.2.7" id="labor-kalibrációs-görbe-készítése"><span
+class="header-section-number">26.2.7</span> 7. Labor: kalibrációs görbe
+készítése</h3>
+<p>A labor célja, hogy reprodukálható módon megmérjük egy kis modell
+kalibrációját egy feladaton, és elkészítsük a reliability diagramot. A
+labor a könyv konvencióinak megfelelően rögzített seeddel, környezettel
+és adatverzióval dolgozik, a mért és várt eredményt pedig külön
+választja.</p>
+<p><strong>Feladat</strong>: bináris szövegosztályozás (például vélemény
+pozitív/negatív) egy előre betanított kis modell segítségével. A modell
+legyen például <code>distilbert-base-uncased</code> (verzió és revízió
+rögzítve), a feladat egy nyilvános adathalmaz (pl. IMDb vagy SST-2,
+licenc feltüntetve). A labor CPU-n is futtatható, de GPU ajánlott az
+alacsonyabb késleltetésért.</p>
+<p><strong>Lépések</strong>:</p>
+<ol type="1">
+<li><strong>Környezet rögzítése</strong>: Python 3.12, PyTorch,
+Transformers, Datasets, scikit-learn. A <code>requirements.txt</code>
+vagy <code>environment.yml</code> és a lockfile rögzíti a verziókat. A
+seed legyen <code>SEED=42</code>, a determinisztikus mód beállítva
+(<code>torch.manual_seed</code>, <code>random.seed</code>,
+<code>numpy.random.seed</code>).</li>
+<li><strong>Adatverzió</strong>: az adathalmaz pontos verziója (pl.
+<code>imdb</code> dataset a Hugging Face Datasets-ből, a commit hash
+vagy a verziószám rögzítve). A split: a hivatalos train/test splitet
+használjuk, a train-ből leválasztunk egy kalibrációs részt (pl. 10%) a
+kalibrátor tanításához, a maradék a teszt. A train és test szigorúan
+diszjunkt.</li>
+<li><strong>Modell inicializálás</strong>: a
+<code>distilbert-base-uncased</code> modell betöltése a megadott
+revízióval, tokenizer ugyanazzal a revízióval. A modell kimenete a
+<code>[CLS]</code> tokenre vetített logit, majd softmax. A pozitív
+osztály confidence-ét vesszük.</li>
+<li><strong>Predikció és confidence</strong>: a tesztadatokra
+kiszámítjuk a modell confidence-ét (a softmax maximuma vagy a
+<code>[CLS]</code> logitból számított valószínűség). A predikciót a
+magasabb valószínűségű osztály jelenti. A tényleges címkékkel
+összehasonlítva megkapjuk a pontosságot.</li>
+<li><strong>Kalibrációs görbe</strong>: a confidence-eket 10 egyenlő
+szélességű binbe soroljuk (0–0,1, …, 0,9–1,0). Minden binben kiszámítjuk
+az átlagos confidence-et és a pontosságot. A pontokat ábrázoljuk, és
+rárajzoljuk az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>y</mi><mo>=</mo><mi>x</mi></mrow><annotation encoding="application/x-tex">y=x</annotation></semantics></math>
+átlót. Az ECE-t a fenti képlet alapján számítjuk.</li>
+<li><strong>Várt eredmény</strong>: a modern, előre betanított
+transformer modellek gyakran enyhén túl magabiztosak, ezért az ECE
+várhatóan &gt; 0,05, a görbe pedig az átló alatt fut a magas confidence
+tartományban. A laborban ezt külön jelöljük: „mért ECE: X”, „várt ECE:
+&gt; 0,05”. Ha a mért érték jelentősen eltér, érdemes ellenőrizni az
+adatfeldolgozást és a binelést.</li>
+</ol>
+<p><strong>Notebook struktúra</strong> (illusztráció):</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># lm098_lab_calibration.ipynb</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Környezet: Python 3.12, torch 2.3.1, transformers 4.41.2, datasets 2.19.1</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Modell: distilbert-base-uncased (rev: main)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Adat: imdb (Hugging Face Datasets, verzió: 1.0.0)</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Seed: 42</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Licenc: Apache-2.0 (modell), IMDb adat licenc feltüntetve</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> torch</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> transformers <span class="im">import</span> AutoTokenizer, AutoModelForSequenceClassification</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> datasets <span class="im">import</span> load_dataset</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sklearn.metrics <span class="im">import</span> accuracy_score</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> scipy.stats <span class="im">import</span> entropy</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Reprodukálhatóság</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>SEED <span class="op">=</span> <span class="dv">42</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>torch.manual_seed(SEED)</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>np.random.seed(SEED)</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="co"># Adat betöltése</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>dataset <span class="op">=</span> load_dataset(<span class="st">&quot;imdb&quot;</span>, split<span class="op">=</span><span class="st">&quot;test&quot;</span>)  <span class="co"># teszt split</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a><span class="co"># Kalibrációs halmaz a train-ből (vagy a tesztből levágva, de akkor a teszt kisebb)</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="co"># Az egyszerűség kedvéért itt csak a tesztet használjuk, és a kalibrációt a tesztből leválasztjuk.</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="co"># Ez nem ideális, de a laborban az oktatási cél érdekében megengedhető, ha jelezzük.</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="co"># Modell</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>model_name <span class="op">=</span> <span class="st">&quot;distilbert-base-uncased&quot;</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>tokenizer <span class="op">=</span> AutoTokenizer.from_pretrained(model_name)</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>model <span class="op">=</span> AutoModelForSequenceClassification.from_pretrained(model_name, num_labels<span class="op">=</span><span class="dv">2</span>)</span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="co"># Predikciók és confidence-ek gyűjtése (batching, evaluation mód, no_grad)</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="co"># ...</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a><span class="co"># confidence = softmax(logits)[:, 1]  # pozitív osztály valószínűsége</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="co"># predictions = confidence &gt; 0.5</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a><span class="co"># Kalibrációs görbe</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>bins <span class="op">=</span> np.arange(<span class="dv">0</span>, <span class="fl">1.1</span>, <span class="fl">0.1</span>)</span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>bin_indices <span class="op">=</span> np.digitize(confidence, bins) <span class="op">-</span> <span class="dv">1</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>ece <span class="op">=</span> <span class="fl">0.0</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> b <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">10</span>):</span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>    mask <span class="op">=</span> bin_indices <span class="op">==</span> b</span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mask.<span class="bu">sum</span>() <span class="op">&gt;</span> <span class="dv">0</span>:</span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a>        avg_conf <span class="op">=</span> confidence[mask].mean()</span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>        avg_acc <span class="op">=</span> accuracy_score(y_true[mask], predictions[mask])</span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>        ece <span class="op">+=</span> (mask.<span class="bu">sum</span>() <span class="op">/</span> <span class="bu">len</span>(confidence)) <span class="op">*</span> <span class="bu">abs</span>(avg_acc <span class="op">-</span> avg_conf)</span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a>        <span class="co"># ábrázolás</span></span></code></pre></div>
+<p>A labor utánpótlása magában foglalja a kalibrációs görbe ábráját
+(vonal- és pontdiagram), a tengelyfeliratokkal, a modell, hardver,
+precision és batch mérete feltüntetésével.</p>
+<h3 data-number="26.2.8" id="összefoglalás-és-továbbvezetés"><span
+class="header-section-number">26.2.8</span> 8. Összefoglalás és
+továbbvezetés</h3>
+<p>Ebben a fejezetben megvizsgáltuk, hogyan kezelhető a modell
+önbizalma. Az entrópia és a confidence alapfogalmak, a kalibráció mérése
+lehetővé teszi a modell megbízhatóságának számszerűsítését, a
+hőmérséklet-skálázás és a konzisztencia-alapú becslés javíthatja a
+kalibrációt, a konformális predikció pedig garantált lefedettségű
+predikciós halmazt kínál. A legfontosabb mérnöki tanulság, hogy a
+softmax valószínűséget nem szabad vakon megbízhatóságnak tekinteni;
+mindig mérni és kalibrálni kell a rendszer kontextusában.</p>
+<p>A következő fejezetben erre építve tárgyaljuk a fallback
+mechanizmusokat, az ensemble módszereket és az emberi kontroll
+bevonását. A kalibrációs eredményekből származó confidence-küszöbök
+közvetlenül használhatók lesznek a döntési folyamatban: ha a konformális
+halmaz túl nagy vagy a confidence a küszöb alatt van, a rendszer
+emberhez irányít, vagy biztonságos tartalék választ ad.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm097.html">← 26.1 Hallucination taxonómia és mérés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm099.html">26.3 Fallback, ensemble és emberi kontroll →</a></div>
+</nav>
+</body>
+</html>

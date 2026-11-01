@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>6.1 Privilegiszintek és a kernel/user tér átlépése – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz1">I. RÉSZ – Alapok és rendszerfelépítés</a> › <a href="index.html#osch05">6 Rendszerhívások és felhasználói interfész</a></p>
+<div class="links"><a class="prev" rel="prev" href="os017.html">← 5.4 Interruptok, időzítők és eszközök felfedezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os019.html">6.2 Rendszerhívások, ABI és libc →</a></div>
+</nav>
+<h2 data-number="6.1" id="os018"><span
+class="header-section-number">6.1</span> Privilegiszintek és a
+kernel/user tér átlépése</h2>
+<p>A felhasználói program egyetlen gépi utasítása sem módosíthatja
+közvetlenül a lapregisztereket, a megszakításvezérlőt vagy a processzor
+futási szintjét. Ha ezt megtehetné, egyetlen rossz mutató vagy szándékos
+kódrészlet megkerülhetné a memóriavédelmet, leállíthatná a gépet, vagy
+más folyamatok adatait olvashatná. A védelmi gyűrűk és a kernel/user tér
+közötti átlépés éppen ezt a határt szabályozza: a processzor hardveresen
+kényszeríti ki, hogy bizonyos műveletek csak a kernel számára elérhetők,
+a felhasználói kód pedig csak ellenőrzött belépési pontokon keresztül
+kérheti ezek végrehajtását. Ez az alfejezet ezt a mechanizmust bontja ki
+a hardveres alapoktól a rendszerhívási út költségéig, majd egy emulált
+környezetben elvégezhető méréssel zárul.</p>
+<h3 data-number="6.1.1"
+id="védelmi-gyűrűk-és-privilegizált-műveletek"><span
+class="header-section-number">6.1.1</span> Védelmi gyűrűk és
+privilegizált műveletek</h3>
+<p>A klasszikus x86 architektúra négy védelmi gyűrűt definiál: a 0.
+gyűrű a legmagasabb, a 3. a legalacsonyabb jogosultsági szint. A
+gyakorlati operációs rendszerek általában csak két szintet használnak: a
+0. gyűrűt a kernel, a 3. gyűrűt a felhasználói programok számára. A
+köztes 1. és 2. gyűrűt az x86-on ritkán használják, mert a mai operációs
+rendszerek inkább lapozáson alapuló védelmet és virtualizációs
+kiterjesztéseket alkalmaznak. Az ARM architektúra az <code>EL0</code>
+(user) és <code>EL1</code> (kernel) kivételszinteket használja, a RISC-V
+pedig az <code>U-mode</code> és <code>S-mode</code> (supervisor)
+szinteket. A fogalmi modell mindenütt azonos: létezik egy magasabb
+jogosultságú kernelmód és egy alacsonyabb jogosultságú felhasználói
+mód.</p>
+<p>A processzor a futó kód aktuális jogosultsági szintjét egy belső
+állapotban tárolja, és minden egyes utasítás végrehajtása előtt
+ellenőrzi, hogy az adott utasítás végrehajtható-e az aktuális szinten. A
+privilegizált utasítások – például a vezérlőregiszterek írása, a
+megszakítások globális engedélyezése vagy tiltása, a lapozás
+engedélyezése, a MMU konfiguráció módosítása – csak a magasabb szinten
+hajthatók végre. Ha egy felhasználói program ilyen utasítást próbál meg
+futtatni, a processzor kivételt generál, és a vezérlést a kernel
+megfelelő hibakezelőjének adja át. Ezt a mechanizmust hívjuk védett
+utasítások hardveres kikényszerítésének.</p>
+<p>A memóriavédelem a gyűrűk másik alappillére. A lapozási táblák minden
+bejegyzése tartalmaz egy jogosultsági bitet, amely meghatározza, hogy az
+adott lap elérhető-e felhasználói módból. A kernel címterének lapjai
+általában csak kernelmódban érhetők el; a felhasználói oldalak mindkét
+módból, de írásvédett vagy nem végrehajtható attribútumokkal. Így a
+kernel adatai és kódja fizikailag is el van szigetelve a felhasználói
+programoktól, még akkor is, ha azok ismerik a címtartományokat. A
+gyűrűváltás önmagában nem elegendő; a lapozási táblák és a gyűrűszintek
+együttesen adják a teljes védelmet.</p>
+<h3 data-number="6.1.2" id="rendszerhívás-trap-és-visszatérés"><span
+class="header-section-number">6.1.2</span> Rendszerhívás, trap és
+visszatérés</h3>
+<p>A felhasználói program akkor léphet be a kernelbe, ha:</p>
+<ol type="1">
+<li>rendszerhívást hajt végre (<code>syscall</code>),</li>
+<li>kivételt vált ki (például osztás nullával, érvénytelen
+memóriacím),</li>
+<li>megszakítást kap (időzítő, eszköz),</li>
+<li>laphibát okoz (ez valójában a kivételek egy fajtája).</li>
+</ol>
+<p>Ezek közös neve: trap vagy csapda. A trap lényege, hogy a processzor
+automatikusan átvált kernelmódba, elmenti a felhasználói környezet egy
+részét, és egy előre meghatározott belépési pontra ugrik a kernelben. A
+rendszerhívás ennek egy speciális esete: a felhasználói program
+szándékosan, egy erre fenntartott utasítással kéri a kernel
+szolgáltatását.</p>
+<p>Az x86-64 architektúrán a <code>syscall</code> utasítás egy gyors
+belépési mechanizmust valósít meg. A processzor a
+<code>IA32_LSTAR</code> modell-specifikus regiszterben tárolt címre
+ugrik, átvált 0. gyűrűbe, és letiltja a megszakításokat. A felhasználói
+kód a rendszerhívás számát és az argumentumait regiszterekben adja át. A
+Linux x86-64 ABI szerint a rendszerhívás számát a <code>rax</code>, az
+argumentumokat sorrendben a <code>rdi</code>, <code>rsi</code>,
+<code>rdx</code>, <code>r10</code>, <code>r8</code>, <code>r9</code>
+regiszterek tartalmazzák. A kernel a visszatérési értéket a
+<code>rax</code>-ben adja vissza; a hibát a <code>-errno</code> értékkel
+jelzi, amit a libc a felhasználói térben <code>errno</code>-ra
+fordít.</p>
+<p>Az ARM64-en a <code>svc</code> (supervisor call) utasítás tölti be
+ugyanezt a szerepet. A RISC-V-en az <code>ecall</code> utasítás. A
+mechanizmus közös: a felhasználói kód egy speciális utasítással kivált
+egy trap-et, a processzor átvált kernelmódba, és a kernel trapkezelője a
+rendszerhívási szám alapján kiválasztja a megfelelő függvényt.</p>
+<p>A visszatérés a kernelből a felhasználói térbe általában egy pár
+utasítással történik: x86-64-en a <code>sysret</code> (vagy a régebbi
+<code>iretq</code>), ARM64-en az <code>eret</code>, RISC-V-en az
+<code>sret</code>. Ezek visszaállítják a felhasználói program
+utasításszámlálóját, veremmutatóját és jogosultsági szintjét. A
+kernelnek a visszatérés előtt gondoskodnia kell arról, hogy a
+felhasználói kontextus konzisztens legyen: a regiszterek, a verem, a
+futási állapot és a memóriavédelem mind helyes értékeket
+tartalmazzon.</p>
+<h3 data-number="6.1.3" id="a-határ-átlépésének-útja"><span
+class="header-section-number">6.1.3</span> A határ átlépésének útja</h3>
+<p>Egy rendszerhívás tipikus útja a következő lépésekből áll:</p>
+<ol type="1">
+<li>A libc függvény (például <code>write</code>) betölti a rendszerhívás
+számát a <code>rax</code>-be, az argumentumokat a megfelelő
+regiszterekbe, majd végrehajtja a <code>syscall</code> utasítást.</li>
+<li>A processzor kernelmódba vált, elmenti a felhasználói
+<code>rsp</code>-t, <code>rip</code>-et és a <code>rflags</code>-et,
+betölti a kernel vermét, és a <code>IA32_LSTAR</code>-ban tárolt címre
+ugrik.</li>
+<li>A kernel belépési pontja (assembly) elmenti a felhasználói
+regisztereket a kernel vermére, majd meghívja a C nyelvű
+rendszerhívás-kezelőt.</li>
+<li>A C kezelő a <code>rax</code>-ben kapott rendszerhívási szám alapján
+kiválasztja a megfelelő kernelfüggvényt, ellenőrzi az argumentumokat, és
+végrehajtja a kért műveletet.</li>
+<li>A kernelfüggvény visszatérési értéket ad; a C kezelő ezt a
+<code>rax</code>-be helyezi.</li>
+<li>Az assembly kilépési pont visszaállítja a felhasználói
+regisztereket, és a <code>sysret</code> utasítással visszatér a
+felhasználói módba.</li>
+<li>A libc ellenőrzi a visszatérési értéket, és ha negatív, beállítja az
+<code>errno</code>-t.</li>
+</ol>
+<p>Az alábbi pszeudokód egy egyszerű <code>write</code> rendszerhívás
+felhasználói oldalát szemlélteti:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* userland: write(fd, buf, count) – szemléltető pszeudokód */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> count<span class="op">)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> ret<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    asm <span class="dt">volatile</span><span class="op">(</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;mov %[fd], </span><span class="sc">%%</span><span class="st">rdi</span><span class="sc">\n\t</span><span class="st">&quot;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;mov %[buf], </span><span class="sc">%%</span><span class="st">rsi</span><span class="sc">\n\t</span><span class="st">&quot;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;mov %[count], </span><span class="sc">%%</span><span class="st">rdx</span><span class="sc">\n\t</span><span class="st">&quot;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;mov $1, </span><span class="sc">%%</span><span class="st">rax</span><span class="sc">\n\t</span><span class="st">&quot;</span>       <span class="co">/* Linux x86-64 write syscall száma */</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;syscall</span><span class="sc">\n\t</span><span class="st">&quot;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;mov </span><span class="sc">%%</span><span class="st">rax, %[ret]</span><span class="sc">\n\t</span><span class="st">&quot;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="op">[</span>ret<span class="op">]</span> <span class="st">&quot;=r&quot;</span> <span class="op">(</span>ret<span class="op">)</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="op">[</span>fd<span class="op">]</span> <span class="st">&quot;r&quot;</span> <span class="op">((</span><span class="dt">long</span><span class="op">)</span>fd<span class="op">),</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>          <span class="op">[</span>buf<span class="op">]</span> <span class="st">&quot;r&quot;</span> <span class="op">((</span><span class="dt">const</span> <span class="dt">void</span> <span class="op">*)</span>buf<span class="op">),</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>          <span class="op">[</span>count<span class="op">]</span> <span class="st">&quot;r&quot;</span> <span class="op">((</span><span class="dt">long</span><span class="op">)</span>count<span class="op">)</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="st">&quot;rax&quot;</span><span class="op">,</span> <span class="st">&quot;rdi&quot;</span><span class="op">,</span> <span class="st">&quot;rsi&quot;</span><span class="op">,</span> <span class="st">&quot;rdx&quot;</span><span class="op">,</span> <span class="st">&quot;rcx&quot;</span><span class="op">,</span> <span class="st">&quot;r11&quot;</span><span class="op">,</span> <span class="st">&quot;memory&quot;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        errno <span class="op">=</span> <span class="op">-</span>ret<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A példa csak a mechanizmust mutatja; a valódi libc a
+regiszterkiosztást és a hibakezelést architektúrafüggő assemblyben
+valósítja meg. A kernel oldalán a belépési pont a következő vázlatot
+követheti:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode asm"><code class="sourceCode fasm"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>/* kernel entry<span class="op">:</span> x86<span class="op">-</span><span class="dv">64</span> syscall belépési pont – szemléltető vázlat <span class="op">*/</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">syscall_entry:</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="bu">swapgs</span>                  <span class="op">/*</span> kernel <span class="kw">GS</span> bázis betöltése <span class="op">*/</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">rsp</span><span class="op">,</span> <span class="op">%</span><span class="kw">gs</span><span class="op">:</span><span class="dv">12</span>        <span class="op">/*</span> felhasználói <span class="kw">rsp</span> mentése <span class="op">*/</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">gs</span><span class="op">:</span><span class="dv">8</span><span class="op">,</span> <span class="op">%</span><span class="kw">rsp</span>         <span class="op">/*</span> kernel verem betöltése <span class="op">*/</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">$</span><span class="bn">0</span>x2b             <span class="op">/*</span> <span class="kw">SS</span> <span class="op">(</span>user data selector<span class="op">)</span> <span class="op">*/</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">%</span><span class="kw">gs</span><span class="op">:</span><span class="dv">12</span>            <span class="op">/*</span> felhasználói <span class="kw">rsp</span> <span class="op">*/</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">%</span><span class="kw">r11</span>              <span class="op">/*</span> RFLAGS <span class="op">*/</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">$</span><span class="bn">0</span>x33             <span class="op">/*</span> <span class="kw">CS</span> <span class="op">(</span>user code selector<span class="op">)</span> <span class="op">*/</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">%</span><span class="kw">rcx</span>              <span class="op">/*</span> visszatérési RIP <span class="op">*/</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    pushq <span class="op">%</span><span class="kw">rbp</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    /* további regisztermentés<span class="op">...</span> <span class="op">*/</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">call</span> do_syscall         <span class="op">/*</span> C kezelő hívása <span class="op">*/</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    /* visszatérési érték <span class="kw">rax</span><span class="op">-</span>ben <span class="op">*/</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    /* regiszterek visszaállítása<span class="op">...</span> <span class="op">*/</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">swapgs</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">sysretq</span></span></code></pre></div>
+<p>A C kezelő egy egyszerű diszpécser lehet:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* kernel: rendszerhívás-diszpécser – szemléltető vázlat */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">long</span> do_syscall<span class="op">(</span><span class="dt">long</span> nr<span class="op">,</span> <span class="dt">long</span> a0<span class="op">,</span> <span class="dt">long</span> a1<span class="op">,</span> <span class="dt">long</span> a2<span class="op">,</span> <span class="dt">long</span> a3<span class="op">,</span> <span class="dt">long</span> a4<span class="op">,</span> <span class="dt">long</span> a5<span class="op">)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">switch</span> <span class="op">(</span>nr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> SYS_write<span class="op">:</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> sys_write<span class="op">((</span><span class="dt">int</span><span class="op">)</span>a0<span class="op">,</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">void</span> <span class="op">*)</span>a1<span class="op">,</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>a2<span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> SYS_getpid<span class="op">:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> current_process<span class="op">-&gt;</span>pid<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">default</span><span class="op">:</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>ENOSYS<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>sys_write</code> függvény feladata, hogy ellenőrizze a
+<code>buf</code> mutató érvényességét, átmásolja a felhasználói adatot a
+kernel címterébe (például a <code>copy_from_user</code> segítségével),
+és továbbítsa a megfelelő eszközmeghajtónak. A mutató ellenőrzése
+kritikus: a kernel soha nem hivatkozhat közvetlenül egy felhasználói
+címre, mert az a felhasználói folyamat által tetszőlegesen módosítható,
+és a laphiba kernelmódban végzetes lehet.</p>
+<h3 data-number="6.1.4" id="a-határ-átlépésének-költsége"><span
+class="header-section-number">6.1.4</span> A határ átlépésének
+költsége</h3>
+<p>A rendszerhívás nem egy egyszerű függvényhívás. A költség több
+összetevőből áll:</p>
+<ol type="1">
+<li><strong>Módváltás</strong>: a processzor átvált a 3. gyűrűből a 0.
+gyűrűbe, ami a futási szint megváltoztatásával és a kernel verem
+betöltésével jár. Ez hardveres művelet, de a modern processzorokban
+optimalizált.</li>
+<li><strong>Regisztermentés és -visszaállítás</strong>: a kernelnek el
+kell mentenie a felhasználói regiszterek egy részét, hogy a
+rendszerhívás után helyre tudja állítani a program állapotát. Ez
+legalább néhány tucat regiszter írását és olvasását jelenti.</li>
+<li><strong>A belépési pont és a diszpécser kódjának
+végrehajtása</strong>: a kernel C kódjának belépése, a rendszerhívási
+szám ellenőrzése, a függvény kiválasztása és hívása.</li>
+<li><strong>Cache- és TLB-hatások</strong>: a kernel kódja és adatai más
+címterületen vannak, mint a felhasználói program. A belépéskor a
+processzor gyakran új TLB-bejegyzéseket és cache-sorokat tölt be, ami
+lassíthatja a végrehajtást. A <code>syscall</code> utasítás önmagában
+nem üríti a TLB-t, de a kernel lapjainak elérése új bejegyzéseket
+igényel.</li>
+<li><strong>Spekulatív végrehajtási mellékhatások</strong>: a modern
+processzorok spekulatívan hajtják végre az utasításokat, ami a
+biztonsági résekhez (Spectre, Meltdown) vezetett. A kernel belépésekor a
+CPU-nak meg kell akadályoznia, hogy a felhasználói kód spekulatív úton
+hozzáférjen a kernel adataihoz, ami további hardveres és szoftveres
+költségekkel jár. A Linux kernelben a <code>KPTI</code> (Kernel Page
+Table Isolation) például külön lapozási táblákat használ a kernel és a
+felhasználói tér számára, ami növeli a belépési költséget.</li>
+<li><strong>Veremváltás</strong>: a kernel a saját vermét használja, ami
+szintén cache- és TLB-műveletekkel jár.</li>
+</ol>
+<p>A tényleges költség erősen függ a processzortól, a kernel
+konfigurációjától és a rendszerhívás típusától. Egy üres
+<code>getpid</code> rendszerhívás egy modern x86-64 CPU-n körülbelül
+50–150 ns-ot vehet igénybe, míg egy bonyolult <code>read</code> vagy
+<code>write</code> műveletnél a tényleges I/O dominál. A régebbi
+architektúrákon, ahol a <code>int 0x80</code> utasítást használták, a
+belépés lényegesen lassabb volt (több száz ciklus), mert a szoftveres
+megszakítás általános trapkezelőn keresztül ment. A
+<code>syscall</code>/<code>sysenter</code> utasítások bevezetése
+jelentősen csökkentette ezt a költséget.</p>
+<p>A méréshez fontos a módszertan rögzítése. A <code>rdtsc</code>
+utasítással ciklusszintű időbélyeget olvashatunk, de figyelembe kell
+venni az out-of-order végrehajtást és a CPU frekvenciaváltást. A
+<code>clock_gettime</code> rendszerhívás önmaga is rendszerhívás, ezért
+alkalmatlan a syscall-költség mérésére. A szokásos módszer egy szoros
+ciklus, amely sokszor meghívja a vizsgált rendszerhívást, és a teljes
+időt elosztja a hívások számával.</p>
+<h3 data-number="6.1.5" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">6.1.5</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A kernel/user határ átlépése számos buktatót rejt. A leggyakoribb
+hibák a következők:</p>
+<ol type="1">
+<li><strong>Közvetlen felhasználói mutató hivatkozás
+kernelmódban.</strong> A kernel soha nem olvashat vagy írhat közvetlenül
+egy felhasználói címre, mert a felhasználói program a mutatót bármikor
+megváltoztathatja, a cím nem feltétlenül érvényes, és a laphiba
+kernelmódban a kernel összeomlását okozhatja. A helyes megoldás a
+<code>copy_from_user</code> és <code>copy_to_user</code> függvények
+használata, amelyek ellenőrzik a cím érvényességét, és biztonságosan
+másolják az adatokat.</li>
+<li><strong>A rendszerhívási szám és az argumentumok rossz regiszterben
+való átadása.</strong> Az ABI szigorúan meghatározza, hogy melyik
+regiszter mit tartalmaz. Ha a felhasználói kód rossz regisztert használ,
+a kernel rossz argumentumot kap, ami nem definiált viselkedéshez vezet.
+A libc ezt elrejti, de az assemblyben írt kódnál gondosan kell követni
+az ABI-t.</li>
+<li><strong>A visszatérési érték és az <code>errno</code> hibás
+kezelése.</strong> A kernel a hibákat negatív értékként adja vissza, a
+libc pedig ezt <code>errno</code>-ra fordítja. Ha a felhasználói program
+a nyers visszatérési értéket ellenőrzi, téves hibakezelést valósíthat
+meg. Például a <code>-1</code> visszatérési érték azt jelenti, hogy a
+hibakód az <code>errno</code>-ban van; a <code>-2</code> már egy konkrét
+hibát (<code>ENOENT</code>) jelenthet.</li>
+<li><strong>TOCTOU (time-of-check-to-time-of-use)
+versenyhelyzet.</strong> A kernel a felhasználói adat ellenőrzése és a
+felhasználói adat használata között a felhasználói program
+megváltoztathatja az adatot. Ha a kernel például egy fájlnevet
+ellenőriz, majd később újra beolvassa, a két olvasás között a
+felhasználói program módosíthatja a puffert. A megoldás az adat
+egyszeri, atomi másolása a kernel címterébe.</li>
+<li><strong>A regiszterek nem megfelelő mentése és
+visszaállítása.</strong> A kernel belépési pontjának pontosan kell
+kezelnie a regisztereket. Ha egy regisztert nem ment el, a felhasználói
+program állapota sérül. A C ABI szerint a kernel C függvényei csak a
+callee-saved regisztereket kötelesek megőrizni, ezért az assembly
+belépési pontnak minden olyan regisztert mentenie kell, amelyet a
+felhasználói program használhat.</li>
+<li><strong>Nem megfelelő jogosultság-ellenőrzés.</strong> A
+rendszerhívás-kezelőnek minden esetben ellenőriznie kell, hogy a hívó
+folyamat jogosult-e a kért műveletre. Például a <code>ptrace</code>
+rendszerhívásnál a kernelnek ellenőriznie kell a folyamatok közötti
+viszonyt és a <code>CAP_SYS_PTRACE</code> képességet.</li>
+<li><strong>A <code>swapgs</code> elhagyása vagy rossz sorrendje
+x86-64-en.</strong> A <code>swapgs</code> utasítás cseréli a GS
+bázisregiszter tartalmát a kernel és a felhasználói érték között. Ha a
+kernel belépéskor elfelejti meghívni, akkor a felhasználói GS bázist
+használja a kernel adatok eléréséhez, ami azonnali összeomláshoz
+vezet.</li>
+</ol>
+<h3 data-number="6.1.6"
+id="labor-rendszerhívási-út-vázlata-és-mérése"><span
+class="header-section-number">6.1.6</span> Labor: rendszerhívási út
+vázlata és mérése</h3>
+<p>A labor célja, hogy egy emulált környezetben saját kezűleg kövesse
+végig a rendszerhívási utat, és megmérje a belépés költségét. A
+konfiguráció a következő:</p>
+<ul>
+<li><strong>Emulátor</strong>: QEMU 8.0 vagy újabb (ellenőrizze a helyi
+telepítés verzióját; a leírás a kiadáskori stabil verziót
+feltételezi).</li>
+<li><strong>Architektúra</strong>: x86-64, 1 vCPU, 512 MiB RAM,
+<code>-cpu max</code> vagy <code>-cpu qemu64</code>.</li>
+<li><strong>Kernel</strong>: minimális, a laborhoz mellékelt
+freestanding C és assembly kód.</li>
+<li><strong>Fordító</strong>: GCC vagy Clang cross-compiler,
+<code>-O2 -fno-stack-protector -fno-pic -mno-red-zone</code>.</li>
+<li><strong>Mérési módszer</strong>: <code>rdtsc</code> ciklusszámláló,
+a mérés előtt <code>cpuid</code> sorompóval; a frekvenciaváltás
+elkerülése érdekében a QEMU <code>-icount</code> opciója használható,
+vagy a mérési eredményt ciklusokban adjuk meg.</li>
+</ul>
+<p>A labor kiinduló állapota egy bootolható kernel, amely egyetlen
+felhasználói folyamatot indít, és a felhasználói folyamat egy üres
+<code>getpid</code> rendszerhívást hív egy szoros ciklusban. A kernel a
+belépési ponton rögzíti a <code>rdtsc</code> értéket, a kilépési ponton
+ismét, és a különbséget egy kernelbeli számlálóban összegzi. A
+felhasználói program a ciklus végén egy másik rendszerhívással lekéri a
+mért értékeket, és kiírja azokat.</p>
+<p>A labor lépései:</p>
+<ol type="1">
+<li><strong>Build</strong>: <code>make</code> a labor könyvtárában. A
+Makefile előállítja a kernel binárist és a felhasználói programot.</li>
+<li><strong>Futtatás</strong>:
+<code>qemu-system-x86_64 -kernel kernel.bin -initrd initrd.img -append "console=ttyS0" -nographic -no-reboot</code>.</li>
+<li><strong>Eredmény</strong>: a kernel a felhasználói program kimenetét
+a soros konzolra írja. A program kiírja a hívások számát, a teljes
+ciklusszámot és az egy hívásra jutó átlagos ciklusszámot.</li>
+<li><strong>Várt eredmény</strong>: az üres <code>getpid</code>
+rendszerhívás egy hívásra jutó költsége QEMU emulációban általában több
+ezer ciklus, mert a QEMU szoftveresen emulálja a processzort. Valódi
+hardveren ez az érték 50–150 ciklus körül alakul. A mérési naplóban a
+mért és a várt értéket külön kell feltüntetni.</li>
+</ol>
+<p>A mérési napló sablonja:</p>
+<pre class="text"><code>Labor: syscall út mérése
+Dátum: [helyőrző]
+Környezet: QEMU [verzió], x86-64, 1 vCPU, 512 MiB RAM
+Fordító: [GCC verzió], -O2 -fno-stack-protector -fno-pic -mno-red-zone
+Mérési módszer: rdtsc + cpuid sorompó, 10^6 hívás, átlagolás
+Mért átlagos ciklusszám: [érték]
+Várt átlagos ciklusszám (valós hardveren): 50–150 ciklus
+Eltérés indoklása: QEMU szoftveres emuláció, nem natív sebesség</code></pre>
+<p>A labor során a kernel csak a szükséges hardverhozzáférést kapja; a
+megszakítások és lapozási táblák módosítása előtt mentési pont készül.
+Valós lemezre, firmware-re vagy bootloaderre destruktív művelet nem
+kerül. A kód szemléltetés, nem éles rendszeren végrehajtandó
+utasítás.</p>
+<h3 data-number="6.1.7" id="önellenőrző-kérdés"><span
+class="header-section-number">6.1.7</span> Önellenőrző kérdés</h3>
+<p>Miért kell a kernelnek a felhasználói mutatókat a
+<code>copy_from_user</code> segítségével másolnia, és mi történne, ha a
+kernel közvetlenül hivatkozna egy felhasználói címre? Indokolja a
+választ a laphiba és a TOCTOU versenyhelyzet szempontjából.</p>
+<h3 data-number="6.1.8" id="összefoglalás"><span
+class="header-section-number">6.1.8</span> Összefoglalás</h3>
+<p>A védelmi gyűrűk és a kernel/user tér közötti átlépés az operációs
+rendszer biztonsági alapja. A processzor hardveresen kényszeríti ki,
+hogy a privilegizált műveletek csak kernelmódban futhatnak, a
+felhasználói program pedig csak ellenőrzött trap-eken keresztül léphet
+be a kernelbe. A rendszerhívás útja a felhasználói <code>syscall</code>
+utasítástól a kernel belépési pontján, a diszpécseren és a konkrét
+kernelfüggvényen át a <code>sysret</code>-ig tart. A belépés költsége a
+módváltásból, a regisztermentésből, a cache- és TLB-hatásokból, valamint
+a spekulatív végrehajtás mitigációiból adódik. A helyes implementációhoz
+elengedhetetlen a felhasználói adatok biztonságos másolása, az ABI
+pontos betartása és a jogosultságok ellenőrzése. A következő alfejezet a
+rendszerhívások ABI-ját és a libc szerepét részletezi, építve az itt
+bevezetett fogalmakra.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os017.html">← 5.4 Interruptok, időzítők és eszközök felfedezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os019.html">6.2 Rendszerhívások, ABI és libc →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>28.2 Interruptkezelés, időzítő és kontextusváltás – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch27">28 Kernel implementáció</a></p>
+<div class="links"><a class="prev" rel="prev" href="os106.html">← 28.1 C és assembly alapok, fordítás és linkelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os108.html">28.3 QEMU, GDB és kernel debugging →</a></div>
+</nav>
+<h2 data-number="28.2" id="os107"><span
+class="header-section-number">28.2</span> Interruptkezelés, időzítő és
+kontextusváltás</h2>
+<h3 data-number="28.2.1"
+id="megszakításkezelés-időzítő-és-kontextusváltás"><span
+class="header-section-number">28.2.1</span> 7.7 Megszakításkezelés,
+időzítő és kontextusváltás</h3>
+<p>Az előző egységben (<a href="os106.html">C és assembly alapok,
+fordítás és linkelés</a>) felépítettük a kernelt C és assembly
+forráskódokból, és sikerült a bootolást egy minimális függvényhívásig
+eljuttatni. Ez a futtatható kép azonban még passzív: a CPU utasításról
+utasításra hajtja végre a kódot, de nem reagál a külvilág eseményeire,
+nem képes több folyamatot időosztásosan futtatni, és nem tudja
+megszakítani a felhasználói kódot. Ebben az alfejezetben a kernel
+“életre keltésének” három alappillérét építjük fel: a megszakítások
+(interrupt) tárgyalását, a rendszer időzítőjének (timer) bevezetését,
+valamint a folyamatok közötti átkapcsolást lehetővé tevő
+kontextusváltást (context switch).</p>
+<p>Az itt bemutatott kód és viselkedés szorosan kapcsolódik az általános
+OS-elmélethez, de a megvalósítás szintjén az x86-64 architektúrát és az
+ahhoz kapcsolódó szabványos periféria-illesztőket (PIC, PIT) használjuk.
+Fontos megjegyezni, hogy ezek a hardverkomponensek a modern
+rendszerekben már javarészt újabb interfészeknek adták át a helyüket
+(APIC, HPET), de az emulált QEMU környezetben kiválóan alkalmasak az
+alapelvek tanítására, mivel programozásuk egyszerű, determinisztikus, és
+nem igényel bonyolult specifikációs réteget.</p>
+<h4 data-number="28.2.1.1"
+id="a-megszakítások-és-az-időzítő-szerepe"><span
+class="header-section-number">28.2.1.1</span> A megszakítások és az
+időzítő szerepe</h4>
+<p>Az operációs rendszer kernelének alapvető működési módja az
+eseményvezérelt (event-driven) modell. A CPU a felhasználói program
+végrehajtása vagy éppen az idle hurok közben külső eseményekről kell,
+hogy értesüljön. Ilyen esemény lehet egy billentyűleütés, egy hálózati
+csomag érkezése, egy lemez I/O befejezése, vagy éppen egy hibás
+memóriacím elérése.</p>
+<p>A hardver és a CPU közötti kommunikáció két alapvető módja a
+<strong>polling</strong> és a <strong>megszakítás (interrupt)</strong>.
+Polling esetén a kernel folyamatosan, aktívan kérdezgeti az eszközök
+állapotregisztereit, hogy történt-e esemény. Ez a megoldás rendkívül
+pazarló: a CPU feleslegesen pörög, és a késleltetési idő függ a
+lekérdezés gyakoriságától. A megszakítás ezzel szemben egy hardveres
+jelzés: az eszköz (vagy a CPU maga egy kivétel esetén) félbeszakítja a
+futó utasításfolyamot, és a vezérlést a kernel egy előre meghatározott
+belépési pontjára adja.</p>
+<p>A megszakítások szerepe három fő pontban foglalható össze:</p>
+<ol type="1">
+<li><strong>Reaktivitás:</strong> A kernelnek azonnal tudnia kell
+reagálni a hardvereseményekre anélkül, hogy a futó felhasználói kódot
+együttműködésre kényszerítené.</li>
+<li><strong>Védelem és hibakezelés:</strong> A kivételek (pl. nullával
+való osztás, érvénytelen cím elérése) szintén megszakítási mechanizmuson
+keresztül jutnak a kernel tudomására. Ez teszi lehetővé a folyamatok
+izolációját.</li>
+<li><strong>Preemptív ütemezés:</strong> A kernel nem bízhat abban, hogy
+egy felhasználói program önként visszaadja a CPU-t. Az időzítő
+megszakítás az a “szívverés”, amely rendszeres időközönként visszaadja a
+vezérlést a kernel ütemezőjének.</li>
+</ol>
+<p>Az <strong>időzítő (timer)</strong> tehát a megszakítási rendszer
+egyik legkritikusabb eleme. Az időzítő egy programozható oszcillátor
+(pl. az Intel 8253/8254 Programmable Interval Timer, PIT), amelyet úgy
+állítunk be, hogy periodikusan, például
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>f</mi><mo>=</mo><mn>100</mn></mrow><annotation encoding="application/x-tex">f=100</annotation></semantics></math>
+Hz-es gyakorisággal megszakítást generáljon. Ennek periódusideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>t</mi><mi>i</mi><mi>c</mi><mi>k</mi></mrow></msub><mo>=</mo><mfrac><mn>1</mn><mi>f</mi></mfrac><mo>=</mo><mn>10</mn><mo>,</mo><mn>000</mn><mspace width="0.222em"></mspace><mi>μ</mi><mi mathvariant="normal">s</mi></mrow><annotation encoding="application/x-tex">T_{tick} = \frac{1}{f} = 10{,}000\ \mu\mathrm{s}</annotation></semantics></math>.
+A kernel ezt a megszakítást “tick”-ként tartja nyilván. A tick szerepe
+kettős: egyrészt frissíti a rendszer belső óráját (uptime, jiffies),
+másrészt meghívja az ütemezőt (scheduler), amely eldönti, hogy az éppen
+futó folyamat lejárt-e már a rendelkezésére álló időszeletéből (time
+slice), és szükség van-e kontextusváltásra.</p>
+<h4 data-number="28.2.1.2" id="az-idt-és-a-megszakítási-útvonal"><span
+class="header-section-number">28.2.1.2</span> Az IDT és a megszakítási
+útvonal</h4>
+<p>Ahhoz, hogy a CPU tudja, hová ugorjon, ha egy megszakítás érkezik,
+egy speciális adatszerkezetre van szükség: az <strong>Interrupt
+Descriptor Table (IDT)</strong>. Az IDT nem más, mint egy olyan
+bejegyzésekből (gate) álló tömb, amely a CPU által ismert megszakítási
+vektorokhoz (0-255) rendel belépési pontokat.</p>
+<p>A Linux és a legtöbb modern x86-64 kernel a <strong>0x20</strong>-as
+vektor felett használja a szoftveres megszakításokat, mivel a 0-31
+közötti vektorok a CPU kivételei számára vannak fenntartva (pl. 0:
+Division Error, 13: General Protection Fault, 14: Page Fault). A
+hardveres megszakításokat (IRQ-k) a régi 8259A PIC (Programmable
+Interrupt Controller) alapból a 0x08-0x0F vektorokra irányítaná, ami
+ütközik a CPU kivételeivel. Ezért a PIC-et <strong>remapeljük</strong>,
+vagyis áthelyezzük a hardveres megszakításokat a 0x20-0x2F
+tartományba.</p>
+<p>Egy IDT bejegyzés struktúrája C-ben a következőképpen írható le (a
+gép szóhosszának megfelelően x86-64 módban 16 bájt):</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> idt_entry <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> base_low<span class="op">;</span>    <span class="co">// A handler címének alsó 16 bitje</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> selector<span class="op">;</span>    <span class="co">// Kernel kód szegmens szelektor (0x08)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  ist<span class="op">;</span>         <span class="co">// Interrupt Stack Table index (itt 0)</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  type_attr<span class="op">;</span>   <span class="co">// 0x8E: Present, DPL=0, 32/64-bit Interrupt Gate</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> base_mid<span class="op">;</span>    <span class="co">// A handler címének középső 16 bitje</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> base_high<span class="op">;</span>   <span class="co">// A handler címének felső 32 bitje</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> zero<span class="op">;</span>        <span class="co">// Fenntartva, kötelezően 0</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">));</span></span></code></pre></div>
+<p>A kernel inicializálásakor (<code>idt_init</code>) a NULL pointerrel
+való hibás hívásra fenn kell tartanunk a 0. vektort, be kell töltenünk a
+CPU kivételeit kezelő rutinokat, majd a hardveres megszakításokra a
+megfelelő ISR-eket (Interrupt Service Routine). Az IDT eléréséhez
+használt mutatót az <code>LIDT</code> utasítással kell betölteni:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> idt_ptr <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> limit<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> base<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">));</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> idt_load<span class="op">(</span><span class="kw">struct</span> idt_ptr<span class="op">*);</span></span></code></pre></div>
+<pre class="assembly"><code>; idt_load (assembly)
+; Betölti az IDT mutatót az IDTR regiszterbe
+global idt_load
+idt_load:
+    lidt [rdi]   ; RDI tartalmazza az idt_ptr* mutatót
+    ret</code></pre>
+<p>A kernel inicializálásakor a <code>load_idt</code> meghívása után a
+CPU már képes megszakítást fogadni, bár a <code>STI</code> utasításig
+letiltott állapotban van. A <code>STI</code> (Set Interrupt Flag)
+engedélyezi a hardveres megszakítások fogadását.</p>
+<h4 data-number="28.2.1.3" id="isr-ek-és-a-megszakítási-kód"><span
+class="header-section-number">28.2.1.3</span> ISR-ek és a megszakítási
+kód</h4>
+<p>A megszakítási vektorhoz tartozó függvényben assembly szinten kell
+elvégezni a “regisztermentést”. A C ABI (Application Binary Interface)
+szerint egy C függvény a regiszterek egy részét (caller-saved: RAX, RCX,
+RDX, RSI, RDI, R8-R11) szabadon módosíthatja. Ha a megszakítás egy
+felhasználói program futása közben érkezik, a megszakításkezelőből
+visszatérve a felhasználói program állapotát bitre pontosan ugyanabban
+az állapotban kell helyreállítani, mintha mi sem történt volna, kivéve,
+ha a kernel kontextusváltást tervez.</p>
+<p>Ehhez egy <strong>interrupt stub</strong>-ot (csonkot) írunk
+assemblyben, amely elmenti a CPU regisztereit a veremre, meghívja a
+magas szintű C nyelvű kezelőt, majd visszatérés előtt visszaállítja a
+regisztereket és az <code>IRETQ</code> utasítással visszatér a
+megszakított kontextusba.</p>
+<p>A hardveres megszakítások kezelésére az x86-64-ben a következő mintát
+alkalmazzuk:</p>
+<pre class="assembly"><code>; Megszakítási csonk (ISR stub)
+%macro ISR_NOERRCODE 1
+global isr_stub_%1
+isr_stub_%1:
+    push 0          ; Hamis hibakód a konzisztens veremképhez
+    push %1         ; Megszakítási vektor száma
+    jmp isr_common
+%endmacro
+
+%macro ISR_ERRCODE 1
+global isr_stub_%1
+isr_stub_%1:
+    ; A CPU automatikusan tolja a hibakódot a verembe
+    push %1         ; Megszakítási vektor száma
+    jmp isr_common
+%endmacro
+
+; IRQ-k a remapelt vektorokon (0x20-0x2F)
+ISR_NOERRCODE 32
+ISR_NOERRCODE 33
+; ... és így tovább ...</code></pre>
+<p>A közös belépési rutin (<code>isr_common</code>) menti a C ABI
+megőrzéséhez szükséges regisztereket. A legkritikusabb lépések: az RSP
+igazítása és a kernel stack használata. Amikor egy felhasználói folyamat
+fut, a CPU az RSP-t a felhasználói veremre állítva hívja meg a
+megszakítást. A kernelnek gondoskodnia kell arról, hogy a kernel adatai
+ne a felhasználói veremre kerüljenek. Ezt a feladatot a <strong>TSS
+(Task State Segment)</strong> <code>RSP0</code> mezője oldja meg: amikor
+a CPU alacsonyabb privilégiumszintről (ring 3) magasabbra (ring 0) vált,
+automatikusan betölti a kernel veremmutatót az <code>RSP0</code>
+mezőből. Ha már kernel módban vagyunk, a verem marad az aktuális kernel
+verem.</p>
+<p>A <code>isr_common</code> lényege:</p>
+<pre class="assembly"><code>isr_common:
+    ; C ABI szerinti callee-saved regiszterek mentése
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+
+    ; Hívjuk a C nyelvű diszpécsert
+    mov rdi, rsp        ; RDI = pointer a veremkeretre (pt_regs)
+    call interrupt_handler
+
+    ; Visszatérés a megszakításból
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    ; Eltávolítjuk a vektor számát és a hibakódot
+    add rsp, 16
+    iretq</code></pre>
+<p>A C nyelvű <code>interrupt_handler</code> megkapja a veremkeretre
+mutató pointert. Ebből ki tudja olvasni a megszakítás számát, és el
+tudja dönteni, hogy kivételt (pl. laphiba) vagy hardveres megszakítást
+kapott-e.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> pt_regs <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> r11<span class="op">,</span> r10<span class="op">,</span> r9<span class="op">,</span> r8<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rdi<span class="op">,</span> rsi<span class="op">,</span> rdx<span class="op">,</span> rcx<span class="op">,</span> rax<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> int_no<span class="op">;</span>      <span class="co">// Megszakítás vektora</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> err_code<span class="op">;</span>    <span class="co">// Hibakód (ha van)</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rip<span class="op">;</span>         <span class="co">// Megszakított utasítás címe</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> cs<span class="op">;</span>          <span class="co">// Kód szegmens</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rflags<span class="op">;</span>      <span class="co">// CPU flag-ek</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rsp<span class="op">;</span>         <span class="co">// Veremmutató a megszakítás pillanatában</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> ss<span class="op">;</span>          <span class="co">// Verem szegmens</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> interrupt_handler<span class="op">(</span><span class="kw">struct</span> pt_regs <span class="op">*</span>regs<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>regs<span class="op">-&gt;</span>int_no <span class="op">==</span> <span class="dv">14</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Laphiba kezelése (lásd későbbi memória fejezet)</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ...</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>regs<span class="op">-&gt;</span>int_no <span class="op">&gt;=</span> <span class="dv">32</span> <span class="op">&amp;&amp;</span> regs<span class="op">-&gt;</span>int_no <span class="op">&lt;=</span> <span class="dv">47</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Hardveres megszakítás (IRQ 0-15)</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>        irq_handler<span class="op">(</span>regs<span class="op">-&gt;</span>int_no <span class="op">-</span> <span class="dv">32</span><span class="op">);</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="28.2.1.4" id="a-pit-és-a-timer-tick"><span
+class="header-section-number">28.2.1.4</span> A PIT és a Timer Tick</h4>
+<p>A kontextusváltás rendszeres kiváltásához szükségünk van egy
+időforrásra. A QEMU-ban a legegyszerűbb a <strong>PIT (Programmable
+Interval Timer)</strong> használata. A PIT három csatornával
+rendelkezik, amelyek közül a 0. csatorna van a rendszer-időzítőhöz
+kötve. Az alap órajele
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>193</mn><mo>,</mo><mn>182</mn></mrow><annotation encoding="application/x-tex">1{,}193{,}182</annotation></semantics></math>
+Hz.</p>
+<p>Ahhoz, hogy 100 Hz-es megszakítást kapjunk, ki kell számolnunk az
+osztó értékét:
+<math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>D</mi><mo>=</mo><mfrac><mrow><mn>1</mn><mo>,</mo><mn>193</mn><mo>,</mo><mn>182</mn></mrow><mn>100</mn></mfrac><mo>=</mo><mn>11</mn><mo>,</mo><mn>931</mn><mo>,</mo><mn>82</mn><mo>≈</mo><mn>11</mn><mo>,</mo><mn>932</mn></mrow><annotation encoding="application/x-tex">D = \frac{1{,}193{,}182}{100} = 11{,}931{,}82 \approx 11{,}932</annotation></semantics></math>
+A valóságban, mivel a PIT csak egész osztót fogad el, a tényleges
+frekvencia
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>f</mi><mrow><mi>r</mi><mi>e</mi><mi>a</mi><mi>l</mi></mrow></msub><mo>=</mo><mfrac><mrow><mn>1</mn><mo>,</mo><mn>193</mn><mo>,</mo><mn>182</mn></mrow><mrow><mn>11</mn><mo>,</mo><mn>932</mn></mrow></mfrac><mo>≈</mo><mn>100</mn><mo>,</mo><mn>0007</mn></mrow><annotation encoding="application/x-tex">f_{real} = \frac{1{,}193{,}182}{11{,}932} \approx 100{,}0007</annotation></semantics></math>
+Hz lesz, ami elhanyagolható eltérés. A beállításhoz a 0x43-as portra
+írjuk a vezérlő bájtot (<code>0x36</code>), majd a 0x40-es portra két
+lépésben az osztó alsó és felső bájtját.</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PIT_CHANNEL0 </span><span class="bn">0x40</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define PIT_CMD      </span><span class="bn">0x43</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> timer_init<span class="op">(</span><span class="dt">uint32_t</span> frequency_hz<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> divisor <span class="op">=</span> <span class="dv">1193182</span> <span class="op">/</span> frequency_hz<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 0x36: 0011 0110</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Csatorna 0, mindkét bájt kiírása, 3-as mód (négyszögjel)</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>PIT_CMD<span class="op">,</span> <span class="bn">0x36</span><span class="op">);</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>PIT_CHANNEL0<span class="op">,</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)(</span>divisor <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">));</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>PIT_CHANNEL0<span class="op">,</span> <span class="op">(</span><span class="dt">uint8_t</span><span class="op">)((</span>divisor <span class="op">&gt;&gt;</span> <span class="dv">8</span><span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0xFF</span><span class="op">));</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A rendszer futása során a kernel egy <code>timer_ticks</code> nevű
+globális változót növel. Az <code>irq_handler</code>-ben megvizsgáljuk
+az IRQ számát. Ha az 0 (azaz a remapelt 32-es vektor), akkor a PIT
+megszakadt.</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="dt">volatile</span> <span class="dt">uint64_t</span> timer_ticks <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> irq_handler<span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> irq<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>irq <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        <span class="co">// PIT tick</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        timer_ticks<span class="op">++;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Itt hívjuk meg az ütemezőt (ld. kontextusváltás)</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        scheduler_tick<span class="op">();</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// EOI (End of Interrupt) elküldése a PIC-nek</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>irq <span class="op">&gt;=</span> <span class="dv">8</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>        outb<span class="op">(</span><span class="bn">0xA0</span><span class="op">,</span> <span class="bn">0x20</span><span class="op">);</span> <span class="co">// Slave PIC EOI</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span><span class="bn">0x20</span><span class="op">,</span> <span class="bn">0x20</span><span class="op">);</span> <span class="co">// Master PIC EOI</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Kritikus hibaforrás:</strong> Ha az EOI (End of Interrupt)
+jelzést elfelejtjük elküldeni a PIC-nek, az nem fog több megszakítást
+generálni, így az időzítő megáll, és a rendszer lefagy. Ez az egyik
+leggyakoribb hiba a kezdő kernelhackelés során.</p>
+<h4 data-number="28.2.1.5" id="a-kontextusváltás-mechanizmusa"><span
+class="header-section-number">28.2.1.5</span> A kontextusváltás
+mechanizmusa</h4>
+<p>A kontextusváltás (context switch) az a folyamat, amikor a kernel a
+CPU vezérlését az egyik folyamatból
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>)
+átadja egy másiknak
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>).
+Ez a legbonyolultabb és legalacsonyabb szintű művelet a kernelben, mivel
+közvetlenül a CPU regisztereivel és a veremmel dolgozik.</p>
+<p>Elméletben a kontextusváltás a következő lépésekből áll: 1.
+<strong>Belépés a kernelbe:</strong> Egy megszakítás (általában a timer
+tick) vagy egy rendszerhívás hatására a CPU kernel módba vált, és a
+folyamat kernel vermére ugrik. 2. <strong>Állapotmentés:</strong> A
+kernel elmenti az aktuális folyamat
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>)
+architekturális állapotát (regiszterek, utasításmutató, veremmutató) a
+folyamat leíró táblájába (PCB). 3. <strong>Döntés:</strong> Az ütemező
+kiválasztja a következő futó folyamatot
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>).
+4. <strong>Állapot-visszaállítás:</strong> A kernel betölti
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>
+PCB-jéből a korábban elmentett architekturális állapotot. 5.
+<strong>Visszatérés:</strong> A kernel visszatér a megszakításból, és a
+CPU a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>
+folyamat utolsó kernelbeli pontján folytatja a végrehajtást, majd
+visszatér a felhasználói térbe.</p>
+<p>A gyakorlati megvalósítás során a <code>context_switch</code>
+függvénynek el kell mentenie a callee-saved regisztereket, át kell
+állítania a veremmutatót, majd vissza kell állítania az új folyamat
+regisztereit. Az x86-64 ABI szerint ezek az RBX, RBP, R12-R15
+regiszterek.</p>
+<p>A kontextusváltás egy egyszerű, de működő modelljét a következőképpen
+valósíthatjuk meg. Minden folyamatnak van egy <code>task_struct</code>
+(vagy PCB) struktúrája, amelynek első mezője a kernel stack tetejére
+mutató pointer (<code>rsp</code>). Amikor a folyamat fut, a kernel stack
+tetején vannak a callee-saved regiszterek és a visszatérési cím.</p>
+<pre class="assembly"><code>; context_switch(uint64_t *old_rsp, uint64_t new_rsp)
+; RDI = mutató az aktuális folyamat rsp mezőjére
+; RSI = az új folyamat rsp értéke
+global context_switch
+context_switch:
+    ; Callee-saved regiszterek mentése a JELENLEGI kernel veremre
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Az aktuális kernel veremmutató elmentése az &#39;old_rsp&#39; pointerre
+    mov [rdi], rsp
+
+    ; Az új veremmutató beállítása
+    mov rsp, rsi
+
+    ; Callee-saved regiszterek visszaállítása az ÚJ veremről
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+
+    ; Visszatérés az új folyamat context_switch hívása utáni pontjára
+    ret</code></pre>
+<p>A fenti assembly kód kulcsfontosságú trükkje a <code>ret</code>
+utasítás. Amikor
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+meghívja a <code>context_switch</code>-et, a <code>call</code> utasítás
+a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+visszatérési címét
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mn>1</mn></msub><annotation encoding="application/x-tex">R_1</annotation></semantics></math>)
+a verem tetejére helyezi. A függvény elején ezt a címet további 6
+regiszter mentése fedi. Amikor elmentjük az <code>rsp</code>-t, a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+kernel állapota félbehagyva marad.</p>
+<p>Amikor legközelebb valaki visszakapcsol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>-re,
+az <code>rsp</code> pontosan arra a pontra fog mutatni. A kód
+visszaállítja a regisztereket, majd a <code>ret</code> ezen a veremcímen
+a mentett
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mn>1</mn></msub><annotation encoding="application/x-tex">R_1</annotation></semantics></math>
+címet fogja látni, és oda ugrik. Így
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+számára úgy tűnik, mintha a <code>context_switch</code> függvény
+egyszerűen csak visszatért volna, miközben a valóságban közben milliónyi
+utasítást hajtott végre egy másik folyamat.</p>
+<p><strong>A preemptív ütemező kapcsolása:</strong> A
+<code>scheduler_tick</code> függvényben a tick számláló alapján
+eldönthetjük, hogy lejárt-e a folyamat időszelete. Ha igen, a
+<code>context_switch</code> segítségével átváltunk egy másik, futásra
+kész folyamatra.</p>
+<p>Tegyük fel, hogy van egy nagyon egyszerű, round-robin ütemezőnk, ahol
+két folyamat (<code>task_a</code> és <code>task_b</code>) váltja
+egymást. A <code>scheduler_tick</code> megnézi, hogy az aktuális
+folyamat <code>time_slice</code> értéke elérte-e a 0-t. Ha igen, akkor
+meghívja a <code>context_switch</code>-et.</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> scheduler_tick<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>current<span class="op">-&gt;</span>time_slice <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>        current<span class="op">-&gt;</span>time_slice<span class="op">--;</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>current<span class="op">-&gt;</span>time_slice <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Váltsunk!</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> task <span class="op">*</span>next <span class="op">=</span> <span class="op">(</span>current <span class="op">==</span> <span class="op">&amp;</span>task_a<span class="op">)</span> <span class="op">?</span> <span class="op">&amp;</span>task_b <span class="op">:</span> <span class="op">&amp;</span>task_a<span class="op">;</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>        next<span class="op">-&gt;</span>time_slice <span class="op">=</span> <span class="dv">10</span><span class="op">;</span> <span class="co">// Adjunk 10 tick időt</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint64_t</span> old_rsp <span class="op">=</span> current<span class="op">-&gt;</span>rsp<span class="op">;</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>        current <span class="op">=</span> next<span class="op">;</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Assembly hívás: az aktuális verem mentése, új verem betöltése</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>        context_switch<span class="op">(&amp;</span>old_rsp<span class="op">,</span> current<span class="op">-&gt;</span>rsp<span class="op">);</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>Fontos versenyhelyzeti megjegyzés:</strong> A
+<code>context_switch</code> hívása a megszakításkezelő kontextusában
+történik. Ez azt jelenti, hogy az új folyamat futtatása is a
+megszakításkezelő belsejében kezdődik. Ez a legtöbb oktatási kernelben
+így működik, de meg kell értenünk, hogy a
+<code>context_switch</code>-ből való visszatérés után az új folyamat a
+<code>scheduler_tick</code> függvényből tér vissza a
+megszakításkezelőbe, ahol az EOI-t elküldjük, majd az
+<code>iretq</code>-val a felhasználói folyamatra. Ez a minta biztosítja,
+hogy a váltás atomi, mert megszakítások tiltva vannak (vagy a folyamat
+éppen kernel módban van).</p>
+<h4 data-number="28.2.1.6" id="hibakezelés-és-tipikus-csapdák"><span
+class="header-section-number">28.2.1.6</span> Hibakezelés és tipikus
+csapdák</h4>
+<p>A megszakításkezelés és a kontextusváltás során a legalattomosabb
+hibák általában nem fordítási hibák, hanem finom logikai vagy
+konvencióbeli eltérések:</p>
+<ol type="1">
+<li><strong>Hiányzó EOI:</strong> Ahogy korábban említettük, a PIC-hez
+nem küldött EOI után a rendszer lefagy. Ha a “timer tick” nyomkövetése
+azt mutatja, hogy egyszer lefut, majd megáll, ellenőrizzük az EOI
+logikát.</li>
+<li><strong>ABI megsértése:</strong> Ha a <code>isr_common</code>
+rutinban elfelejtünk egy callee-saved regisztert elmenteni, a
+megszakításból visszatérve a futó program rejtélyes
+regiszterérték-korrupciót fog látni. Ez különösen akkor jelentkezik, ha
+a C kódot magas optimalizálási szinten (<code>-O2</code>) fordítjuk,
+ahol a fordító erősen támaszkodik az ABI-ra.</li>
+<li><strong>Helytelen IDT bejegyzés:</strong> Ha a
+<code>type_attr</code> mezőben a Present bitet nem állítjuk be, vagy
+rossz a DPL (Descriptor Privilege Level) értéke, a CPU General
+Protection Fault-tal (#GP) fog leállni a megszakítás kiváltásának
+pillanatában.</li>
+<li><strong>Veremigazítás hiánya:</strong> Az x86-64 System V ABI
+előírja, hogy a <code>call</code> utasítás előtt a verem 16 bájtra
+legyen igazítva. A megszakítási stubokban a hamis hibakódok és vektorok
+pusholása eltolhatja az igazítást. Ha a C függvényben SSE utasításokat
+használunk (pl. <code>movaps</code>), az hibás címhez vezet.</li>
+<li><strong>Szelektor hiba:</strong> A kontextusváltás során a
+<code>cs</code> és <code>ss</code> szegmensszelektorokat nem szabad
+elfelejteni. Bár a modern x86-64-ben ezek nagyrészt statikusak, a
+felhasználói és kernel mód közötti váltásnál (<code>iretq</code>) a CPU
+ellenőrzi ezeket.</li>
+</ol>
+<h4 data-number="28.2.1.7"
+id="labor-idt--és-interrupt-handler-vázlat"><span
+class="header-section-number">28.2.1.7</span> Labor: IDT- és
+interrupt-handler vázlat</h4>
+<p>A cél egy olyan minimumrendszer készítése, amely bizonyítja, hogy a
+megszakítási rendszerünk működik. A labor során a QEMU-ban futtatott
+kernelünk kap egy PIT által generált megszakítást, a megszakításkezelő
+megnövel egy számlálót, és a képernyőre írva vizuálisan is igazoljuk a
+működést.</p>
+<p><strong>Kiinduló állapot:</strong> Az <code>os106</code> fejezetben
+elkészített freestanding C/Assembly build környezet (linker script,
+<code>boot.s</code>, <code>kernel.c</code>).</p>
+<p><strong>Feladatok:</strong></p>
+<ol type="1">
+<li>Hozz létre egy <code>idt.c</code> fájlt az IDT bejegyzések
+inicializálásához. Írj egy <code>set_idt_gate</code> függvényt, amely
+feltölti a <code>struct idt_entry</code> mezőit. A <code>selector</code>
+értéke <code>0x08</code> legyen, a <code>type_attr</code> értéke pedig
+<code>0x8E</code> (Interrupt Gate, Ring 0).</li>
+<li>Hozz létre egy <code>isr.s</code> assembly fájlt a
+<code>ISR_NOERRCODE</code> makróval. Készíts el legalább 16 IRQ stubot a
+<code>32</code>-től <code>47</code>-ig terjedő vektorokon.</li>
+<li>Implementáld a <code>isr_common</code> rutint a regisztermentéssel.
+A <code>interrupt_handler</code> C függvény kezdetben csak naplózza a
+megszakítás számát.</li>
+<li>A <code>kernel_main</code>-ben hívd meg a
+<code>timer_init(100)</code>-et, töltsd be az IDT-t, és engedélyezd a
+megszakításokat (<code>sti</code>).</li>
+<li>A <code>irq_handler</code>-ben a <code>timer_ticks</code> értékét
+írasd ki a VGA pufferba (a <a href="os106.html">C és assembly alapok,
+fordítás és linkelés</a> alfejezetben már megismert módon).</li>
+</ol>
+<p><strong>Futtatási parancs (reprodukálható környezet):</strong> Az
+alábbi parancs a kernel lefordításához és futtatásához egy izolált,
+emulált környezetben. Ne futtasd a hoszt gépen közvetlenül!</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Fordítás</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-ffreestanding</span> <span class="at">-mno-red-zone</span> <span class="at">-m64</span> <span class="at">-c</span> kernel.c <span class="at">-o</span> kernel.o</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="fu">nasm</span> <span class="at">-f</span> elf64 isr.s <span class="at">-o</span> isr.o</span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="fu">ld</span> <span class="at">-T</span> linker.ld <span class="at">-o</span> kernel.elf kernel.o isr.o</span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás emulált környezetben (QEMU)</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="at">-kernel</span> kernel.elf <span class="at">-display</span> curses <span class="at">-no-reboot</span> <span class="at">-no-shutdown</span></span></code></pre></div>
+<p><strong>Mérési napló:</strong></p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Paraméter</th>
+<th style="text-align: left;">Várt/Levezetett érték</th>
+<th style="text-align: left;">Mért érték</th>
+<th style="text-align: left;">Módszer</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">PIT frekvencia</td>
+<td
+style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>100</mn><annotation encoding="application/x-tex">100</annotation></semantics></math>
+Hz</td>
+<td style="text-align: left;">(ellenőrizendő)</td>
+<td style="text-align: left;">Tick számláló és QEMU virtuális idő</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Megszakítási vektor</td>
+<td style="text-align: left;"><code>32</code> (0x20)</td>
+<td style="text-align: left;"><code>32</code></td>
+<td style="text-align: left;">Naplózott <code>int_no</code></td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Tick periódus</td>
+<td
+style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>10</mn><mo>,</mo><mn>000</mn><mspace width="0.222em"></mspace><mi>μ</mi><mi mathvariant="normal">s</mi></mrow><annotation encoding="application/x-tex">10{,}000\ \mu\mathrm{s}</annotation></semantics></math></td>
+<td style="text-align: left;">(ellenőrizendő)</td>
+<td style="text-align: left;">QEMU systick mérés</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Kontextusváltás ciklusszám</td>
+<td style="text-align: left;">(levezetés: ~6 push + 6 pop + mov + ret ≈
+100-150 ciklus)</td>
+<td style="text-align: left;">(mérést igényel a hardver/emuláció
+profilozóval)</td>
+<td style="text-align: left;">GDB/QEMU trace</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Elvárt eredmény:</strong> A QEMU képernyőjén a
+<code>timer_ticks</code> számláló folyamatosan növekszik, jelezve, hogy
+a PIT megszakításai elérik a CPU-t, a CPU az IDT-n keresztül belép a
+csonkba, a C handler lefut, majd az EOI után a rendszer visszatér a
+normál futáshoz.</p>
+<p><strong>Hibakeresési tippek:</strong> Ha a rendszer lefagy, először
+ellenőrizzük, hogy a <code>timer_ticks</code> változó növekedett-e. Ha
+egyszer nőtt, majd megállt, az EOI hiányát jelzi. Ha Triple Fault lép
+fel (a QEMU hirtelen újraindul), az általában az IDT mutató hibás
+betöltésére vagy a stub címek rossz eltolására utal. A részletes
+nyomkövetést a következő alfejezetben (<a href="os108.html">QEMU, GDB és
+kernel debugging</a>) tárgyaljuk a QEMU monitor és a GDB
+integrációjával.</p>
+<p><strong>Önellenőrző kérdések:</strong></p>
+<ol type="1">
+<li>Miért kell a PIC-et remapelni, és mi történne, ha a 0x08-as vektorra
+hagynánk?</li>
+<li>Írd le szavakban, mi történik a CPU regisztereivel és a veremmel
+attól a pillanattól kezdve, hogy a PIT megszakítást generál, egészen
+addig, amíg a <code>context_switch</code> visszatér a második
+folyamatba.</li>
+<li>Mi a különbség a trap gate és az interrupt gate között az IDT
+bejegyzésben, és miért fontos ez a megszakítások engedélyezése
+szempontjából?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os106.html">← 28.1 C és assembly alapok, fordítás és linkelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os108.html">28.3 QEMU, GDB és kernel debugging →</a></div>
+</nav>
+</body>
+</html>

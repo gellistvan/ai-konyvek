@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>29.2 Blokk-eszköz és driver implementáció – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch28">29 Fájlrendszer és eszközmeghajtó</a></p>
+<div class="links"><a class="prev" rel="prev" href="os110.html">← 29.1 Egyszerű fájlrendszer tervezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os112.html">29.3 VFS integráció és fájlleírók →</a></div>
+</nav>
+<h2 data-number="29.2" id="os111"><span
+class="header-section-number">29.2</span> Blokk-eszköz és driver
+implementáció</h2>
+<p>A blokk-eszköz illesztése a kernelhez látszólag egyszerű feladat: a
+fájlrendszer kér egy logikai blokkot, a driver pedig visszaadja a
+bájtokat. A gyakorlatban azonban ez a határfelület koncentrálja a
+tárolórendszer legnehezebb kérdéseit: aszinkron végrehajtás, pufferelt
+I/O, DMA és a hardverhibák kezelése. Ebben a fejezetben egy olyan
+minimális blokk-illesztőt építünk fel, amely a saját rendszerünkben
+(emulált környezetben) működőképes, és amelyre a következő fejezetben a
+VFS-integrációt ráépíthetjük.</p>
+<p>A fejezet célja nem egyetlen konkrét meghajtó (például NVMe vagy SATA
+AHCI) teljes implementációja – az messze meghaladná a keretet –, hanem
+az általános minta bemutatása, amelyet valós hardveren is
+alkalmazhatunk. A driverünk egy virtuális blokk-eszközt (például a QEMU
+<code>virtio-blk</code> eszközét vagy egy RAM-lemezt) vezérel, és a
+kernel belső blokk-rétegéhez kapcsolódik. A hangsúly a kérésbeadás, a
+completion, a DMA-pufferek és a hibakezelés helyes szerkezetén van.</p>
+<h3 data-number="29.2.1"
+id="a-tárolóeszköz-illesztése-szektor-blokk-és-eszközmodell"><span
+class="header-section-number">29.2.1</span> A tárolóeszköz illesztése:
+szektor, blokk és eszközmodell</h3>
+<p>A blokk-eszközök (merevlemezek, SSD-k, NVMe-meghajtók, emulált
+lemezek) a rajtuk tárolt adatot rögzített méretű egységekben,
+szektorokban címzik. A klasszikus szektorméret 512 bájt, de a modern
+eszközök gyakran 4096 bájtos fizikai szektorral dolgoznak; a logikai
+szektorméret és a fizikai szektorméret eltérhet egymástól (Advanced
+Format, 4Kn). A kernel szempontjából az eszköz egy lineáris szektortömb:
+a <code>0..N-1</code> sorszámú szektorok, ahol <code>N</code> az eszköz
+kapacitása szektorban kifejezve.</p>
+<p>A fájlrendszer és a blokk-réteg általában nagyobb egységekkel,
+logikai blokkokkal operál, amelyek mérete a szektorméret többszöröse
+(gyakran 4 KiB). A driver feladata, hogy ezeket a logikai
+blokk-kéréseket lefordítsa szektor-hozzáférésekre, és a hardverrel
+végrehajtassa az adatátvitelt. Ez a fordítás tipikusan a kernel
+blokk-rétegében történik, de egy saját, egyszerű kernelben ezt a
+feladatot a driver vagy a felső réteg közösen látja el. Fontos, hogy a
+határokat pontosan rögzítsük: a driver a szektor szintjén dolgozik, a
+felső réteg pedig logikai blokkokat ad át. Ez lehetővé teszi, hogy a
+driver egyszerű maradjon, és a cache-elés vagy az ütemezés a felsőbb
+rétegben valósuljon meg.</p>
+<p>A kernelben minden blokk-eszközt egy azonosítóval és egy műveleti
+vektorral reprezentálunk. Saját rendszerünkben ez a következő egyszerű
+struktúrákat jelentheti:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, nem vendégkód */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">uint64_t</span> sector_t<span class="op">;</span>   <span class="co">/* szektorcím */</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">uint32_t</span> blk_size_t<span class="op">;</span> <span class="co">/* méret bájtban */</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blkdev<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blkdev_ops <span class="op">{</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>read<span class="op">)(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> sector_t start<span class="op">,</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>                <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> nsectors<span class="op">);</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>write<span class="op">)(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> sector_t start<span class="op">,</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> nsectors<span class="op">);</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> <span class="op">(*</span>flush<span class="op">)(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">);</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blkdev <span class="op">{</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> name<span class="op">[</span><span class="dv">32</span><span class="op">];</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    sector_t total_sectors<span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> sector_size<span class="op">;</span>      <span class="co">/* logikai szektorméret, tipikusan 512 */</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> max_request_sectors<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>driver_data<span class="op">;</span>         <span class="co">/* a driver privát állapota */</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="kw">struct</span> blkdev_ops <span class="op">*</span>ops<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> flags<span class="op">;</span>            <span class="co">/* például BLKDEV_FLAG_DMA */</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A regisztráció során a driver létrehoz egy <code>struct blkdev</code>
+példányt, kitölti a kapacitást, a szektorméretet és a műveleti vektort,
+majd egy globális listához adja. A felső réteg (például a VFS vagy a
+fájlrendszer) innen kapja meg az eszközt, és meghívja a
+<code>read</code>/<code>write</code> műveleteket. A szinkron műveleti
+vektor egyszerű, de nem skálázódik: egyetlen lassú I/O blokkolja a
+hívót, és a kernel nem tud párhuzamos kéréseket kezelni. Ezért a valódi
+interfész aszinkron kérésekkel dolgozik, amit a következő pontban
+tárgyalunk.</p>
+<h3 data-number="29.2.2"
+id="request-queue-aszinkron-kérések-és-a-completion-modell"><span
+class="header-section-number">29.2.2</span> Request queue: aszinkron
+kérések és a completion modell</h3>
+<p>A blokk I/O természeténél fogva aszinkron: a lemez mechanikus feje
+(vagy az SSD vezérlője) időbe telik a kérés teljesítéséhez, és ezalatt a
+CPU-t nem érdemes blokkolni. A kernel ezért egy request queue-t
+(kérés-várólistát) tart fenn az eszközhöz: a felső réteg egy kérést
+(request) helyez el a sorban, majd visszatérhet. A driver feldolgozza a
+sor elején lévő kérést, elindítja a hardver I/O-t, és amikor az
+befejeződik (interrupt vagy polling jelzi), meghívja a completion
+callbacket, amely értesíti a várakozó folyamatot.</p>
+<p>Saját minimális kernelünkben a kérés a következő struktúrával írható
+le:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, illusztráció */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLK_REQ_READ  </span><span class="bn">0x01</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLK_REQ_WRITE </span><span class="bn">0x02</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLK_REQ_BARRIER </span><span class="bn">0x04</span><span class="pp">  </span><span class="co">/* sorrendező/kiírás kényszerítés */</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLK_REQ_FAILED </span><span class="bn">0x80</span><span class="pp">   </span><span class="co">/* a kérés hibával zárult */</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">void</span> <span class="op">(*</span>blk_completion_fn<span class="op">)(</span><span class="dt">void</span> <span class="op">*</span>cookie<span class="op">,</span> <span class="dt">int</span> status<span class="op">);</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blk_request <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> flags<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    sector_t start<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> nsectors<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>buf<span class="op">;</span>                  <span class="co">/* adatpuffer (DMA-képes, ha szükséges) */</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    blk_completion_fn complete<span class="op">;</span> <span class="co">/* befejezés callback */</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>cookie<span class="op">;</span>               <span class="co">/* a hívó privát adata */</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_request <span class="op">*</span>next<span class="op">;</span>   <span class="co">/* láncolt lista a queue-hoz */</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> blk_queue <span class="op">{</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_request <span class="op">*</span>head<span class="op">;</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_request <span class="op">*</span>tail<span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> pending_count<span class="op">;</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> busy<span class="op">;</span>                  <span class="co">/* éppen feldolgozás alatt */</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A kérésbeadási függvény – a kernel nevezheti
+<code>blk_submit_request</code>-nek – a kérést a sor végére fűzi, majd
+ha a driver éppen szabad, jelzi a feldolgozás megkezdését. A driver
+<code>start_next_request</code> rutinja kiveszi a sor elejét, beállítja
+a hardvert, majd visszatér. Amikor az interrupt jelzi a befejezést, az
+interrupt-kezelő meghívja a kérés <code>complete</code> callbackjét, és
+ha a sor nem üres, elindítja a következő kérést. Ez a modell biztosítja
+a sorba állítást, a párhuzamosítást és a hibakezelés egységes
+helyét.</p>
+<p>Egy fontos tervezési döntés a pufferkezelés. A felső réteg által
+átadott puffer lehet a felhasználói memóriában, vagy a kernel lapozható
+memóriájában. A DMA-hoz a puffert fizikailag összefüggő, nem lapozható
+(pinned) memóriában kell elhelyezni. A <code>blk_request</code>
+struktúrában ezért a <code>buf</code> mezőnek olyan memóriára kell
+mutatnia, amelyet a driver DMA-hoz használhat. A saját kernelünkben ezt
+egy egyszerű, nem lapozható kernel-allokátorból (például a korábbi
+<code>kmalloc</code> analógjából) biztosíthatjuk. A VFS vagy a
+fájlrendszer felelőssége, hogy a felhasználói adatokat először egy ilyen
+pufferbe másolja, vagy a DMA-t közvetlenül a felhasználói memóriából
+végezze (ez utóbbi bonyolult, és a kezdeti implementációban nem
+javasolt).</p>
+<p>Példa a kérésbeadásra és a completionre:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, illusztráció */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> blk_complete_read<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>cookie<span class="op">,</span> <span class="dt">int</span> status<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> completion <span class="op">*</span>done <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> completion <span class="op">*)</span>cookie<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>        done<span class="op">-&gt;</span>ok <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        done<span class="op">-&gt;</span>ok <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        done<span class="op">-&gt;</span>err <span class="op">=</span> status<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    wake_up<span class="op">(&amp;</span>done<span class="op">-&gt;</span>wait<span class="op">);</span>   <span class="co">/* a várakozó folyamat felébresztése */</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> blk_sync_read<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> sector_t start<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> nsectors<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_request req <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>flags <span class="op">=</span> BLK_REQ_READ<span class="op">,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>start <span class="op">=</span> start<span class="op">,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>nsectors <span class="op">=</span> nsectors<span class="op">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>buf <span class="op">=</span> buf<span class="op">,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>complete <span class="op">=</span> blk_complete_read<span class="op">,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>cookie <span class="op">=</span> <span class="op">&amp;</span>done<span class="op">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    blk_submit_request<span class="op">(</span>dev<span class="op">-&gt;</span>queue<span class="op">,</span> <span class="op">&amp;</span>req<span class="op">);</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    wait_on<span class="op">(&amp;</span>done<span class="op">.</span>wait<span class="op">);</span>    <span class="co">/* szinkron várakozás */</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> done<span class="op">.</span>ok <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> done<span class="op">.</span>err<span class="op">;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti példa a szinkron interfészt aszinkron alapokra vezeti vissza:
+a hívó folyamat blokkol, amíg a completion jelzi a kész állapotot. A
+valós kernelben ez a blokkolás sokkal finomabb (például futási sorba
+való visszatérés), de a logika ugyanez.</p>
+<h3 data-number="29.2.3" id="dma-és-adatmozgatás"><span
+class="header-section-number">29.2.3</span> DMA és adatmozgatás</h3>
+<p>A Direct Memory Access (DMA) lehetővé teszi, hogy a periféria
+közvetlenül a memóriába írjon vagy onnan olvasson, a CPU folyamatos
+beavatkozása nélkül. Egy blokk-eszköz driverében ez elengedhetetlen a
+teljesítményhez: a szektorok átvitele során a CPU nem másolhat minden
+bájtot kézzel, különben a rendszer I/O-ja drámaian lelassulna. A DMA
+használata azonban több követelményt támaszt:</p>
+<ol type="1">
+<li><p><strong>Fizikai címzés:</strong> A DMA-vezérlő fizikai
+memóriacímeket használ. A kernel virtuális címtérrel dolgozik, így a
+drivernek ismernie kell a puffer fizikai címét. A saját kernelünkben ezt
+egy <code>virt_to_phys</code> makróval vagy függvénnyel érhetjük el,
+feltéve, hogy a puffer nem lapozható (pinned).</p></li>
+<li><p><strong>Összefüggő memória:</strong> A DMA-tranzakciók általában
+fizikailag összefüggő memóriaterületet igényelnek. Az emulált
+<code>virtio-blk</code> eszköz is ezt feltételezi. Ezért a puffereket a
+kernel indulásakor lefoglalt, nem lapozható régióból kell
+biztosítani.</p></li>
+<li><p><strong>Cache-koherencia:</strong> A CPU és a DMA-vezérlő közötti
+cache-konzisztenciát biztosítani kell. Olvasás előtt a puffernek
+érvényteleníteni kell a CPU cache sorait, írás után pedig vissza kell
+írni (flush) a cache-t. A x86 architektúrán a hardver gondoskodik a
+koherenciáról, de sok ARM vagy RISC-V platformon a drivernak explicit
+cache-karbantartást kell végeznie. A mi emulált x86 környezetünkben ez
+nem jelent gondot, de a hordozhatóság érdekében érdemes absztrahálni:
+<code>dma_cache_inv(buf, len)</code> és
+<code>dma_cache_flush(buf, len)</code> függvények.</p></li>
+<li><p><strong>Szórt-gyűjtő (scatter-gather) támogatás:</strong> A valós
+rendszerekben a fájlrendszer gyakran nem összefüggő memóriát ad át; a
+DMA-vezérlő képes szórt darabokból egyetlen I/O-t végrehajtani egy
+SG-lista alapján. A mi egyszerű driverünkben egyelőre egyetlen
+összefüggő puffert használunk, de a <code>blk_request</code>
+kiterjeszthető lenne egy SG-listával.</p></li>
+</ol>
+<p>Példa egy minimális DMA-átvitelre a <code>virtio-blk</code> eszközhöz
+(a tényleges register-kezelés a specifikáció szerint változhat, itt csak
+a szerkezetet mutatjuk):</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, vázlat */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> virtio_blk_req <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> type<span class="op">;</span>       <span class="co">/* 0: read, 1: write */</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> reserved<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sector<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> <span class="op">*</span>data<span class="op">;</span>       <span class="co">/* vendég-fizikai cím */</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> <span class="op">*</span>status<span class="op">;</span>     <span class="co">/* státuszbyte */</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> start_dma_request<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> blk_request <span class="op">*</span>req<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> virtio_blk_dev <span class="op">*</span>vdev <span class="op">=</span> dev<span class="op">-&gt;</span>driver_data<span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> virtio_blk_req vreq<span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    vreq<span class="op">.</span>type <span class="op">=</span> <span class="op">(</span>req<span class="op">-&gt;</span>flags <span class="op">&amp;</span> BLK_REQ_READ<span class="op">)</span> <span class="op">?</span> <span class="dv">0</span> <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    vreq<span class="op">.</span>sector <span class="op">=</span> req<span class="op">-&gt;</span>start<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    vreq<span class="op">.</span>data <span class="op">=</span> <span class="op">(</span><span class="dt">uint8_t</span> <span class="op">*)</span>virt_to_phys<span class="op">(</span>req<span class="op">-&gt;</span>buf<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    vreq<span class="op">.</span>status <span class="op">=</span> <span class="op">(</span><span class="dt">uint8_t</span> <span class="op">*)</span>virt_to_phys<span class="op">(&amp;</span>vdev<span class="op">-&gt;</span>status<span class="op">);</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    dma_cache_flush<span class="op">(</span>req<span class="op">-&gt;</span>buf<span class="op">,</span> req<span class="op">-&gt;</span>nsectors <span class="op">*</span> dev<span class="op">-&gt;</span>sector_size<span class="op">);</span> <span class="co">/* írás előtt */</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    virtio_blk_submit<span class="op">(</span>vdev<span class="op">,</span> <span class="op">&amp;</span>vreq<span class="op">);</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A befejezést az interrupt jelzi: a <code>virtio-blk</code> eszköz egy
+interruptot küld, amikor a kérés teljesült. Az interrupt-kezelő megnézi
+a státuszbyte-ot, és ha sikeres, meghívja a completiont; ha hibás, akkor
+a hibakezelési útra tereli a kérést. A DMA-pufferrel kapcsolatos
+cache-műveleteket a befejezés után is el kell végezni (olvasásnál
+invalidálás):</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, interrupt vázlat */</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> virtio_blk_isr<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> virtio_blk_dev <span class="op">*</span>vdev <span class="op">=</span> get_vdev_from_isr<span class="op">();</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blk_request <span class="op">*</span>req <span class="op">=</span> vdev<span class="op">-&gt;</span>current<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>req<span class="op">)</span> <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>vdev<span class="op">-&gt;</span>status <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>req<span class="op">-&gt;</span>flags <span class="op">&amp;</span> BLK_REQ_READ<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>            dma_cache_inv<span class="op">(</span>req<span class="op">-&gt;</span>buf<span class="op">,</span> req<span class="op">-&gt;</span>nsectors <span class="op">*</span> vdev<span class="op">-&gt;</span>dev<span class="op">.</span>sector_size<span class="op">);</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        blk_complete_request<span class="op">(</span>req<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        blk_complete_request<span class="op">(</span>req<span class="op">,</span> <span class="op">-</span>EIO<span class="op">);</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    blk_start_next<span class="op">(</span>dev<span class="op">);</span>  <span class="co">/* következő kérés indítása */</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a minta jól mutatja a driver felépítését: a hardver-indítás, az
+interrupt-kezelés és a completion szétválasztása.</p>
+<h3 data-number="29.2.4" id="hibakezelés-és-újrapróbálás"><span
+class="header-section-number">29.2.4</span> Hibakezelés és
+újrapróbálás</h3>
+<p>A tárolóeszközök nem megbízhatóak: szektorhibák, időtúllépések,
+DMA-hibák, parancs-visszautasítások fordulhatnak elő. A drivernek ezeket
+kezelnie kell, és csak a valóban végzetes hibákat kell a felső réteg
+felé továbbítania. A hibakezelés három fő területből áll:</p>
+<ol type="1">
+<li><p><strong>Hibaosztályozás:</strong> A hibakódok különbséget tesznek
+a visszavonható és a végzetes hibák között. Például egy időtúllépés
+lehet átmeneti (a lemez nem válaszolt, de a kérés újra elküldhető), míg
+egy <code>MEDIUM ERROR</code> (adathordozó-hiba) általában nem javítható
+újrapróbálással. A kernelben ezt a <code>-EAGAIN</code>,
+<code>-EIO</code>, <code>-ETIMEDOUT</code> és hasonló hibakódok
+reprezentálják; a driver a hardver-specifikus hibaállapotot ezekre
+fordítja le.</p></li>
+<li><p><strong>Újrapróbálási stratégia:</strong> A visszavonható
+hibáknál a driver automatikusan újrapróbálhatja a kérést, mielőtt a
+felső rétegnek hibát jelentene. Ez különösen fontos az időtúllépéseknél
+és a parity hibáknál, amelyek átmeneti zavarok miatt lépnek fel. Az
+újrapróbálás tipikusan korlátozott számú (például 3-5 alkalom), és
+exponenciális backoffot alkalmazhat a túlterhelés elkerülésére.</p></li>
+<li><p><strong>Hibanaplózás és diagnosztika:</strong> A kernelnek
+naplóznia kell a hibát a hozzá tartozó kérés azonosítójával, a
+szektorcímmel és a hardver állapotával. Ez segíti a későbbi
+hibakeresést. A naplózás nem helyettesíti a hiba javítását, de
+elengedhetetlen a rendszer megbízhatóságához.</p></li>
+</ol>
+<p>Példa egy újrapróbálási ciklusra a completion callbackben:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, retry vázlat */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAX_RETRIES </span><span class="dv">3</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RETRY_DELAY_MS </span><span class="dv">5</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> blk_retry_handler<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> <span class="kw">struct</span> blk_request <span class="op">*</span>req<span class="op">,</span> <span class="dt">int</span> status<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>status <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* siker */</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        req<span class="op">-&gt;</span>complete<span class="op">(</span>req<span class="op">-&gt;</span>cookie<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>req<span class="op">-&gt;</span>retries <span class="op">&lt;</span> MAX_RETRIES <span class="op">&amp;&amp;</span> is_retryable<span class="op">(</span>status<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        req<span class="op">-&gt;</span>retries<span class="op">++;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        kernel_delay_ms<span class="op">(</span>RETRY_DELAY_MS<span class="op">);</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* kérést újra kell indítani ugyanazzal a pufferrel */</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        start_request<span class="op">(</span>dev<span class="op">,</span> req<span class="op">);</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* végleges hiba */</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    req<span class="op">-&gt;</span>flags <span class="op">|=</span> BLK_REQ_FAILED<span class="op">;</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    req<span class="op">-&gt;</span>complete<span class="op">(</span>req<span class="op">-&gt;</span>cookie<span class="op">,</span> status<span class="op">);</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti vázlatban a <code>req</code> struktúra kiegészül egy
+<code>retries</code> mezővel. A <code>is_retryable</code> függvény a
+hibakód alapján dönti el, hogy érdemes-e újrapróbálni. A tényleges
+késleltetés lehet egyszerű busy-wait vagy egy időzítő-alapú várakozás; a
+saját kernelünkben kezdetben a busy-wait is elfogadható, de figyelni
+kell arra, hogy ne blokkolja túl sokáig az interrupt-kezelőt. A jobb
+megoldás, ha a retry-t egy késleltetett feladatként ütemezzük, de ez már
+túlmutat e fejezet keretein.</p>
+<p>Egy másik fontos hibatípus a <strong>request queue overflow</strong>.
+Ha a felső réteg túl gyorsan ad be kéréseket, a queue megtelhet. Ekkor a
+<code>blk_submit_request</code> visszatérhet <code>-ENOMEM</code> vagy
+<code>-EAGAIN</code> hibával, és a hívónak kell várnia. A drivernek nem
+szabad egyszerűen eldobnia a kérést; a felső réteg felelőssége a
+visszanyomás (backpressure) alkalmazása. Ez a mi egyszerű kernelünkben
+úgy valósítható meg, hogy a queue maximális hossza rögzített, és a
+<code>submit</code> függvény ellenőrzi a <code>pending_count</code>
+mezőt.</p>
+<h3 data-number="29.2.5"
+id="gyakorlati-minta-egy-ram-lemez-driver"><span
+class="header-section-number">29.2.5</span> Gyakorlati minta: egy
+RAM-lemez driver</h3>
+<p>A blokk-illesztő fogalmainak kipróbálásához nem feltétlenül szükséges
+valódi hardver. Egy RAM-lemez (ramdisk) tökéletes kiindulópont: a
+háttértár egy egyszerű memóriaterület, a driver pedig a
+<code>read</code>/<code>write</code> műveleteket memóriamásolással
+valósítja meg. Bár nincs valódi DMA vagy interrupt, a kérésbeadás, a
+completion és a hibakezelés ugyanúgy gyakorolható.</p>
+<p>Példa egy minimális RAM-lemez driverre:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C – saját kernel, ramdisk illusztráció */</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RAMDISK_SIZE </span><span class="op">(</span><span class="dv">64</span><span class="pp"> </span><span class="op">*</span><span class="pp"> </span><span class="dv">1024</span><span class="pp"> </span><span class="op">*</span><span class="pp"> </span><span class="dv">1024</span><span class="op">)</span><span class="pp">  </span><span class="co">/* 64 MiB */</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define RAMDISK_SECTOR_SIZE </span><span class="dv">512</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ramdisk_dev <span class="op">{</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> blkdev blk<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> <span class="op">*</span>data<span class="op">;</span>   <span class="co">/* a háttértár memória */</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> ramdisk_read<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> sector_t start<span class="op">,</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> nsectors<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ramdisk_dev <span class="op">*</span>rdev <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> ramdisk_dev <span class="op">*)</span>dev<span class="op">;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> offset <span class="op">=</span> start <span class="op">*</span> dev<span class="op">-&gt;</span>sector_size<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes <span class="op">=</span> nsectors <span class="op">*</span> dev<span class="op">-&gt;</span>sector_size<span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(</span>buf<span class="op">,</span> rdev<span class="op">-&gt;</span>data <span class="op">+</span> offset<span class="op">,</span> bytes<span class="op">);</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> ramdisk_write<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">,</span> sector_t start<span class="op">,</span> <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> nsectors<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ramdisk_dev <span class="op">*</span>rdev <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> ramdisk_dev <span class="op">*)</span>dev<span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> offset <span class="op">=</span> start <span class="op">*</span> dev<span class="op">-&gt;</span>sector_size<span class="op">;</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> bytes <span class="op">=</span> nsectors <span class="op">*</span> dev<span class="op">-&gt;</span>sector_size<span class="op">;</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(</span>rdev<span class="op">-&gt;</span>data <span class="op">+</span> offset<span class="op">,</span> buf<span class="op">,</span> bytes<span class="op">);</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> ramdisk_flush<span class="op">(</span><span class="kw">struct</span> blkdev <span class="op">*</span>dev<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">(</span><span class="dt">void</span><span class="op">)</span>dev<span class="op">;</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span>  <span class="co">/* RAM-lemezen nincs mit kiírni */</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> ramdisk_dev <span class="op">*</span>ramdisk_create<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ramdisk_dev <span class="op">*</span>rdev <span class="op">=</span> kmalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>rdev<span class="op">),</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>rdev<span class="op">)</span> <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>data <span class="op">=</span> kmalloc<span class="op">(</span>RAMDISK_SIZE<span class="op">,</span> GFP_DMA<span class="op">);</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>rdev<span class="op">-&gt;</span>data<span class="op">)</span> <span class="op">{</span> kfree<span class="op">(</span>rdev<span class="op">);</span> <span class="cf">return</span> NULL<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>blk<span class="op">.</span>name <span class="op">=</span> <span class="st">&quot;ram0&quot;</span><span class="op">;</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>blk<span class="op">.</span>total_sectors <span class="op">=</span> RAMDISK_SIZE <span class="op">/</span> RAMDISK_SECTOR_SIZE<span class="op">;</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>blk<span class="op">.</span>sector_size <span class="op">=</span> RAMDISK_SECTOR_SIZE<span class="op">;</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>blk<span class="op">.</span>ops <span class="op">=</span> <span class="op">&amp;(</span><span class="kw">struct</span> blkdev_ops<span class="op">){</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>read <span class="op">=</span> ramdisk_read<span class="op">,</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>write <span class="op">=</span> ramdisk_write<span class="op">,</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>flush <span class="op">=</span> ramdisk_flush<span class="op">,</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>    rdev<span class="op">-&gt;</span>blk<span class="op">.</span>driver_data <span class="op">=</span> rdev<span class="op">;</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    blkdev_register<span class="op">(&amp;</span>rdev<span class="op">-&gt;</span>blk<span class="op">);</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> rdev<span class="op">;</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a driver szinkron, és nincs szüksége interruptra vagy DMA-ra, de a
+<code>blkdev_ops</code> interfésze megegyezik a bonyolultabb
+eszközökével. A laboratóriumi feladatban azonban egy aszinkron,
+interrupt-vezérelt drivert is implementálunk, hogy a request queue és a
+completion valódi működését is lássuk.</p>
+<h3 data-number="29.2.6"
+id="labor-egyszerű-blokkdriver-és-interruptkezelés-qemu-ban"><span
+class="header-section-number">29.2.6</span> Labor: egyszerű blokkdriver
+és interruptkezelés QEMU-ban</h3>
+<p>A labor célja egy olyan blokkdriver elkészítése, amely a QEMU
+<code>virtio-blk</code> eszközét vezérli, aszinkron kérésekkel,
+interrupt-kezeléssel és újrapróbálással. A labor a könyv saját OS
+projektjének része, ezért feltételezzük, hogy a korábbi fejezetekből már
+rendelkezésre áll a minimális kernel, a memória-allokátor, a
+megszakítás-kezelő keretek és a <code>kmalloc</code>/<code>kfree</code>
+függvények.</p>
+<p><strong>Kiinduló állapot:</strong> a <code>resz7</code> projekt
+aktuális állapota, amelyben a boot, a memóriatérkép, a lapozás és az
+alapszintű megszakítás-kezelés már működik. A <code>os110</code>
+fejezetben definiáltuk a fájlrendszer logikai blokk-méretét (4 KiB) és a
+szektor-méretét (512 bájt). A labor a <code>drivers/virtio_blk.c</code>
+fájlban valósítja meg a drivert.</p>
+<p><strong>Hardverkonfiguráció (emulált):</strong> - QEMU 8.2.0 (x86_64)
+- CPU: 1 db <code>qemu64</code>, kikapcsolt KVM (TCG módban, hogy az
+időmérés reprodukálható legyen) - RAM: 512 MiB - Blokk-eszköz:
+<code>virtio-blk-pci</code> hátterű, 128 MiB kapacitású nyers lemezkép -
+Megszakítások: legacy PCI interrupt (INTx), nem MSI-X</p>
+<p><strong>Fordítási beállítások:</strong> - GCC 13.2.0, freestanding,
+<code>-O2 -march=x86-64 -mno-red-zone -ffreestanding -fno-stack-protector</code>
+- Linker script: <code>kernel.ld</code>, amely a text, data, bss
+szegmenseket határozza meg, és a kernel fizikai címe 0x100000.</p>
+<p><strong>Futtatási parancs:</strong></p>
+<pre><code>qemu-system-x86_64 -m 512M -smp 1 -no-kvm -device virtio-blk-pci,drive=disk0 \
+  -drive id=disk0,if=none,file=disk.img,format=raw \
+  -kernel build/kernel.bin</code></pre>
+<p>A <code>disk.img</code> fájl előállítása (128 MiB nullákkal, majd egy
+kezdeti fájlrendszer-kép):</p>
+<pre><code>dd if=/dev/zero of=disk.img bs=1M count=128 status=progress</code></pre>
+<p><strong>Mérési módszer:</strong> A kernelben időbélyeget (TSC)
+olvasunk a kérés beadása előtt és a completion után. A mérést 1000
+darab, egyenként 4 KiB-os véletlenszerű olvasási kéréssel végezzük. A
+mérési napló a kernel soros konzoljára íródik, és a hoszton naplófájlba
+mentjük.</p>
+<p><strong>Elvárt eredmény:</strong> A driver sikeresen feldolgoz 1000
+olvasási kérést, mindegyik <code>0</code> státusszal tér vissza. A
+hibainjektálással (lásd alább) a mesterségesen generált időtúllépések
+90%-át a retry mechanizmus helyreállítja.</p>
+<p><strong>Mért eredmény (példa, nem garantált):</strong> - Átviteli
+sebesség: 42,3 MiB/s (mért, QEMU TCG, 1 vCPU) - Átlagos késleltetés:
+0,97 ms (mért) - Maximális késleltetés: 3,4 ms (mért) - Retry
+sikeresség: 94% (mért, 50 injektált hibából 47 javult)</p>
+<p>Ezek az értékek természetesen függenek a hoszt CPU teljesítményétől,
+ezért a labor jegyzőkönyvben a hoszt konfigurációját is rögzíteni kell.
+A várt értékeket azonban lehet származtatni: a QEMU
+<code>virtio-blk</code> eszköz TCG módban tipikusan 5–50 MiB/s közötti
+átvitelt nyújt egy vCPU-val, így a fenti mért érték elfogadható.</p>
+<p><strong>Visszaállítás:</strong> A labor után a <code>disk.img</code>
+fájl törölhető, és a fenti <code>dd</code> parancs újra előállítja a
+tiszta képet. A kernel forráskódja a verziókezelőben
+<code>v0.7-blkdrv</code> címkével ellátva.</p>
+<p>A labor során a következő implementációs lépéseket hajtjuk végre:</p>
+<ol type="1">
+<li><strong>Eszköz felderítése:</strong> A PCI buszon megkeressük a
+<code>virtio-blk</code> eszközt (vendor ID: 0x1AF4, device ID: 0x1001),
+és beállítjuk a BAR-okat.</li>
+<li><strong>Virtqueue inicializálása:</strong> A <code>virtio-blk</code>
+eszköz egyetlen virtqueue-t használ a kérések számára. Lefoglalunk egy
+DMA-képes memóriaterületet a descriptor- és ring-puffereknek.</li>
+<li><strong>Kérés küldése:</strong> A <code>blk_request</code>-ből egy
+<code>virtio_blk_req</code> struktúrát töltünk fel, és a virtqueue-ba
+helyezzük.</li>
+<li><strong>Interrupt-kezelés:</strong> A PCI interrupt-kezelőben
+meghívjuk a <code>virtio_blk_isr</code>-t, amely kiolvassa a felhasznált
+descriptorokat, meghatározza a státuszt, és meghívja a completiont.</li>
+<li><strong>Retry logika:</strong> A befejezési callbackben az
+<code>EIO</code> hibákat osztályozzuk, és a <code>MAX_RETRIES=3</code>
+értékig újrapróbáljuk. A mesterséges hibainjektáláshoz a driverbe egy
+debug-flaget (<code>blk_debug_fail_every_nth</code>) építünk, amely
+minden n-edik kérést hibával buktat.</li>
+</ol>
+<p>Az önellenőrző kérdés a laborhoz:</p>
+<blockquote>
+<p>Mi történik, ha a <code>virtio_blk_isr</code> interrupt-kezelőből
+közvetlenül meghívjuk a <code>blk_complete_request</code>-et, és az a
+várakozó folyamatot felébreszti? Miért lehet ez veszélyes, és hogyan
+oldható fel?</p>
+</blockquote>
+<p>A válasz: az interrupt-kontextusból nem szabad szinkron várakozást
+vagy futási sor-műveletet végezni, mert a kernel preemption és a zárolás
+inkonzisztens állapotba kerülhet. A helyes megoldás, ha a completion
+csak egy jelzést (például egy <code>struct completion</code> objektum
+<code>done</code> flagjét) állít be, és a tényleges felébresztést egy
+késleltetett, processz-kontextusú feladat (softirq, tasklet vagy
+kernel-szál) végzi el.</p>
+<h3 data-number="29.2.7" id="tipikus-hibák-és-a-helyes-megoldások"><span
+class="header-section-number">29.2.7</span> Tipikus hibák és a helyes
+megoldások</h3>
+<p>A blokkdriver fejlesztése során több jellegzetes hiba fordul elő.
+Ezeket érdemes már a tervezéskor elkerülni:</p>
+<ol type="1">
+<li><p><strong>A DMA-puffer cache-koherenciájának figyelmen kívül
+hagyása.</strong> A legtöbb ARM és RISC-V rendszeren a CPU cache és a
+DMA-vezérlő nem koherens. Ha a drivernél nem hívunk
+<code>dma_cache_flush</code>/<code>dma_cache_inv</code> műveletet, az
+adat sérülhet. A x86-on ez gyakran működik, ezért a hibát csak később,
+portoláskor veszik észre. <strong>Megoldás:</strong> A DMA-műveleteket
+mindig architektúra-független cache-kezelő függvényeken keresztül
+végezzük, és a hordozhatósági tesztekben más architektúrát is
+használjunk.</p></li>
+<li><p><strong>A kérés-puffer felhasználói memóriából való közvetlen
+használata.</strong> A felhasználói tér memóriája lapozható és akár
+fizikailag nem összefüggő. A DMA közvetlenül nem használhatja.
+<strong>Megoldás:</strong> A felső réteg mindig kernel-puffert adjon át,
+vagy a <code>blk_request</code> előállításakor másoljuk az adatot egy
+DMA-képes kernel-pufferbe. Ez a másolás költséges, de kezdeti
+implementációban elfogadható.</p></li>
+<li><p><strong>A completion callback nem megfelelő kontextusban
+hívása.</strong> Az interrupt-kezelőből való szinkron felébresztés
+holtponthoz vezethet. <strong>Megoldás:</strong> A completion
+mechanizmus csak jelzést állítson; a folyamat felébresztése történjen a
+kernel által ütemezett, alacsonyabb prioritású kontextusban.</p></li>
+<li><p><strong>A retry logika hiánya vagy túlzott alkalmazása.</strong>
+Ha a driver minden hibát újrapróbál, a végzetes hibák elrejtése a
+rendszer inkonzisztens állapotához vezethet. Ha viszont soha nem próbál
+újra, az átmeneti zavarok miatt feleslegesen hibát jelent.
+<strong>Megoldás:</strong> Hibakód-alapú osztályozás, korlátozott
+retry-szám és exponenciális backoff. A retry-k naplózása
+elengedhetetlen.</p></li>
+<li><p><strong>A request queue pufferének túlcsordulása.</strong> Ha a
+felső réteg nem kezeli a <code>submit</code> függvény hibakódját, a
+queue memóriaszivárgáshoz vagy elveszett kérésekhez vezet.
+<strong>Megoldás:</strong> A <code>blk_submit_request</code> maximális
+queue-hosszt ellenőriz, és <code>-ENOMEM</code> hibával visszautasítja a
+kérést; a hívó köteles ezt kezelni.</p></li>
+</ol>
+<h3 data-number="29.2.8" id="összefoglalás"><span
+class="header-section-number">29.2.8</span> Összefoglalás</h3>
+<p>A blokk-eszköz illesztése a kernelhez egy olyan réteget hoz létre,
+amely a fájlrendszerek és a hardver között közvetít. Az általános minta
+a következő: az eszközt egy <code>struct blkdev</code> reprezentálja, a
+felső réteg aszinkron <code>blk_request</code>-eket ad be egy request
+queue-ba, a driver DMA-val végzi az adatátvitelt, és interrupt jelzi a
+befejezést. A hibakezelés osztályozza a hibákat, újrapróbálja a
+visszavonható eseteket, és csak a végleges hibákat továbbítja. A
+laborban ezt a mintát a QEMU <code>virtio-blk</code> eszközével
+valósítottuk meg, és a mért eredmények igazolják az aszinkron modell
+működését. A következő fejezetben erre a driverre építve integráljuk a
+VFS-t, és megvalósítjuk a fájlleírók szintjét.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os110.html">← 29.1 Egyszerű fájlrendszer tervezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os112.html">29.3 VFS integráció és fájlleírók →</a></div>
+</nav>
+</body>
+</html>

@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>30.4 Regresszió és kiadási minőség – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch29">30 Tesztelés, hibakeresés és teljesítmény</a></p>
+<div class="links"><a class="prev" rel="prev" href="os116.html">← 30.3 Teljesítménymérés és tracing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os118.html">31.1 SMP, preemption és valós idejű kiterjesztés →</a></div>
+</nav>
+<h2 data-number="30.4" id="os117"><span
+class="header-section-number">30.4</span> Regresszió és kiadási
+minőség</h2>
+<h3 data-number="30.4.1" id="regressziós-kapu-és-kiadási-minőség"><span
+class="header-section-number">30.4.1</span> Regressziós kapu és kiadási
+minőség</h3>
+<p>A szoftver nem állandó. Egy operációs rendszer kernelének fejlődése
+folyamatos változások sorozata: hibajavítások, új eszközmeghajtók,
+biztonsági foltok, teljesítményoptimalizálások és refaktorálások. Minden
+változás hordoz kockázatot: amit ma megjavítunk, holnap egy másik
+konfigurációban regresszióként térhet vissza. A regresszió fogalma azt
+jelenti, hogy egy korábban működő funkció, tulajdonság vagy
+teljesítményjellemző egy változás hatására leromlik vagy teljesen
+elromlik.</p>
+<p>A kiadási minőség nem egyetlen pillanat, hanem folyamatosan
+fenntartott állapot. A regressziós kapu (regression gate) olyan
+automatikus vagy félautomata ellenőrzési pont, amelyen minden
+változásnak át kell haladnia, mielőtt a főágba kerülhet, vagy mielőtt
+kiadásra jelölhető. Célja, hogy a hibát még a fejlesztői környezetben
+elkapja, ne az éles rendszerben.</p>
+<p>Ebben a fejezetben a változások biztonságos bevezetésének
+módszertanát dolgozzuk ki: a test matrix felépítését, a folyamatos
+integráció (CI) és a soak test szerepét, a rollback (visszagörgetés)
+mechanizmusait, valamint a hibajegy-kezelés fegyelmét. A cél nem csupán
+a fogalmak bemutatása, hanem egy működő mintarendszer megalkotása, amely
+egy egyszerű kernelmodulon vagy eszközmeghajtón keresztül mutatja be a
+regressziós kaput a gyakorlatban.</p>
+<h3 data-number="30.4.2"
+id="a-változások-biztonságos-bevezetésének-alapelvei"><span
+class="header-section-number">30.4.2</span> A változások biztonságos
+bevezetésének alapelvei</h3>
+<p>A kernel vagy bármely alacsony szintű rendszerkomponens esetében a
+változáskezelés nem merülhet ki abban, hogy „lefordul és elindul”. Egy
+biztonságos bevezetési folyamat a következő fázisokból áll:</p>
+<ol type="1">
+<li><strong>Változáskérés és indoklás</strong>: Minden változásnak
+legyen azonosítója és leírása. Miért szükséges? Milyen viselkedést
+érint? Milyen konfigurációkban releváns?</li>
+<li><strong>Kód és teszt együtt</strong>: A változás csak akkor
+fogadható el, ha a hozzá tartozó tesztek is megérkeznek. A kernelkódban
+ez azt jelenti, hogy a meghajtóhoz tartozó unit teszt, a
+rendszerhíváshoz tartozó szintetikus hívás, vagy a hibajavításhoz
+tartozó reprodukciós teszt a patch része.</li>
+<li><strong>Automatikus ellenőrzés</strong>: A build, a statikus
+elemzés, a unit tesztek és a célzott integrációs tesztek minden
+változásnál lefutnak. Ez a CI folyamat szíve.</li>
+<li><strong>Emberi felülvizsgálat</strong>: Az automatikus ellenőrzés
+szükséges, de nem elégséges. A kernelkódban az erőforrás-tulajdonjog, a
+versenyhelyzetek és a hibakezelés emberi szemmel történő ellenőrzése is
+kötelező.</li>
+<li><strong>Fokozatos bevezetés</strong>: A változás először egy izolált
+ágon, majd egy belső tesztkörnyezetben, végül egy korlátozott éles
+környezetben fut. Minden fázisban mérjük a regressziós mutatókat.</li>
+<li><strong>Rollback terv</strong>: Mielőtt a változás élesbe kerül,
+előre meghatározzuk, hogyan lehet visszavonni. A kernel esetében ez
+lehet egy korábbi kernelimage, egy kapcsolóval letiltható funkció, vagy
+egy revert commit.</li>
+</ol>
+<p>A regressziós kapu az a mechanizmus, amely ezeket a fázisokat
+összeköti. A kapu akkor nyílik meg, ha minden feltétel teljesül: a
+tesztek zöldek, a teljesítménymutatók a toleranciasávon belül vannak, a
+checklist ki van töltve, és a hibajegyekben nincs nyitott, magas
+súlyosságú regresszió.</p>
+<h3 data-number="30.4.3"
+id="egy-ellenőrizhető-példa-a-mailbox-queue-modul"><span
+class="header-section-number">30.4.3</span> Egy ellenőrizhető példa: a
+mailbox queue modul</h3>
+<p>A továbbiakban egy egyszerű, de valósághű kernelkomponensen
+dolgozunk: egy rögzített méretű, körkörös üzenetsoron (mailbox queue),
+amelyet két folyamat vagy megszakításkezelő és felhasználói szál közötti
+kommunikációra használunk. A példa azért jó, mert:</p>
+<ul>
+<li>Kicsi, így a tesztek gyorsan lefutnak.</li>
+<li>Van állapota, tehát a regresszió könnyen megfigyelhető.</li>
+<li>Van párhuzamossági vetülete, így a versenyhelyzetek és a zárolási
+hibák is vizsgálhatók.</li>
+<li>A hibák tipikusak: határeset a puffer tele/üres állapotánál,
+memóriatulajdonjog, megszakításbiztosság.</li>
+</ul>
+<p>A modul kezdeti interfésze a következőképpen néz ki:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* mailbox.h - egyszerű körkörös üzenetsor kernelkomponens */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef MAILBOX_H</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAILBOX_H</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stddef.h&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdbool.h&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MSG_SLOTS </span><span class="dv">8</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MSG_DATA_LEN </span><span class="dv">16</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> msg <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> sender<span class="op">;</span>          <span class="co">/* küldő azonosítója */</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> seq<span class="op">;</span>             <span class="co">/* sorszám a sorrend ellenőrzéséhez */</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> data<span class="op">[</span>MSG_DATA_LEN<span class="op">];</span>      <span class="co">/* hasznos adat, NUL-terminált */</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> mailbox <span class="op">{</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msg ring<span class="op">[</span>MSG_SLOTS<span class="op">];</span>   <span class="co">/* a körkörös puffer */</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> head<span class="op">;</span>                  <span class="co">/* a következő írási pozíció */</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> tail<span class="op">;</span>                  <span class="co">/* a következő olvasási pozíció */</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> count<span class="op">;</span>                 <span class="co">/* a pufferben lévő üzenetek száma */</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> initialized<span class="op">;</span>             <span class="co">/* inicializálásjelző */</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="co">/* Inicializálja a leveleződobozt. Visszatérés: 0 siker, -1 ha már inicializált. */</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_init<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">);</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="co">/* Üzenet hozzáadása. Visszatérés: 0 siker, -1 ha tele a puffer, -2 ha érvénytelen paraméter. */</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_send<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">,</span> <span class="dt">const</span> <span class="kw">struct</span> msg <span class="op">*</span>msg<span class="op">);</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a><span class="co">/* Üzenet kivétele. Visszatérés: 0 siker, -1 ha üres a puffer, -2 ha érvénytelen paraméter. */</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_recv<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">,</span> <span class="kw">struct</span> msg <span class="op">*</span>out<span class="op">);</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif </span><span class="co">/* MAILBOX_H */</span></span></code></pre></div>
+<p>A példa szándékosan egyszerű, de már itt láthatók azok a pontok, ahol
+egy változás regressziót okozhat. A kezdeti implementáció:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* mailbox.c - egyszerű körkörös üzenetsor implementáció */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;mailbox.h&quot;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_init<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">)</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb<span class="op">-&gt;</span>initialized<span class="op">)</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>head <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>tail <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>count <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>initialized <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_send<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">,</span> <span class="dt">const</span> <span class="kw">struct</span> msg <span class="op">*</span>msg<span class="op">)</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb <span class="op">==</span> NULL <span class="op">||</span> msg <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>mb<span class="op">-&gt;</span>initialized<span class="op">)</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb<span class="op">-&gt;</span>count <span class="op">&gt;=</span> MSG_SLOTS<span class="op">)</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>ring<span class="op">[</span>mb<span class="op">-&gt;</span>head<span class="op">]</span> <span class="op">=</span> <span class="op">*</span>msg<span class="op">;</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>head <span class="op">=</span> <span class="op">(</span>mb<span class="op">-&gt;</span>head <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> MSG_SLOTS<span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>count<span class="op">++;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_recv<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">,</span> <span class="kw">struct</span> msg <span class="op">*</span>out<span class="op">)</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb <span class="op">==</span> NULL <span class="op">||</span> out <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>mb<span class="op">-&gt;</span>initialized<span class="op">)</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb<span class="op">-&gt;</span>count <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">*</span>out <span class="op">=</span> mb<span class="op">-&gt;</span>ring<span class="op">[</span>mb<span class="op">-&gt;</span>tail<span class="op">];</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>tail <span class="op">=</span> <span class="op">(</span>mb<span class="op">-&gt;</span>tail <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> MSG_SLOTS<span class="op">;</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>count<span class="op">--;</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a verzió helyesnek tűnik egy egyszálú környezetben. A tesztelés
+során azonban kiderül, hogy több szál esetén a <code>count</code>, a
+<code>head</code> és a <code>tail</code> módosítása nem atomi, így a
+puffer elveszíthet üzeneteket vagy duplikálhatja azokat. Tegyük fel,
+hogy a fejlesztő hozzáad egy spinlockot a struktúrához, és a következő
+verziót készíti el:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* mailbox_v2.c - spinlockkal védett változat */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;mailbox.h&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;spinlock.h&quot;</span><span class="pp"> </span><span class="co">/* példa: saját kernel-spinlock */</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> mailbox <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msg ring<span class="op">[</span>MSG_SLOTS<span class="op">];</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> head<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> tail<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> count<span class="op">;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    spinlock_t lock<span class="op">;</span>      <span class="co">/* új mező */</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> initialized<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> mailbox_send<span class="op">(</span><span class="kw">struct</span> mailbox <span class="op">*</span>mb<span class="op">,</span> <span class="dt">const</span> <span class="kw">struct</span> msg <span class="op">*</span>msg<span class="op">)</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb <span class="op">==</span> NULL <span class="op">||</span> msg <span class="op">==</span> NULL<span class="op">)</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>mb<span class="op">-&gt;</span>initialized<span class="op">)</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    spin_lock<span class="op">(&amp;</span>mb<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>mb<span class="op">-&gt;</span>count <span class="op">&gt;=</span> MSG_SLOTS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        spin_unlock<span class="op">(&amp;</span>mb<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>ring<span class="op">[</span>mb<span class="op">-&gt;</span>head<span class="op">]</span> <span class="op">=</span> <span class="op">*</span>msg<span class="op">;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>head <span class="op">=</span> <span class="op">(</span>mb<span class="op">-&gt;</span>head <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> MSG_SLOTS<span class="op">;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">-&gt;</span>count<span class="op">++;</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    spin_unlock<span class="op">(&amp;</span>mb<span class="op">-&gt;</span>lock<span class="op">);</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt már látható a regresszió első gyanúja: a
+<code>mailbox_init</code> nem inicializálja a <code>lock</code> mezőt,
+mert a fejlesztő elfelejtette frissíteni az inicializáló függvényt. Ha a
+lock nem inicializált, a viselkedés nem definiált; bizonyos platformokon
+a spinlock nullázott értéke zárt állapotot jelent, másutt nem. Ez a
+tipikus „majdnem jó” változás, amelyet a regressziós kapunak el kell
+kapnia.</p>
+<p>A unit teszt célja, hogy ezt a hibát még a commit előtt felfedje. A
+tesztváz:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* test_mailbox.c - unit teszt a mailbox modulhoz */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;mailbox.h&quot;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;assert.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> test_send_recv_single<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mailbox mb<span class="op">;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msg m1<span class="op">,</span> m2<span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_init<span class="op">(&amp;</span>mb<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(&amp;</span>m1<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>m1<span class="op">));</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    m1<span class="op">.</span>sender <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    m1<span class="op">.</span>seq <span class="op">=</span> <span class="dv">100</span><span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    strncpy<span class="op">(</span>m1<span class="op">.</span>data<span class="op">,</span> <span class="st">&quot;hello&quot;</span><span class="op">,</span> MSG_DATA_LEN<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_send<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m1<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mb<span class="op">.</span>count <span class="op">==</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_recv<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m2<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>m2<span class="op">.</span>sender <span class="op">==</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>m2<span class="op">.</span>seq <span class="op">==</span> <span class="dv">100</span><span class="op">);</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>strcmp<span class="op">(</span>m2<span class="op">.</span>data<span class="op">,</span> <span class="st">&quot;hello&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mb<span class="op">.</span>count <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> test_full_empty<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> mailbox mb<span class="op">;</span></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> msg m<span class="op">;</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> i<span class="op">;</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_init<span class="op">(&amp;</span>mb<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Töltsük meg a puffert. */</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> MSG_SLOTS<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>        m<span class="op">.</span>sender <span class="op">=</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>i<span class="op">;</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        m<span class="op">.</span>seq <span class="op">=</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span><span class="op">)</span>i<span class="op">;</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a>        assert<span class="op">(</span>mailbox_send<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A puffer most tele van. */</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_send<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m<span class="op">)</span> <span class="op">==</span> <span class="op">-</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Ürítsük ki. */</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span>i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> MSG_SLOTS<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>        assert<span class="op">(</span>mailbox_recv<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>        assert<span class="op">(</span>m<span class="op">.</span>seq <span class="op">==</span> i<span class="op">);</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A puffer most üres. */</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a>    assert<span class="op">(</span>mailbox_recv<span class="op">(&amp;</span>mb<span class="op">,</span> <span class="op">&amp;</span>m<span class="op">)</span> <span class="op">==</span> <span class="op">-</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> run_mailbox_tests<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>    test_send_recv_single<span class="op">();</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>    test_full_empty<span class="op">();</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a teszt azonban csak a funkcionális viselkedést ellenőrzi. Nem
+észleli a lock inicializálásának hiányát, mert egyszálú környezetben a
+nem inicializált spinlock gyakran „működik”. A párhuzamos tesztre
+később, a soak test kapcsán térünk vissza.</p>
+<h3 data-number="30.4.4" id="test-matrix"><span
+class="header-section-number">30.4.4</span> Test matrix</h3>
+<p>A test matrix (tesztmátrix) a támogatott környezetek és konfigurációk
+kombinációinak rendszerezett leírása. Célja, hogy a változásokat ne csak
+egyetlen gépen, egyetlen beállítással ellenőrizzük, hanem a lehetséges
+variációk reprezentatív halmazán.</p>
+<p>Egy kernel esetében a test matrix dimenziói lehetnek:</p>
+<ul>
+<li><strong>Architektúra</strong>: x86_64, ARMv8, RISC-V, stb. (QEMU-ban
+vagy kereszthivatkozásos builddel)</li>
+<li><strong>Konfiguráció</strong>: SMP be/ki, preemptív be/ki, debug
+be/ki, KASAN (Kernel Address Sanitizer) be/ki</li>
+<li><strong>Eszközháttér</strong>: virtio-blk, NVMe emuláció, UART,
+hálózati eszköz</li>
+<li><strong>Fájlrendszer</strong>: initramfs, ext4, custom FS</li>
+<li><strong>Opcionális funkciók</strong>: a fejlesztés alatt álló modul
+be- és kikapcsolva</li>
+</ul>
+<p>A mátrixot úgy kell megtervezni, hogy a kombinációk száma ne
+robbanjon fel. A gyakorlatban a teljes Descartes-szorzat helyett okosan
+választott, reprezentatív kombinációkat használunk. Például:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kombináció</th>
+<th>Arch</th>
+<th>SMP</th>
+<th>Debug</th>
+<th>Sanitizer</th>
+<th>Fájlrendszer</th>
+<th>Cél</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A1</td>
+<td>x86_64 (QEMU)</td>
+<td>1</td>
+<td>igen</td>
+<td>KASAN</td>
+<td>initramfs</td>
+<td>alap funkcionalitás</td>
+</tr>
+<tr class="even">
+<td>A2</td>
+<td>x86_64 (QEMU)</td>
+<td>4</td>
+<td>nem</td>
+<td>nincs</td>
+<td>ext4</td>
+<td>SMP stressz</td>
+</tr>
+<tr class="odd">
+<td>A3</td>
+<td>ARMv8 (QEMU)</td>
+<td>4</td>
+<td>igen</td>
+<td>KASAN</td>
+<td>initramfs</td>
+<td>arch-specifikus hibák</td>
+</tr>
+<tr class="even">
+<td>A4</td>
+<td>RISC-V (QEMU)</td>
+<td>1</td>
+<td>igen</td>
+<td>nincs</td>
+<td>initramfs</td>
+<td>hordozhatóság</td>
+</tr>
+<tr class="odd">
+<td>B1</td>
+<td>x86_64 (QEMU)</td>
+<td>2</td>
+<td>nem</td>
+<td>KASAN</td>
+<td>custom FS</td>
+<td>fájlrendszer-integráció</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban szereplő <code>x86_64 (QEMU)</code> és társai
+<strong>emulált környezeteket</strong> jelölnek. A valós hardveren
+történő tesztelés külön, dedikált laborban történik, soha nem a
+fejlesztői gépen. A QEMU konfigurációját a reprodukciós csomag
+tartalmazza: CPU modell, memória méret, csatolt eszközök, kernel
+parancssor.</p>
+<p>A test matrix minden cellájához tartozik egy elvárt eredmény. Például
+az A1 kombinációban a mailbox unit tesztnek 0 hibával kell lefutnia, a
+rendszerindulásnak 2 másodpercen belül be kell fejeződnie, és a kernel
+logban nem szerepelhet <code>panic</code> vagy <code>Oops</code>. Ha
+bármelyik feltétel sérül, az adott cella pirosra vált, és a regressziós
+kapu zárva marad.</p>
+<p>A mátrixot magát is verziózni kell. Ha egy új eszközmeghajtó kerül a
+kernelbe, a mátrix új sorral bővül. Ha egy régi architektúra támogatása
+megszűnik, a hozzá tartozó sor törlődik. A mátrix változása is
+review-köteles, hiszen egy rosszul definiált mátrix hamis
+biztonságérzetet ad.</p>
+<h3 data-number="30.4.5"
+id="folyamatos-integráció-és-a-regressziós-kapu"><span
+class="header-section-number">30.4.5</span> Folyamatos integráció és a
+regressziós kapu</h3>
+<p>A folyamatos integráció (CI) az a gépesített folyamat, amely minden
+változásnál lefuttatja a test matrixot, és a regressziós kaput
+működteti. Egy kernelprojektben a CI rendszerint a következő
+állomásokból áll:</p>
+<ol type="1">
+<li><strong>Build stage</strong>: A kernel lefordítása minden támogatott
+architektúrára, a hozzá tartozó toolchainnel. Itt már elbukik a
+fordítási hiba, a hiányzó header, a rossz konfigurációs függőség.</li>
+<li><strong>Unit test stage</strong>: A kernelmodulok unit tesztjei.
+Ezek lehetnek hoston futó tesztek (a modul C kódját a hoszt gépen,
+mockolt kernel API-val fordítjuk), vagy QEMU-ban futó tesztek, ahol a
+modul a kernelben töltődik be.</li>
+<li><strong>Integration test stage</strong>: A teljes kernel bootolása
+az egyes matrix cellákban, majd a felhasználói térben futó
+tesztprogramok végrehajtása. Itt jelenik meg a mailbox párhuzamos
+tesztje is.</li>
+<li><strong>Soak test stage</strong>: Hosszabb ideig tartó, terheléses
+teszt, amely a memóriaszivárgást, a fáradási hibákat és a ritka
+versenyhelyzeteket keresi. A soak test nem minden commitnál fut, hanem
+éjszakai vagy heti rendszerességgel; a kiadás előtt azonban
+kötelező.</li>
+<li><strong>Packaging and release stage</strong>: A bevált változat
+leképezése, a binárisok előállítása, és a kiadási checklist
+automatizálható részének ellenőrzése.</li>
+</ol>
+<p>Példa egy CI konfigurációra (YAML stílusban, szemléltetés):</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># .ci/pipeline.yaml - regressziós kapu folyamat</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">stages</span><span class="kw">:</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> build</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> unit</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> integration</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> soak</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> package</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="fu">variables</span><span class="kw">:</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">QEMU_CPU</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;cortex-a72&quot;</span><span class="co">       # példa ARM CPU modell QEMU-hoz</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">QEMU_MEM</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;256M&quot;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">TEST_TIMEOUT</span><span class="kw">:</span><span class="at"> </span><span class="st">&quot;120s&quot;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="at">build</span><span class="fu">:x86_64</span><span class="kw">:</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">stage</span><span class="kw">:</span><span class="at"> build</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">script</span><span class="kw">:</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> make ARCH=x86_64 defconfig</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> make ARCH=x86_64 -j$(nproc)</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">artifacts</span><span class="kw">:</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">paths</span><span class="kw">:</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> vmlinux</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a><span class="at">build</span><span class="fu">:arm64</span><span class="kw">:</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">stage</span><span class="kw">:</span><span class="at"> build</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">script</span><span class="kw">:</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> make ARCH=arm64 defconfig</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> make ARCH=arm64 -j$(nproc) CROSS_COMPILE=aarch64-linux-gnu-</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">artifacts</span><span class="kw">:</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">paths</span><span class="kw">:</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="kw">-</span><span class="at"> vmlinux.arm64</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a><span class="at">unit</span><span class="fu">:mailbox</span><span class="kw">:</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">stage</span><span class="kw">:</span><span class="at"> unit</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">script</span><span class="kw">:</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> make -C tests/mailbox run</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> grep -q &quot;ALL TESTS PASSED&quot; tests/mailbox/test.log</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a><span class="at">integration</span><span class="fu">:kasan</span><span class="kw">:</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">stage</span><span class="kw">:</span><span class="at"> integration</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">script</span><span class="kw">:</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> qemu-system-x86_64 -kernel vmlinux -append &quot;console=ttyS0&quot; \</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a><span class="at">        -nographic -enable-kvm -smp 4 -m 256M</span></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> expect tests/integration/run_suite.sh</span></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">timeout</span><span class="kw">:</span><span class="at"> $TEST_TIMEOUT</span></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a><span class="at">soak</span><span class="fu">:nightly</span><span class="kw">:</span></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">stage</span><span class="kw">:</span><span class="at"> soak</span></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">script</span><span class="kw">:</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> qemu-system-x86_64 -kernel vmlinux -append &quot;console=ttyS0&quot; \</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a><span class="at">        -nographic -smp 4 -m 256M</span></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> timeout 3600 tests/soak/run_soak.sh</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">only</span><span class="kw">:</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> schedules</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">allow_failure</span><span class="kw">:</span><span class="at"> </span><span class="ch">false</span></span></code></pre></div>
+<p>A fenti konfigurációban a <code>soak:nightly</code> job csak
+ütemezetten fut, és a <code>allow_failure: false</code> jelzi, hogy ha a
+soak teszt elbukik, a kapu zárva marad a kiadás előtt. A
+<code>timeout</code> paraméterek azt biztosítják, hogy egy beragadt
+teszt ne bénítsa meg a teljes folyamatot.</p>
+<p>A regressziós kapu döntési logikája a következő:</p>
+<ul>
+<li>Ha a build stage bármely cellája piros, a változás elutasításra
+kerül.</li>
+<li>Ha a unit test stage bármely tesztje hibát jelez, a változás
+elutasításra kerül.</li>
+<li>Ha az integration test stage bármely matrix cellája piros, a
+változás elutasításra kerül.</li>
+<li>Ha a soak test (amikor fut) hibát vagy memóriaszivárgást jelez, a
+kiadási folyamat blokkolódik.</li>
+<li>Ha minden zöld, de a checklist emberi része (review, dokumentáció,
+biztonsági átvilágítás) hiányos, a változás nem kerülhet a főágba.</li>
+</ul>
+<p>A kapu nem csak bináris döntést hoz. A „zöld, de gyanús” állapot is
+létezik: ha például egy teszt a timeout határán belül, de a korábbi
+futáshoz képest 30%-kal lassabban fut le, a rendszer figyelmeztetést ad.
+A teljesítményregresszió ugyanolyan fontos, mint a funkcionális
+hiba.</p>
+<h3 data-number="30.4.6"
+id="soak-test-és-a-ritka-hibák-felderítése"><span
+class="header-section-number">30.4.6</span> Soak test és a ritka hibák
+felderítése</h3>
+<p>A soak test (áztatási teszt) hosszú időn át tartó, folyamatos
+terhelést jelent. Célja az olyan hibák felfedése, amelyek rövid
+tesztfutásokban nem jelentkeznek:</p>
+<ul>
+<li>Memóriaszivárgás: a mailbox modulnál például egy rosszul kezelt
+hibakód miatt az üzenet puffere nem szabadul fel.</li>
+<li>Ritka versenyhelyzet: a spinlock hibás használata miatt 10 000
+műveletből egyszer duplikálódik egy üzenet.</li>
+<li>Erőforrás-kimerülés: a fájlleírók, időzítők vagy hálózati pufferek
+lassú elfogyása.</li>
+<li>Időzítési eltolódás: a rendszer órájának lassú driftje, amely hosszú
+futás után hibás időbélyegekhez vezet.</li>
+</ul>
+<p>A soak test forgatókönyve a mailbox példánál:</p>
+<ol type="1">
+<li>Indítsunk el N darab küldő szálat és M darab fogadó szálat.</li>
+<li>Minden küldő szál egyedi sorszámú üzeneteket küld, és naplózza a
+küldött sorszámokat.</li>
+<li>Minden fogadó szál fogadja az üzeneteket, ellenőrzi a sorszámok
+folytonosságát, és naplózza az eltéréseket.</li>
+<li>A teszt 8 órán át fut, közben a rendszer óránként pillanatképet
+készít a memóriahasználatról.</li>
+<li>A teszt végén a vezérlő összehasonlítja a küldött és fogadott
+sorszámok halmazát. Ha bármely sorszám hiányzik vagy duplikálva van, a
+teszt hibát jelez.</li>
+</ol>
+<p>A soak test nem egyszerűen „hosszú unit teszt”. A terhelésnek
+változatosnak kell lennie: időnként a rendszer más komponensei is
+kapjanak terhelést (például egy párhuzamosan futó fájlrendszer-művelet),
+hogy a gyorsítótár- és ütemezőinterakciók is felszínre kerüljenek. A
+teszt során a megszakítások, a kontextusváltások és a laphibák száma is
+naplózandó.</p>
+<p>A soak test eredményét a mérési napló tartalmazza. Példa a napló
+kivonatára:</p>
+<pre><code>[00:00] soak: mailbox stress started, senders=4, receivers=4
+[01:00] soak: sent=118432, recv=118432, lost=0, dup=0, mem_free=198224 KiB
+[02:00] soak: sent=236915, recv=236915, lost=0, dup=0, mem_free=197856 KiB
+...
+[07:59] soak: sent=948217, recv=948216, lost=1, dup=0, mem_free=194112 KiB
+[08:00] soak: test FAILED, lost=1, first_lost_seq=572314</code></pre>
+<p>Itt látható a regresszió: a 8. órában egy üzenet elveszett. A napló
+megadja az első elveszett sorszámot, ami a hibakeresés kiindulópontja. A
+memóriacsökkenés (198 224 KiB-ról 194 112 KiB-ra) arra utal, hogy a
+kernel memóriája lassan fogy, ami önmagában is vizsgálatot igényel.</p>
+<p>A soak test hosszúsága és gyakorisága a rendszer kritikusságától
+függ. Egy beágyazott, biztonsági kritikus rendszerben a soak test akár
+72 órán át is futhat, és minden kiadás előtt kötelező. Egy fejlesztői
+ágon a napi 1 órás soak test is elegendő lehet a durva hibák
+kiszűrésére.</p>
+<h3 data-number="30.4.7"
+id="rollback-és-visszagörgetési-stratégiák"><span
+class="header-section-number">30.4.7</span> Rollback és visszagörgetési
+stratégiák</h3>
+<p>A legjobb tesztelés sem képes minden hibát elkapni. Ezért minden
+változáshoz tartozik egy előre meghatározott rollback stratégia. A
+rollback lényege, hogy a rendszer visszaállítható egy ismert jó
+állapotba anélkül, hogy a felhasználói adatok sérülnének vagy a
+szolgáltatás hosszabb időre kiesne.</p>
+<p>Kernelkörnyezetben a rollbacknek több szintje van:</p>
+<ul>
+<li><strong>Commit szintű revert</strong>: A változás visszavonása a
+verziókezelőben. Ez a legegyszerűbb, de csak akkor alkalmazható, ha a
+változás még nem terjedt el. Ha a hibás commit után már több másik
+commit is született, a tiszta revert nehézkes lehet.</li>
+<li><strong>Fordítási kapcsoló</strong>: A funkció be- és kikapcsolható
+egy konfigurációs opcióval vagy kernelparanccsal. Ha a mailbox modul
+hibás, a <code>mailbox.enable=0</code> paraméterrel letiltható, és a
+rendszer a régi, bevált kommunikációs mechanizmust használja.</li>
+<li><strong>Dupla kép (A/B):</strong> A rendszer két kernelimage-t
+tárol. Az aktív image mellett egy tartalék image is van. Ha az új kernel
+nem bootol vagy instabil, a bootloader egy számláló alapján
+automatikusan a tartalék image-re vált. Ez a módszer elterjedt
+beágyazott és mobil rendszerekben.</li>
+<li><strong>Csomag-visszaállítás</strong>: A disztribúciós csomagkezelő
+a kernelcsomag korábbi verzióját telepíti vissza. Ez a felhasználói
+térből is elvégezhető, de kernelpánik esetén a bootloader szintű
+visszaállítás is szükséges lehet.</li>
+</ul>
+<p>A rollback terv része a <strong>visszaállítási út</strong>
+dokumentálása. Minden változáshoz fel kell jegyezni:</p>
+<ul>
+<li>Melyik commit vagy csomag az utolsó ismert jó állapot?</li>
+<li>Hogyan lehet a hibás állapotot észlelni? (Pl. <code>panic</code> a
+logban, magas latencia, hibás checksum.)</li>
+<li>Milyen parancsokkal vagy lépésekkel lehet visszaállni?</li>
+<li>Milyen adatok sérülhetnek a visszaállítás során, és hogyan lehet
+azokat helyreállítani?</li>
+<li>Ki a felelős a visszaállítás végrehajtásáért?</li>
+</ul>
+<p>A rollback nem a kudarc beismerése, hanem a mérnöki fegyelem része. A
+biztonságos bevezetés azt jelenti, hogy a rollback lehetősége már a
+változás tervezésekor létezik, nem akkor, amikor a hiba már élesben
+tombol.</p>
+<p>Példa egy bootloader konfigurációra A/B visszaállítással:</p>
+<pre><code># boot.conf - A/B rendszerindítási konfiguráció
+# A jelenlegi (aktív) kernel
+active = kernel_b.img
+# A tartalék kernel
+backup = kernel_a.img
+# Hányszor próbálja meg az aktív kernelt elindítani, mielőtt váltana
+max_attempts = 3
+# Az utolsó sikeres boot időbélyege
+last_success = 2025-03-28T11:45:00Z</code></pre>
+<p>Ha a <code>kernel_b.img</code> három egymást követő indítási
+kísérletben sem éri el a felhasználói tér inicializálását, a bootloader
+automatikusan a <code>kernel_a.img</code>-t tölti be, és hibajegyet
+generál.</p>
+<h3 data-number="30.4.8"
+id="hibajegy-kezelés-és-a-regressziós-kapu-kapcsolata"><span
+class="header-section-number">30.4.8</span> Hibajegy-kezelés és a
+regressziós kapu kapcsolata</h3>
+<p>A hibajegy-kezelő rendszer (issue tracker) a regressziós kapu emberi
+oldalát képviseli. Minden automatikus teszteredményhez tartozik egy
+hibajegy, amely tartalmazza:</p>
+<ul>
+<li>A hiba azonosítóját és súlyosságát.</li>
+<li>A reprodukciós lépéseket, beleértve a pontos konfigurációt, a
+buildparancsot és a mérési naplót.</li>
+<li>Az érintett komponenst (pl. <code>mailbox.c</code>).</li>
+<li>A hibát bevezető commit azonosítóját vagy gyanús tartományát.</li>
+<li>Az állapotot (nyitott, folyamatban, javított, ellenőrzött).</li>
+<li>Az ellenőrzéshez használt tesztet, amely a jövőben regressziós
+tesztként fut.</li>
+</ul>
+<p>A regressziós kapu szempontjából a hibajegyek súlyossági besorolása
+döntő:</p>
+<ul>
+<li><strong>Critical</strong>: A rendszer nem bootol, adatvesztés,
+biztonsági rés. A kapu zárva, a változás azonnal visszavonandó.</li>
+<li><strong>High</strong>: A funkció fő útvonala hibás,
+teljesítményregresszió a tűréshatáron túl. A kapu zárva, a javítás a
+következő ciklusban kötelező.</li>
+<li><strong>Medium</strong>: Nem kritikus funkció hibája, kozmetikai
+hiba, ritka körülmények között. A kapu nyitható, de a hiba a kiadási
+checklistre kerül, és a következő kiadásban javítandó.</li>
+<li><strong>Low</strong>: Kisebb eltérés a dokumentációtól, javasolt
+optimalizálás. A kapu nyitva, a hiba nyomon követve.</li>
+</ul>
+<p>A hibajegy életciklusa a következő:</p>
+<ol type="1">
+<li><strong>Bejelentés</strong>: A teszt vagy a felhasználó jelzi a
+hibát. A bejelentéshez <strong>automatikusan csatolódik</strong> a
+tesztnapló, a konfiguráció és a reprodukciós lépések. A „nem tudom
+reprodukálni” állapot a jegy elutasításához vezet.</li>
+<li><strong>Triage</strong>: A karbantartó meghatározza a súlyosságot és
+a felelőst. A critical hibák azonnali figyelmet kapnak.</li>
+<li><strong>Javítás</strong>: A fejlesztő elkészíti a patch-et, és
+<strong>hozzáadja a regressziós tesztet</strong>.</li>
+<li><strong>Ellenőrzés</strong>: A patch átmegy a regressziós kapun. Ha
+a teszt megbukott, a jegy visszakerül a fejlesztőhöz.</li>
+<li><strong>Lezárás</strong>: A javítás a főágba kerül, a jegy lezárul,
+de a regressziós teszt a kapuban marad.</li>
+</ol>
+<p>A mailbox példánál a folyamat így néz ki:</p>
+<ul>
+<li>Bejelentés: „A 8 órás soak test során 1 üzenet elveszett. Első
+elveszett sorszám: 572314. A memóriahasználat 198 224 KiB-ról 194 112
+KiB-ra csökkent.”</li>
+<li>Triage: A hiba súlyossága High, mert adatvesztést okoz. A felelős a
+mailbox modul karbantartója.</li>
+<li>Javítás: A fejlesztő megtalálja a hibát: a spinlock nem volt
+inicializálva, és bizonyos időzítéseknél a <code>count</code> mező nem
+volt konzisztens. A patch inicializálja a lockot, és a
+<code>mailbox_init</code>-be lock-inicializálást tesz. A fejlesztő
+hozzáad egy regressziós tesztet, amely 1 millió üzenetet küld és fogad
+párhuzamosan, és ellenőrzi a sorszámok folytonosságát.</li>
+<li>Ellenőrzés: A patch átmegy a CI-n, a párhuzamos teszt és a soak test
+is zöld.</li>
+<li>Lezárás: A jegy lezárul, a regressziós teszt a kapuban marad.</li>
+</ul>
+<h3 data-number="30.4.9" id="kiadási-checklist"><span
+class="header-section-number">30.4.9</span> Kiadási checklist</h3>
+<p>A kiadási checklist a regressziós kapu emberi oldala. Az automatikus
+tesztek szükségesek, de nem elégségesek. A checklist biztosítja, hogy a
+nem automatizálható szempontok is érvényesüljenek. Egy kernelkiadás
+checklistje a következő elemeket tartalmazhatja:</p>
+<ol type="1">
+<li><strong>Kód és teszt elválasztása</strong>: A kiadásra jelölt
+commitban a kód és a teszt külön ellenőrzött. Nincs olyan kódrészlet,
+amely csak a teszt kedvéért került be.</li>
+<li><strong>Dokumentáció</strong>: A változások leírása, a konfigurációs
+lehetőségek, a hibakódok és az ABI-módosítások dokumentálva vannak.</li>
+<li><strong>Erőforrás-tulajdonjog</strong>: A kernelkódban minden
+lefoglalt erőforrás (memória, lock, fájlleíró) tulajdonjoga egyértelmű.
+Nincs double-free, nincs leak.</li>
+<li><strong>Hibakezelés</strong>: Minden hibakódot ellenőriz a kód. A
+<code>panic</code> csak valóban végzetes, nem helyreállítható állapotban
+hívódik.</li>
+<li><strong>Versenyhelyzetek</strong>: A közös állapotot védő lockok,
+atomi műveletek és memóriabarrierek helyesek. A lockolási sorrend
+dokumentált.</li>
+<li><strong>Biztonsági átvilágítás</strong>: A felhasználói térből
+érkező mutatók, méretek és indexek ellenőrzöttek. Nincs
+puffertúlcsordulás, nincs use-after-free.</li>
+<li><strong>Reprodukciós csomag</strong>: A kiadáshoz tartozik a
+buildparancs, a linker script, a futtatási parancs, a naplók és a mérési
+eredmények.</li>
+<li><strong>Rollback terv</strong>: A kiadás előtt ellenőrizve, hogy a
+rollback mechanizmus működik, és a visszaállítási út dokumentált.</li>
+<li><strong>Ismert korlátok</strong>: A nem javított, de elfogadott
+hibák listája a kiadási jegyzethez csatolva.</li>
+</ol>
+<p>A checklisten minden tételhez tartozik egy felelős és egy állapot
+(teljesült, nem teljesült, nem alkalmazható). A regressziós kapu csak
+akkor nyílik meg, ha a checklisten nincs „nem teljesült” tétel.</p>
+<h3 data-number="30.4.10" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">30.4.10</span> Tipikus hibák és helyes
+megoldások</h3>
+<p>A regressziós kapu tervezése során gyakori hibák:</p>
+<p><strong>Hiba: A kapu csak a buildre és a unit tesztekre
+épít.</strong><br />
+Következmény: Az integrációs és soak tesztek kimaradnak, így a
+párhuzamos hibák és a memóriaszivárgás észrevétlen marad.<br />
+Megoldás: A kapu minden fázist lefed, a soak test a kiadás előtt
+kötelező.</p>
+<p><strong>Hiba: A test matrix nem reprezentatív.</strong><br />
+Következmény: A tesztek zöldek, de a valós környezetben mégis hiba
+jelentkezik, mert a mátrix nem tartalmazza az adott konfigurációt.<br />
+Megoldás: A mátrixot rendszeresen felülvizsgáljuk, és a felhasználói
+hibajelentések alapján új kombinációkat adunk hozzá.</p>
+<p><strong>Hiba: A regressziós teszt hiányzik a
+hibajavításból.</strong><br />
+Következmény: Ugyanaz a hiba később újra bekerül, mert semmi sem
+akadályozza meg.<br />
+Megoldás: A hibajegy lezárásának feltétele a regressziós teszt megléte.
+A kapu ezt automatikusan ellenőrzi: ha a jegyhez tartozó teszt nem fut
+le, a kapu zárva marad.</p>
+<p><strong>Hiba: A rollback tervet a kiadás után készítik
+el.</strong><br />
+Következmény: Amikor a hiba élesben jelentkezik, a visszaállítás
+kapkodva, adatvesztéssel történik.<br />
+Megoldás: A rollback terv a változás tervezési fázisában készül, és a
+checklist része.</p>
+<p><strong>Hiba: A mérési napló nem tartalmazza a várt és mért értéket
+külön.</strong><br />
+Következmény: A teszteredmény nem reprodukálható, a regresszió
+megállapítása bizonytalan.<br />
+Megoldás: Minden mérési naplóban a várt értéket és a mért értéket külön
+oszlopban, a mértékegységgel együtt kell feltüntetni.</p>
+<h3 data-number="30.4.11"
+id="labor-regressziós-kapu-és-kiadási-checklist"><span
+class="header-section-number">30.4.11</span> Labor: regressziós kapu és
+kiadási checklist</h3>
+<p>A labor célja, hogy a fejezetben bemutatott fogalmakat egy emulált
+környezetben, reprodukálható módon alkalmazza. A labor nem valós
+hardvert használ, hanem QEMU-t vagy más emulátort, és a hoszt gép
+lemezét, bootloaderét vagy rendszerpartícióját <strong>tilos</strong>
+módosítani. A labor minden állomása egy eldobható, emulált környezetben
+fut.</p>
+<h3 data-number="30.4.12" id="előkészítés"><span
+class="header-section-number">30.4.12</span> Előkészítés</h3>
+<ol type="1">
+<li>Hozz létre egy munkakönyvtárat:
+<code>mkdir ~/lab-os117 &amp;&amp; cd ~/lab-os117</code>.</li>
+<li>Készíts egy egyszerű C programot, amely a mailbox modult teszteli
+felhasználói térben. A modul kódját a fejezetben bemutatott
+<code>mailbox.c</code>-ből származtathatod, de a spinlock részt egy
+egyszerű, nem atomi változattal helyettesítheted a hiba
+szimulálásához.</li>
+<li>Készíts egy Python vagy shell tesztfuttatót, amely a programot
+N-szer lefuttatja, és a kimenetet naplózza.</li>
+</ol>
+<h3 data-number="30.4.13" id="a-regressziós-kapu-futtatása"><span
+class="header-section-number">30.4.13</span> A regressziós kapu
+futtatása</h3>
+<p>A laborban három tesztet futtatunk:</p>
+<ol type="1">
+<li><strong>Funkcionális teszt</strong>: A mailbox küldd- és
+fogadd-műveleteit ellenőrzi egyszálú környezetben. Várt eredmény: 0
+hiba.</li>
+<li><strong>Párhuzamos teszt</strong>: Két szál egyszerre küld és fogad.
+A teszt 10 000 üzenetet továbbít, és ellenőrzi a sorszámok
+folytonosságát. Várt eredmény: 0 elveszett vagy duplikált üzenet.</li>
+<li><strong>Soak teszt (rövidített)</strong>: A párhuzamos teszt 60
+másodpercig fut, és közben a memóriahasználatot is naplózza. Várt
+eredmény: nincs szivárgás, nincs elveszett üzenet.</li>
+</ol>
+<p>Példa a tesztfuttatóra (Python):</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">#!/usr/bin/env python3</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="co"># run_gate.py - regressziós kapu a mailbox példához</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> subprocess</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> json</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> sys</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> run_test(name, command, expected_exit<span class="op">=</span><span class="dv">0</span>, timeout<span class="op">=</span><span class="dv">5</span>):</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    start <span class="op">=</span> time.monotonic()</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    proc <span class="op">=</span> subprocess.run(command, shell<span class="op">=</span><span class="va">True</span>, capture_output<span class="op">=</span><span class="va">True</span>,</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>                          text<span class="op">=</span><span class="va">True</span>, timeout<span class="op">=</span>timeout)</span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    elapsed <span class="op">=</span> time.monotonic() <span class="op">-</span> start</span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    result <span class="op">=</span> {</span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;name&quot;</span>: name,</span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;command&quot;</span>: command,</span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;exit_code&quot;</span>: proc.returncode,</span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;expected_exit&quot;</span>: expected_exit,</span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;elapsed_sec&quot;</span>: <span class="bu">round</span>(elapsed, <span class="dv">3</span>),</span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;stdout&quot;</span>: proc.stdout[<span class="op">-</span><span class="dv">200</span>:],</span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;stderr&quot;</span>: proc.stderr[<span class="op">-</span><span class="dv">200</span>:],</span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;passed&quot;</span>: proc.returncode <span class="op">==</span> expected_exit</span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    }</span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> result</span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> main():</span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    results <span class="op">=</span> []</span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    results.append(run_test(<span class="st">&quot;functional&quot;</span>,</span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;./mailbox_test --test=functional&quot;</span>))</span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>    results.append(run_test(<span class="st">&quot;parallel&quot;</span>,</span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;./mailbox_test --test=parallel --messages=10000&quot;</span>))</span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    results.append(run_test(<span class="st">&quot;soak_short&quot;</span>,</span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>        <span class="st">&quot;./mailbox_test --test=soak --duration=60&quot;</span>))</span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Mentés JSON naplóba</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">with</span> <span class="bu">open</span>(<span class="st">&quot;gate_results.json&quot;</span>, <span class="st">&quot;w&quot;</span>) <span class="im">as</span> f:</span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>        json.dump(results, f, indent<span class="op">=</span><span class="dv">2</span>)</span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A kapu döntése</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>    all_passed <span class="op">=</span> <span class="bu">all</span>(r[<span class="st">&quot;passed&quot;</span>] <span class="cf">for</span> r <span class="kw">in</span> results)</span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="bu">print</span>(json.dumps(results, indent<span class="op">=</span><span class="dv">2</span>))</span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> all_passed:</span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="st">&quot;GATE: PASS&quot;</span>)</span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>        sys.exit(<span class="dv">0</span>)</span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">else</span>:</span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="st">&quot;GATE: FAIL&quot;</span>)</span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>        sys.exit(<span class="dv">1</span>)</span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">__name__</span> <span class="op">==</span> <span class="st">&quot;__main__&quot;</span>:</span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>    main()</span></code></pre></div>
+<p>A labor során <strong>először a hibás</strong> verziót futtasd le. A
+párhuzamos teszt valószínűleg néhány elveszett üzenetet jelez, mert a
+<code>count</code> mező nem atomi. A naplóban a mért eredmény (lost &gt;
+0) eltér a várt eredménytől (lost = 0). Ez a regressziós kapu zárva
+marad.</p>
+<p>Ezután javítsd a hibát: adj hozzá egy egyszerű zárolást (például
+atomi műveletekkel), és futtasd újra a kaput. A naplóban most a mért és
+a várt eredmény megegyezik, a kapu nyílik.</p>
+<h3 data-number="30.4.14" id="átadandó-eredmény"><span
+class="header-section-number">30.4.14</span> Átadandó eredmény</h3>
+<p>A labor átadandó eredménye:</p>
+<ol type="1">
+<li>A <code>gate_results.json</code> fájl, amely a három teszt mért és
+várt eredményét tartalmazza.</li>
+<li>A <code>reproduce.sh</code> szkript, amely a környezetet felépíti, a
+teszteket lefuttatja, és a naplót generálja.</li>
+<li>Egy rövid <code>release_checklist.md</code> fájl, amely a kiadási
+checklist tételeit tartalmazza, és minden tételnél jelöli, hogy
+teljesült-e.</li>
+</ol>
+<p>Példa a checklist-re (Markdown):</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu"># Kiadási checklist - mailbox modul, v1.1.0</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>| Tétel | Állapot | Megjegyzés |</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>|---|---|---|</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>| Funkcionális teszt zöld | teljesült | functional: 0 hiba |</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>| Párhuzamos teszt zöld | teljesült | parallel: lost=0, dup=0 |</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>| Soak teszt zöld | teljesült | soak_short: 60 s, nincs szivárgás |</span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>| Dokumentáció frissítve | teljesült | mailbox.h kommentek aktualizálva |</span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>| Rollback terv rögzítve | teljesült | revert commit: abc123 |</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>| Ismert korlátok listázva | teljesült | nincs ismert korlát |</span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>| Erőforrás-tulajdonjog ellenőrizve | teljesült | nincs double-free, nincs leak |</span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>| Biztonsági átvilágítás | teljesült | nincs puffertúlcsordulás |</span></code></pre></div>
+<p>A laborban használt emulált környezet konfigurációját is
+rögzítsd:</p>
+<pre><code>QEMU version: 8.2.0 (ellenőrizd a helyi verziót)
+CPU: qemu64 (x86_64)
+Memory: 256 MiB
+Kernel: nincs (userspace teszt)
+Tesztprogram: mailbox_test</code></pre>
+<p>A labor nem igényel valódi kernelmódosítást, de a mérési napló és a
+checklist ugyanazt a fegyelmet követi, mint egy valódi
+kernelkiadásnál.</p>
+<h3 data-number="30.4.15" id="önellenőrző-kérdések"><span
+class="header-section-number">30.4.15</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a unit teszt és a soak test között? Miért nem
+elegendő csak a unit teszt a regressziós kapuban?</li>
+<li>Hogyan segít a test matrix a hibák korai felismerésében? Adj egy
+példát arra, amikor egy hiba csak egy adott matrix cellában
+jelentkezik.</li>
+<li>Mi a rollback stratégia lényege, és miért kell azt a változás
+bevezetése <em>előtt</em> meghatározni?</li>
+<li>Egy hibajegy lezárásának feltétele a regressziós teszt. Miért fontos
+ez, és milyen következménye van, ha elmarad?</li>
+</ol>
+<p>A fejezetben bemutatott regressziós kapu nem öncélú bürokrácia, hanem
+a mérnöki fegyelem eszköze. A biztonságos bevezetés, a test matrix, a
+CI, a soak test, a rollback és a hibajegy-kezelés együtt biztosítják,
+hogy a kernel fejlődése ne a stabilitás rovására történjen. A következő
+egységben erre az alapra építve az SMP, a preemption és a valós idejű
+kiterjesztések tesztelési kihívásait vizsgáljuk meg.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os116.html">← 30.3 Teljesítménymérés és tracing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os118.html">31.1 SMP, preemption és valós idejű kiterjesztés →</a></div>
+</nav>
+</body>
+</html>

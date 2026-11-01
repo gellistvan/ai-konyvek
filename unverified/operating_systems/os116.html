@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>30.3 Teljesítménymérés és tracing – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch29">30 Tesztelés, hibakeresés és teljesítmény</a></p>
+<div class="links"><a class="prev" rel="prev" href="os115.html">← 30.2 Emuláció, fuzzing és statikus elemzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os117.html">30.4 Regresszió és kiadási minőség →</a></div>
+</nav>
+<h2 data-number="30.3" id="os116"><span
+class="header-section-number">30.3</span> Teljesítménymérés és
+tracing</h2>
+<p>A kernel teljesítmény- és viselkedésmérése nem utólagos díszítés,
+hanem a tervezés és a hibakeresés szerves része. A korábbi fejezetekben
+a helyességre, a tesztelésre és a statikus elemzésre koncentráltunk; itt
+azt vizsgáljuk, hogyan lehet a futó rendszerből olyan adatokat kinyerni,
+amelyek alapján a rendszer viselkedése megérthető, a feltételezések
+ellenőrizhetők, és a regressziók korán észlelhetők. A cél nem az, hogy
+egyetlen „jó” számot kapjunk, hanem az, hogy reprodukálható módon, a
+mérési körülmények ismeretében tudjunk dönteni.</p>
+<p>A fejezet a <strong>latency</strong>, a <strong>throughput</strong>
+és a <strong>CPU cycle</strong> fogalmából indul ki, majd bemutatja a
+Linux kernel leggyakoribb megfigyelési eszközeit: az
+<strong>ftrace</strong>-et, a <strong>perf</strong>-et és az
+<strong>eBPF</strong>-et. A hangsúly a mérési terv elkészítésén és a
+tipikus hibák felismerésén van, nem pedig az eszközök teljes
+referencia-dokumentációján. A bemutatott parancsok és kimenetek
+szemléltetésnek számítanak; az aktuális verziók és kapcsolók mindig a
+felhasznált kernel és disztribúció dokumentációjában ellenőrizendők.</p>
+<h3 data-number="30.3.1" id="alapfogalmak-mit-mérünk"><span
+class="header-section-number">30.3.1</span> 1. Alapfogalmak: mit
+mérünk?</h3>
+<h3 data-number="30.3.2" id="latency"><span
+class="header-section-number">30.3.2</span> 1.1. Latency</h3>
+<p>A <strong>latency</strong> (késleltetés) az az idő, amely egy esemény
+kezdeményezése és a hatása között eltelik. Kernelkontextusban tipikus
+események:</p>
+<ul>
+<li>rendszerhívás belépésétől a visszatérésig eltelt idő;</li>
+<li>megszakítás beérkezésétől a megszakításkezelő első utasításáig
+eltelt idő;</li>
+<li>ütemező döntésétől a folyamat tényleges futásáig eltelt idő;</li>
+<li>lemezolvasási kérelem kiadásától az adat rendelkezésre állásáig
+eltelt idő.</li>
+</ul>
+<p>A latency mértékegysége idő, tipikusan nanoszekundum (ns),
+mikroszekundum (µs) vagy milliszekundum (ms). A mérés során három
+értéket szokás megkülönböztetni:</p>
+<ul>
+<li><strong>átlagos latency</strong>: sok minta számtani közepe;</li>
+<li><strong>percentilis (pl. P50, P95, P99)</strong>: az az érték,
+amelynél a minták adott százaléka kisebb vagy egyenlő;</li>
+<li><strong>maximális (worst-case) latency</strong>: a legnagyobb
+megfigyelt érték.</li>
+</ul>
+<p>Az átlag önmagában félrevezető lehet, mert elrejti a kiugró
+késleltetéseket. Például ha ezer rendszerhívásból 999 100 ns alatt tér
+vissza, egy pedig 10 ms-ot várakozik, az átlag 10,1 µs, ami nem
+reprezentálja a tipikus viselkedést. Ezért a latency elemzésnél a
+percentilisek és a maximum legalább olyan fontosak, mint az átlag.</p>
+<p>A latency és a throughput között gyakran átváltás van: a nagyobb
+átbocsátóképesség érdekében a rendszer összevárhat műveleteket
+(batch-elés), ami növeli az egyedi kérések késleltetését. A mérési
+tervben ezért mindig rögzíteni kell, hogy a vizsgált rendszer latency-
+vagy throughput-orientált-e.</p>
+<h3 data-number="30.3.3" id="throughput"><span
+class="header-section-number">30.3.3</span> 1.2. Throughput</h3>
+<p>A <strong>throughput</strong> (átbocsátóképesség) az időegység alatt
+elvégzett munka mennyisége. Kernelben mérhető például:</p>
+<ul>
+<li>rendszerhívás/s vagy művelet/s;</li>
+<li>csomag/s (hálózati stack);</li>
+<li>blokk I/O művelet/s vagy MiB/s;</li>
+<li>kontextusváltás/s.</li>
+</ul>
+<p>A throughput mértékegysége tehát művelet per másodperc, bájt per
+másodperc vagy hasonló. A mérés során fontos megkülönböztetni a
+<strong>csúcsteljesítményt</strong> (peak throughput) és a
+<strong>fenntartható teljesítményt</strong> (sustained throughput). A
+csúcsértéket rövid ideig, ideális körülmények között lehet elérni; a
+fenntartható érték hosszú távon, terhelés alatt is stabil marad.</p>
+<p>A throughput és a latency közötti összefüggést egyszerű sorbanállási
+modellekkel lehet becsülni. Ha egy rendszer egyszerre egy kérést szolgál
+ki, és a kiszolgálási idő átlagosan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>S</mi><annotation encoding="application/x-tex">S</annotation></semantics></math>,
+akkor a maximális throughput
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>/</mi><mi>S</mi></mrow><annotation encoding="application/x-tex">1/S</annotation></semantics></math>.
+Ha a rendszer párhuzamosan több kérést kezel, a Little-törvény szerint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><mi>λ</mi><mo>⋅</mo><mi>W</mi></mrow><annotation encoding="application/x-tex">N = \lambda \cdot W</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
+a rendszerben lévő kérések száma,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>λ</mi><annotation encoding="application/x-tex">\lambda</annotation></semantics></math>
+a beérkezési ráta (throughput),
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>W</mi><annotation encoding="application/x-tex">W</annotation></semantics></math>
+pedig az átlagos tartózkodási idő (latency). Ebből látható, hogy a
+latency és a throughput nem független, de a mérés során külön kell őket
+rögzíteni, mert más-más optimalizálási célokat szolgálnak.</p>
+<h3 data-number="30.3.4" id="cpu-cycle"><span
+class="header-section-number">30.3.4</span> 1.3. CPU cycle</h3>
+<p>A <strong>CPU cycle</strong> (processzorórajel-ciklus) a processzor
+órajelének egy periódusa. A modern processzorokban a végrehajtott
+utasítások száma és a felhasznált ciklusok száma nem azonos, mert a
+pipeline, az out-of-order végrehajtás, a cache-találatok és a branch
+prediction mind befolyásolják, hogy egy utasítás hány ciklust igényel. A
+ciklusszám mérése azért hasznos, mert:</p>
+<ul>
+<li>független az aktuális órajeltől, ezért különböző rendszereken
+összehasonlíthatóbb, mint a nyers idő;</li>
+<li>megmutatja, hogy egy kódrészlet mennyire terheli a processzort;</li>
+<li>a hardveres számlálókkal (pl. <code>cpu-cycles</code>,
+<code>instructions</code>) együtt felhasználható az IPC (instructions
+per cycle) kiszámítására.</li>
+</ul>
+<p>A ciklusszám és az idő közötti átszámítás az órajel ismeretében
+lehetséges:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>t</mi><mo>=</mo><mfrac><mi>C</mi><mi>f</mi></mfrac></mrow><annotation encoding="application/x-tex">t = \frac{C}{f}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>t</mi><annotation encoding="application/x-tex">t</annotation></semantics></math>
+az idő,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>C</mi><annotation encoding="application/x-tex">C</annotation></semantics></math>
+a ciklusszám,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>f</mi><annotation encoding="application/x-tex">f</annotation></semantics></math>
+pedig az órajelfrekvencia. A modern processzorok azonban dinamikusan
+változtatják az órajelet (turbo boost, energiagazdálkodás), így a mérés
+során rögzíteni kell az órajel-viselkedést, vagy hardveres számlálóval
+kell mérni a ciklusszámot. A virtualizált környezetben a vendég CPU
+által látott órajel és a tényleges fizikai órajel eltérhet, ezért a
+mérési jegyzőkönyvben a virtualizációs réteget is fel kell tüntetni.</p>
+<p>A CPU cycle mérése különösen fontos akkor, ha a rendszer időmérését
+megszakítások vagy laphibák torzíthatják. A hardveres számláló
+közvetlenül a processzor belsejéből származik, ezért kevésbé zavarja a
+szoftveres overhead.</p>
+<h3 data-number="30.3.5"
+id="mérési-módszertan-a-reprodukálható-terv"><span
+class="header-section-number">30.3.5</span> 2. Mérési módszertan: a
+reprodukálható terv</h3>
+<p>A kernel viselkedésének mérésekor a legnagyobb kockázat nem az eszköz
+hiánya, hanem a nem dokumentált körülményekből származó hamis
+következtetés. A fejezetben ezért a mérési tervet ugyanolyan komolyan
+kell venni, mint a kódot.</p>
+<h3 data-number="30.3.6" id="a-mérési-terv-kötelező-elemei"><span
+class="header-section-number">30.3.6</span> 2.1. A mérési terv kötelező
+elemei</h3>
+<p>Minden reprodukálható mérésnek tartalmaznia kell:</p>
+<ol type="1">
+<li><strong>Cél</strong>: mit akarunk mérni, és milyen döntést támogat a
+mérés.</li>
+<li><strong>Hardver és virtualizáció</strong>: CPU típus, magok száma,
+memória, QEMU verzió, hypervisor beállítások.</li>
+<li><strong>Szoftver és kernelkonfiguráció</strong>: kernelverzió,
+fontos konfigurációs kapcsolók (pl. <code>CONFIG_PREEMPT</code>,
+<code>CONFIG_HZ</code>, <code>CONFIG_FTRACE</code>), fordítási
+beállítások.</li>
+<li><strong>Mérési módszer</strong>: mely eszközt használjuk, hány
+ismétlést végzünk, mekkora a bemelegítés, hogyan gyűjtjük az
+adatokat.</li>
+<li><strong>Kiinduló állapot</strong>: a rendszer terhelése, a
+háttérfolyamatok, a CPU-affinitás beállítása, a cache-ek állapota.</li>
+<li><strong>Várt eredmény</strong>: a mérés előtt levezetett vagy
+becsült érték, amelyet a mérés után összehasonlítunk a mért
+értékkel.</li>
+<li><strong>Mért eredmény</strong>: a ténylegesen kapott értékek,
+statisztikai összefoglalóval.</li>
+<li><strong>Eltérés elemzése</strong>: ha a mért érték jelentősen eltér
+a várttól, mi lehet az ok.</li>
+</ol>
+<p>A mérési tervben a <strong>várt</strong> és a <strong>mért</strong>
+eredményt mindig külön kell feltüntetni. A várt érték származhat
+elméleti becslésből, korábbi mérésből vagy a dokumentációból. A mért
+érték a kísérlet tényleges kimenete. A kettő összehasonlítása adja a
+mérés validitását.</p>
+<h3 data-number="30.3.7" id="melegítés-ismétlés-és-statisztika"><span
+class="header-section-number">30.3.7</span> 2.2. Melegítés, ismétlés és
+statisztika</h3>
+<p>A kernel méréseknél a hideg cache és a lazy inicializáció torzíthatja
+az első mintákat. Ezért a tényleges mérés előtt
+<strong>bemelegítő</strong> futtatásokat kell végezni, amelyek
+eredményét nem vesszük figyelembe. A bemelegítés hossza a mért
+művelettől függ: egy syscall-latency mérésnél néhány ezer hívás
+elegendő, egy lapcsere-mérésnél viszont több tízezer művelet is
+szükséges lehet.</p>
+<p>Az ismétlések számát úgy kell megválasztani, hogy a statisztikai
+ingadozás kicsi legyen. A gyakorlatban legalább 5–10 független mérési
+sorozatot érdemes futtatni, és minden sorozatból kiszámítani az átlagot,
+a szórást és a percentiliseket. Az eredményt soha ne egyetlen futás
+adja, hanem a sorozatok összesítése.</p>
+<p>A percentilisek számításához a mintákat rendezni kell, majd a kívánt
+százalékhoz tartozó elemet kiválasztani. A P99 például azt jelenti, hogy
+a minták 99%-a kisebb vagy egyenlő ennél az értéknél. A maximális
+értéket mindig külön kell kezelni, mert a kiugrók gyakran a
+leginformatívabbak.</p>
+<h3 data-number="30.3.8" id="kernel-tracing-ftrace"><span
+class="header-section-number">30.3.8</span> 3. Kernel tracing:
+ftrace</h3>
+<p>Az ftrace a Linux kernel beépített nyomkövető keretrendszere, amely a
+<code>tracefs</code> virtuális fájlrendszeren keresztül vezérelhető. Az
+ftrace nem igényel külső eszközt, és a kernel számos alrendszerébe
+beépített nyomkövetési pontokat kínál. A fejezetben a mérési és
+megfigyelési célú használatára koncentrálunk.</p>
+<h3 data-number="30.3.9" id="az-ftrace-felépítése"><span
+class="header-section-number">30.3.9</span> 3.1. Az ftrace
+felépítése</h3>
+<p>Az ftrace a <code>/sys/kernel/tracing</code> (régebbi rendszereken
+<code>/sys/kernel/debug/tracing</code>) könyvtárban érhető el. A
+fontosabb fájlok:</p>
+<ul>
+<li><code>available_tracers</code>: a betölthető nyomkövetők
+listája;</li>
+<li><code>current_tracer</code>: az aktív nyomkövető neve;</li>
+<li><code>trace</code>: a nyomkövetési kimenet;</li>
+<li><code>trace_pipe</code>: folyamatosan olvasható kimenet;</li>
+<li><code>set_ftrace_filter</code>: a nyomkövetendő függvények
+listája;</li>
+<li><code>set_ftrace_pid</code>: a nyomkövetendő folyamat PID-je;</li>
+<li><code>tracing_on</code>: a nyomkövetés ki-/bekapcsolása.</li>
+</ul>
+<p>A leggyakrabban használt nyomkövetők:</p>
+<ul>
+<li><code>function</code>: minden függvényhívás nevét rögzíti a
+kernelben;</li>
+<li><code>function_graph</code>: a függvényhívások hierarchiáját és
+időtartamát rögzíti;</li>
+<li><code>nop</code>: nyomkövetés kikapcsolva.</li>
+</ul>
+<h3 data-number="30.3.10"
+id="példa-rendszerhívás-latency-nyomon-követése-function_graph-segítségével"><span
+class="header-section-number">30.3.10</span> 3.2. Példa: rendszerhívás
+latency nyomon követése function_graph segítségével</h3>
+<p>A következő példa egyetlen folyamat <code>getpid</code>
+rendszerhívásának nyomon követését mutatja be. Az emulált környezetben
+QEMU-t használunk, a kernelben engedélyezett az ftrace.</p>
+<p>Először ellenőrizzük az ftrace elérhetőségét:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="kw">|</span> <span class="fu">grep</span> tracefs</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> /sys/kernel/tracing</span></code></pre></div>
+<p>Ha a tracefs nincs csatolva, csatoljuk:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> tracefs tracefs /sys/kernel/tracing</span></code></pre></div>
+<p>Válasszuk ki a <code>function_graph</code> nyomkövetőt, és szűrjük a
+nyomkövetést a <code>__x64_sys_getpid</code> függvényre:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> function_graph <span class="op">&gt;</span> /sys/kernel/tracing/current_tracer</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> __x64_sys_getpid <span class="op">&gt;</span> /sys/kernel/tracing/set_graph_function</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 1 <span class="op">&gt;</span> /sys/kernel/tracing/tracing_on</span></code></pre></div>
+<p>Futtassuk egy rövid programot, amely <code>getpid</code>-et hív:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* getpid_loop.c – szemléltetés, nem éles rendszeren futtatandó */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/types.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100</span><span class="op">;</span> i<span class="op">++)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span><span class="dt">void</span><span class="op">)</span>getpid<span class="op">();</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A nyomkövetés kikapcsolása után olvassuk ki a kimenetet:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 0 <span class="op">&gt;</span> /sys/kernel/tracing/tracing_on</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/kernel/tracing/trace</span></code></pre></div>
+<p>A kimenetben a <code>__x64_sys_getpid</code> függvény belépése és
+kilépése, valamint az eltelt idő látható. A <code>function_graph</code>
+az időt a <code>duration</code> oszlopban, mikroszekundum pontossággal
+jeleníti meg. A példa kimenete szemléltetés:</p>
+<pre><code># tracer: function_graph
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 0)   0.125 us    |  __x64_sys_getpid() {
+ 0)   0.020 us    |    current-&gt;nsproxy;
+ 0)   0.030 us    |    task_tgid_vnr();
+ 0)   0.025 us    |    __task_pid_nr_ns();
+ 0)   0.015 us    |    __rcu_read_lock();
+ 0)   0.010 us    |    __rcu_read_unlock();
+ 0)   0.125 us    |  }</code></pre>
+<p>Ez a kimenet már önmagában is megmutatja, hogy a <code>getpid</code>
+rendszerhívás kernelbeli kiszolgálása nagyon rövid, a belépés és a
+kilépés közötti idő tipikusan 100–200 ns egy emulált x86_64
+környezetben. A pontos érték erősen függ a CPU-tól, a virtualizációtól
+és a kernel fordítási beállításaitól.</p>
+<p>Az ftrace előnye, hogy szűkíthető egyetlen függvényre, így az
+overhead alacsony marad. Hátránya, hogy a függvénynevek és a hierarchia
+a kernel belső implementációjától függenek, és a kimenet értelmezése
+kernelismeretet igényel.</p>
+<h3 data-number="30.3.11"
+id="perf-hardveres-és-szoftveres-számlálók"><span
+class="header-section-number">30.3.11</span> 4. Perf: hardveres és
+szoftveres számlálók</h3>
+<p>A <code>perf</code> a Linux kernel teljesítménymérő eszköze, amely
+hardveres teljesítményszámlálókat (PMC), szoftveres eseményeket,
+tracepoint-okat és kprobe-okat tud gyűjteni. A perf fő parancsai:</p>
+<ul>
+<li><code>perf stat</code>: egy parancs futása alatt gyűjti a
+számlálókat;</li>
+<li><code>perf record</code>: mintákat gyűjt egy futó folyamatról;</li>
+<li><code>perf report</code>: a <code>perf record</code> által készített
+adatfájlt elemzi;</li>
+<li><code>perf top</code>: élő, folyamatos profilkép;</li>
+<li><code>perf list</code>: elérhető események listája.</li>
+</ul>
+<h3 data-number="30.3.12" id="példa-perf-stat-a-getpid-hurokra"><span
+class="header-section-number">30.3.12</span> 4.1. Példa:
+<code>perf stat</code> a <code>getpid</code> hurokra</h3>
+<p>A korábbi <code>getpid_loop</code> programot futtassuk a perf
+alatt:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat ./getpid_loop</span></code></pre></div>
+<p>A kimenet szemléltetése:</p>
+<pre><code> Performance counter stats for &#39;./getpid_loop&#39;:
+
+              0.41 msec task-clock                #    0.602 CPUs utilized
+                 1      context-switches          #    2.439 K/sec
+                 0      cpu-migrations            #    0.000 /sec
+                45      page-faults               #  109.756 K/sec
+         1,234,567      cycles                    #    3.012 GHz
+           987,654      instructions              #    0.80  insn per cycle
+           123,456      branches                  #  301.123 M/sec
+             1,234      branch-misses             #    1.00% of all branches
+
+       0.000680123 seconds time elapsed
+       0.000400000 seconds user
+       0.000200000 seconds sys</code></pre>
+<p>A <code>task-clock</code> a folyamat által ténylegesen használt
+CPU-időt mutatja. A <code>cycles</code> a felhasznált órajelciklusok
+száma, az <code>instructions</code> a végrehajtott utasítások száma, az
+<code>insn per cycle</code> pedig a kettő hányadosa. A
+<code>context-switches</code> és a <code>cpu-migrations</code> a
+folyamat ütemezési viselkedését jelzi.</p>
+<p>A <code>perf stat</code> kimenete önmagában nem ad latency-t, de a
+ciklusszám és az utasításszám alapján becsülhető a kód
+processzorterhelése. Ha például a <code>getpid_loop</code> 100 hívást
+hajt végre, és a <code>cycles</code> értéke 1 234 567, akkor egy hívásra
+átlagosan 12 345 ciklus jut. Ha a processzor 3,0 GHz-en fut, ez
+körülbelül 4,1 µs-ot jelent. Ez a becslés azonban magában foglalja a
+libc overhead-jét és a perf mérési overhead-jét is, ezért a tiszta
+kernelbeli latency elkülönítéséhez tracing vagy eBPF szükséges.</p>
+<h3 data-number="30.3.13" id="példa-perf-record-és-perf-report"><span
+class="header-section-number">30.3.13</span> 4.2. Példa:
+<code>perf record</code> és <code>perf report</code></h3>
+<p>A <code>perf record</code> segítségével mintavételezhetjük a futó
+folyamatot, és a <code>perf report</code> interaktív vagy szöveges
+kimenetben megmutatja, hol tölti az időt a CPU.</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> record ./getpid_loop</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> report <span class="at">--stdio</span></span></code></pre></div>
+<p>A kimenetben a leggyakrabban mintavételezett függvények szerepelnek,
+például:</p>
+<pre><code># Overhead  Command      Shared Object      Symbol
+# ........  ...........  .................  ......................
+    60.00%  getpid_loop  [kernel.kallsyms]  [k] do_syscall_64
+    20.00%  getpid_loop  [kernel.kallsyms]  [k] __x64_sys_getpid
+    10.00%  getpid_loop  libc.so.6          [.] getpid
+    10.00%  getpid_loop  getpid_loop        [.] main</code></pre>
+<p>Ez a profilkép azt mutatja, hogy a CPU-idő nagy része a rendszerhívás
+belépésében és kiszolgálásában telik. A pontos százalékok természetesen
+a mérési körülményektől függenek.</p>
+<h3 data-number="30.3.14"
+id="hardveres-számlálók-és-cache-viselkedés"><span
+class="header-section-number">30.3.14</span> 4.3. Hardveres számlálók és
+cache-viselkedés</h3>
+<p>A perf egyik legerősebb képessége a hardveres teljesítményszámlálók
+elérése. Például a cache-találatok és -hibák mérése:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">perf</span> stat <span class="at">-e</span> cache-references,cache-misses,instructions,cycles ./getpid_loop</span></code></pre></div>
+<p>A cache-miss arány fontos jelzés lehet a memóriarendszer terhelésére.
+A mérési jegyzőkönyvben mindig fel kell tüntetni, hogy a számlálók
+hardveres vagy szoftveres események-e, mert a virtualizált környezetben
+a hardveres számlálók pontossága korlátozott lehet. A QEMU például
+bizonyos PMC-ket emulál, másokat pedig nem tesz elérhetővé, ezért a perf
+kimenetét ebben a környezetben kellő óvatossággal kell kezelni.</p>
+<h3 data-number="30.3.15" id="ebpf-programozható-megfigyelés"><span
+class="header-section-number">30.3.15</span> 5. eBPF: programozható
+megfigyelés</h3>
+<p>Az eBPF (extended Berkeley Packet Filter) egy olyan technológia,
+amely lehetővé teszi, hogy a felhasználó kis, ellenőrzött programokat
+töltsön be a kernelbe, amelyeket az adott események (tracepoint, kprobe,
+uprobe) bekövetkezésekor futtat a kernel. Az eBPF programok nem
+férhetnek hozzá a kernel teljes memóriájához, hanem a verifier ellenőrzi
+őket, így biztonságosan használhatók futó rendszeren is.</p>
+<p>A fejezetben az eBPF-et megfigyelési célra használjuk, nem hálózati
+csomagfeldolgozásra. A leggyakoribb frontend eszközök:</p>
+<ul>
+<li><strong>bpftrace</strong>: magas szintű, awk-szerű nyelv, amelyet
+rövid, egyszerű mérésekhez terveztek;</li>
+<li><strong>bcc</strong>: Python kötések és C programok gyűjteménye
+összetettebb elemzésekhez;</li>
+<li><strong>libbpf</strong>: alacsony szintű C könyvtár a BPF programok
+betöltéséhez.</li>
+</ul>
+<h3 data-number="30.3.16"
+id="példa-syscall-latency-mérése-bpftrace-szel"><span
+class="header-section-number">30.3.16</span> 5.1. Példa: syscall latency
+mérése bpftrace-szel</h3>
+<p>A következő bpftrace szkript a <code>getpid</code> rendszerhívás
+belépését és kilépését figyeli, és hisztogramot készít a latency-ről
+nanomásodpercben:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bpftrace</span> <span class="at">-e</span> <span class="st">&#39;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_enter_getpid {</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="st">    @start[tid] = nsecs;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="st">tracepoint:syscalls:sys_exit_getpid /@start[tid]/ {</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="st">    @latency_ns = hist(nsecs - @start[tid]);</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="st">    delete(@start[tid]);</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="st">}</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="st">END {</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="st">    clear(@start);</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="st">    print(@latency_ns);</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="st">}&#39;</span></span></code></pre></div>
+<p>A szkript a <code>sys_enter_getpid</code> tracepoint-on rögzíti az
+aktuális időt, majd a <code>sys_exit_getpid</code> eseménynél kiszámítja
+a különbséget, és a <code>hist</code> beépített függvénnyel hisztogramot
+készít. A kimenet például:</p>
+<pre><code>@latency_ns: 
+[128, 256)    12345 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|
+[256, 512)     6789 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@                      |
+[512, 1K)       890 |@@@@                                                |
+[1K, 2K)        123 |                                                    |
+[2K, 4K)         45 |                                                    |</code></pre>
+<p>A hisztogramból kiolvasható a latency eloszlása, a módusz, a
+percentilisek és a kiugrók. Az eBPF előnye, hogy a mérés közvetlenül a
+kernelben fut, ezért a felhasználói térbe történő átmenet overhead-je
+kicsi. A <code>bpftrace</code> azonban a szkript futása alatt maga is
+overhead-et generál, ezért a mért értékeket mindig a mérési
+körülményekkel együtt kell dokumentálni.</p>
+<h3 data-number="30.3.17" id="ebpf-és-a-biztonság"><span
+class="header-section-number">30.3.17</span> 5.2. eBPF és a
+biztonság</h3>
+<p>Az eBPF programokat a kernel beépített verifier-e ellenőrzi, mielőtt
+betöltené őket. A verifier biztosítja, hogy a program nem tartalmaz
+végtelen ciklust, nem fér hozzá érvénytelen memóriához, és nem módosítja
+a kernel állapotát nem megengedett módon. Ez az ellenőrzés azonban nem
+jelenti azt, hogy az eBPF használata kockázatmentes. A mérési
+környezetben ezért csak megbízható forrásból származó szkripteket szabad
+futtatni, és a laborban az eBPF-et izolált, eldobható virtuális gépen
+kell használni.</p>
+<h3 data-number="30.3.18"
+id="eszközválasztás-ftrace-perf-vagy-ebpf"><span
+class="header-section-number">30.3.18</span> 6. Eszközválasztás: ftrace,
+perf vagy eBPF?</h3>
+<p>A három eszköz nem versenytárs, hanem kiegészíti egymást. A választás
+a mérési kérdéstől függ.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kérdés</th>
+<th>Javasolt eszköz</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Melyik kernel függvény hívódik meg, és mennyi ideig tart?</td>
+<td>ftrace <code>function_graph</code></td>
+</tr>
+<tr class="even">
+<td>Mennyi a folyamat CPU-ideje, hány utasítást hajt végre?</td>
+<td><code>perf stat</code></td>
+</tr>
+<tr class="odd">
+<td>Hol tölti a folyamat a CPU-időt (profil)?</td>
+<td><code>perf record</code> + <code>perf report</code></td>
+</tr>
+<tr class="even">
+<td>Mi a rendszerhívás latency eloszlása?</td>
+<td>eBPF (bpftrace)</td>
+</tr>
+<tr class="odd">
+<td>Mi a cache-miss arány egy adott kódrészletnél?</td>
+<td><code>perf stat</code> hardveres számlálókkal</td>
+</tr>
+<tr class="even">
+<td>Mi történik egy adott kernel ponton, pl. ütemező belépésnél?</td>
+<td>tracepoint + eBPF vagy ftrace</td>
+</tr>
+<tr class="odd">
+<td>Mi a kontextusváltások száma és időbeli eloszlása?</td>
+<td><code>perf sched</code> vagy eBPF</td>
+</tr>
+</tbody>
+</table>
+<p>A hibrid megközelítés gyakran a legjobb: a <code>perf</code> átfogó
+képet ad, az ftrace a részletes függvényhívási láncot mutatja, az eBPF
+pedig rugalmasan testre szabott méréseket tesz lehetővé.</p>
+<h3 data-number="30.3.19" id="tipikus-hibák-és-félreértések"><span
+class="header-section-number">30.3.19</span> 7. Tipikus hibák és
+félreértések</h3>
+<p>A kernel teljesítménymérésben a következő hibák fordulnak elő
+leggyakrabban:</p>
+<h3 data-number="30.3.20"
+id="az-átlagos-latency-mint-egyetlen-mérőszám"><span
+class="header-section-number">30.3.20</span> 7.1. Az átlagos latency
+mint egyetlen mérőszám</h3>
+<p>Az átlag elrejti a kiugrókat, és nem mutatja a valós felhasználói
+élményt. A latency elemzésnél mindig meg kell adni a percentiliseket és
+a maximumot. Ha a rendszerben időnként nagy késleltetések vannak, az
+átlag akkor is alacsony lehet, ha a felhasználók rendszeresen érzékelik
+a lassulást.</p>
+<h3 data-number="30.3.21"
+id="a-cpu-ciklus-és-az-idő-összekeverése"><span
+class="header-section-number">30.3.21</span> 7.2. A CPU ciklus és az idő
+összekeverése</h3>
+<p>A ciklusszám csak akkor konvertálható időre, ha ismerjük az órajelet,
+amely a modern processzorokon dinamikusan változik. A mérési
+jegyzőkönyvben ezért rögzíteni kell az órajel-viselkedést, vagy a
+ciklusszámot önmagában, időre való átváltás nélkül kell jelenteni.</p>
+<h3 data-number="30.3.22"
+id="a-mérési-overhead-figyelmen-kívül-hagyása"><span
+class="header-section-number">30.3.22</span> 7.3. A mérési overhead
+figyelmen kívül hagyása</h3>
+<p>Minden mérőeszköz maga is fogyaszt erőforrást. Az ftrace
+függvényszintű nyomkövetése például jelentősen meglassíthatja a
+rendszert, ha túl sok függvényt figyel. A perf stat és az eBPF szkriptek
+is overhead-et okoznak. Ezért a mérési tervben mindig szerepelnie kell
+annak, hogy mekkora a mérési overhead, és hogyan lehet csökkenteni (pl.
+szűkített trace, kevésbé gyakori mintavétel).</p>
+<h3 data-number="30.3.23" id="nem-reprodukálható-környezet"><span
+class="header-section-number">30.3.23</span> 7.4. Nem reprodukálható
+környezet</h3>
+<p>Ha a mérési környezet nincs dokumentálva (CPU, kernelverzió,
+konfiguráció, terhelés), az eredmény nem reprodukálható, és nem lehet rá
+alapozni. A könyv konvenciója szerint minden mérésnél rögzíteni kell a
+hardvert, a fordítási beállításokat, az órajelet és a mérési
+módszert.</p>
+<h3 data-number="30.3.24"
+id="a-várt-és-a-mért-eredmény-összekeverése"><span
+class="header-section-number">30.3.24</span> 7.5. A várt és a mért
+eredmény összekeverése</h3>
+<p>A várt érték a mérés előtti elméleti becslés, a mért érték a kísérlet
+tényleges kimenete. Ha a kettőt nem választjuk szét, a mérés elveszíti
+ellenőrző szerepét. A laborban ezért külön táblázatban kell feltüntetni
+a várt és a mért értéket, és az eltérést elemezni kell.</p>
+<h3 data-number="30.3.25"
+id="a-hideg-cache-és-a-lazy-inicializáció-figyelmen-kívül-hagyása"><span
+class="header-section-number">30.3.25</span> 7.6. A hideg cache és a
+lazy inicializáció figyelmen kívül hagyása</h3>
+<p>Az első mérések gyakran lassabbak, mert a cache-ek üresek, és a
+kernel egyes adatstruktúrái még nincsenek inicializálva. A mérési
+tervben bemelegítő futtatásokat kell előírni, és az első mintákat ki
+kell zárni az elemzésből.</p>
+<h3 data-number="30.3.26"
+id="a-virtualizáció-hatásainak-alábecsülése"><span
+class="header-section-number">30.3.26</span> 7.7. A virtualizáció
+hatásainak alábecsülése</h3>
+<p>QEMU-ban vagy virtuális gépben a vendég kernel által látott idő és a
+tényleges fizikai idő eltérhet. A hardveres számlálók pontossága
+korlátozott, az órajel pedig nem feltétlenül stabil. A mérési
+jegyzőkönyvben ezért a virtualizációs réteget és annak beállításait is
+fel kell tüntetni.</p>
+<h3 data-number="30.3.27"
+id="labor-benchmark--és-tracing-terv-készítése"><span
+class="header-section-number">30.3.27</span> 8. Labor: benchmark- és
+tracing-terv készítése</h3>
+<p>A fejezet laborjának célja, hogy a hallgató elkészítsen egy
+reprodukálható mérési tervet, és azt dokumentálja egy jegyzetfüzetben
+vagy jegyzőkönyvben. A labor nem feltétlenül igényli a tényleges mérést,
+de a tervnek tartalmaznia kell minden olyan elemet, amely alapján a
+mérés később végrehajtható.</p>
+<h3 data-number="30.3.28" id="kiinduló-állapot"><span
+class="header-section-number">30.3.28</span> 8.1. Kiinduló állapot</h3>
+<ul>
+<li>Emulált környezet: QEMU x86_64, 4 vCPU, 2 GiB RAM,
+<code>-enable-kvm</code> ha elérhető, ellenkező esetben TCG
+emuláció.</li>
+<li>Kernel: egy friss stabil Linux kernel (a pontos verzió a
+dokumentációban ellenőrizendő), a következő konfigurációs kapcsolókkal:
+<code>CONFIG_FTRACE=y</code>, <code>CONFIG_FUNCTION_TRACER=y</code>,
+<code>CONFIG_FUNCTION_GRAPH_TRACER=y</code>,
+<code>CONFIG_PERF_EVENTS=y</code>, <code>CONFIG_BPF=y</code>,
+<code>CONFIG_BPF_SYSCALL=y</code>, <code>CONFIG_KPROBES=y</code>.</li>
+<li>A hoszt valódi rendszerét tilos módosítani; minden művelet a vendég
+rendszerre korlátozódik.</li>
+<li>A vendég rendszerben egy root jogosultságú shell áll rendelkezésre,
+de a méréshez nem szükséges valós hitelesítő adat vagy éles adat.</li>
+</ul>
+<h3 data-number="30.3.29" id="a-mérési-cél"><span
+class="header-section-number">30.3.29</span> 8.2. A mérési cél</h3>
+<p>A cél a <code>getpid</code> rendszerhívás latency-ének mérése
+nanoszekundumban, valamint a rendszerhívás kernelbeli kiszolgálási
+idejének megfigyelése ftrace és eBPF segítségével. A mérés másodlagos
+célja a throughput mérése: hány <code>getpid</code> hívás hajtható végre
+másodpercenként egyetlen szálon.</p>
+<h3 data-number="30.3.30" id="várt-eredmény-levezetése"><span
+class="header-section-number">30.3.30</span> 8.3. Várt eredmény
+levezetése</h3>
+<p>A <code>getpid</code> egy triviális rendszerhívás, amely nem végez
+I/O-t, nem blokkol, és a kernelben csak néhány mezőt olvas ki a
+folyamatleíróból. A várt latency a következő összetevőkből áll:</p>
+<ul>
+<li>user-kernel átmenet (syscall belépés): néhány tíz ns;</li>
+<li>kernelbeli kiszolgálás: néhány tíz ns;</li>
+<li>kernel-user átmenet (visszatérés): néhány tíz ns.</li>
+</ul>
+<p>Egy emulált x86_64 környezetben a teljes latency várhatóan 100–500 ns
+között van. A pontos érték függ az órajeltől, a virtualizációtól és a
+CPU-tól. A throughput egyetlen szálon várhatóan 1–5 millió hívás/s,
+mivel a rendszerhívás nagyon rövid, de a libc hívási overhead és a perf
+mérési overhead csökkenti a tényleges értéket.</p>
+<p>A várt értéket a laborjegyzőkönyvben így kell rögzíteni:</p>
+<pre><code>Várt latency: 100–500 ns (eltolódás a mérési overhead miatt lehetséges)
+Várt throughput: 1–5 M ops/s (egyszálú, QEMU-ban)</code></pre>
+<h3 data-number="30.3.31" id="mérési-terv"><span
+class="header-section-number">30.3.31</span> 8.4. Mérési terv</h3>
+<ol type="1">
+<li><strong>Bemelegítés</strong>: futtassunk 10 000 <code>getpid</code>
+hívást, az eredményt ne rögzítsük.</li>
+<li><strong>Latency mérés eBPF-fel</strong>: használjuk a fejezetben
+bemutatott bpftrace szkriptet, és gyűjtsünk legalább 100 000
+mintát.</li>
+<li><strong>Throughput mérés</strong>: használjunk egy C programot,
+amely egy másodpercig folyamatosan hívja a <code>getpid</code>-et, és
+számolja a hívások számát. A mérést 10-szer ismételjük, és átlagot
+számítunk.</li>
+<li><strong>Ftrace nyomkövetés</strong>: kapcsoljuk be a
+<code>function_graph</code> nyomkövetőt a <code>__x64_sys_getpid</code>
+függvényre, futtassunk 100 hívást, majd rögzítsük a függvényhívási
+láncot és az időtartamokat.</li>
+<li><strong>Perf stat</strong>: futtassuk a <code>getpid_loop</code>-ot
+a <code>perf stat</code> alatt, és rögzítsük a ciklusszámot, az
+utasításszámot, a cache-miss-eket és a kontextusváltásokat.</li>
+<li><strong>Rögzítés</strong>: minden mérésből készítsünk naplót, amely
+tartalmazza a pontos parancsokat, a kimeneteket és az időbélyeget.</li>
+</ol>
+<h3 data-number="30.3.32" id="a-mérési-napló-szerkezete"><span
+class="header-section-number">30.3.32</span> 8.5. A mérési napló
+szerkezete</h3>
+<p>A laborjegyzőkönyvben a következő szakaszoknak kell szerepelniük:</p>
+<ul>
+<li><strong>Környezet</strong>: QEMU verzió, kernelverzió, konfigurációs
+kapcsolók, CPU típus, memória.</li>
+<li><strong>Módszer</strong>: a használt parancsok és szkriptek.</li>
+<li><strong>Várt eredmény</strong>: a fenti levezetés.</li>
+<li><strong>Mért eredmény</strong>: a mért latency percentilisek, a
+throughput, a ciklusszám és az ftrace kimenet összefoglalása.</li>
+<li><strong>Eltérés elemzése</strong>: ha a mért érték kívül esik a várt
+tartományon, mi lehet az ok?</li>
+</ul>
+<p>A mért és a várt eredményt külön táblázatban kell feltüntetni.
+Például:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Metrika</th>
+<th>Várt</th>
+<th>Mért</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Átlagos latency (ns)</td>
+<td>100–500</td>
+<td>342</td>
+</tr>
+<tr class="even">
+<td>P99 latency (ns)</td>
+<td>200–1000</td>
+<td>612</td>
+</tr>
+<tr class="odd">
+<td>Throughput (ops/s)</td>
+<td>1–5 M</td>
+<td>2,3 M</td>
+</tr>
+<tr class="even">
+<td>CPU cycles per syscall</td>
+<td>800–3000</td>
+<td>1540</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban a mért értékek csak illusztrációk; a labor során a
+tényleges értékeket kell beírni.</p>
+<h3 data-number="30.3.33" id="ellenőrző-kérdések-a-laborhoz"><span
+class="header-section-number">30.3.33</span> 8.6. Ellenőrző kérdések a
+laborhoz</h3>
+<ol type="1">
+<li>Miért nem elegendő az átlagos latency a mérési eredmény
+bemutatásához?</li>
+<li>Hogyan befolyásolja a QEMU TCG emuláció a mért ciklusszámot az
+<code>perf stat</code> kimenetében?</li>
+<li>Miért kell a bpftrace szkript futása alatt is mérni a
+háttérterhelést?</li>
+<li>Milyen okok miatt térhet el a mért latency a várt tartománytól?</li>
+</ol>
+<h3 data-number="30.3.34" id="összefoglalás"><span
+class="header-section-number">30.3.34</span> 9. Összefoglalás</h3>
+<p>A kernel viselkedésének mérése és megfigyelése három pilléren
+nyugszik: a <strong>latency</strong>, a <strong>throughput</strong> és a
+<strong>CPU cycle</strong> pontos definícióján; a <strong>reprodukálható
+mérési terven</strong>; valamint a megfelelő <strong>megfigyelési
+eszköz</strong> kiválasztásán. Az ftrace a függvényhívási láncok és
+időtartamok részletes feltárására alkalmas, a perf a hardveres és
+szoftveres számlálók gyűjtésére, az eBPF pedig rugalmas, programozható
+méréseket tesz lehetővé.</p>
+<p>A leggyakoribb hibák – az átlag fetisizálása, a ciklus és az idő
+összekeverése, a mérési overhead elhanyagolása, a nem dokumentált
+környezet – mind elkerülhetők, ha a mérési tervben a várt és a mért
+eredményt mindig elkülönítjük, és a mérési körülményeket teljes körűen
+rögzítjük. A fejezet laborja ezt a fegyelmet gyakoroltatja: a hallgató
+nem egyetlen számot ad át, hanem egy olyan tervet, amely alapján a mérés
+bárhol, bármikor megismételhető.</p>
+<p>A következő egység (<a href="os117.html">Regresszió és kiadási
+minőség</a>) a regresszió és a kiadási minőség kérdéseire épít majd az
+itt bevezetett mérési és megfigyelési fogalmakra. Aki a fejezetben
+bemutatott eszközökkel és módszertannal dolgozik, képes lesz a kernel
+viselkedését nemcsak megmérni, hanem a mérési eredményeket a tervezési
+döntésekbe is visszavezetni.</p>
+<p><strong>Önellenőrző kérdések</strong></p>
+<ol type="1">
+<li>Definiálja a latency és a throughput fogalmát, és mutasson példát
+arra, amikor az egyik javítása rontja a másikat.</li>
+<li>Mi a különbség a CPU cycle és a végrehajtott utasítások száma
+között? Miért fontos ez a mérésben?</li>
+<li>Melyik eszközt választaná egy adott rendszerhívás kernelbeli
+kiszolgálási idejének függvényszintű nyomon követésére? Indokolja a
+választást.</li>
+<li>Soroljon fel három tipikus hibát a kernel teljesítménymérésben, és
+magyarázza el, hogyan lehet őket elkerülni.</li>
+<li>Mit jelent a P99 latency, és miért informatívabb az átlagnál egy
+interaktív rendszer esetén?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os115.html">← 30.2 Emuláció, fuzzing és statikus elemzés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os117.html">30.4 Regresszió és kiadási minőség →</a></div>
+</nav>
+</body>
+</html>

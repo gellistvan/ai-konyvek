@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>11.3 Laphiba, demand paging és másolás – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz3">III. RÉSZ – Memória és I/O</a> › <a href="index.html#osch10">11 Memóriakezelés alapjai</a></p>
+<div class="links"><a class="prev" rel="prev" href="os039.html">← 11.2 Lapozás, szegmentálás és TLB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os041.html">11.4 Memóriavédelem, ASLR és izoláció →</a></div>
+</nav>
+<h2 data-number="11.3" id="os040"><span
+class="header-section-number">11.3</span> Laphiba, demand paging és
+másolás</h2>
+<p>A laphiba az operációs rendszer memóriakezelőjének az a pontja, ahol
+a hardver által észlelt memória-hozzáférési kivétel találkozik a kernel
+által karbantartott virtuális memória-leírókkal. A laphiba nem
+feltétlenül hiba: a legtöbb esetben a késleltetett, igény szerinti
+lapbetöltés (<em>demand paging</em>) és a másolás-halasztó optimalizáció
+(<em>copy-on-write</em>) szándékosan idézi elő. Ebben a fejezetben a
+laphiba kezelését, a demand paging és a COW mechanizmusát, továbbá a
+laphiba költségének és a munkakészletnek az összefüggését tárgyaljuk. A
+<a href="os039.html">Lapozás, szegmentálás és TLB</a> fogalmait –
+címterek, lapozás, TLB – ismertnek tételezzük fel.</p>
+<p><strong>Laphiba mint hardverkivétel</strong></p>
+<p>Amikor a CPU egy virtuális címet akar lefordítani fizikai címre, a
+lapozó hardver a folyamat oldaltábláját járja be. Ha a bejegyzés
+hiányzik, vagy a hozzáférés jogosultsága nem felel meg a műveletnek, a
+CPU laphibát (<em>page fault</em>) vált ki. A kivétel megszakítja az
+aktuális utasítást, mielőtt az befejeződnék, így az utasítás később
+újraindítható. A hardver a hibás virtuális címet egy
+architektúra-specifikus regiszterbe menti: x86 rendszeren a
+<code>CR2</code>, RISC-V rendszeren a <code>stval</code> regiszter tölti
+be ezt a szerepet. A kernel laphibakezelője innen olvassa ki a
+címet.</p>
+<p>A laphiba három fő okból keletkezhet:</p>
+<ol type="1">
+<li><strong>Nincs jelen a lap</strong> (<em>not present</em>): a
+oldaltábla bejegyzés <code>present</code> bitje 0. Ez lehet valódi
+késleltetett betöltés (demand paging), swap-ből visszaolvasandó lap,
+vagy egyszerűen hibás, nem leképezett cím.</li>
+<li><strong>Védelmi hiba</strong> (<em>protection fault</em>): a lap
+jelen van, de a művelet nem engedélyezett, például írás egy csak
+olvasható lapra. A copy-on-write ezt a hibát használja fel.</li>
+<li><strong>Foglalási vagy hardverhiba</strong>: például a lapnak
+foglalt (<em>reserved</em>) bitje van, vagy a lapozó bejegyzés sérült.
+Ez rendszerint kernelhiba.</li>
+</ol>
+<p>A laphiba kezelője a processz kontextusában fut, nem pedig
+megszakítás-kontextusban, mert a kezelés során szükség lehet alvásra:
+egy <em>major fault</em> esetén a lapot lemezről vagy swap-ből kell
+betölteni, ami akár több milliszekundumot is igénybe vehet. Ezért a
+laphibakezelő nem futhat atomi vagy megszakítási kontextusban,
+ellentétben például az időzítő megszakítás kezelőjével.</p>
+<p><strong>Laphibakezelő lépései</strong></p>
+<p>A kernel laphibakezelőjének bemenete: a hibás virtuális cím, a
+hozzáférés típusa (olvasás, írás, végrehajtás), a hibát okozó mód
+(felhasználói vagy kernel), valamint az, hogy a hiba felhasználói térből
+érkezett-e. A kimenete: a hiba kijavítása és az utasítás újraindítása,
+vagy szignál küldése a folyamatnak (általában <code>SIGSEGV</code> vagy
+<code>SIGBUS</code>).</p>
+<p>Az alábbi pszeudokód a tipikus kezelési folyamatot mutatja:</p>
+<pre class="pszeudocode"><code>laphiba_kezelo(hibas_cim, hozzaferes, user_mod):
+    ha user_mod:
+        ha hibas_cim &gt;= TASK_SIZE:          // kernel cím felhasználói módból
+            return SIGSEGV
+
+    vma = kereses_a_vma_faban(processz, hibas_cim)
+    ha vma == NULL:
+        return SIGSEGV                     // nincs leképezett terület
+
+    ha hozzaferes == IRAS_A_NEM_IRHATORA:
+        ha vma.iras_engedelyezett == HAMIS:
+            ha vma.COW_jelolt == IGAZ:
+                return COW_kezeles(processz, vma, hibas_cim)
+            return SIGSEGV                 // valódi védelmi hiba
+
+    ha lap_nincs_jelen(vma, hibas_cim):
+        ha vma.tamogato_fajl == NULL:
+            return zero_lap_hozzarendeles(processz, vma, hibas_cim)
+        else:
+            return lap_betoltes_fajlbol(processz, vma, hibas_cim)
+
+    return SIGSEGV                          // egyéb hiba</code></pre>
+<p>A <code>kereses_a_vma_faban</code> a folyamat virtuális
+memória-területeit (<em>VMA</em>, virtual memory area) leíró
+struktúrákban keres. A VMA tartalmazza a tartomány kezdetét, végét,
+jogosultságait, valamint a lapok forrását: anonim memória, fájl vagy
+eszköz. A laphibakezelő nem közvetlenül az oldaltáblából dönt, hanem a
+VMA-ból, mert a VMA írja le a leképezés szemantikáját, például hogy egy
+fájl mely tartománya van hozzárendelve.</p>
+<p>Ha a cím egyetlen VMA-ba sem esik, a folyamat szegmentálási hibát
+kap. Ha a hozzáférés írás egy csak olvasható VMA-ra, a kernel először
+ellenőrzi, hogy a lap COW-jelölt-e. Ha igen, akkor a COW-kezelés
+következik; ha nem, akkor valódi <code>SIGSEGV</code>. Ha a lap nincs
+jelen, akkor demand paging: anonim esetben egy nullákkal feltöltött
+lapot rendel hozzá, fájlos esetben pedig a megfelelő blokkot
+beolvassa.</p>
+<p><strong>Demand paging: késleltetett lapbetöltés</strong></p>
+<p>A hagyományos, nem késleltetett betöltés egy futtatható program
+indításakor a teljes szegmenst – kódot, adatot, vermet – a memóriába
+olvasná. Ez lassú és pazarló. A <em>demand paging</em> ezzel szemben
+csak akkor hozza létre a fizikai lapot, amikor a program először
+hozzáfér hozzá. A folyamat kezdeti oldaltáblája rendszerint üres, vagy
+csak néhány lapot tartalmaz; a többi bejegyzés
+<code>present=0</code>.</p>
+<p>A demand paging két alesetre bontható:</p>
+<ul>
+<li><strong>Anonim lapok</strong> (heap, verem, <code>mmap</code>
+<code>MAP_ANONYMOUS</code>): nincs háttértároló. Amikor a folyamat
+először ír vagy olvas egy ilyen lapot, a kernel egy fizikai keretet
+allokál, nullázza, és a oldaltáblába bejegyzi. Ha a hozzáférés olvasás,
+és a lap még nincs meg, a kernel egy globális, csak olvasható <em>nulla
+lapot</em> (<em>zero page</em>) rendelhet hozzá. Az első írási kísérlet
+ezen a lapon COW laphibát vált ki, és ekkor jön létre az egyedi,
+nullázott fizikai lap.</li>
+<li><strong>Fájl alapú lapok</strong> (kód, <code>mmap</code> fájl): a
+lap forrása egy fájl egy adott blokkja. A laphiba kezelője meghatározza
+a fájlbeli offsetet, majd a blokkot beolvassa a lapgyorsítótárba. A
+<code>mmap</code> szemantikája szerint a módosítások visszaírhatók a
+fájlba, vagy ha a leképezés <code>MAP_PRIVATE</code>, akkor COW
+használatos.</li>
+</ul>
+<p>A laphiba típusa a költség szempontjából két kategóriába sorolható. A
+<em>minor fault</em> azt jelenti, hogy a hiba kiszolgálása nem igényel
+lemez I/O-t: a lap már a memóriában van (például a lapgyorsítótárban, a
+nulla lapon vagy egy COW miatt), csak a oldaltábla-bejegyzést kell
+frissíteni. A <em>major fault</em> lemezről vagy swap-ből való
+beolvasást igényel, ami nagyságrendekkel drágább.</p>
+<p>A demand paging előnyei: gyorsabb folyamatindítás, kisebb induló
+memórialábnyom, több egyidejű folyamat. Hátrányai: kiszámíthatatlan
+késleltetés az első hozzáféréseknél, valamint a laphibák futás közbeni
+többletköltsége. Beágyazott, valós idejű rendszerekben gyakran inkább
+előre lefoglalt, zárolt lapokat használnak, hogy a laphiba soha ne
+jelenjen meg a kritikus szakaszban.</p>
+<p><strong>Copy-on-write (COW)</strong></p>
+<p>A másolás írásra (<em>copy-on-write</em>) a memóriakezelés egyik
+legfontosabb optimalizációja. A <code>fork</code> rendszerhívás során a
+gyermekfolyamat elvileg megkapja a szülő teljes címterének másolatát. Ha
+ezt fizikailag lemásolnánk, a <code>fork</code> költsége a folyamat
+memóriaméretével arányos lenne, és sokszor felesleges, mert a gyermek
+azonnal <code>exec</code>-et hív. A COW ehelyett a lapokat megosztja a
+szülő és a gyermek között, és mindkét oldaltáblában csak olvashatóvá
+teszi őket. Amint valamelyik folyamat írni próbál egy ilyen lapra, a CPU
+védelmi laphibát vált ki. A kernel COW-kezelője ekkor:</p>
+<ol type="1">
+<li>felismeri, hogy a lap COW-jelölt;</li>
+<li>ha a lap referenciaszámlálója (<code>refcount</code>) 1, akkor
+egyszerűen írhatóvá teszi az oldaltáblát;</li>
+<li>ha a <code>refcount</code> &gt; 1, akkor új fizikai lapot allokál,
+átmásolja a tartalmat, csökkenti a régi lap referenciaszámlálóját, és az
+író folyamat oldaltábláját az új lapra állítja írási joggal.</li>
+</ol>
+<p>A lépést szemléltető egyszerű pszeudokód:</p>
+<pre class="pszeudocode"><code>COW_kezeles(processz, vma, hibas_cim):
+    lap = lekerdez_a_page_tablabol(processz, hibas_cim)
+    ha lap.refcount == 1:
+        page_table_bejegyzes.iras = IGAZ
+        TLB_invalidalas(hibas_cim)
+        return UJRAINDITAS
+    uj_lap = fizikai_lap_allokalasa()
+    masolas(uj_lap, lap)
+    lap.refcount -= 1
+    page_table_bejegyzes.lap = uj_lap
+    page_table_bejegyzes.iras = IGAZ
+    TLB_invalidalas(hibas_cim)
+    return UJRAINDITAS</code></pre>
+<p>A COW nem csupán a <code>fork</code> sajátja. Ugyanez a mechanizmus
+működik a <code>MAP_PRIVATE</code> leképezésű fájloknál: a fájl lapjai
+csak olvashatóak, az első írásra a folyamat saját, nem fájlba
+visszaírandó lapot kap. A nulla lap is COW: az első írás váltja ki a
+valódi, nullázott lap létrehozását.</p>
+<p>A COW előnye a <code>fork</code> esetében különösen látványos. Egy
+több száz MiB memóriát használó folyamat <code>fork</code>-ja COW-val
+ezredmásodpercek alatt lezajlik, mert nem kell a memóriát másolni; csak
+a oldaltáblákat kell bejárni és a bejegyzéseket írásvédetté tenni. A
+tényleges másolás akkor történik, amikor valamelyik folyamat ténylegesen
+ír. A <code>vmstat</code> vagy a <code>getrusage</code> ilyenkor a COW
+laphibákat minor faultként számolja el.</p>
+<p><strong>Laphiba költsége és munkakészlet</strong></p>
+<p>A laphiba kezelésének költsége két részből áll: a hardverkivétel és a
+kernelbeli feldolgozás fix költségéből, valamint a hiba típusától függő
+változó költségből. A minor fault jellemzően néhány mikroszekundum
+modern processzoron, mert csak a oldaltábla-frissítés és a
+TLB-invalidálás történik. A major fault ezzel szemben lemez I/O-t
+igényel: NVMe SSD-n 5–20 ms, hagyományos HDD-n 5–15 ms vagy több is
+lehet, ha a lemez várakozik. A pontos értékek hardver-, kernel-,
+fájlrendszer- és terhelésfüggők; a mérési laborban ezeket külön
+rögzíteni kell.</p>
+<p>A laphiba költsége a folyamat munkakészletének (<em>working set</em>)
+fogalmával hozható összefüggésbe. A munkakészlet Denning definíciója
+szerint azoknak a lapoknak a halmaza, amelyekre a folyamat az utolsó
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>Δ</mi><annotation encoding="application/x-tex">\Delta</annotation></semantics></math>
+időablakban hivatkozott:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>W</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>t</mi><mo>,</mo><mi>Δ</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mo stretchy="false" form="prefix">{</mo><mrow><mtext mathvariant="normal">lap </mtext><mspace width="0.333em"></mspace></mrow><mi>L</mi><mo>∣</mo><mi>L</mi><mrow><mtext mathvariant="normal">-re a </mtext><mspace width="0.333em"></mspace></mrow><mrow><mo stretchy="true" form="prefix">[</mo><mi>t</mi><mo>−</mo><mi>Δ</mi><mo>,</mo><mi>t</mi><mo stretchy="true" form="postfix">]</mo></mrow><mrow><mspace width="0.333em"></mspace><mtext mathvariant="normal"> intervallumban hivatkozás történt</mtext></mrow><mo stretchy="false" form="postfix">}</mo><mi>.</mi></mrow><annotation encoding="application/x-tex">
+W(t, \Delta) = \{ \text{lap } L \mid L \text{-re a } [t-\Delta, t] \text{ intervallumban hivatkozás történt} \}.
+</annotation></semantics></math></p>
+<p>Amíg a munkakészlet belefér a fizikai memóriába, a laphibák többsége
+minor fault: a lapok a lapgyorsítótárban vagy a szabad listán vannak, és
+a betöltés gyors. Amikor a teljes munkakészlet meghaladja a
+rendelkezésre álló fizikai keretek számát, a rendszer folyamatosan
+cserél: egy lap betöltése kiszorít egy másik, éppen használt lapot,
+amely a következő hivatkozáskor ismét major faultot okoz. Ezt a
+jelenséget <em>thrashing</em>nek nevezzük. A thrashing tünete a
+laphiba-ráta drasztikus növekedése, a CPU kihasználtság csökkenése és a
+lemez I/O telítettsége.</p>
+<p>A munkakészlet becslésére a rendszer a laphiba-statisztikákat és a
+folyamatonkénti memóriahasználatot figyeli. A demand paginget használó
+általános célú rendszerekben a munkakészlet időben változik; a scheduler
+és a memóriakezelő együtt próbálja elkerülni a thrashinget, például a
+lapcsere-algoritmusok (<a href="os042.html">Lapcsere-algoritmusok: FIFO,
+LRU és Clock</a>) és a folyamatzárolás segítségével. Valós idejű
+rendszerekben ezzel szemben a laphibákat gyakran teljesen letiltják a
+kritikus utasítások alatt, mert a major fault kiszámíthatatlan
+késleltetést okozna.</p>
+<p><strong>Gyakorlati példa: COW és demand paging mérése</strong></p>
+<p>A következő C program illusztrálja a demand paging és a COW
+laphibákat. A kód szemléltetés, nem végrehajtandó utasítás éles
+rendszeren; a futtatást emulált környezetben kell elvégezni.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define </span><span class="ot">_GNU_SOURCE</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/mman.h&gt;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/wait.h&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sys/resource.h&gt;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">long</span> minor_faults<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> rusage ru<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    getrusage<span class="op">(</span>RUSAGE_SELF<span class="op">,</span> <span class="op">&amp;</span>ru<span class="op">);</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ru<span class="op">.</span>ru_minflt<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> mib <span class="op">=</span> <span class="op">(</span>argc <span class="op">&gt;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">?</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>atol<span class="op">(</span>argv<span class="op">[</span><span class="dv">1</span><span class="op">])</span> <span class="op">:</span> <span class="dv">256</span><span class="op">;</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> len <span class="op">=</span> mib <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> page_size <span class="op">=</span> sysconf<span class="op">(</span>_SC_PAGESIZE<span class="op">);</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> len<span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>                   MAP_PRIVATE <span class="op">|</span> MAP_ANONYMOUS<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>p <span class="op">==</span> MAP_FAILED<span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;mmap&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> before <span class="op">=</span> minor_faults<span class="op">();</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> off <span class="op">&lt;</span> len<span class="op">;</span> off <span class="op">+=</span> page_size<span class="op">)</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        p<span class="op">[</span>off<span class="op">]</span> <span class="op">=</span> <span class="dv">1</span><span class="op">;</span>                       <span class="co">// demand zero page + COW</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Demand paging minor faults: </span><span class="sc">%ld\n</span><span class="st">&quot;</span><span class="op">,</span> minor_faults<span class="op">()</span> <span class="op">-</span> before<span class="op">);</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    pid_t pid <span class="op">=</span> fork<span class="op">();</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>pid <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span> perror<span class="op">(</span><span class="st">&quot;fork&quot;</span><span class="op">);</span> <span class="cf">return</span> <span class="dv">1</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>pid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span>                       <span class="co">// gyermek</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">long</span> child_before <span class="op">=</span> minor_faults<span class="op">();</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> off <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> off <span class="op">&lt;</span> len<span class="op">;</span> off <span class="op">+=</span> <span class="dv">2</span> <span class="op">*</span> page_size<span class="op">)</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>            p<span class="op">[</span>off<span class="op">]</span> <span class="op">=</span> <span class="dv">2</span><span class="op">;</span>                   <span class="co">// COW: írás, lap másolása</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Child COW minor faults: </span><span class="sc">%ld\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>               minor_faults<span class="op">()</span> <span class="op">-</span> child_before<span class="op">);</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>        _exit<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    wait<span class="op">(</span>NULL<span class="op">);</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A program lefoglal egy <code>MAP_ANONYMOUS | MAP_PRIVATE</code>
+területet, amely kezdetben egyetlen fizikai lapot sem foglal. Az első
+ciklus minden 4 KiB-os oldal első bájtját írja, ezzel anonim demand
+paging laphibát vált ki. Az első írás a nulla lapról COW-t is jelent,
+így a minor faultok száma a lefoglalt lapok számával közel azonos. A
+<code>fork</code> után a gyermek minden második oldalt módosít; ezek a
+lapok COW-jelöltek, így a gyermekben a módosított lapok számával
+megegyező minor fault keletkezik. A mérés <code>getrusage</code>-on
+alapul, amely a <code>ru_minflt</code> mezőben adja vissza a minor
+faultok számát.</p>
+<p><strong>Tipikus hibák és megoldások</strong></p>
+<p>A laphibakezelő és a COW implementációja számos buktatót rejt. A
+leggyakoribb hibák:</p>
+<ul>
+<li><strong>Hiányzó VMA-ellenőrzés</strong>: ha a kezelő nem ellenőrzi,
+hogy a hibás cím a folyamathoz tartozó VMA-ba esik-e, akkor egy
+felhasználói folyamat kernel címre hivatkozhat, vagy egy hibás mutatóval
+olvashat ki memóriát. A helyes megoldás a VMA-fában keresés, és annak
+hiányában <code>SIGSEGV</code> küldése.</li>
+<li><strong>COW refcount verseny</strong>: a referenciaszámláló
+csökkentése és növelése nem atomi, így egyidejű <code>fork</code> és
+lap-felszabadítás esetén a lap kétszer szabadulhat fel, vagy
+elérhetetlenné válhat. A megoldás atomi műveletek vagy per-CPU
+lap-láncolt struktúrák használata.</li>
+<li><strong>Nulla lap helytelen írhatóvá tétele</strong>: ha a kernel a
+zero page-et írhatóvá teszi ahelyett, hogy COW-t hajtana végre, a
+folyamatok egy közös lapot írnak, és adat szivárog át. A zero page
+mindig csak olvasható; az írásnak mindig új lap allokálását kell
+eredményeznie.</li>
+<li><strong>TLB-invalidálás elmaradása</strong>: a oldaltábla frissítése
+után a régi, írásvédett bejegyzés a TLB-ben marad, így a következő írás
+továbbra is védelmi hibát okoz. A megoldás a TLB-shootdown vagy legalább
+a lokális TLB-bejegyzés invalidálása. Többmagos rendszeren a COW-jelölt
+lap írhatóvá tétele minden CPU-ra kiterjedő TLB-invalidálást
+igényel.</li>
+<li><strong>Alvás nem megengedett kontextusból</strong>: ha a
+laphibakezelő egy megszakításkezelőből hívódik, a major fault alvása
+kernel oops-hoz vezet. A laphibakezelőt mindig processz-kontextusból
+kell hívni, és a megszakítási kontextusból nem szabad lemez I/O-t
+kezdeményezni.</li>
+</ul>
+<p>A fenti ellenőrzési pontok közül a VMA-keresés és a COW-refcount
+kezelése a memóriabiztonság sarokköve. A kernelkódban minden
+laphiba-ágat naplózni kell a hibás címmel, a hozzáféréssel és az okkal,
+hogy a hibakeresés reprodukálható legyen.</p>
+<p><strong>Labor: laphiba-forgatókönyv készítése</strong></p>
+<p>A labor célja, hogy reprodukálható módon mérjük a demand paging és a
+COW által okozott laphibákat, és a mért eredményeket a várt értékekkel
+összehasonlítsuk. A mérés emulált környezetben, QEMU-ban fut, a hoszt
+valódi lemezét nem módosítjuk.</p>
+<p><strong>Kiinduló állapot és konfiguráció</strong></p>
+<ul>
+<li>Hoszt: tetszőleges Linux, QEMU 8.0 vagy újabb (verzió
+rögzítendő).</li>
+<li>Vendég: Linux kernel 6.6 LTS, <code>x86_64</code>, 1 vCPU, 512 MiB
+RAM.</li>
+<li>Kernel parancssor:
+<code>console=ttyS0 root=/dev/vda rw transparent_hugepage=never</code>.</li>
+<li>A vendégen a swap ki van kapcsolva (<code>swapoff -a</code>), hogy a
+major faultok ne swapből, hanem fájlból jöjjenek, ha lesznek.</li>
+<li>A vendégen a <code>gcc</code> és a <code>musl</code> vagy
+<code>glibc</code> development csomag telepítve.</li>
+</ul>
+<p><strong>Build parancs</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-O2</span> <span class="at">-o</span> lab_pagefault lab_pagefault.c</span></code></pre></div>
+<p><strong>Futtatási parancs</strong></p>
+<p>A vendégen belül:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./lab_pagefault</span> 256</span></code></pre></div>
+<p>A futtatás <code>256</code> MiB anonim memóriát foglal, demand
+paginget és COW-t mér. A mérést háromszor ismételjük, és a mediánt
+jegyezzük fel.</p>
+<p><strong>Mérési napló (sablon)</strong></p>
+<pre class="text"><code>Időpont: 2025-05-01 10:00:00
+QEMU: 8.2.1
+Vendég kernel: 6.6.21
+CPU: 1 vCPU, host: AMD Ryzen 5 5600X
+RAM: 512 MiB
+THP: transparent_hugepage=never
+Swap: off
+Lapméret: 4096 B
+
+Futás 1:
+  Demand paging minor faults (mért): 65530
+  Várt demand paging minor faults:      65536
+  Gyermek COW minor faults (mért):      32765
+  Várt gyermek COW minor faults:        32768
+Futás 2: ...
+Futás 3: ...
+Medián demand paging minor faults: ...
+Medián COW minor faults: ...</code></pre>
+<p>A várt érték a lefoglalt méret és a lapméret hányadosa:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>256</mn><mo>⋅</mo><msup><mn>1024</mn><mn>2</mn></msup><mi>/</mi><mn>4096</mn><mo>=</mo><mn>65536</mn></mrow><annotation encoding="application/x-tex">256 \cdot 1024^2 / 4096 = 65536</annotation></semantics></math>
+lap. A mért érték ettől néhány lappal eltérhet, mert a kernel a program
+indításakor bizonyos lapokat már lefoglalhat, vagy a <code>mmap</code>
+belső struktúrái is foglalnak. A COW esetében a gyermek minden második
+oldalt írja, tehát a várt COW laphibák száma
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>32768</mn><annotation encoding="application/x-tex">32768</annotation></semantics></math>.
+A mért és várt érték külön oszlopban szerepel, ahogy a
+minőségbiztosítási konvenció előírja.</p>
+<p><strong>Visszaállítás</strong></p>
+<p>A QEMU vendég lemezképe eldobható. A mérés után a vendég leáll, a
+lemezkép törölhető vagy újra klónozható. A hoszt rendszer nem változik,
+bootloaderét és partícióit nem érintjük.</p>
+<p><strong>Önellenőrző kérdés</strong></p>
+<p>Miért okoz a <code>fork</code> utáni első írás laphibát, és miért nem
+szegmentálási hibát? A válasz: mert a COW-jelölt lapok az oldaltáblában
+írásvédettként szerepelnek, de a VMA leírása megengedi az írást. A
+laphibakezelő felismeri a COW-t, lemásolja a lapot, írhatóvá teszi, és
+újraindítja az utasítást, ezért a folyamat nem kap
+<code>SIGSEGV</code>-t.</p>
+<p>A demand paging és a COW a virtuális memóriakezelés két alappillére.
+A laphiba az a mechanizmus, amely ezeket futás közben összeköti a
+hardverrel. A fejezetben bemutatott kezelői lépések, a COW-logika és a
+munkakészlet-fogalom alapozza meg a <a href="os041.html">Memóriavédelem,
+ASLR és izoláció</a> memóriavédelmi és izolációs témáját, valamint a
+későbbi lapcsere-algoritmusok tárgyalását.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os039.html">← 11.2 Lapozás, szegmentálás és TLB</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os041.html">11.4 Memóriavédelem, ASLR és izoláció →</a></div>
+</nav>
+</body>
+</html>

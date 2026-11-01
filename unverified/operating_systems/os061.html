@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.4 Hálózati fájlrendszerek: NFS, SMB és objektumtár –
+Operációs rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Fájlrendszerek és tárolás</a> › <a href="index.html#osch15">16 Fájlrendszer-implementációk</a></p>
+<div class="links"><a class="prev" rel="prev" href="os060.html">← 16.3 NTFS, APFS és zárt rendszerek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os062.html">17.1 Journaling és tranzakciós metaadat →</a></div>
+</nav>
+<h2 data-number="16.4" id="os061"><span
+class="header-section-number">16.4</span> Hálózati fájlrendszerek: NFS,
+SMB és objektumtár</h2>
+<p>A hálózati fájlrendszerek célja, hogy a fájlabsztrakciót – nyitás,
+olvasás, írás, lezárás, metaadat-műveletek – egy távoli gépen tárolt
+adatra is kiterjessze. Ezzel a háttértároló fizikailag elválik a
+kliensgéptől, és központilag menedzselhető, megosztható, replikálható és
+skálázható lesz. A hálózati tárolásnak három, jól elkülöníthető rétege
+van:</p>
+<ul>
+<li><strong>hálózati blokkeszköz</strong>: a kliens nyers blokkokat lát
+(iSCSI, NVMe-oF), a fájlrendszert a kliens valósítja meg;</li>
+<li><strong>hálózati fájlrendszer</strong>: a szerver exportál egy
+fájlrendszer-fát, a kliens fájlműveleteket küld a hálózaton (NFS,
+SMB);</li>
+<li><strong>objektumtár</strong>: a kliens nem fájlokat, hanem
+objektumokat címez meg HTTP/REST API-val (S3, Swift).</li>
+</ul>
+<p>Ez a fejezet a második és harmadik csoporttal foglalkozik. A
+blokkszintű távoli tárolást a tárolóeszközökről szóló rész (<a
+href="os053.html">Tárolóeszközök: HDD, SSD, NVMe és buffering</a>)
+tárgyalja. Az itt bemutatott fogalmakra épül a következő fejezet
+crash-konzisztencia- és naplózási anyaga, mert a hálózati
+fájlrendszereknél a szerveroldali állapot és a kliensoldali cache
+összehangolása ugyanazokat a tartóssági kérdéseket veti fel, mint egy
+lokális fájlrendszer.</p>
+<h3 data-number="16.4.1" id="a-hálózati-fájlrendszer-modellje"><span
+class="header-section-number">16.4.1</span> A hálózati fájlrendszer
+modellje</h3>
+<p>A hálózati fájlrendszer protokollja két komponensből áll: egy
+<strong>hívásrétegből</strong> és egy <strong>adatábrázolási
+rétegből</strong>. Az NFS a Sun RPC (ONC RPC) és az XDR mechanizmust
+használja: a kliens egy eljáráshívást csomagol be, a szerver meghívja a
+megfelelő fájlműveletet, majd az eredményt visszaküldi. Az SMB ezzel
+szemben egy puffer-alapú, hitelesített kérés-válasz protokoll, amelyben
+a fájlműveletek a share fogalmára épülnek. Az S3 objektumtár pedig egy
+szokásos HTTP-vel megvalósított REST API, ahol az erőforrás az objektum,
+a műveletek pedig a <code>PUT</code>, <code>GET</code>,
+<code>DELETE</code> és <code>HEAD</code> metódusok.</p>
+<p>A közös absztrakció a <strong>fájlkezelő</strong> (file handle). A
+kliens a nyitáskor kap egy, a szerver számára értelmes azonosítót, amely
+lehet:</p>
+<ul>
+<li>NFS-ben egy <code>struct nfs_fh</code> jellegű, a szerver által
+generált, átlátszatlan bájtfolyam;</li>
+<li>SMB-ben a fájl azonosítója, amelyhez a szerver állapotot (nyitott
+fájl, zárak, aktuális pozíció) rendel;</li>
+<li>S3-ban az objektum kulcsa, például
+<code>bucket/docs/report.pdf</code>.</li>
+</ul>
+<p>A szerver a handle mögött a saját lokális fájlleíróját, inode-számát
+vagy egy generációs számmal ellátott belső rekordot tart nyilván. A
+handle érvényessége a szerver újraindulása után változhat: NFSv3-ban a
+file handle az exportált inode-ra mutat, ezért általában stabil,
+NFSv4-ben a szerver állapotgépe miatt a klienseknek újra kell
+csatlakozniuk, és a handle-ök újraérvényesítése szükséges.</p>
+<h3 data-number="16.4.2" id="nfs-sun-hálózati-fájlrendszere"><span
+class="header-section-number">16.4.2</span> NFS: Sun hálózati
+fájlrendszere</h3>
+<p>Az NFS a UNIX világ klasszikus megosztási protokollja. A korai NFSv2
+és NFSv3 <strong>közel állapotmentes</strong> (stateless) szervert
+feltételezett: a szerver nem tartotta nyilván, melyik kliens melyik
+fájlt nyitotta meg. A fájlműveletek közvetlenül a handle-re hivatkoztak,
+a lockolást pedig külön protokollok (NLM, NSM) kezelték. Ez egyszerű
+helyreállítást tett lehetővé, de komoly cache-koherencia- és zárolási
+problémákat okozott.</p>
+<p><strong>NFSv4</strong> alapvetően megváltoztatta a modellt: a szerver
+<strong>állapottartó</strong> (stateful). Bevezette a <code>open</code>,
+<code>close</code>, <code>lock</code>, <code>locku</code> műveleteket,
+integrálta a byte-range lockolást, és a kliensek
+<strong>lease</strong>-t kapnak. A lease egy időkorlát, amelyen belül a
+kliensnek meg kell újítania az állapotát. Ha a szerver nem kap
+megújítást, felszabadíthatja a zárakat és delegációkat. A szerver
+újraindulása után <strong>türelmi időszak</strong> (grace period)
+következik, amely alatt a kliensek visszajátszhatják a záraikat, de új
+zárat nem kérhetnek. Ez a mechanizmus teszi lehetővé a szerveroldali
+állapot helyreállítását anélkül, hogy a klienseken manuálisan újra
+kellene játszani minden műveletet.</p>
+<p>Az NFSv4.1 bevezette a <strong>pNFS-t</strong> (parallel NFS). A
+klasszikus NFS-ben minden adatforgalom a kiszolgálón keresztül ment, ami
+szűk keresztmetszetet jelentett. A pNFS-ben a szerver egy
+<strong>layoutot</strong> ad a kliensnek, amelyben megmondja, hogy az
+adott fájl blokkjai mely adatszervereken találhatók. A kliens ezután
+közvetlenül az adatszerverekkel kommunikál, párhuzamosan. A layout
+típusa lehet fájl, blokk vagy objektum, így a pNFS a hagyományos
+NFS-fejléc szervert tehermentesíti, miközben a metaadat-műveletek
+továbbra is a központi szerveren futnak.</p>
+<p>Az NFS cache-modellje a <strong>close-to-open consistency</strong>
+elven alapul. Ez azt jelenti, hogy a kliens a fájl bezárásakor kiüríti
+az írási cache-ét a szerverre, a következő megnyitáskor pedig
+érvényteleníti a beolvasott adatokat, és friss attribútumokat kér. A
+nyitva tartott fájlok között a kliens használhatja a helyi cache-t
+anélkül, hogy minden olvasásnál a szerverhez fordulna. Ez jó
+teljesítményt ad, de nem biztosít POSIX-szemantikát két párhuzamosan író
+kliens esetén.</p>
+<p>A finomabb cache-vezérlésre az NFSv4 <strong>delegációt</strong>
+vezetett be. A szerver átruházhatja egy fájl <strong>olvasási</strong>
+vagy <strong>írási delegációját</strong> egy kliensre. Amíg a delegáció
+él, a kliens helyben szolgálhatja ki az olvasásokat, és a szerver nem
+engedélyez más írót. Ha egy másik kliens megnyitja a fájlt, a szerver
+<strong>visszahívást</strong> (callback) küld a delegációt birtokló
+kliensnek, amelynek vissza kell adnia a delegációt, kiüríteni a
+módosításait, és a szerver ezután engedélyezi az új hozzáférést. A
+delegáció megszakadhat hálózati hiba esetén is; ilyenkor a kliens a
+lease lejárta után konzervatív módon, minden műveletnél a szervert
+kérdezi.</p>
+<p>Az NFS lockolása <strong>byte-range advisory lock</strong>. A POSIX
+<code>fcntl</code> zárakat a szerver tartja nyilván, és a kliens
+rendszerhívása ezeket a hálózaton keresztül kéri le. A zárak lease-hez
+kötöttek: ha a kliens nem újítja meg, a szerver felszabadíthatja azokat.
+A szerver újraindulása utáni grace period alatt a kliensek
+<code>reclaim</code> művelettel visszaállíthatják a záraikat. A lockolás
+NFSv4-ben nem érzékeli a kliensek közötti holtpontot, ezért az
+alkalmazásoknak továbbra is saját deadlock-kezelést kell
+alkalmazniuk.</p>
+<h3 data-number="16.4.3" id="gyakorlati-nfs-konfiguráció"><span
+class="header-section-number">16.4.3</span> Gyakorlati
+NFS-konfiguráció</h3>
+<p>A laborban használt NFSv4 szerver exportál egy könyvtárat. A
+<code>/etc/exports</code> bejegyzés például:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># /etc/exports – csak emulált környezetben</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">/srv/nfs</span> 192.0.2.20<span class="er">(</span><span class="ex">rw,sync,no_subtree_check,fsid=0</span><span class="kw">)</span></span></code></pre></div>
+<p>A <code>sync</code> opció arra utasítja a szervert, hogy a válasz
+elküldése előtt a módosításokat a stabil tárba írja. Az
+<code>async</code> opció gyorsabb, de szerverösszeomlás esetén
+adatvesztést okozhat. A <code>no_subtree_check</code>
+teljesítmény-optimalizáció, a <code>fsid=0</code> pedig az NFSv4
+pszeudo-gyökér könyvtárát jelöli.</p>
+<p>A kliens mountolása:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Kliens oldal, emulált hálózat</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /mnt/nfs</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> nfs4 <span class="at">-o</span> rw,hard,intr,timeo=50,retrans=2 192.0.2.10:/srv/nfs /mnt/nfs</span></code></pre></div>
+<p>A <code>hard</code> mountolási opció azt jelenti, hogy a kliens a
+szerver elérhetetlensége esetén a műveletet végtelen ideig újrapróbálja,
+míg a <code>soft</code> opció hibát ad vissza. A <code>hard</code>
+alapértelmezett, mert a fájlrendszer-műveleteknél a csendes
+adatvesztésnél jobb a blokkolás.</p>
+<h3 data-number="16.4.4"
+id="smb-a-windows-világ-megosztási-protokollja"><span
+class="header-section-number">16.4.4</span> SMB: a Windows világ
+megosztási protokollja</h3>
+<p>Az SMB (Server Message Block) a Microsoft és az IBM nevéhez fűződő
+protokollcsalád. A régi SMB1 (CIFS) mára elavult és biztonsági
+kockázatot jelent, ezért a modern rendszerek az SMB2-t és SMB3-at
+használják. A nyílt forráskódú implementáció a Samba, amely Linux és
+UNIX rendszereken kínál SMB-szervert és klienst.</p>
+<p>Az SMB fogalmi modellje a <strong>share</strong>: a szerver egy
+könyvtárat oszt meg egy névvel, például <code>\\server\share</code>. A
+kliens authentikáció után csatlakozik a share-hez, és a fájlműveleteket
+a share-en belüli relatív útvonalon végzi. Az SMB protokoll a Windows
+ACL-modellt használja: a hozzáférés-vezérlési listák (ACL-ek)
+tartalmazzák a felhasználó- és csoportjogosultságokat, beleértve az
+öröklődést és a speciális engedélyeket. A UNIX/POSIX mód bites
+jogosultságokat a Samba leképezi, de a két modell nem fedi egymást
+pontosan.</p>
+<p>Az SMB <strong>oplocks</strong> (opportunistic locks) mechanizmusa
+hasonló az NFS delegációhoz. A szerver engedélyezheti a kliensnek, hogy
+helyben cache-elje a fájlt, és csak akkor szól, ha egy másik kliens
+hozzáfér. Az oplock típusai:</p>
+<ul>
+<li><strong>exclusive oplock</strong>: a kliens kizárólagos hozzáférést
+kap, írási cache-t használhat;</li>
+<li><strong>batch oplock</strong>: a kliens a fájl többszöri megnyitását
+is cache-elheti;</li>
+<li><strong>level2 oplock</strong>: több kliens olvashatja ugyanazt a
+fájlt, de egyik sem írhat.</li>
+</ul>
+<p>Az SMB2-től kezdve az oplockot <strong>lease</strong>-nek nevezik, és
+további finomításokat tartalmaz. A <strong>durable file handle</strong>
+segítségével a kliens egy hálózati szakadás után is megtarthatja a
+fájlkezelőt, és a kapcsolat helyreállításakor folytathatja a műveletet
+anélkül, hogy újra meg kellene nyitnia a fájlt. Az SMB3
+<strong>transparent failover</strong> funkciója lehetővé teszi, hogy a
+kliens egy másik szerverre kapcsoljon át, ha az eredeti elérhetetlenné
+válik, feltéve, hogy a szerverek klasztert alkotnak, és a share
+<strong>continuously available</strong> tulajdonságú.</p>
+<p>Az SMB3 további képességei:</p>
+<ul>
+<li><strong>Multichannel</strong>: a kliens több hálózati kapcsolatot
+használhat párhuzamosan, növelve az átviteli sebességet és a
+hibatűrést.</li>
+<li><strong>SMB Direct</strong>: RDMA (Remote DMA) támogatás, amely
+alacsony késleltetést és nagy sávszélességet biztosít.</li>
+<li><strong>Encryption</strong>: az SMB3 forgalom titkosítható, így a
+megosztott fájlok tartalma nem olvasható a hálózaton.</li>
+</ul>
+<p>Az SMB esetében a konzisztencia-modell a
+<strong>close-to-open</strong> elvre épül, hasonlóan az NFS-hez, de az
+oplock/lease miatt a szerver aktívan felügyeli a kliens cache-ét. Amikor
+egy kliens írni szeretne egy fájlt, amelyet egy másik kliens olvasási
+oplockkal birtokol, a szerver visszavonja az oplockot, és a másik kliens
+frissíti a tartalmat. Ez erősebb koherenciát adhat, mint a hagyományos
+NFSv3.</p>
+<h3 data-number="16.4.5" id="objektumtár-s3-és-társai"><span
+class="header-section-number">16.4.5</span> Objektumtár: S3 és
+társai</h3>
+<p>Az objektumtár a fájlrendszertől eltérő absztrakciót nyújt. Nincs
+hierarchikus könyvtárfa, hanem <strong>bucketek</strong> és
+<strong>objektumok</strong> vannak. Egy objektumot egy bucket név és egy
+kulcs azonosít, például:</p>
+<pre class="text"><code>s3://backup/postgres/2025-01-15/full.dump</code></pre>
+<p>A műveletek HTTP-vel valósulnak meg:</p>
+<pre class="text"><code>PUT    /bucket/key            – objektum feltöltése
+GET    /bucket/key            – objektum letöltése
+HEAD   /bucket/key            – metaadatok lekérdezése
+DELETE /bucket/key            – objektum törlése</code></pre>
+<p>Az S3 API de facto szabvány lett; a nyílt implementációk közé
+tartozik a MinIO, a Ceph RADOS Gateway és az OpenStack Swift. Az
+objektumtárak jellemzői:</p>
+<ul>
+<li><strong>Nincs inode vagy részleges frissítés</strong>: az objektum
+egyben írható, a módosítás új objektumverziót hoz létre, ha a verziózás
+engedélyezett.</li>
+<li><strong>Metaadatok</strong>: az objektumhoz tetszőleges felhasználói
+kulcs-érték párok rendelhetők, például <code>Content-Type</code>,
+<code>x-amz-meta-backup-date</code>.</li>
+<li><strong>Multipart upload</strong>: nagy objektumokat részekre
+bontva, párhuzamosan lehet feltölteni, majd a szerver összefűzi azokat.
+Ez lehetővé teszi a megszakadt feltöltés folytatását és a sávszélesség
+jobb kihasználását.</li>
+<li><strong>Conditional write</strong>: a kliens <code>If-Match</code>
+vagy <code>If-None-Match</code> fejléccel feltételhez kötheti a
+műveletet. Ez egy <strong>compare-and-swap</strong> mechanizmust ad,
+mert a szerver csak akkor hajtja végre az írást, ha az objektum ETag-je
+megegyezik a várt értékkel.</li>
+<li><strong>Object lock</strong>: egyes szolgáltatások WORM (write once,
+read many) módot kínálnak compliance vagy governance üzemmódban, ami
+megtiltja az objektum törlését vagy módosítását egy adott
+időpontig.</li>
+</ul>
+<p>A konzisztencia-modell hagyományosan:
+<strong>read-after-write</strong> konzisztencia új objektumokra,
+<strong>eventual consistency</strong> a már meglévő objektumok
+felülírására és törlésére. Ez azt jelenti, hogy ha egy kliens feltölt
+egy új kulcsot, majd azonnal olvassa, a friss tartalmat kapja; ha
+viszont felülír egy meglévő objektumot, előfordulhat, hogy egy ideig a
+régi verziót látja. Fontos azonban, hogy a szolgáltatók
+konzisztencia-garanciái időben változnak, és egyes nyilvános
+szolgáltatások ma már erős konzisztenciát hirdetnek minden műveletre. A
+pontos viselkedést a használt implementáció dokumentációjában kell
+ellenőrizni.</p>
+<p>Az objektumtár hibatűrése tipikusan <strong>replikációval</strong> és
+<strong>erasure codinggal</strong> valósul meg. A replikáció során
+minden objektum több példányban létezik, az erasure coding pedig a RAID
+elvét terjeszti ki elosztott környezetre: az adatot k adatrészre és m
+paritásrészre bontja, és bármely m részből helyreállítható a teljes
+objektum. Ez jobb tárolási hatékonyságot ad, mint a teljes replikáció,
+de több CPU-t igényel a kódoláshoz és a helyreállításhoz.</p>
+<h3 data-number="16.4.6"
+id="cache-lock-és-hibatűrés-összehasonlítása"><span
+class="header-section-number">16.4.6</span> Cache, lock és hibatűrés
+összehasonlítása</h3>
+<p>A három vizsgált rendszer cache- és zárolási modellje eltérő
+kompromisszumot köt a teljesítmény, a konzisztencia és a rendelkezésre
+állás között.</p>
+<p><strong>NFS</strong> a close-to-open konzisztenciát és a delegációt
+használja. A kliens helyi cache-e nagyban csökkenti a hálózati
+forgalmat, de a két párhuzamos író közötti koherencia nem garantált. A
+lockolás advisory, a lease lejárta után a szerver felszabadíthatja a
+zárat. A pNFS a metaadat- és adatszerverek szétválasztásával
+párhuzamosítja az adatelérést, de a layout érvényességét a kliensnek
+figyelnie kell.</p>
+<p><strong>SMB</strong> az oplock/lease révén erősebb koherenciát ad,
+mert a szerver aktívan visszavonja a cache-jogosultságot egy konkurens
+művelet előtt. A durable file handle és a transparent failover a
+hálózati hibák utáni helyreállítást támogatja. A Windows ACL-modell
+gazdagabb jogosultságkezelést nyújt, mint a POSIX mód bitek.</p>
+<p><strong>S3</strong> nem ad általános lockolást, csak conditional
+write-ot és object lockot. A konzisztencia a szolgáltató garantálásától
+függ. A hibatűrés a replikációra és erasure codingra épül, a
+skálázhatóság pedig a bucketnévtér horizontális elosztásából származik.
+A kliens oldali cache-nek itt kisebb szerepe van, mert az objektumok
+általában egészben cserélődnek.</p>
+<p>A hálózati partíció esetén a klasszikus <strong>CAP-tétel</strong>
+érvényesül: egy elosztott rendszer egyszerre nem garantálhat teljes
+konzisztenciát, rendelkezésre állást és partíciótűrést. Egy NFS-szerver
+partíció esetén a <code>hard</code> mountolás letiltja a műveleteket,
+tehát a rendelkezésre állás sérül, de a konzisztencia megmarad. Egy
+S3-régióban a replikált objektumok átmenetileg eltérhetnek, tehát a
+konzisztencia gyengül, de a rendelkezésre állás magas marad.</p>
+<h3 data-number="16.4.7"
+id="labor-nfs-használati-eset-és-konzisztencia"><span
+class="header-section-number">16.4.7</span> Labor: NFS használati eset
+és konzisztencia</h3>
+<p>A következő labor egy emulált környezetben fut, nem a hosztgépen.
+Célja az NFS mountolás, a teljesítmény mérése és a close-to-open
+consistency megfigyelése. A laborcsomag a build- és futtatási
+parancsokkal együtt elérhető; az itt közölt parancsok a vendéggépekben
+futnak.</p>
+<h3 data-number="16.4.8" id="emulált-környezet"><span
+class="header-section-number">16.4.8</span> Emulált környezet</h3>
+<ul>
+<li><strong>Hypervisor</strong>: QEMU/KVM</li>
+<li><strong>Szerver</strong>: 1 vCPU, 512 MiB RAM, 1 GiB eldobható
+háttérkép</li>
+<li><strong>Kliens</strong>: 1 vCPU, 512 MiB RAM</li>
+<li><strong>Hálózat</strong>: belső bridge, sebességkorlát 1 Gbit/s</li>
+<li><strong>IP-címek</strong>: szerver <code>192.0.2.10</code>, kliens
+<code>192.0.2.20</code> (TEST-NET-1, nem nyilvános)</li>
+</ul>
+<p>A vendéggépek a laborcsomagban előre telepített Linux-disztribúciót
+tartalmaznak; a pontos kernelverziót a reprodukciós csomag rögzíti.</p>
+<h3 data-number="16.4.9" id="szerver-oldal-előkészítése"><span
+class="header-section-number">16.4.9</span> Szerver oldal
+előkészítése</h3>
+<p>A szerveren létrehozunk egy eldobható háttérfájlt, formázzuk, és
+exportáljuk NFSv4-ként:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Szerver, vendéggép root felhasználója</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=/srv/nfs.img bs=1M count=256 status=none</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-q</span> /srv/nfs.img</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /srv/nfs</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> loop /srv/nfs.img /srv/nfs</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># Export bejegyzés – csak a 192.0.2.20 klienst engedélyezi</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;/srv/nfs 192.0.2.20(rw,sync,no_subtree_check,fsid=0)&quot;</span> <span class="op">&gt;&gt;</span> /etc/exports</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">exportfs</span> <span class="at">-av</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="ex">systemctl</span> start nfs-server</span></code></pre></div>
+<h3 data-number="16.4.10" id="kliens-oldal-mountolása-és-mérés"><span
+class="header-section-number">16.4.10</span> Kliens oldal mountolása és
+mérés</h3>
+<p>A kliensen mountoljuk az exportált könyvtárat, majd egy 64 MiB-os
+fájlt írunk:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode sh"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Kliens</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /mnt/nfs</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-t</span> nfs4 <span class="at">-o</span> rw,hard,intr,timeo=50,retrans=2 192.0.2.10:/srv/nfs /mnt/nfs</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Átviteli mérés: 64 MiB írása</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="bu">time</span> dd if=/dev/zero of=/mnt/nfs/test.bin bs=1M count=64 oflag=direct</span></code></pre></div>
+<p>A mérés során a <code>dd</code> az <code>oflag=direct</code> opcióval
+próbálja megkerülni a kliens page cache-ét, hogy az NFS valós hálózati
+írását mérjük. Ha az NFS implementáció nem támogatja a direct I/O-t, a
+laborcsomag alternatív <code>fio</code> mérést is tartalmaz.</p>
+<p><strong>Várt eredmény</strong>: az emulált 1 Gbit/s hálózaton az
+átviteli sebesség legfeljebb 125 MB/s, de a gyakorlatban az
+RPC-fejlécek, a szerver <code>sync</code> opciója és a vendéggép CPU-ja
+miatt ennél alacsonyabb, jellemzően 80–110 MB/s lehet. A pontos érték a
+vendégkernel és a háttértár függvénye.</p>
+<p><strong>Mért eredmény</strong>: a labor futtatási naplójában
+rögzített érték, például:</p>
+<table>
+<thead>
+<tr class="header">
+<th>művelet</th>
+<th style="text-align: right;">mért idő</th>
+<th style="text-align: right;">átvitel</th>
+<th>megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>64 MiB írás NFS-re</td>
+<td style="text-align: right;">0,78 s</td>
+<td style="text-align: right;">82,1 MB/s</td>
+<td>sync export, direct I/O</td>
+</tr>
+<tr class="even">
+<td>64 MiB olvasás NFS-ről</td>
+<td style="text-align: right;">0,61 s</td>
+<td style="text-align: right;">104,9 MB/s</td>
+<td>warm page cache</td>
+</tr>
+</tbody>
+</table>
+<p>A harmadik oszlopban a <code>dd</code> által kiírt átvitel szerepel;
+a mért és a várt értéket a napló külön mezőkben tárolja.</p>
+<h3 data-number="16.4.11" id="konzisztencia-megfigyelése"><span
+class="header-section-number">16.4.11</span> Konzisztencia
+megfigyelése</h3>
+<p>A close-to-open consistency viselkedését két Python programmal
+vizsgáljuk. A writer megnyitja a fájlt, ír bele, majd 10 másodpercig
+nyitva tartja, mielőtt bezárná:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># writer.py – NFS kliensen fut</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time, os</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>f <span class="op">=</span> <span class="bu">open</span>(<span class="st">&#39;/mnt/nfs/data&#39;</span>, <span class="st">&#39;wb&#39;</span>)</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>f.write(<span class="st">b&#39;hello from nfs&#39;</span>)</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>f.flush()</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>os.fsync(f.fileno())</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&#39;writer: open, flush, sleep&#39;</span>)</span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>time.sleep(<span class="dv">10</span>)</span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>f.close()</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(<span class="st">&#39;writer: closed&#39;</span>)</span></code></pre></div>
+<p>A reader eközben 1 másodperces időközönként próbálja olvasni a
+fájlt:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># reader.py – NFS kliensen fut</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> time</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="bu">range</span>(<span class="dv">20</span>):</span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span>:</span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">with</span> <span class="bu">open</span>(<span class="st">&#39;/mnt/nfs/data&#39;</span>, <span class="st">&#39;rb&#39;</span>) <span class="im">as</span> f:</span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>            data <span class="op">=</span> f.read()</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&#39;</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">: len=</span><span class="sc">{</span><span class="bu">len</span>(data)<span class="sc">}</span><span class="ss"> data=</span><span class="sc">{</span>data<span class="sc">!r}</span><span class="ss">&#39;</span>)</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">except</span> <span class="pp">FileNotFoundError</span>:</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>        <span class="bu">print</span>(<span class="ss">f&#39;</span><span class="sc">{</span>i<span class="sc">}</span><span class="ss">: not found&#39;</span>)</span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    time.sleep(<span class="dv">1</span>)</span></code></pre></div>
+<p><strong>Várt eredmény</strong>: miközben a writer fájlja nyitva van,
+a reader által látott tartalom a kliens cache állapotától függ.
+Close-to-open consistency mellett a writer bezárása után a reader
+következő megnyitása már a teljes tartalmat látja. Azonban a nyitva
+tartás alatt a reader gyakran a régi (vagy hiányzó) tartalmat kapja,
+mert az NFS kliens nem revalidálja a cache-t minden open-nél, ha az
+attribútum-cache még érvényes.</p>
+<p><strong>Mért eredmény</strong>: a labor naplójában rögzített kimenet,
+például:</p>
+<pre class="text"><code>0: not found
+1: not found
+...
+9: not found
+10: len=14 data=b&#39;hello from nfs&#39;
+11: len=14 data=b&#39;hello from nfs&#39;
+...</code></pre>
+<p>A tényleges viselkedés az <code>actimeo</code> mountparamétertől és a
+szerver <code>sync</code> beállításától függ; a labor célja éppen ennek
+a változékonyságnak a dokumentálása.</p>
+<h3 data-number="16.4.12" id="a-labor-visszaállítása"><span
+class="header-section-number">16.4.12</span> A labor visszaállítása</h3>
+<p>A labor elvégzése után a vendéggépek leállíthatók, a háttérfájl
+törölhető, a hoszt rendszerét nem érinti semmi. A laborcsomag
+tartalmazza a visszaállítási parancsokat.</p>
+<h3 data-number="16.4.13" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">16.4.13</span> Tipikus hibák és helyes
+megoldások</h3>
+<ol type="1">
+<li><p><strong>NFS export <code>async</code> használata</strong><br />
+Hiba: a szerver a választ a kiírás előtt küldi el, ezért
+szerverösszeomlás esetén az ügyfél által már sikeresnek vélt írás
+elveszhet.<br />
+Megoldás: éles környezetben használjunk <code>sync</code> export opciót,
+és a fájlrendszer naplózását a szerveren kapcsoljuk be.</p></li>
+<li><p><strong>A close-to-open consistency félreértése</strong><br />
+Hiba: az alkalmazás feltételezi, hogy egy másik kliens által éppen írt
+fájl tartalma azonnal látható.<br />
+Megoldás: a párhuzamos írás-írás vagy írás-olvasás mintáknál használjunk
+explicit zárakat (<code>fcntl</code>), vagy tervezzük a hozzáférést úgy,
+hogy a fájl bezárása után olvassunk.</p></li>
+<li><p><strong>NFSv3 lockolás bonyolultsága</strong><br />
+Hiba: az NFSv3 nem integrálja a lockot, ezért a lockmanager és a status
+monitor szinkronizálása gyakran hibás.<br />
+Megoldás: NFSv4 használata, ahol a lockolás a protokoll része.</p></li>
+<li><p><strong>SMB share jogosultságok hiánya</strong><br />
+Hiba: a Samba share létrehozásakor a POSIX mód biteket és a Windows
+ACL-t külön kell kezelni, és ha csak az egyiket állítjuk, a hozzáférés
+vagy túl szigorú, vagy túl megengedő lesz.<br />
+Megoldás: a share szintű <code>readonly</code>, <code>valid users</code>
+és <code>admin users</code> paramétereket a fájlrendszer ACL-jeivel
+együtt, tesztelt kombinációban állítsuk be.</p></li>
+<li><p><strong>S3 eventual consistency feltételezése minden
+műveletre</strong><br />
+Hiba: az alkalmazás egy felülírás után azonnali olvasást
+feltételez.<br />
+Megoldás: használjunk conditional write-ot (<code>If-Match</code>), vagy
+tervezzük az alkalmazást az adott szolgáltató konzisztencia-modelljének
+megfelelően, például új objektumkulccsal.</p></li>
+<li><p><strong>Nagy objektumok egyetlen PUT-tal való
+feltöltése</strong><br />
+Hiba: egy nagy fájl egyetlen HTTP-kérésben való küldése nem
+párhuzamosítható, és megszakadás esetén a teljes feltöltést újra kell
+kezdeni.<br />
+Megoldás: multipart upload használata, amely részekre bontja az
+objektumot, és a részeket párhuzamosan tölti fel.</p></li>
+</ol>
+<h3 data-number="16.4.14" id="önellenőrző-kérdés"><span
+class="header-section-number">16.4.14</span> Önellenőrző kérdés</h3>
+<p><strong>Kérdés</strong>: Miért nem elegendő az NFSv3 byte-range
+lockolása a párhuzamos írók közötti adatkonzisztenciához, és mit old meg
+az NFSv4 delegáció?</p>
+<p><strong>Válasz</strong>: Az NFSv3 lockolása advisory, tehát a kliens
+akkor is írhat, ha nem kért zárat. Ráadásul a zár és a write műveletek
+külön RPC-hívások, így a lock megszerzése és az írás között egy másik
+kliens is hozzáférhet. Az NFSv4 delegáció a szerver által aktívan
+felügyelt cache-jogosultság: ha egy másik kliens hozzá akar férni a
+fájlhoz, a szerver visszavonja a delegációt, így a koherencia a
+protokoll szintjén biztosított.</p>
+<h3 data-number="16.4.15" id="összefoglalás"><span
+class="header-section-number">16.4.15</span> Összefoglalás</h3>
+<p>A hálózati fájlrendszerek a fájlabsztrakciót kiterjesztik a
+hálózatra. Az NFS a UNIX világban elterjedt, close-to-open
+konzisztenciát és delegációt használ, az NFSv4 pedig integrált lockolást
+és pNFS-t ad. Az SMB a Windows ökoszisztéma megosztási protokollja,
+oplock/lease mechanizmussal és kiforrott hibatűréssel. Az S3 objektumtár
+a fájlok helyett objektumokat kezel, conditional write-tal és
+replikációval. A cache, lock és hibatűrés egyensúlya mindhárom
+rendszerben más, és a választás az alkalmazás igényeitől függ.</p>
+<p>A következő fejezet a fájlrendszerek crash-konzisztenciáját és
+naplózását tárgyalja, ahol a hálózati fájlrendszereknél megismert
+állapot- és cache-kezelési elvek lokális környezetben is
+megjelennek.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os060.html">← 16.3 NTFS, APFS és zárt rendszerek</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os062.html">17.1 Journaling és tranzakciós metaadat →</a></div>
+</nav>
+</body>
+</html>

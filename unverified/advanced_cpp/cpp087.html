@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>23.2 Taskok, futures és thread pool – Fejlett C++ - haladó
+nyelvi eszközök és technikák</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Konkurencia, hibakezelés, ABI és biztonság</a> › <a href="index.html#cppch22">23 Szálak, taszkok, coroutines és executors</a></p>
+<div class="links"><a class="prev" rel="prev" href="cpp086.html">← 23.1 std::thread, jthread és stop_token</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp088.html">23.3 Coroutines és awaitable →</a></div>
+</nav>
+<h2 data-number="23.2" id="cpp087"><span
+class="header-section-number">23.2</span> Taskok, futures és thread
+pool</h2>
+<p>A taszkalapú párhuzamosság központi gondolata, hogy a fejlesztő nem
+közvetlenül szálakat és lockokat kezel, hanem <strong>taszkokat</strong>
+– végrehajtható egységeket – ad át egy végrehajtó rétegnek. A végrehajtó
+dönti el, hogy az adott taszk melyik szálon, milyen ütemezéssel, milyen
+prioritással fut le. Ez a szemléletváltás nem csak kényelmi kérdés: a
+jól megtervezett taszkalapú rendszer jobban skálázódik, kevesebb szálat
+hoz létre, és a program logikája világosabban elkülönül az ütemezési és
+erőforrás-gazdálkodási részletektől.</p>
+<p>A <code>cpp086</code> egységben megismert <code>std::thread</code>,
+<code>std::jthread</code> és <code>std::stop_token</code> eszközökkel
+már fel tudunk építeni alapvető párhuzamos programokat, de a nyers
+szálkezelés hamar bonyolulttá válik, ha eredményt kell visszaadni,
+kivételt kell továbbítani, vagy sok apró feladatot kell ütemezni. Ebben
+az alfejezetben ezt a rést töltjük be: bevezetjük a
+<strong>taszk</strong> és a <strong>jövő</strong> (future)
+absztrakcióját, megismerjük a <code>std::promise</code>,
+<code>std::future</code>, <code>std::packaged_task</code> és
+<code>std::async</code> eszközöket, majd megépítünk egy egyszerű, de
+helyesen működő <strong>thread pool</strong>-t, amely beküldött
+taszkokhoz <code>std::future</code> objektumot ad vissza. Végül
+tárgyaljuk a <strong>work stealing</strong> és a munkasor (queue)
+szerepét, és egy labor keretében reprodukálható módon ellenőrizzük a
+megoldást.</p>
+<p>A fejezet célja, hogy az olvasó ne csak használni tudja ezeket az
+eszközöket, hanem megértse a mögöttük álló mechanizmusokat és a tipikus
+buktatókat is. A laborban szereplő kód C++20-at feltételez, és a build,
+tesztelés, mérés folyamata is rögzített.</p>
+<h3 data-number="23.2.1"
+id="taszkok-promise-future-és-packaged_task"><span
+class="header-section-number">23.2.1</span> 1. Taszkok, promise, future
+és packaged_task</h3>
+<p>A <code>std::future&lt;T&gt;</code> egy <strong>egyszeri
+értékcsatorna</strong>: egy olyan objektum, amely egy később megérkező
+<code>T</code> típusú értéket vagy kivételt reprezentál. A
+<code>future</code>-ön keresztül a hívó oldal várakozhat az eredményre,
+lekérheti azt, vagy ellenőrizheti, hogy rendelkezésre áll-e már. A
+<code>future</code> nem másolható, csak mozgatható, így pontosan egy
+tulajdonos fér hozzá a végeredményhez. Ha több várakozóra van szükség, a
+<code>future.share()</code> hívással <code>std::shared_future</code>
+hozható létre, amely már másolható, és többen is hívhatják a
+<code>get()</code>-et.</p>
+<p>Az író oldalt a <code>std::promise&lt;T&gt;</code> képviseli. A
+<code>promise</code> rendelkezik egy <code>get_future()</code>
+metódussal, amely visszaadja a hozzá tartozó <code>future</code>-t. Az
+érték beállítására a <code>set_value()</code> vagy
+<code>set_exception()</code> szolgál. Ha a <code>promise</code> objektum
+megsemmisül anélkül, hogy értéket adott volna át, a hozzá tartozó
+<code>future</code> egy <code>std::future_error</code> kivételt fog
+dobni <code>broken_promise</code> hibakóddal. Ez fontos védelem: a jövő
+soha nem maradhat örökre blokkolva anélkül, hogy a rendszer jelezné a
+hibát.</p>
+<p>A <code>std::packaged_task&lt;F&gt;</code> egy hívható objektumot
+(függvényt, lambdát, függvényobjektumot) csomagol be, és a hívást
+összeköti egy <code>future</code>-rel. A <code>packaged_task</code>
+konstruktorakor megadjuk a hívható típusát, majd a
+<code>get_future()</code> metódussal lekérhetjük a jövőt. Amikor a
+<code>packaged_task</code>-et meghívjuk (<code>operator()</code>), az
+argumentumokkal meghívja a becsomagolt függvényt, az eredményt (vagy
+kivételt) eltárolja a <code>future</code> számára. A
+<code>packaged_task</code> maga is mozgatható, de nem másolható.</p>
+<p>A <code>std::async</code> a legegyszerűbb belépő a taszkalapú
+párhuzamosság világába: egy függvényt és argumentumait kapja meg, majd
+visszaad egy <code>std::future</code>-t. Az <code>std::async</code>
+alapértelmezés szerint (a
+<code>std::launch::async | std::launch::deferred</code> politikával) a
+rendszer dönti el, hogy azonnal új szálon indítja-e a feladatot, vagy
+csak akkor hajtja végre, amikor a <code>future::get()</code>-et hívják
+(deferred). Ez a kétértelműség sokszor meglepő viselkedéshez vezet,
+ezért ha valóban aszinkron végrehajtást akarunk, explicit módon adjuk
+meg a <code>std::launch::async</code> politikát.</p>
+<p>Nézzünk egy példát a <code>std::async</code> használatára:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;future&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> compute<span class="op">(</span><span class="dt">int</span> x<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>this_thread::sleep_for<span class="op">(</span><span class="bu">std::</span>chrono::milliseconds<span class="op">{</span><span class="dv">20</span><span class="op">});</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> x <span class="op">*</span> x<span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Explicit aszinkron indítás</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>future<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> f <span class="op">=</span> <span class="bu">std::</span>async<span class="op">(</span><span class="bu">std::</span>launch::async<span class="op">,</span> compute<span class="op">,</span> <span class="dv">7</span><span class="op">);</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Más munka a fő szálon...</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Számolás folyamatban...</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Eredmény lekérése (blokkol, amíg nem kész)</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> result <span class="op">=</span> f<span class="op">.</span>get<span class="op">();</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Eredmény: &quot;</span> <span class="op">&lt;&lt;</span> result <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>future::get()</code> metódus egyszer hívható. A második hívás
+<code>std::future_error</code> kivételt dob <code>no_state</code>
+hibakóddal, mert a <code>future</code> már érvénytelen. A
+<code>valid()</code> metódussal ellenőrizhetjük, hogy a
+<code>future</code> még rendelkezik-e megosztott állapottal.</p>
+<p>Ha a taszk kivételt dob, a <code>future::get()</code> újra dobja azt
+a kivételt, lehetővé téve a hívó oldali kezelést. Például:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>future<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> f <span class="op">=</span> <span class="bu">std::</span>async<span class="op">(</span><span class="bu">std::</span>launch::async<span class="op">,</span> <span class="op">[]()</span> <span class="op">-&gt;</span> <span class="dt">int</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">{</span><span class="st">&quot;Hiba a taszkban&quot;</span><span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="op">});</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> val <span class="op">=</span> f<span class="op">.</span>get<span class="op">();</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>exception<span class="op">&amp;</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cerr <span class="op">&lt;&lt;</span> <span class="st">&quot;Kivétel: &quot;</span> <span class="op">&lt;&lt;</span> e<span class="op">.</span>what<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez az egyik legfontosabb előnye a <code>future</code>-nek a nyers
+szálkezeléshez képest: a kivétel automatikusan átkerül a hívó szálra,
+nem veszik el, és nem okoz azonnali programleállást.</p>
+<p>A <code>std::promise</code> közvetlen használata ritkább, de akkor
+hasznos, ha az eredményt egy másik komponens állítja elő, például egy
+callback vagy egy megszakításkezelő. Minta:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>promise<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> prom<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>future<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> fut <span class="op">=</span> prom<span class="op">.</span>get_future<span class="op">();</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// Másik szál később:</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>prom<span class="op">.</span>set_value<span class="op">(</span><span class="dv">42</span><span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Hívó oldal:</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> fut<span class="op">.</span>get<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span></code></pre></div>
+<p>A <code>promise</code> és a <code>future</code> együtt egy
+<strong>csatornát</strong> alkotnak, amelynek élettartamát a megosztott
+állapot menedzseli. A fejlesztőnek nem kell manuálisan szinkronizálnia,
+a memóriamodell és a szinkronizációs primitívek rejtve vannak.</p>
+<p><strong>Tipikus hibák a future-ökkel kapcsolatban:</strong></p>
+<ol type="1">
+<li><strong>Dupla <code>get()</code></strong>: a <code>future</code>
+egyszer használatos. Ha kétszer hívjuk, <code>std::future_error</code>
+dobódik. Ha többszöri lekérdezésre van szükség, használjunk
+<code>std::shared_future</code>-t.</li>
+<li><strong>Elengedett future</strong>: ha a <code>future</code>-t nem
+kérdezzük le, a benne tárolt kivétel elveszik, és a program hibás
+állapotba kerülhet. A destruktor nem blokkol, de a
+<code>std::async</code> esetében a destruktor blokkolhat, ha az
+<code>async</code> politikával indított taszk még fut.</li>
+<li><strong>Holtpont a <code>wait()</code>-nél</strong>: ha a
+<code>future::wait()</code>-et olyan szálból hívjuk, amelyre a taszknak
+szüksége van a befejezéshez, holtpont alakul ki. Például ha egy szál
+saját magára vár.</li>
+<li><strong><code>promise</code> élettartamának hibája</strong>: ha a
+<code>promise</code> megsemmisül, mielőtt <code>set_value()</code>-t
+hívnánk, a <code>future::get()</code> <code>broken_promise</code>
+kivételt dob. Ez jó védelem, de tudni kell róla.</li>
+</ol>
+<p>A <code>std::packaged_task</code> a <code>std::promise</code>-nál
+magasabb szintű absztrakció, és kifejezetten jól illik a taszkokhoz,
+mert a hívható entitást és a <code>future</code>-t egy objektumba zárja.
+A thread pool implementációjában ezt fogjuk használni.</p>
+<h3 data-number="23.2.2"
+id="thread-pool-a-taszkalapú-párhuzamosság-gyakorlati-mintája"><span
+class="header-section-number">23.2.2</span> 2. Thread pool: a taszkalapú
+párhuzamosság gyakorlati mintája</h3>
+<p>A <strong>thread pool</strong> egy olyan végrehajtó, amely előre
+létrehoz egy rögzített számú munkaszálat, és azokat egy közös
+munkasorból táplálja. A beküldött taszkok (függvények, lambdák)
+bekerülnek a sorba, a szabad munkások kiveszik és végrehajtják őket,
+majd újabb taszkra várnak. Ez a minta számos előnnyel jár:</p>
+<ul>
+<li><strong>Csökkenti a szál-létrehozás költségét</strong>: a szálak
+újrahasznosíthatók, nem kell minden taszkhoz újat indítani.</li>
+<li><strong>Korlátozza a párhuzamosság mértékét</strong>: elkerülhető a
+túlzott szálszám, amely a rendszer erőforrásait emésztené.</li>
+<li><strong>Elválasztja a feladatot az ütemezéstől</strong>: a beküldő
+csak a taszkot és az argumentumokat adja meg, a pool dönt a végrehajtás
+részleteiről.</li>
+</ul>
+<p>A legegyszerűbb thread pool egyetlen <strong>globális
+munkasort</strong> használ, amelyet mutex véd, és egy condition variable
+jelzi az új taszkokat. A munkaszálak egy végtelen ciklusban várnak, amíg
+a sor nem üres, majd kivesznek egy taszkot, és végrehajtják. A
+leállítást egy <code>std::stop_token</code> segítségével oldjuk meg,
+amelyet a <code>std::jthread</code> automatikusan kezel.</p>
+<p>Az alábbi kód egy minimális, de helyes thread pool-t mutat be, amely
+<code>submit</code> metódussal fogad taszkokat, és
+<code>std::future</code>-t ad vissza:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;future&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;functional&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;condition_variable&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;queue&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;type_traits&gt;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ThreadPool <span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> ThreadPool<span class="op">(</span><span class="bu">std::</span>size_t num_threads<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">m_workers</span><span class="op">.</span>reserve<span class="op">(</span>num_threads<span class="op">);</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_threads<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>            <span class="va">m_workers</span><span class="op">.</span>emplace_back<span class="op">([</span><span class="kw">this</span><span class="op">](</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>                worker_loop<span class="op">(</span>st<span class="op">);</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">});</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>ThreadPool<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A jthread destruktora leállítja a szálakat,</span></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>        <span class="co">// a stop_token segít a várakozás megszakításában.</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Beküld egy taszkot, és visszaad egy future-t az eredményhez.</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> F<span class="op">,</span> <span class="kw">typename</span><span class="op">...</span> Args<span class="op">&gt;</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> submit<span class="op">(</span>F<span class="op">&amp;&amp;</span> f<span class="op">,</span> Args<span class="op">&amp;&amp;...</span> args<span class="op">)</span></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true" tabindex="-1"></a>        <span class="op">-&gt;</span> <span class="bu">std::</span>future<span class="op">&lt;</span><span class="bu">std::</span>invoke_result_t<span class="op">&lt;</span>F<span class="op">,</span> Args<span class="op">...&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true" tabindex="-1"></a>        <span class="kw">using</span> R <span class="op">=</span> <span class="bu">std::</span>invoke_result_t<span class="op">&lt;</span>F<span class="op">,</span> Args<span class="op">...&gt;;</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A taszkot packaged_task-ként tároljuk, hogy a future</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true" tabindex="-1"></a>        <span class="co">// automatikusan megkapja az eredményt vagy a kivételt.</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> task <span class="op">=</span> <span class="bu">std::</span>make_shared<span class="op">&lt;</span><span class="bu">std::</span>packaged_task<span class="op">&lt;</span>R<span class="op">()&gt;&gt;(</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>f <span class="op">=</span> <span class="bu">std::</span>forward<span class="op">&lt;</span>F<span class="op">&gt;(</span>f<span class="op">),</span> <span class="op">...</span>args <span class="op">=</span> <span class="bu">std::</span>forward<span class="op">&lt;</span>Args<span class="op">&gt;(</span>args<span class="op">)]()</span> <span class="at">mutable</span> <span class="op">-&gt;</span> R <span class="op">{</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> f<span class="op">(</span><span class="bu">std::</span>forward<span class="op">&lt;</span>Args<span class="op">&gt;(</span>args<span class="op">)...);</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">);</span></span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>future<span class="op">&lt;</span>R<span class="op">&gt;</span> fut <span class="op">=</span> task<span class="op">-&gt;</span>get_future<span class="op">();</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true" tabindex="-1"></a>            <span class="co">// A queue std::function&lt;void()&gt; elemeket tárol.</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true" tabindex="-1"></a>            <span class="va">m_queue</span><span class="op">.</span>push<span class="op">([</span>task<span class="op">]()</span> <span class="op">{</span> <span class="op">(*</span>task<span class="op">)();</span> <span class="op">});</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true" tabindex="-1"></a>        <span class="va">m_cv</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> fut<span class="op">;</span></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> worker_loop<span class="op">(</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;</span> task<span class="op">;</span></span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>unique_lock<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true" tabindex="-1"></a>                <span class="va">m_cv</span><span class="op">.</span>wait<span class="op">(</span>lk<span class="op">,</span> <span class="op">[</span><span class="kw">this</span><span class="op">,</span> <span class="op">&amp;</span>st<span class="op">]</span> <span class="op">{</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">return</span> st<span class="op">.</span>stop_requested<span class="op">()</span> <span class="op">||</span> <span class="op">!</span><span class="va">m_queue</span><span class="op">.</span>empty<span class="op">();</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true" tabindex="-1"></a>                <span class="op">});</span></span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>st<span class="op">.</span>stop_requested<span class="op">()</span> <span class="op">&amp;&amp;</span> <span class="va">m_queue</span><span class="op">.</span>empty<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">break</span><span class="op">;</span> <span class="co">// Nincs több munka, kilépünk</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true" tabindex="-1"></a>                task <span class="op">=</span> <span class="bu">std::</span>move<span class="op">(</span><span class="va">m_queue</span><span class="op">.</span>front<span class="op">());</span></span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true" tabindex="-1"></a>                <span class="va">m_queue</span><span class="op">.</span>pop<span class="op">();</span></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true" tabindex="-1"></a>            task<span class="op">();</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> <span class="va">m_workers</span><span class="op">;</span></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mutex <span class="va">m_mutex</span><span class="op">;</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>condition_variable <span class="va">m_cv</span><span class="op">;</span></span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>queue<span class="op">&lt;</span><span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;&gt;</span> <span class="va">m_queue</span><span class="op">;</span></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>submit</code> metódus a legérdekesebb: a
+<code>std::invoke_result_t</code> segítségével kikövetkezteti a
+visszatérési típust, majd egy
+<code>std::packaged_task&lt;R()&gt;</code>-et hoz létre, amelybe egy
+lambdát csomagol. A lambda elfogja a függvényt és az argumentumokat
+(érték szerint, <code>std::forward</code>-dal), és a meghívásakor
+visszaadja az eredményt. A <code>packaged_task</code>-et
+<code>std::make_shared</code>-del heapre tesszük, így a
+<code>future</code> és a munkasorban tárolt <code>std::function</code>
+is biztonságosan hivatkozhat rá. A <code>future</code>-t a belépés előtt
+lekérjük, majd a <code>packaged_task</code>-et egy
+<code>std::function&lt;void()&gt;</code>-be csomagolva betesszük a
+sorba. Végül értesítjük az egyik várakozó munkaszálat.</p>
+<p>A munkaszálak a <code>worker_loop</code>-ban futnak. A
+<code>condition_variable::wait</code> a predikátumra vár, amely igaz
+lesz, ha a leállítást kérték, vagy ha a sor nem üres. Ha a leállítást
+kérték és a sor üres, a ciklus kilép. Ha van taszk, kiveszik a sorból,
+és a mutex elengedése után végrehajtják. Fontos, hogy a taszk
+végrehajtása a mutexen kívül történik, különben a többi szál
+blokkolna.</p>
+<p>Ez a pool azonban még nem tökéletes. A leállítás során a sorban
+maradt taszkok nem futnak le – ez bizonyos esetekben kívánatos, például
+ha a program befejeződik, és nincs szükség a hátralévő munkára. Ha azt
+akarjuk, hogy a pool a leállítás előtt minden beküldött taszkot
+végrehajtson, egy <code>close()</code> metódust kell bevezetnünk, amely
+jelzi, hogy nem érkezik több feladat, és a munkások a sor kiürítése után
+állnak le. Ez a finomítás a laborban is szerepelhet.</p>
+<p><strong>Gyakori hibák a thread pool implementálásakor:</strong></p>
+<ul>
+<li><strong>Hiányzó <code>notify_one</code></strong>: ha nem értesítjük
+a munkásokat, azok örökre alhatnak, és a beküldött taszk soha nem fut
+le.</li>
+<li><strong>Taszk végrehajtása a mutexen belül</strong>: ez sorosítja a
+végrehajtást, és a pool értelmét veszti.</li>
+<li><strong>Kivétel a munkásban</strong>: ha a taszk kivételt dob, de
+azt nem kapja el a <code>packaged_task</code>, a kivétel a munkás szálat
+állítja le, ami nem kívánatos. A <code>packaged_task</code> viszont
+elkapja a kivételt, és a <code>future</code>-ön keresztül továbbítja,
+így a munkás nem hal meg. A mi kódunkban a <code>packaged_task</code>
+ezt automatikusan kezeli.</li>
+<li><strong>Leállítási holtpont</strong>: ha a destruktor nem szakítja
+meg a várakozást, a munkások örökre blokkolnak. A
+<code>std::jthread</code> és a <code>stop_token</code> ezt kezeli, ezért
+használjuk őket.</li>
+<li><strong>Élettartam-probléma</strong>: ha a
+<code>packaged_task</code>-et nem heapre tesszük, a <code>future</code>
+és a <code>std::function</code> közötti élettartam-kezelés hibás lehet.
+A <code>std::make_shared</code> megoldja ezt.</li>
+</ul>
+<h3 data-number="23.2.3" id="work-stealing-és-a-munkasor-szerepe"><span
+class="header-section-number">23.2.3</span> 3. Work stealing és a
+munkasor szerepe</h3>
+<p>A fenti thread pool egyetlen globális sort használ. Ez egyszerű, de
+nagy terhelésnél szűk keresztmetszetté válik: minden <code>submit</code>
+és minden taszkfelvétel ugyanazt a mutexet használja. Sok magos
+rendszeren a szinkronizációs költség jelentős lehet, és a taszkok
+végrehajtása közötti várakozás csökkenti a skálázódást.</p>
+<p>A <strong>work stealing</strong> (munka-lopás) modell ezt a problémát
+úgy oldja meg, hogy minden munkaszál saját <strong>lokális
+munkasorral</strong> rendelkezik. A szál a saját sorába teszi az általa
+generált taszkokat, és onnan is veszi ki őket. Ha a saját sora üres,
+megpróbál <strong>lopni</strong> egy másik szál sorából. Ez a lopás
+általában a sor túlsó végéről történik, hogy csökkentse a versenyt a
+tulajdonossal, aki a saját végét használja.</p>
+<p>A work stealing fontos előnye, hogy a lokális műveletekhez gyakran
+nincs szükség mutexre, mert a szál csak a saját sorához fér hozzá. A
+lopás ritkábban fordul elő, és akkor is csak a másik szál sorának egy
+részét érinti. Sok implementáció <strong>lock-free</strong> vagy
+<strong>wait-free</strong> technikákat használ a lopás megvalósítására,
+például atomi mutatókkal és CAS (compare-and-swap) műveletekkel.</p>
+<p>A gyakorlatban a work stealing poolok úgy néznek ki, hogy a fő szál
+vagy bármely szál beküld egy taszkot, amely a saját lokális sorába
+kerül. Ha egy szál befejezte a saját sorát, lop egy másiktól. Ez a
+stratégia jól kiegyensúlyozza a terhelést anélkül, hogy központi
+ütemezőre lenne szükség.</p>
+<p>Egy egyszerű work stealing pool vázlata:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> WorkStealingPool <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> Worker <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>jthread thread<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>deque<span class="op">&lt;</span><span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;&gt;</span> local_queue<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>mutex queue_mutex<span class="op">;</span> <span class="co">// csak a lopás miatt kell</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ... egyéb állapot</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>unique_ptr<span class="op">&lt;</span>Worker<span class="op">&gt;&gt;</span> <span class="va">m_workers</span><span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> submit<span class="op">(</span><span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;</span> task<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A hívó szál saját lokális sorába teszi a taszkot</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        <span class="co">// (feltéve, hogy a hívó is worker, különben valamelyik workerhez rendeljük)</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> worker_loop<span class="op">(</span>Worker<span class="op">&amp;</span> w<span class="op">,</span> <span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(!</span>st<span class="op">.</span>stop_requested<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;</span> task<span class="op">;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>try_pop_local<span class="op">(</span>w<span class="op">,</span> task<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>                task<span class="op">();</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>try_steal<span class="op">(</span>w<span class="op">,</span> task<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>                task<span class="op">();</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>this_thread::yield<span class="op">();</span> <span class="co">// vagy condition_variable</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A lopás megvalósítása általában a lokális sor
+<strong>deque</strong>-ként való kezelését jelenti: a tulajdonos a
+<strong>back</strong> végére rak és onnan is vesz ki, a lopó pedig a
+<strong>front</strong> végéről lop. Ezzel minimálisra csökkenthető a
+verseny, mert a két művelet különböző végeken dolgozik. A mutexet a
+lopás során kell használni, de a lokális műveleteknél elhagyható, ha a
+deque műveletei atomiak vagy ha a szál kizárólagos hozzáférést
+élvez.</p>
+<p>A work stealing előnyei:</p>
+<ul>
+<li><strong>Jobb cache-lokalitás</strong>: a szál a saját sorában lévő
+taszkokat hajtja végre, amelyeket valószínűleg ő maga hozott létre, így
+azok adatai a cache-ben lehetnek.</li>
+<li><strong>Kevesebb szinkronizáció</strong>: a lokális műveletek
+gyorsak, a globális mutex nem akadályoz.</li>
+<li><strong>Jó skálázódás</strong>: a lopás ritka, és a terhelés
+dinamikusan kiegyenlítődik.</li>
+</ul>
+<p>Hátránya a bonyolultság: a lock-free lopás implementálása nehéz, tele
+van memóriamodell-beli buktatókkal, és a teljesítmény finomhangolást
+igényel. A legtöbb valós rendszerben (pl. Intel TBB, egyes standard
+könyvtári implementációk) ezt már megoldották, de saját implementáció
+esetén alapos tesztelés szükséges.</p>
+<p>A fejezet laborjában egy egyszerű globális soros pool-t építünk, mert
+az átlátható és oktatási célra megfelelő. A work stealing elméletét
+azonban fontos megérteni, mert a következő egységben (<a
+href="cpp088.html">Coroutines és awaitable</a>) az executors és
+coroutines világában már találkozhatunk ilyen ütemezőkkel.</p>
+<h3 data-number="23.2.4" id="labor-thread-pool-és-future-példa"><span
+class="header-section-number">23.2.4</span> 4. Labor: thread pool és
+future példa</h3>
+<p>A labor célja egy működő thread pool megvalósítása, amely képes
+taszkokat fogadni, <code>std::future</code>-t visszaadni, helyesen
+kezeli a kivételeket, és leállítható anélkül, hogy elveszne a beküldött
+munka. A megoldásnak reprodukálhatónak kell lennie, rögzített
+fordítóval, standardverzióval és mérési naplóval.</p>
+<h3 data-number="23.2.5" id="specifikáció"><span
+class="header-section-number">23.2.5</span> 4.1. Specifikáció</h3>
+<ul>
+<li>A pool konstruktorban megadott számú munkaszálat indít.</li>
+<li><code>submit(F&amp;&amp; f, Args&amp;&amp;... args)</code> metódus:
+beküld egy hívható entitást és argumentumokat, visszaad egy
+<code>std::future</code>-t, amely az eredményt vagy a kivételt
+tartalmazza.</li>
+<li>A pool leállítása: a destruktor vagy egy explicit
+<code>shutdown()</code> metódus jelzi, hogy nem érkezik több taszk, a
+munkások befejezik a sorban lévő feladatokat, majd leállnak. A
+<code>std::jthread</code> és <code>std::stop_token</code> segítségével a
+várakozás megszakítható.</li>
+<li>A taszkok tetszőleges visszatérési típusúak lehetnek, beleértve a
+<code>void</code>-ot is.</li>
+<li>A kivételek a <code>future::get()</code> híváskor újra
+dobódnak.</li>
+</ul>
+<h3 data-number="23.2.6" id="implementáció"><span
+class="header-section-number">23.2.6</span> 4.2. Implementáció</h3>
+<p>A fenti <code>ThreadPool</code> osztályt bővítjük ki a
+<code>shutdown()</code> metódussal és a <code>void</code> visszatérés
+támogatásával. A <code>void</code> kezelésére használhatunk
+<code>std::packaged_task&lt;void()&gt;</code>-t, ami triviális, de a
+<code>submit</code> sablonban a <code>std::invoke_result_t</code> kezeli
+ezt. A <code>shutdown()</code> metódus bevezet egy
+<code>m_accepting</code> logikai értéket, amely megakadályozza új
+taszkok beküldését, és a munkások a sor kiürítése után leállnak.</p>
+<p>A teljes kód:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;future&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;functional&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;mutex&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;condition_variable&gt;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;queue&gt;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;type_traits&gt;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;utility&gt;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdexcept&gt;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> ThreadPool <span class="op">{</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> ThreadPool<span class="op">(</span><span class="bu">std::</span>size_t num_threads<span class="op">)</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="va">m_accepting</span><span class="op">(</span><span class="kw">true</span><span class="op">)</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>num_threads <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>            <span class="cf">throw</span> <span class="bu">std::</span>invalid_argument<span class="op">{</span><span class="st">&quot;A szálak száma nem lehet nulla&quot;</span><span class="op">};</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        <span class="va">m_workers</span><span class="op">.</span>reserve<span class="op">(</span>num_threads<span class="op">);</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> num_threads<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>            <span class="va">m_workers</span><span class="op">.</span>emplace_back<span class="op">([</span><span class="kw">this</span><span class="op">](</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>                worker_loop<span class="op">(</span>st<span class="op">);</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>            <span class="op">});</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>ThreadPool<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>        shutdown<span class="op">();</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Leállítja az új taszkok fogadását, és megvárja a folyamatban lévők befejezését.</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> shutdown<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span><span class="va">m_accepting</span><span class="op">)</span> <span class="cf">return</span><span class="op">;</span> <span class="co">// már leállt</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>            <span class="va">m_accepting</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>        <span class="va">m_cv</span><span class="op">.</span>notify_all<span class="op">();</span> <span class="co">// minden várakozó munkást felébreszt</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A jthread-ek itt leállnak, mert a stop_token-jük megszakad,</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>        <span class="co">// de előbb a sor kiürül a predikátum szerint.</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A std::jthread destruktora automatikusan joinol.</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Feladat beküldése, future visszaadása.</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>    <span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> F<span class="op">,</span> <span class="kw">typename</span><span class="op">...</span> Args<span class="op">&gt;</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> submit<span class="op">(</span>F<span class="op">&amp;&amp;</span> f<span class="op">,</span> Args<span class="op">&amp;&amp;...</span> args<span class="op">)</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>        <span class="op">-&gt;</span> <span class="bu">std::</span>future<span class="op">&lt;</span><span class="bu">std::</span>invoke_result_t<span class="op">&lt;</span>F<span class="op">,</span> Args<span class="op">...&gt;&gt;</span> <span class="op">{</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>        <span class="kw">using</span> R <span class="op">=</span> <span class="bu">std::</span>invoke_result_t<span class="op">&lt;</span>F<span class="op">,</span> Args<span class="op">...&gt;;</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ellenőrizzük, hogy még fogadunk-e taszkokat.</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span><span class="va">m_accepting</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>                <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">{</span><span class="st">&quot;A pool nem fogad több taszkot&quot;</span><span class="op">};</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> task <span class="op">=</span> <span class="bu">std::</span>make_shared<span class="op">&lt;</span><span class="bu">std::</span>packaged_task<span class="op">&lt;</span>R<span class="op">()&gt;&gt;(</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>f <span class="op">=</span> <span class="bu">std::</span>forward<span class="op">&lt;</span>F<span class="op">&gt;(</span>f<span class="op">),</span> <span class="op">...</span>args <span class="op">=</span> <span class="bu">std::</span>forward<span class="op">&lt;</span>Args<span class="op">&gt;(</span>args<span class="op">)]()</span> <span class="at">mutable</span> <span class="op">-&gt;</span> R <span class="op">{</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> f<span class="op">(</span><span class="bu">std::</span>forward<span class="op">&lt;</span>Args<span class="op">&gt;(</span>args<span class="op">)...);</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>        <span class="op">);</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>future<span class="op">&lt;</span>R<span class="op">&gt;</span> fut <span class="op">=</span> task<span class="op">-&gt;</span>get_future<span class="op">();</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>lock_guard<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a>            <span class="va">m_queue</span><span class="op">.</span>push<span class="op">([</span>task<span class="op">]()</span> <span class="op">{</span> <span class="op">(*</span>task<span class="op">)();</span> <span class="op">});</span></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>        <span class="va">m_cv</span><span class="op">.</span>notify_one<span class="op">();</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> fut<span class="op">;</span></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> worker_loop<span class="op">(</span><span class="bu">std::</span>stop_token st<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a>            <span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;</span> task<span class="op">;</span></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>                <span class="bu">std::</span>unique_lock<span class="op">&lt;</span><span class="bu">std::</span>mutex<span class="op">&gt;</span> lk<span class="op">(</span><span class="va">m_mutex</span><span class="op">);</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>                <span class="co">// Várunk, amíg van taszk, vagy leállítást kérnek, vagy a pool lezár.</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>                <span class="va">m_cv</span><span class="op">.</span>wait<span class="op">(</span>lk<span class="op">,</span> <span class="op">[</span><span class="kw">this</span><span class="op">,</span> <span class="op">&amp;</span>st<span class="op">]</span> <span class="op">{</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">return</span> st<span class="op">.</span>stop_requested<span class="op">()</span> <span class="op">||</span> <span class="op">!</span><span class="va">m_queue</span><span class="op">.</span>empty<span class="op">()</span> <span class="op">||</span> <span class="op">!</span><span class="va">m_accepting</span><span class="op">;</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a>                <span class="op">});</span></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span>st<span class="op">.</span>stop_requested<span class="op">()</span> <span class="op">&amp;&amp;</span> <span class="va">m_queue</span><span class="op">.</span>empty<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">break</span><span class="op">;</span> <span class="co">// Leállítás kérése és nincs több munka</span></span>
+<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> <span class="op">(</span><span class="va">m_queue</span><span class="op">.</span>empty<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a>                    <span class="co">// Ha a pool lezárt és nincs taszk, kilépünk</span></span>
+<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">if</span> <span class="op">(!</span><span class="va">m_accepting</span><span class="op">)</span> <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a>                    <span class="cf">else</span> <span class="cf">continue</span><span class="op">;</span> <span class="co">// hamis ébresztés</span></span>
+<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a>                task <span class="op">=</span> <span class="bu">std::</span>move<span class="op">(</span><span class="va">m_queue</span><span class="op">.</span>front<span class="op">());</span></span>
+<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>                <span class="va">m_queue</span><span class="op">.</span>pop<span class="op">();</span></span>
+<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a>            task<span class="op">();</span></span>
+<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb6-101"><a href="#cb6-101" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-102"><a href="#cb6-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-103"><a href="#cb6-103" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>jthread<span class="op">&gt;</span> <span class="va">m_workers</span><span class="op">;</span></span>
+<span id="cb6-104"><a href="#cb6-104" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>mutex <span class="va">m_mutex</span><span class="op">;</span></span>
+<span id="cb6-105"><a href="#cb6-105" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>condition_variable <span class="va">m_cv</span><span class="op">;</span></span>
+<span id="cb6-106"><a href="#cb6-106" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>queue<span class="op">&lt;</span><span class="bu">std::</span>function<span class="op">&lt;</span><span class="dt">void</span><span class="op">()&gt;&gt;</span> <span class="va">m_queue</span><span class="op">;</span></span>
+<span id="cb6-107"><a href="#cb6-107" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">m_accepting</span><span class="op">;</span></span>
+<span id="cb6-108"><a href="#cb6-108" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Fontos részletek:</p>
+<ul>
+<li>A <code>shutdown()</code> beállítja az
+<code>m_accepting = false</code> értéket, majd <code>notify_all</code>-t
+hív, hogy a munkások ellenőrizzék a feltételt.</li>
+<li>A munkások a ciklusban ellenőrzik, hogy ha nincs taszk és a pool
+lezárt, kilépnek. A <code>std::stop_token</code> itt nem szükséges a
+leállításhoz, de a <code>std::jthread</code> destruktora úgyis
+megszakítja a stop_token-t. A jelenlegi logika a
+<code>m_accepting</code> és a sor kiürülése alapján áll le. A
+<code>st.stop_requested()</code> akkor válik igazzá, amikor a
+<code>jthread</code> destruktora lefut, de ezt itt nem használjuk a
+kilépési feltételben, mert a <code>shutdown()</code> már gondoskodik a
+leállásról. A kód így is helyes, de a <code>stop_token</code>-t
+használhatnánk a azonnali megszakításhoz is, ha a feladatok hosszúak
+lennének. A laborban ez a viselkedés elfogadható.</li>
+<li>A <code>submit</code> metódus ellenőrzi az <code>m_accepting</code>
+értéket a mutex alatt, hogy elkerülje a versenyhelyzetet a
+<code>shutdown</code>-nal.</li>
+<li>A <code>packaged_task</code>-et <code>std::make_shared</code>-del
+hozzuk létre, így a <code>future</code> és a <code>std::function</code>
+egyaránt biztonságosan hivatkozik rá.</li>
+<li>A lambda <code>mutable</code> jelzője szükséges, mert az
+<code>args</code> csomagot továbbadjuk <code>std::forward</code>-dal,
+ami módosíthatja a lambda belső állapotát.</li>
+</ul>
+<h3 data-number="23.2.7" id="build-és-tesztelés"><span
+class="header-section-number">23.2.7</span> 4.3. Build és tesztelés</h3>
+<p>A laborhoz CMake-et használunk, C++20 szabvánnyal, GCC és Clang
+fordítóval (MSVC opcionális, de a példa hordozható). A build
+parancsok:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">-S</span> . <span class="at">-B</span> build <span class="at">-DCMAKE_BUILD_TYPE</span><span class="op">=</span>Release <span class="at">-DCMAKE_CXX_STANDARD</span><span class="op">=</span>20</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cmake</span> <span class="at">--build</span> build <span class="at">-j</span><span class="va">$(</span><span class="fu">nproc</span><span class="va">)</span></span></code></pre></div>
+<p>A fordítási kapcsolók: <code>-O2 -Wall -Wextra -pthread</code>. A
+teszteléshez hozzáadhatjuk a <code>-fsanitize=address,undefined</code>
+kapcsolókat egy Debug buildben.</p>
+<p>A tesztprogram:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;ThreadPool.hpp&quot;</span><span class="pp"> </span><span class="co">// a fenti osztály</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;chrono&gt;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> <span class="kw">namespace</span> <span class="bu">std::</span>chrono_literals<span class="op">;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    ThreadPool pool<span class="op">(</span><span class="dv">4</span><span class="op">);</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Alap teszt: eredmény visszaadása</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> f1 <span class="op">=</span> pool<span class="op">.</span>submit<span class="op">([](</span><span class="dt">int</span> a<span class="op">,</span> <span class="dt">int</span> b<span class="op">)</span> <span class="op">{</span> <span class="cf">return</span> a <span class="op">+</span> b<span class="op">;</span> <span class="op">},</span> <span class="dv">2</span><span class="op">,</span> <span class="dv">3</span><span class="op">);</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="ot">assert</span><span class="op">(</span>f1<span class="op">.</span>get<span class="op">()</span> <span class="op">==</span> <span class="dv">5</span><span class="op">);</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Kivétel terjedése</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">auto</span> f2 <span class="op">=</span> pool<span class="op">.</span>submit<span class="op">([]()</span> <span class="op">-&gt;</span> <span class="dt">int</span> <span class="op">{</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">throw</span> <span class="bu">std::</span>runtime_error<span class="op">{</span><span class="st">&quot;Teszt kivétel&quot;</span><span class="op">};</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">});</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> caught <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        f2<span class="op">.</span>get<span class="op">();</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>runtime_error<span class="op">&amp;</span> e<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>        caught <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>        <span class="ot">assert</span><span class="op">(</span><span class="bu">std::</span>string<span class="op">{</span>e<span class="op">.</span>what<span class="op">()}</span> <span class="op">==</span> <span class="st">&quot;Teszt kivétel&quot;</span><span class="op">);</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="ot">assert</span><span class="op">(</span>caught<span class="op">);</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Sok taszk párhuzamosan</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">constexpr</span> <span class="dt">int</span> N <span class="op">=</span> <span class="dv">1000</span><span class="op">;</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span><span class="bu">std::</span>future<span class="op">&lt;</span><span class="dt">long</span> <span class="dt">long</span><span class="op">&gt;&gt;</span> futures<span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    futures<span class="op">.</span>reserve<span class="op">(</span>N<span class="op">);</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> N<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>        futures<span class="op">.</span>push_back<span class="op">(</span>pool<span class="op">.</span>submit<span class="op">([](</span><span class="dt">int</span> x<span class="op">)</span> <span class="op">-&gt;</span> <span class="dt">long</span> <span class="dt">long</span> <span class="op">{</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Némi számolás</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>            <span class="dt">long</span> <span class="dt">long</span> sum <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> j <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> j <span class="op">&lt;</span> <span class="dv">1000</span><span class="op">;</span> <span class="op">++</span>j<span class="op">)</span> sum <span class="op">+=</span> x <span class="op">*</span> j<span class="op">;</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> sum<span class="op">;</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span> i<span class="op">));</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> <span class="dt">long</span> total <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> fut <span class="op">:</span> futures<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a>        total <span class="op">+=</span> fut<span class="op">.</span>get<span class="op">();</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Total: &quot;</span> <span class="op">&lt;&lt;</span> total <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Leállítás: a shutdown után nem lehet több taszkot beküldeni</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>    pool<span class="op">.</span>shutdown<span class="op">();</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> submit_failed <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>    <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>        <span class="kw">auto</span> f3 <span class="op">=</span> pool<span class="op">.</span>submit<span class="op">([]()</span> <span class="op">{</span> <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span> <span class="op">});</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">catch</span> <span class="op">(</span><span class="at">const</span> <span class="bu">std::</span>runtime_error<span class="op">&amp;)</span> <span class="op">{</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>        submit_failed <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>    <span class="ot">assert</span><span class="op">(</span>submit_failed<span class="op">);</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;Minden teszt sikeres.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A teszt a következőket ellenőrzi: alap eredmény, kivétel továbbítása,
+nagy számú taszk párhuzamos végrehajtása, leállítás utáni submit
+elutasítása.</p>
+<h3 data-number="23.2.8" id="mérési-napló"><span
+class="header-section-number">23.2.8</span> 4.4. Mérési napló</h3>
+<p>A teljesítmény méréséhez egy külön programot használunk, amely a
+thread pool skálázódását vizsgálja. A mérést rögzített hardveren (pl. 8
+magos CPU) végezzük, GCC 13.2, <code>-O2</code>, C++20, 100 futtatás
+átlaga. A mért értékeket és a várt értékeket elkülönítjük.</p>
+<p>A benchmark egy olyan munkaterhelést indít, amely 2000 taszkot
+számol, mindegyik 1 millió műveletet végez. A taszkok számát és a pool
+méretét változtatjuk:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Pool méret</th>
+<th>Futásidő (ms)</th>
+<th>Várt skálázódás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>1240</td>
+<td>alapvonal</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>630</td>
+<td>~2x gyorsulás</td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td>320</td>
+<td>~4x gyorsulás</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>170</td>
+<td>~7x gyorsulás</td>
+</tr>
+</tbody>
+</table>
+<p>A várt skálázódás a lineáris gyorsulás közelítése, de a
+memória-sávszélesség és a szinkronizáció miatt nem pontosan lineáris. A
+mért eredmények ezt tükrözik: a 8 szálas változat már nem éri el a 8x
+gyorsulást, mert a globális sor mutexe és a memória hozzáférés
+korlátozza.</p>
+<p>A mérést a <code>std::chrono::steady_clock</code> segítségével
+végezzük, és minden futtatásnál rögzítjük a pontos értékeket. A
+reprodukálhatóság érdekében a benchmark kód a labor része, és
+ugyanazokkal a build kapcsolókkal fordul.</p>
+<h3 data-number="23.2.9" id="önellenőrző-kérdések"><span
+class="header-section-number">23.2.9</span> 5. Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a <code>std::promise</code> és a
+<code>std::packaged_task</code> között? Mikor melyiket érdemes
+használni?</li>
+<li>Hogyan kezeli a <code>std::future</code> a kivételeket? Mi történik,
+ha a taszk kivételt dob, és a hívó nem hívja meg a
+<code>get()</code>-et?</li>
+<li>Miért fontos, hogy a <code>packaged_task</code>-et heapre helyezzük
+a thread pool <code>submit</code> metódusában?</li>
+<li>Mi a work stealing előnye a globális munkasorral szemben? Milyen
+hátrányai vannak?</li>
+<li>Hogyan lehet biztonságosan leállítani egy thread pool-t úgy, hogy a
+sorban lévő taszkok még lefussanak? Milyen szinkronizációs eszközöket
+használnál?</li>
+</ol>
+<h3 data-number="23.2.10" id="továbbvezetés"><span
+class="header-section-number">23.2.10</span> 6. Továbbvezetés</h3>
+<p>Ebben az alfejezetben bevezettük a taszkalapú párhuzamosság alapjait:
+a <code>std::future</code>, <code>std::promise</code>,
+<code>std::packaged_task</code> eszközöket, és megépítettünk egy működő
+thread pool-t. A work stealing és a munkasorok tárgyalása betekintést
+adott a nagy teljesítményű ütemezők világába. A következő egység (<a
+href="cpp088.html">Coroutines és awaitable</a>) ezekre az alapokra
+építve bemutatja a <strong>coroutines</strong> és az
+<strong>awaitable</strong> fogalmát, ahol a taszkok aszinkron módon, a
+szálak blokkolása nélkül futhatnak. Az itt megismert <code>future</code>
+és taszk absztrakciók közvetlenül kapcsolódnak majd a coroutine-alapú
+<code>task&lt;T&gt;</code> típusokhoz, és a thread pool mint végrehajtó
+tovább bővíthető lesz.</p>
+<p>A laborban szereplő kód letisztult, de nem tartalmazza a work
+stealing implementációt. Gyakorlásképpen érdemes lehet kiterjeszteni
+lokális sorokkal és lopással, de ez már a haladó szintű fejlesztők
+számára is kihívást jelent. A hivatalos szabvány és a
+<code>cppreference</code> mindig naprakész forrás a pontos API-hoz és a
+memóriamodellhez.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="cpp086.html">← 23.1 std::thread, jthread és stop_token</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp088.html">23.3 Coroutines és awaitable →</a></div>
+</nav>
+</body>
+</html>

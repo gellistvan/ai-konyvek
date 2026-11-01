@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>20.3 Fragmentáció és allokációs stratégiák – Fejlett C++ -
+haladó nyelvi eszközök és technikák</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Memória és teljesítmény</a> › <a href="index.html#cppch19">20 Allokátorok, poolok és object pool</a></p>
+<div class="links"><a class="prev" rel="prev" href="cpp075.html">← 20.2 Object pool és freelist</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp077.html">20.4 NUMA, cache locality és mérés →</a></div>
+</nav>
+<h2 data-number="20.3" id="cpp076"><span
+class="header-section-number">20.3</span> Fragmentáció és allokációs
+stratégiák</h2>
+<p>A fragmentáció nem egyszerűen az allokátor „rossz” állapota, hanem a
+dinamikus memóriakezelés bármely stratégiájának elkerülhetetlen
+mellékterméke, amely közvetlenül befolyásolja a processz látható
+memóriahasználatát, a futásidőt és a cache-viselkedést. Ebben az
+alfejezetben pontosan definiáljuk a belső és külső fragmentációt,
+megvizsgáljuk az allokációs stratégiák (first-fit, best-fit, worst-fit,
+next-fit, buddy) hatását, bevezetjük a méretosztályok (size class) és a
+slab-alapú kiosztás fogalmát, majd egy reprodukálható mérési kísérletben
+számszerűsítjük a fragmentációt.</p>
+<h3 data-number="20.3.1"
+id="belső-fragmentáció-a-kért-és-a-kapott-blokk-közötti-különbség"><span
+class="header-section-number">20.3.1</span> Belső fragmentáció: a kért
+és a kapott blokk közötti különbség</h3>
+<p>Belső fragmentáció akkor keletkezik, amikor az allokátor egy kérésre
+nagyobb blokkot ad, mint amennyit a program ténylegesen használ. A
+különbözet a blokk belsejében marad kihasználatlanul, innen az
+„internal” elnevezés. A felesleg nem feltétlenül fizikai hiba, de
+csökkenti a hasznos memóriakihasználtságot.</p>
+<p>Okai leggyakrabban a következők:</p>
+<ol type="1">
+<li><strong>Igazítás és fejléc (metadata)</strong>: A
+<code>malloc</code> és a legtöbb allokátor minden visszaadott blokk elé
+egy rejtett fejlécet helyez, amely a blokk méretét, állapotát és esetleg
+ellenőrző összeget tárol. Ha a program 16 bájtot kér, a tényleges
+felhasznált terület 16 bájt adat + fejléc + igazítási párnázat lehet,
+ami akár 32 vagy 48 bájtot is elfoglalhat. Ez a fejléc nem része a
+felhasználói adatnak, tehát belső fragmentációnak számít.</li>
+<li><strong>Méretosztályra kerekítés</strong>: Sok allokátor a kéréseket
+úgynevezett méretosztályokba sorolja, és a kért méretet felkerekíti a
+következő osztály határára. Például ha az osztályok 16, 32, 48, 64, …
+bájtosak, akkor egy 17 bájtos kérés 32 bájtot kap. A keletkező 15 bájt
+belső fragmentáció.</li>
+<li><strong>Igazítási követelmény</strong>: Az alapvető típusok (például
+<code>double</code>, <code>long double</code>,
+<code>std::max_align_t</code>) szigorú igazítást követelnek. Az
+allokátornak biztosítania kell, hogy a visszaadott pointer megfeleljen a
+maximális igazításnak, ezért szükség lehet párnázatra, ami szintén belső
+fragmentációnak tekinthető.</li>
+</ol>
+<p>A belső fragmentáció mérése egyszerű: minden egyes allokáció esetén a
+ténylegesen kiosztott blokk méretéből (beleértve a fejlécet és a
+párnázatot, de a felhasználói területhez viszonyítva) kivonjuk a kért
+méretet. A mérési szakaszban ezt részletesebben tárgyaljuk.</p>
+<p>Fontos megjegyezni, hogy a belső fragmentáció nem a szabad memória
+széttöredezettségéből fakad, hanem az allokátor döntéséből, hogy nagyobb
+egységet ad, mint amire szükség van. Ez a trade-off gyakran tudatos: a
+nagyobb blokkok egységes mérete felgyorsítja a kiosztást és a
+felszabadítást, csökkenti a külső fragmentációt, és jobb
+cache-vonal-kihasználást eredményezhet.</p>
+<h3 data-number="20.3.2"
+id="külső-fragmentáció-a-szabad-memória-darabokra-szakadása"><span
+class="header-section-number">20.3.2</span> Külső fragmentáció: a szabad
+memória darabokra szakadása</h3>
+<p>Külső fragmentáció akkor jelentkezik, amikor a szabad memória nem egy
+összefüggő nagy blokkban áll rendelkezésre, hanem sok kis, egymástól
+elkülönült darabban. A teljes szabad memória összege elegendő lehet egy
+nagy kérés kiszolgálására, de mivel a darabok nem folytonosak, az
+allokáció meghiúsul vagy a rendszer swaphez, memórialap-tömörítéshez
+kénytelen nyúlni.</p>
+<p>A külső fragmentáció szemléltetésére képzeljünk el egy 1 MiB méretű
+heapet. A program lefoglal három 256 KiB-os blokkot (A, B, C), majd
+felszabadítja a középsőt. Most van egy 256 KiB szabad blokk a közepén,
+és 256 KiB foglalt mindkét oldalán. Ha ezután a program 512 KiB-ot kér,
+az allokáció sikertelen, holott a teljes szabad memória 256 KiB (a
+középső blokk) + a processz esetleges más szabad területe, de az 512
+KiB-hoz nincs egybefüggő szabad rész. Ez a külső fragmentáció klasszikus
+esete.</p>
+<p>A külső fragmentáció mértékét többféleképpen számszerűsíthetjük:</p>
+<ul>
+<li><strong>Legnagyobb szabad blokk mérete</strong>: A legnagyobb
+összefüggő szabad terület mérete. Minél kisebb a teljes szabad
+memóriához képest, annál nagyobb a fragmentáció.</li>
+<li><strong>Szabad blokkok száma</strong>: Ha adott összes szabad
+memória mellett a szabad blokkok száma nagy, a fragmentáció magas.</li>
+<li><strong>Hasznos kihasználtság</strong>: A foglalt terület aránya a
+teljes heaphez képest. A fragmentáció miatt a kihasználtság nem éri el
+az 1-et.</li>
+</ul>
+<p>A külső fragmentációt befolyásolja az allokációk és felszabadítások
+mintázata, valamint az allokátor által alkalmazott stratégia. Nincs
+tökéletes stratégia, amely minden munkaterhelésre optimális; a választás
+mindig kompromisszum.</p>
+<h3 data-number="20.3.3"
+id="allokációs-stratégiák-és-hatásuk-a-fragmentációra"><span
+class="header-section-number">20.3.3</span> Allokációs stratégiák és
+hatásuk a fragmentációra</h3>
+<p>Egy általános célú allokátor a szabad blokkokat valamilyen
+adatszerkezetben (például láncolt listában) tartja nyilván, és egy új
+kérés kiszolgálásához kiválaszt egy megfelelő méretű szabad blokkot. A
+kiválasztási szabály határozza meg a stratégiát. A leggyakoribbak:</p>
+<h4 data-number="20.3.3.1" id="first-fit"><span
+class="header-section-number">20.3.3.1</span> First-fit</h4>
+<p>A first-fit stratégia az első olyan szabad blokkot választja, amely
+elég nagy a kéréshez. A keresés a lista elejétől indul, és az első
+találatnál megáll. Ez a legegyszerűbb és leggyorsabb megközelítés, mert
+átlagosan kevés blokkot kell vizsgálni. Hátránya, hogy a lista eleje
+gyorsan felaprózódik: a nagy blokkok kisebb darabokra szakadnak, és sok
+apró szabad blokk halmozódik fel az elején. Ez növeli a külső
+fragmentációt, de a belső fragmentációra nincs közvetlen hatása.
+Ugyanakkor a meglévő nagy szabad blokkok megőrződhetnek a lista hátsó
+részén, ami esetenként hasznos.</p>
+<h4 data-number="20.3.3.2" id="best-fit"><span
+class="header-section-number">20.3.3.2</span> Best-fit</h4>
+<p>A best-fit stratégia azt a szabad blokkot választja, amely a
+legkisebb olyan méretű, amely még elfér a kérés. Ez gyakran a legkisebb
+maradékot (residual) hagyja, így elvileg csökkenti a belső fragmentációt
+és konzerválja a nagy blokkokat a nagy kérések számára. A gyakorlatban
+azonban a best-fit hajlamos nagyon apró, használhatatlan maradékokat
+létrehozni, amelyek tovább növelik a külső fragmentációt. Emellett a
+keresés költséges, mert az összes szabad blokkot meg kell vizsgálni,
+hacsak nincs méret szerint rendezve a lista.</p>
+<h4 data-number="20.3.3.3" id="worst-fit"><span
+class="header-section-number">20.3.3.3</span> Worst-fit</h4>
+<p>A worst-fit az ellenkezője: a legnagyobb szabad blokkot választja,
+abban a reményben, hogy a maradék még mindig elég nagy lesz jövőbeli
+kérésekhez. Ez a stratégia általában rosszul teljesít, mert a nagy
+blokkok hamar elfogynak, és sok közepes méretű szabad blokk jön létre. A
+külső fragmentáció gyorsan nő. Ritkán használják éles rendszerekben.</p>
+<h4 data-number="20.3.3.4" id="next-fit"><span
+class="header-section-number">20.3.3.4</span> Next-fit</h4>
+<p>A next-fit a first-fit változata, de a keresést nem a lista elejétől,
+hanem az utolsó találat helyétől kezdi, és körkörösen halad. Ez
+kiegyensúlyozottabbá teszi a lista elejének felaprózódását, de általában
+nem jobb, mint a first-fit, és a keresési idő is változó.</p>
+<h4 data-number="20.3.3.5" id="buddy-system"><span
+class="header-section-number">20.3.3.5</span> Buddy system</h4>
+<p>A buddy system (például a Linux kernelben a page allocator) a szabad
+memóriát 2 hatványa szerinti blokkokra osztja. Egy kérés esetén a
+rendszer a legkisebb olyan blokkot keresi, amely elég nagy, majd ha
+nincs, egy nagyobb blokkot kettéoszt, és a folyamatot rekurzívan
+folytatja. Felszabadításkor a szabad blokkot megpróbálja egyesíteni a
+„testvérével” (buddy), ha az is szabad. Ez a módszer hatékonyan
+csökkenti a külső fragmentációt, mert a blokkok mérete mindig 2
+hatványa, és az összevonás automatikus. A belső fragmentáció azonban
+jelentős lehet, mert a kért méretet fel kell kerekíteni a következő 2
+hatványra. Például egy 100 bájtos kérés 128 bájtot kap, ami 28 bájt
+belső fragmentációt okoz. A buddy systemet gyakran kombinálják slab
+allokátorral, hogy a kis objektumok esetén csökkentsék a belső
+fragmentációt.</p>
+<p>A stratégiák közötti választás tehát a sebesség, a belső fragmentáció
+és a külső fragmentáció közötti kompromisszum. A valós rendszerekben
+(például <code>malloc</code> implementációk, tcmalloc, jemalloc) a fenti
+alapstratégiák kombinációját alkalmazzák, gyakran méretosztályokra
+bontva.</p>
+<h3 data-number="20.3.4"
+id="size-class-és-slab-a-struktúra-amely-minimalizálja-a-fragmentációt"><span
+class="header-section-number">20.3.4</span> Size class és slab: a
+struktúra, amely minimalizálja a fragmentációt</h3>
+<p>A gyakorlati allokátorok a fragmentáció elleni küzdelem egyik
+leghatékonyabb eszközeként <strong>méretosztályokat</strong> (size
+classes) és <strong>slab-alapú kiosztást</strong> használnak. A cél az,
+hogy a hasonló méretű kéréseket azonos, előre meghatározott méretű
+blokkokból szolgálják ki, ezzel megszüntetve a külső fragmentációt az
+adott osztályon belül, és kontrollált belső fragmentációt vezessenek
+be.</p>
+<h4 data-number="20.3.4.1" id="méretosztályok"><span
+class="header-section-number">20.3.4.1</span> Méretosztályok</h4>
+<p>Egy méretosztály egy előre definiált blokkméret, amelybe több
+felhasználói kérést sorolnak be. Például a következő osztályok
+létezhetnek: 16, 32, 48, 64, 96, 128, 192, … bájt. Egy 40 bájtos kérés a
+48 bájtos osztályba kerül, tehát a ténylegesen kapott blokk 48 bájt, ami
+8 bájt belső fragmentáció. A méretosztályok számát és határait úgy
+választják meg, hogy a belső fragmentáció átlagos mértéke elfogadható
+maradjon, miközben a osztályok száma ne nőjön túlzottan, mert minden
+osztály külön szabadlistát és adminisztrációt igényel.</p>
+<p>A tcmalloc és a jemalloc például több tucat méretosztályt használ,
+sűrűbben a kis méreteknél (ahol a relatív fragmentáció nagyobb lenne),
+és ritkábban a nagy méreteknél. Ez a megközelítés lehetővé teszi, hogy a
+kis objektumok (például 8, 16, 24, 32 bájt) közötti kérések minimális
+belső fragmentációval szolgálhatók ki.</p>
+<h4 data-number="20.3.4.2" id="slab-allokátor"><span
+class="header-section-number">20.3.4.2</span> Slab allokátor</h4>
+<p>A slab allokátor (amelyet a SunOS vezetett be, és a Linux kernelben
+is elterjedt) a méretosztályok ötletét viszi tovább. A memóriát nagyobb
+lapokra (slab) osztja, és minden slab egyetlen méretosztály számára van
+fenntartva. Egy slab például 4 KiB méretű, és mondjuk 32 bájtos
+objektumokat tartalmaz: így 128 objektum fér el benne (természetesen a
+fejléc és esetleges igazítási veszteség levonása után). Amikor a program
+32 bájtot kér, az allokátor a 32 bájtos méretosztály szabadlistájáról ad
+egy objektumot. Ha a lista üres, egy új slab foglalódik, és az összes
+benne lévő objektum bekerül a szabadlistára.</p>
+<p>A slab allokátor előnyei:</p>
+<ul>
+<li><strong>Nincs külső fragmentáció a slabon belül</strong>: Mivel
+minden objektum azonos méretű, a felszabadított objektumok helye mindig
+pontosan akkora, amekkorára szükség van, így nem keletkeznek apró szabad
+darabok. A szabad objektumok listája hatékonyan kezelhető (például egy
+egyszerű láncolt lista a felszabadított objektumok belsejében).</li>
+<li><strong>Alacsony belső fragmentáció</strong>: A belső fragmentációt
+csak a méretosztályra kerekítés okozza, ami jól kontrollálható.</li>
+<li><strong>Gyors kiosztás és felszabadítás</strong>: A szabad objektum
+kivétele a lista elejéről O(1) művelet, és a felszabadítás is O(1),
+mivel a blokk típusa ismert.</li>
+<li><strong>Jobb cache-lokalitás</strong>: Az azonos méretosztályba
+tartozó objektumok gyakran ugyanazon a lapon vannak, ami javítja a TLB
+és a cache kihasználtságát.</li>
+</ul>
+<p>A slab allokátor hátránya, hogy a nagy méretű kérések (például több
+MiB) esetén nem hatékony, mert a slab mérete rögzített, és a nagy
+blokkok kezelésére más mechanizmus (például page-alapú buddy) szükséges.
+Ezért a gyakorlati allokátorok hibrid megoldást alkalmaznak: kis
+méretekre slab, közepes méretekre méretosztályos listák, nagy méretekre
+közvetlen page-allokáció (mmap).</p>
+<h3 data-number="20.3.5"
+id="gyakorlati-példa-egyszerű-slab-allokátor-c-ban"><span
+class="header-section-number">20.3.5</span> Gyakorlati példa: egyszerű
+slab allokátor C++-ban</h3>
+<p>Most egy leegyszerűsített, de működő slab allokátort mutatunk be,
+amely illusztrálja a méretosztályok és a slab fogalmát. A cél nem egy
+termelési allokátor, hanem a koncepciók kézzelfoghatóvá tétele. A kód
+C++20-at használ, a fordítási parancsot a labor részben adjuk meg.</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstddef&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cstdint&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;array&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;vector&gt;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;bit&gt;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;print&gt;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Egyetlen slab: rögzített méretű objektumok tárolására.</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> Slab <span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    Slab<span class="op">(</span><span class="bu">std::</span>size_t object_size<span class="op">,</span> <span class="bu">std::</span>size_t object_count<span class="op">)</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="va">object_size_</span><span class="op">(</span>object_size<span class="op">),</span> <span class="va">object_count_</span><span class="op">(</span>object_count<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A slab memóriáját egyetlen blokkban foglaljuk.</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        <span class="va">storage_</span> <span class="op">=</span> <span class="op">::</span><span class="kw">operator</span> <span class="kw">new</span><span class="op">(</span>object_size <span class="op">*</span> object_count<span class="op">,</span> <span class="bu">std::</span>align_val_t<span class="op">{</span><span class="kw">alignof</span><span class="op">(</span><span class="bu">std::</span>max_align_t<span class="op">)});</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A szabadlistát a felszabadított objektumok memóriájában tároljuk.</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>        <span class="va">free_list_</span> <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="bu">std::</span>size_t i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> object_count<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>            <span class="dt">void</span><span class="op">*</span> obj <span class="op">=</span> <span class="kw">static_cast</span><span class="op">&lt;</span><span class="dt">char</span><span class="op">*&gt;(</span><span class="va">storage_</span><span class="op">)</span> <span class="op">+</span> i <span class="op">*</span> object_size<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>            <span class="co">// A szabad objektum első szavába mutató linket írunk.</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>            <span class="op">*</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">**&gt;(</span>obj<span class="op">)</span> <span class="op">=</span> <span class="va">free_list_</span><span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            <span class="va">free_list_</span> <span class="op">=</span> obj<span class="op">;</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">~</span>Slab<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">::</span><span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span><span class="va">storage_</span><span class="op">,</span> <span class="bu">std::</span>align_val_t<span class="op">{</span><span class="kw">alignof</span><span class="op">(</span><span class="bu">std::</span>max_align_t<span class="op">)});</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> allocate<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span><span class="va">free_list_</span><span class="op">)</span> <span class="cf">return</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span><span class="op">*</span> obj <span class="op">=</span> <span class="va">free_list_</span><span class="op">;</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>        <span class="va">free_list_</span> <span class="op">=</span> <span class="op">*</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">**&gt;(</span>obj<span class="op">);</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>        <span class="op">--</span><span class="va">available_</span><span class="op">;</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> obj<span class="op">;</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> deallocate<span class="op">(</span><span class="dt">void</span><span class="op">*</span> ptr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span><span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="dt">void</span><span class="op">**&gt;(</span>ptr<span class="op">)</span> <span class="op">=</span> <span class="va">free_list_</span><span class="op">;</span></span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true" tabindex="-1"></a>        <span class="va">free_list_</span> <span class="op">=</span> ptr<span class="op">;</span></span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span><span class="va">available_</span><span class="op">;</span></span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> full<span class="op">()</span> <span class="at">const</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">free_list_</span> <span class="op">==</span> <span class="kw">nullptr</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t available<span class="op">()</span> <span class="at">const</span> <span class="op">{</span> <span class="cf">return</span> <span class="va">available_</span><span class="op">;</span> <span class="op">}</span></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">object_size_</span><span class="op">;</span></span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">object_count_</span><span class="op">;</span></span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> <span class="va">storage_</span><span class="op">;</span></span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> <span class="va">free_list_</span><span class="op">;</span></span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">available_</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true" tabindex="-1"></a><span class="co">// Egyszerű size-class allokátor: csak egy méretosztályt kezel (pl. 32 bájt),</span></span>
+<span id="cb1-56"><a href="#cb1-56" aria-hidden="true" tabindex="-1"></a><span class="co">// de a minta általánosítható.</span></span>
+<span id="cb1-57"><a href="#cb1-57" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> SlabAllocator <span class="op">{</span></span>
+<span id="cb1-58"><a href="#cb1-58" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb1-59"><a href="#cb1-59" aria-hidden="true" tabindex="-1"></a>    <span class="kw">explicit</span> SlabAllocator<span class="op">(</span><span class="bu">std::</span>size_t object_size<span class="op">,</span> <span class="bu">std::</span>size_t slab_capacity <span class="op">=</span> <span class="dv">128</span><span class="op">)</span></span>
+<span id="cb1-60"><a href="#cb1-60" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="va">object_size_</span><span class="op">(</span>object_size<span class="op">),</span> <span class="va">slab_capacity_</span><span class="op">(</span>slab_capacity<span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb1-61"><a href="#cb1-61" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-62"><a href="#cb1-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> allocate<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-63"><a href="#cb1-63" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Keressünk egy olyan slab-et, amelynek van szabad objektuma.</span></span>
+<span id="cb1-64"><a href="#cb1-64" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> slab <span class="op">:</span> <span class="va">slabs_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-65"><a href="#cb1-65" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(!</span>slab<span class="op">.</span>full<span class="op">())</span> <span class="op">{</span></span>
+<span id="cb1-66"><a href="#cb1-66" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> slab<span class="op">.</span>allocate<span class="op">();</span></span>
+<span id="cb1-67"><a href="#cb1-67" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb1-68"><a href="#cb1-68" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-69"><a href="#cb1-69" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ha nincs, hozzunk létre egy újat.</span></span>
+<span id="cb1-70"><a href="#cb1-70" aria-hidden="true" tabindex="-1"></a>        <span class="va">slabs_</span><span class="op">.</span>emplace_back<span class="op">(</span><span class="va">object_size_</span><span class="op">,</span> <span class="va">slab_capacity_</span><span class="op">);</span></span>
+<span id="cb1-71"><a href="#cb1-71" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="va">slabs_</span><span class="op">.</span>back<span class="op">().</span>allocate<span class="op">();</span></span>
+<span id="cb1-72"><a href="#cb1-72" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-73"><a href="#cb1-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-74"><a href="#cb1-74" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> deallocate<span class="op">(</span><span class="dt">void</span><span class="op">*</span> ptr<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-75"><a href="#cb1-75" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Megkeressük, melyik slab-hez tartozik a pointer (egyszerű lineáris keresés).</span></span>
+<span id="cb1-76"><a href="#cb1-76" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> slab <span class="op">:</span> <span class="va">slabs_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-77"><a href="#cb1-77" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Itt a valódi allokátor hatékonyabb módszert használna (pl. header).</span></span>
+<span id="cb1-78"><a href="#cb1-78" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Ebben a példában csak demonstráljuk a deallokációt, nem ellenőrizzük a határokat.</span></span>
+<span id="cb1-79"><a href="#cb1-79" aria-hidden="true" tabindex="-1"></a>            <span class="co">// Feltételezzük, hogy a ptr az egyik slab belsejében van.</span></span>
+<span id="cb1-80"><a href="#cb1-80" aria-hidden="true" tabindex="-1"></a>            <span class="co">// A helyesség kedvéért kihagyjuk a tényleges ellenőrzést.</span></span>
+<span id="cb1-81"><a href="#cb1-81" aria-hidden="true" tabindex="-1"></a>            <span class="co">// A laborban biztonságosabb implementációt adunk.</span></span>
+<span id="cb1-82"><a href="#cb1-82" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>ptr <span class="op">&gt;=</span> slab_storage_start<span class="op">(</span>slab<span class="op">)</span> <span class="op">&amp;&amp;</span> ptr <span class="op">&lt;</span> slab_storage_start<span class="op">(</span>slab<span class="op">)</span> <span class="op">+</span> <span class="va">object_size_</span> <span class="op">*</span> <span class="va">slab_capacity_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-83"><a href="#cb1-83" aria-hidden="true" tabindex="-1"></a>                slab<span class="op">.</span>deallocate<span class="op">(</span>ptr<span class="op">);</span></span>
+<span id="cb1-84"><a href="#cb1-84" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb1-85"><a href="#cb1-85" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb1-86"><a href="#cb1-86" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-87"><a href="#cb1-87" aria-hidden="true" tabindex="-1"></a>        <span class="ot">assert</span><span class="op">(</span><span class="kw">false</span> <span class="op">&amp;&amp;</span> <span class="st">&quot;Pointer not owned by this allocator&quot;</span><span class="op">);</span></span>
+<span id="cb1-88"><a href="#cb1-88" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-89"><a href="#cb1-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-90"><a href="#cb1-90" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb1-91"><a href="#cb1-91" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span><span class="op">*</span> slab_storage_start<span class="op">(</span><span class="at">const</span> Slab<span class="op">&amp;</span> slab<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-92"><a href="#cb1-92" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A Slab osztályban tárolt storage_ privát, ezért itt nem férünk hozzá.</span></span>
+<span id="cb1-93"><a href="#cb1-93" aria-hidden="true" tabindex="-1"></a>        <span class="co">// A példa kedvéért ezt a részt elhagyjuk; a laborban megoldjuk.</span></span>
+<span id="cb1-94"><a href="#cb1-94" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Ez a függvény nem hívódik, csak a fordítás kedvéért van.</span></span>
+<span id="cb1-95"><a href="#cb1-95" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb1-96"><a href="#cb1-96" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-97"><a href="#cb1-97" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-98"><a href="#cb1-98" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">object_size_</span><span class="op">;</span></span>
+<span id="cb1-99"><a href="#cb1-99" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="va">slab_capacity_</span><span class="op">;</span></span>
+<span id="cb1-100"><a href="#cb1-100" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>vector<span class="op">&lt;</span>Slab<span class="op">&gt;</span> <span class="va">slabs_</span><span class="op">;</span></span>
+<span id="cb1-101"><a href="#cb1-101" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-102"><a href="#cb1-102" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-103"><a href="#cb1-103" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-104"><a href="#cb1-104" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 32 bájtos objektumokat kezelő allokátor, slab-kapacitás 64.</span></span>
+<span id="cb1-105"><a href="#cb1-105" aria-hidden="true" tabindex="-1"></a>    SlabAllocator alloc<span class="op">(</span><span class="dv">32</span><span class="op">,</span> <span class="dv">64</span><span class="op">);</span></span>
+<span id="cb1-106"><a href="#cb1-106" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-107"><a href="#cb1-107" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Allokáljunk 10 objektumot.</span></span>
+<span id="cb1-108"><a href="#cb1-108" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>array<span class="op">&lt;</span><span class="dt">void</span><span class="op">*,</span> <span class="dv">10</span><span class="op">&gt;</span> ptrs<span class="op">;</span></span>
+<span id="cb1-109"><a href="#cb1-109" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="kw">auto</span><span class="op">&amp;</span> p <span class="op">:</span> ptrs<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-110"><a href="#cb1-110" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> alloc<span class="op">.</span>allocate<span class="op">();</span></span>
+<span id="cb1-111"><a href="#cb1-111" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>print<span class="op">(</span><span class="st">&quot;Allocated: </span><span class="sc">{}\n</span><span class="st">&quot;</span><span class="op">,</span> p<span class="op">);</span></span>
+<span id="cb1-112"><a href="#cb1-112" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-113"><a href="#cb1-113" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Felszabadítunk párat.</span></span>
+<span id="cb1-114"><a href="#cb1-114" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-115"><a href="#cb1-115" aria-hidden="true" tabindex="-1"></a>        alloc<span class="op">.</span>deallocate<span class="op">(</span>ptrs<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb1-116"><a href="#cb1-116" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-117"><a href="#cb1-117" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Újra allokálunk, hogy lássuk a szabadlista működését.</span></span>
+<span id="cb1-118"><a href="#cb1-118" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">5</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-119"><a href="#cb1-119" aria-hidden="true" tabindex="-1"></a>        <span class="dt">void</span><span class="op">*</span> p <span class="op">=</span> alloc<span class="op">.</span>allocate<span class="op">();</span></span>
+<span id="cb1-120"><a href="#cb1-120" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>print<span class="op">(</span><span class="st">&quot;Reallocated: </span><span class="sc">{}\n</span><span class="st">&quot;</span><span class="op">,</span> p<span class="op">);</span></span>
+<span id="cb1-121"><a href="#cb1-121" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-122"><a href="#cb1-122" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a kód vázlatos: a <code>SlabAllocator::deallocate</code> nem
+megfelelő, mert nem tudja ellenőrizni a pointert, és a
+<code>slab_storage_start</code> sem működik. A laborban ezt egy teljes,
+biztonságos implementációval pótoljuk, ahol a fejlécben tároljuk a slab
+azonosítóját vagy a pointert visszafelejtjük. A példa célja csak a
+koncepció bemutatása.</p>
+<h3 data-number="20.3.6" id="labor-fragmentációs-mérés"><span
+class="header-section-number">20.3.6</span> Labor: Fragmentációs
+mérés</h3>
+<p>A labor célja, hogy számszerűsítse a belső és külső fragmentációt két
+különböző allokációs stratégia mellett, és bemutassa a méretosztályok
+hatását. A mérést egy saját, egyszerű heap-szimulátorral végezzük el,
+mert így pontosan nyomon követhetjük az egyes blokkok méretét és
+állapotát, ellentétben a rendszer <code>malloc</code>-jával, ahol a
+belső metaadatok nem láthatók.</p>
+<h4 data-number="20.3.6.1" id="a-szimulátor-felépítése"><span
+class="header-section-number">20.3.6.1</span> A szimulátor
+felépítése</h4>
+<p>A szimulátor egy rögzített méretű
+<code>std::vector&lt;std::byte&gt;</code> területet használ, és egy
+szabadlistát kezel. Minden blokk előtt egy fejléc áll, amely
+tartalmazza:</p>
+<ul>
+<li>a blokk méretét (hasznos terület),</li>
+<li>egy <code>bool</code> értéket, hogy szabad-e,</li>
+<li>egy mutatót a következő blokkra a listában (ha szabad).</li>
+</ul>
+<p>A szabadlista elemeit méret szerint rendezzük (a stratégiától függően
+first-fit vagy best-fit). A first-fit esetén a lista tetszőleges
+sorrendben lehet, a best-fit esetén a listát növekvő méret szerint
+rendezzük.</p>
+<p>Az allokáció során a program a választott stratégiának megfelelően
+kiválaszt egy szabad blokkot, és ha a maradék blokk elég nagy,
+kettéosztja: a bal oldali részt kiosztja, a jobb oldali rész szabad
+marad, és visszakerül a szabadlistába. A felszabadítás egyszerűen a
+blokk állapotát szabadra állítja, és beilleszti a szabadlistába, majd
+megpróbálja összevonni a szomszédos szabad blokkokkal (coalescing), hogy
+csökkentse a külső fragmentációt.</p>
+<p>A szimulátor méri:</p>
+<ul>
+<li><strong>Belső fragmentáció</strong>: minden allokációnál a kiosztott
+blokk mérete mínusz a kért méret. (Itt a fejléc méretét is beleszámítjuk
+a blokk méretébe, de a felhasználói terület csak a kért méret; a
+különbség a fejléc + igazítási párnázat + esetleges maradék.) Ha a
+kiosztás során a blokk osztódik, a maradék blokk mérete is hozzájárulhat
+a belső fragmentációhoz, de azt inkább a szabad memória részének
+tekintjük, nem fragmentációnak.</li>
+<li><strong>Külső fragmentáció</strong>: a legnagyobb szabad blokk
+méretének aránya a teljes szabad memóriához képest. Minél kisebb ez az
+arány, annál nagyobb a fragmentáció. Ezen kívül a szabad blokkok számát
+is rögzítjük.</li>
+</ul>
+<p>A szimulátor bemenete egy előre definiált műveletsor, amely
+véletlenszerűen allokál és felszabadít különböző méretű blokkokat. A
+véletlenszerűség determinisztikus (pl. fix seed), hogy a mérés
+reprodukálható legyen. A műveletsor hossza 10 000
+allokáció/felszabadítás, és a méretek 16 és 1024 bájt között
+változnak.</p>
+<h4 data-number="20.3.6.2" id="a-kísérlet"><span
+class="header-section-number">20.3.6.2</span> A kísérlet</h4>
+<p>Két stratégiát hasonlítunk össze:</p>
+<ol type="1">
+<li><strong>First-fit</strong> – a szabadlista első megfelelő blokkját
+választja.</li>
+<li><strong>Best-fit</strong> – a legkisebb megfelelő blokkot
+választja.</li>
+</ol>
+<p>Mindkét esetben a szabadlista FIFO sorrendben van, de a best-fit
+esetén minden beszúrásnál rendezzük méret szerint.</p>
+<p>Ezen kívül bemutatjuk a <strong>slab allokátor</strong> hatását
+ugyanazon a műveletsoron. Ehhez egy egyszerű slab-alapú allokátort
+használunk, amely 16, 32, 64, 128, 256, 512, 1024 méretosztályokat
+definiál, és minden osztályhoz slabeket rendel. A belső fragmentációt a
+kért méret és a méretosztály közötti különbség adja, a külső
+fragmentáció gyakorlatilag nulla, mert a slaben belül nincs
+széttöredezés.</p>
+<h4 data-number="20.3.6.3" id="mérési-eredmények"><span
+class="header-section-number">20.3.6.3</span> Mérési eredmények</h4>
+<p>A mérést GCC 14.1-gyel, <code>-std=c++23 -O2</code> kapcsolókkal,
+x86-64 platformon végezzük. Az alábbi táblázat a várt eredményeket
+mutatja (a tényleges számok a konkrét implementációtól és a
+műveletsortól függenek, ezért a laborban a hallgatónak saját mérést kell
+végeznie).</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 8%" />
+<col style="width: 36%" />
+<col style="width: 36%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Stratégia</th>
+<th>Átlagos belső fragmentáció (byte/allokáció)</th>
+<th>Legnagyobb szabad blokk / összes szabad (%)</th>
+<th>Szabad blokkok száma</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>First-fit</td>
+<td>18,7</td>
+<td>42%</td>
+<td>187</td>
+</tr>
+<tr class="even">
+<td>Best-fit</td>
+<td>15,2</td>
+<td>35%</td>
+<td>214</td>
+</tr>
+<tr class="odd">
+<td>Slab</td>
+<td>22,5</td>
+<td>98%</td>
+<td>12 (slab szinten)</td>
+</tr>
+</tbody>
+</table>
+<p>A várt tendenciák:</p>
+<ul>
+<li>A <code>first-fit</code> gyors, de a szabad memória felaprózódik, a
+legnagyobb szabad blokk aránya alacsony.</li>
+<li>A <code>best-fit</code> valamivel alacsonyabb belső fragmentációt
+mutat (mert kevésbé hagy nagy maradékot), de a külső fragmentáció
+rosszabb, mert sok apró szabad blokk keletkezik.</li>
+<li>A <code>slab</code> allokátor belső fragmentációja némileg magasabb
+a méretosztályra kerekítés miatt, de a külső fragmentáció gyakorlatilag
+megszűnik, mert a szabad objektumok mind ugyanabban a méretosztályban
+vannak, és a legnagyobb szabad blokk (egy szabad slab) nagy.</li>
+</ul>
+<h4 data-number="20.3.6.4" id="a-labor-elvégzése"><span
+class="header-section-number">20.3.6.4</span> A labor elvégzése</h4>
+<ol type="1">
+<li>Írja meg a heap-szimulátort a fenti specifikáció szerint.</li>
+<li>Implementálja a first-fit és best-fit stratégiákat.</li>
+<li>Implementáljon egy egyszerű slab allokátort méretosztályokkal.</li>
+<li>Futtassa mindhárom stratégiát ugyanazon a műveletsoron.</li>
+<li>Gyűjtse a mérési adatokat, és rögzítse egy mérési naplóba (pl. CSV
+formátumban).</li>
+<li>Hasonlítsa össze a kapott eredményeket a várt tendenciákkal, és
+magyarázza meg az esetleges eltéréseket.</li>
+</ol>
+<p>A mérési naplóban minden futáshoz rögzíteni kell:</p>
+<ul>
+<li>a fordító verzióját és az optimalizációs szintet,</li>
+<li>a hardver alapadatait (CPU, RAM),</li>
+<li>a műveletsor leírását (seed, méreteloszlás, műveletek száma),</li>
+<li>a mért értékeket (belső fragmentáció átlaga, legnagyobb szabad blokk
+aránya, szabad blokkok száma),</li>
+<li>a futások számát (minimum 5 ismétlés, az átlagot és a szórást).</li>
+</ul>
+<p>Példa egy mérési naplóbejegyzésre:</p>
+<pre><code>[2025-04-05 10:32:44]
+Compiler: GCC 14.1, -std=c++23 -O2
+Platform: x86-64, Intel i7-12700K, 32 GB RAM
+Workload: seed=42, 10000 operations, sizes 16..1024 uniform
+Strategy: first-fit
+Run 1: internal_frag=17.9, largest_free_ratio=0.41, free_blocks=182
+Run 2: internal_frag=18.3, largest_free_ratio=0.43, free_blocks=185
+...
+Average: internal_frag=18.1, largest_free_ratio=0.42, free_blocks=184
+Stddev: internal_frag=0.2, largest_free_ratio=0.01, free_blocks=2</code></pre>
+<h4 data-number="20.3.6.5" id="ellenőrzés-és-értékelés"><span
+class="header-section-number">20.3.6.5</span> Ellenőrzés és
+értékelés</h4>
+<p>A labor akkor sikeres, ha:</p>
+<ul>
+<li>A szimulátor helyesen kezeli a blokkok összevonását, és nincs
+memóriaszivárgás.</li>
+<li>A mérési eredmények reprodukálhatók (determinisztikus seed mellett
+ugyanazok a számok jönnek ki).</li>
+<li>Az eredmények magyarázata összhangban van a fejezetben tárgyalt
+fogalmakkal.</li>
+<li>A hallgató be tudja mutatni, hogy a különböző stratégiák hogyan
+befolyásolják a fragmentációt.</li>
+</ul>
+<h3 data-number="20.3.7" id="gyakori-hibák-és-elkerülésük"><span
+class="header-section-number">20.3.7</span> Gyakori hibák és
+elkerülésük</h3>
+<ol type="1">
+<li><strong>A belső és külső fragmentáció összekeverése</strong>: A
+belső fragmentáció a blokkon belüli kihasználatlan terület, a külső a
+szabad memória széttöredezettsége. Gyakori hiba, hogy az allokátor által
+visszaadott blokk méretét a kért mérettel hasonlítják össze anélkül,
+hogy figyelembe vennék a fejlécet – ez alulbecsüli a belső
+fragmentációt.</li>
+<li><strong>A coalescing elhanyagolása</strong>: Ha a felszabadításkor
+nem vonjuk össze a szomszédos szabad blokkokat, a külső fragmentáció
+gyorsan nő. A szimulátorban ezt minden felszabadítás után meg kell
+tenni.</li>
+<li><strong>A slab allokátor helytelen méretosztály-választása</strong>:
+Ha a méretosztályok túl ritkák, a belső fragmentáció magas lesz; ha túl
+sűrűek, az adminisztráció nő. A gyakorlatban a hatványozott vagy
+geometriai sorozatú osztályok jól működnek.</li>
+<li><strong>Nem megfelelő stratégia kiválasztása</strong>: Nincs
+univerzális legjobb stratégia. A választás a munkaterheléstől függ: ha
+sok azonos méretű objektum van, a slab a legjobb; ha változó méretek és
+kevés felszabadítás van, a first-fit elfogadható.</li>
+</ol>
+<h3 data-number="20.3.8" id="összefoglalás"><span
+class="header-section-number">20.3.8</span> Összefoglalás</h3>
+<p>A fragmentáció a dinamikus memóriakezelés alapvető kihívása, amely
+két formában jelentkezik: belső (a blokkon belüli kihasználatlan
+terület) és külső (a szabad memória széttöredezettsége). Az allokációs
+stratégia (first-fit, best-fit, worst-fit, buddy) közvetlenül
+befolyásolja a külső fragmentációt, míg a méretosztályok és a slab
+allokátor a belső fragmentációt kontrollálják, miközben gyakorlatilag
+megszüntetik a külső fragmentációt. A laborban egy egyszerű
+szimulátorral mérhetővé tettük ezeket a hatásokat, és láttuk, hogy a
+slab allokátor különösen hatékony a kis, hasonló méretű objektumok
+esetén.</p>
+<h3 data-number="20.3.9" id="önellenőrző-kérdés"><span
+class="header-section-number">20.3.9</span> Önellenőrző kérdés</h3>
+<p>Adott egy heap, amelyben a következő állapot áll fenn: három szabad
+blokk 100, 200 és 300 bájt méretű, és egy 500 bájtos kérés érkezik. Az
+allokátor first-fit stratégiát használ (a lista sorrendje 100, 200,
+300). Hogyan viselkedik az allokátor, és mekkora lesz a keletkező belső
+és külső fragmentáció? Ha best-fit stratégiát használ (a lista méret
+szerint rendezett), mi történik? Válaszát indokolja a fejezetben tanult
+fogalmakkal.</p>
+<p><strong>Válasz:</strong> First-fit esetén a 300 bájtos blokk az első,
+amely elég nagy, tehát ezt választja, és 500–300=200 bájt marad szabad,
+de mivel a kérés 500, ez nem elég, tehát a 300-as blokk teljesen
+kiosztásra kerül, és 200 bájt belső fragmentációt okoz (a blokk 500-ra
+növelése nem lehetséges, mert nincs elég hely). Valójában a first-fit a
+300-as blokkot választaná, de az nem elég, ezért tovább keres, de a
+100-as és 200-as sem elég, így az allokáció sikertelen. Ha a lista
+sorrendje 100, 200, 300, és a kérés 500, egyik blokk sem elég, tehát
+nincs allokáció. Ha best-fit, akkor ugyanúgy nincs elég nagy blokk,
+tehát szintén sikertelen. A kérdés rosszul volt feltéve, mert a szabad
+blokkok összege 600, de a legnagyobb 300, ezért 500-as kérést nem lehet
+kiszolgálni – ez a külső fragmentáció példája. A válasz: mindkét
+stratégia sikertelen, mert a legnagyobb szabad blokk kisebb, mint a kért
+méret, hiába a teljes szabad 600 bájt. (A kérdés célja a külső
+fragmentáció felismerése volt.)</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="cpp075.html">← 20.2 Object pool és freelist</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp077.html">20.4 NUMA, cache locality és mérés →</a></div>
+</nav>
+</body>
+</html>

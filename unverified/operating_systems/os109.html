@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>28.4 Naplózás, panic és hibakezelés – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch27">28 Kernel implementáció</a></p>
+<div class="links"><a class="prev" rel="prev" href="os108.html">← 28.3 QEMU, GDB és kernel debugging</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os110.html">29.1 Egyszerű fájlrendszer tervezése →</a></div>
+</nav>
+<h2 data-number="28.4" id="os109"><span
+class="header-section-number">28.4</span> Naplózás, panic és
+hibakezelés</h2>
+<p>A kernel fejlesztése során a hibák elkerülhetetlenek. A userland
+programokban egy hibás mutató arra utal, hogy a folyamat megbukott, a
+rendszer többi része tovább működik. A kernelben ugyanez a hiba gyakran
+az egész rendszert veszélyezteti: nincs mögöttes védelmi háló, amely
+elkülönítené a hibás komponenst. Ezért a kernel saját hibakezelési
+eszközöket igényel: láthatóvá kell tenni a hibákat, diagnosztikai
+információt kell gyűjteni, és meg kell határozni, hogy a rendszer
+folytathatja-e a futást, vagy biztonságosan le kell állnia. Ebben a
+fejezetben a kernel naplózásának, a <code>panic</code> mechanizmusnak és
+a <code>oops</code> kezelésének alapelveit és gyakorlati mintáit
+tekintjük át. A cél nem csupán a Linux <code>printk</code> API
+ismertetése, hanem egy olyan gondolkodásmód kialakítása, amelyet a
+saját, minimális rendszerünkben is alkalmazni tudunk.</p>
+<h3 data-number="28.4.1" id="a-kernel-hibakezelés-sajátosságai"><span
+class="header-section-number">28.4.1</span> A kernel hibakezelés
+sajátosságai</h3>
+<p>A kernel futási környezete alapvetően különbözik a felhasználói
+térétől. Nincs <code>libc</code>, nincs szabványos <code>printf</code>,
+nincs fájlrendszer, ahová naplót írhatunk, és nincs processzhatár, amely
+a hibát lokálisan kezelné. A kernel a legmagasabb privilégiumú módban
+fut, közvetlen hozzáféréssel a hardverhez és a memóriához. Egy hibás
+memória-hozzáférés itt nem egyszerűen a hibás folyamat terminálását
+jelenti, hanem potenciálisan a kernel adatstruktúráinak megsérülését,
+eszközök hibás állapotba kerülését vagy váratlan rendszerleállást.</p>
+<p>A hibakezelés három fő célja:</p>
+<ol type="1">
+<li><strong>Láthatóság</strong> – a hiba ne maradjon néma; a fejlesztő
+és a rendszeradminisztrátor értesüljön a bekövetkezéséről, annak
+körülményeiről.</li>
+<li><strong>Diagnosztika</strong> – a naplóüzenet tartalmazzon elegendő
+kontextust (időbélyeg, processzor, folyamat, verem, regiszterek) a hiba
+okának azonosításához.</li>
+<li><strong>Megbízható folytatás vagy biztonságos leállás</strong> – a
+kernelnek döntést kell hoznia: a hiba helyi és javítható-e, vagy a
+rendszer állapota már nem megbízható. Ez utóbbi esetben a
+legbiztonságosabb választás a <code>panic</code>, azaz a rendszer
+azonnali, szándékos leállítása.</li>
+</ol>
+<p>A kernelben a hibakezelés egyszerű eszközökkel dolgozik, mert a hiba
+bekövetkeztekor nem támaszkodhatunk bonyolult futásidejű környezetre. A
+naplózásnak minimális függőségűnek kell lennie, és korán elérhetőnek –
+már a boot legelső fázisában is.</p>
+<h3 data-number="28.4.2"
+id="kernel-naplózás-printk-és-log-szintek"><span
+class="header-section-number">28.4.2</span> Kernel naplózás: printk és
+log szintek</h3>
+<p>A leggyakoribb kernelnaplózási mechanizmus a <code>printk</code>
+(print kernel). Ez a felhasználói <code>printf</code> analógja, de
+közvetlenül a kernelben fut, és a kimenetet nem a standard kimenetre,
+hanem egy körkörös puffere (ring buffer) írja. A <code>printk</code>
+függvény a formázott üzenetet előállítja, majd a megfelelő szinttel
+együtt a naplóba helyezi. A Linux kernelben a <code>printk</code> a
+következőképpen hívható:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>printk<span class="op">(</span>KERN_INFO <span class="st">&quot;kernel booted, version </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> version<span class="op">);</span></span></code></pre></div>
+<p>A <code>KERN_INFO</code> makró nem külön argumentum, hanem a
+formátumstring elejére illesztett log szintet jelölő előtag. Fontos,
+hogy a log szint és a formátumstring egy literálban szerepel, így a
+fordító ellenőrizheti a paramétereket.</p>
+<p>A log szintek jelentése:</p>
+<ul>
+<li><code>KERN_EMERG</code> – a rendszer használhatatlan, azonnali
+beavatkozás szükséges.</li>
+<li><code>KERN_ALERT</code> – súlyos hiba, azonnali figyelem
+szükséges.</li>
+<li><code>KERN_CRIT</code> – kritikus feltétel, például
+hardverhiba.</li>
+<li><code>KERN_ERR</code> – általános hiba, amely nem feltétlenül
+fatális.</li>
+<li><code>KERN_WARNING</code> – figyelmeztetés, potenciális
+probléma.</li>
+<li><code>KERN_NOTICE</code> – normál, de fontos esemény.</li>
+<li><code>KERN_INFO</code> – tájékoztató üzenet.</li>
+<li><code>KERN_DEBUG</code> – részletes, hibakereséshez használt
+üzenet.</li>
+</ul>
+<p>A szintek hierarchiát alkotnak. A kernel egy
+<code>console_loglevel</code> (vagy
+<code>default_message_loglevel</code>) értéket tart nyilván, amely
+meghatározza, hogy mely üzenetek jussanak el a soros konzolra vagy a
+képernyőre. A magasabb prioritású (alacsonyabb numerikus értékű) szintek
+mindig megjelennek, a alacsonyabb prioritásúak csak akkor, ha a
+beállítás ezt engedi. Például ha a konzolszint
+<code>KERN_WARNING</code>, akkor a <code>KERN_INFO</code> és
+<code>KERN_DEBUG</code> üzeneteket a ring bufferbe írjuk, de a konzolra
+nem küldjük. Ezzel elkerülhető, hogy a rendszer indulásakor a konzolt
+elárasszák a részletes debug üzenetek, miközben a hibaüzenetek
+megmaradnak.</p>
+<p>A <code>printk</code> implementációja több rétegből áll:</p>
+<ol type="1">
+<li><strong>Formázás</strong> – a <code>vsnprintf</code> segítségével a
+változó argumentumokból szöveges reprezentációt készít.</li>
+<li><strong>Rekordkészítés</strong> – a formázott üzenethez hozzáfűzi a
+szintet, időbélyeget, processzorazonosítót és egyéb metaadatot.</li>
+<li><strong>Ring bufferbe írás</strong> – a rekordot a körkörös pufferbe
+másolja.</li>
+<li><strong>Konzolra küldés</strong> – ha a szint engedélyezi, a konzol
+drivernek átadja a szöveget.</li>
+</ol>
+<p>A korai boot fázisban a konzoldriver még nem érhető el. Ilyenkor a
+<code>printk</code> üzenetek kizárólag a ring bufferbe kerülnek, és a
+konzol inicializálása után a buffer tartalma kiüríthető. Ezt a
+mechanizmust nevezzük korai naplózásnak; a Linux kernelben például a
+<code>earlycon</code> vagy <code>earlyprintk</code> paraméterekkel
+aktiválható.</p>
+<p>A következő C kód egy minimális, freestanding <code>printk</code>
+vázlatot mutat be. A példa szemléltetés, nem teljes implementáció:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Minimal kernel log - illustrative only */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">enum</span> <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    LOG_EMERG   <span class="op">=</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    LOG_ALERT   <span class="op">=</span> <span class="dv">1</span><span class="op">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    LOG_CRIT    <span class="op">=</span> <span class="dv">2</span><span class="op">,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    LOG_ERR     <span class="op">=</span> <span class="dv">3</span><span class="op">,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    LOG_WARNING <span class="op">=</span> <span class="dv">4</span><span class="op">,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    LOG_NOTICE  <span class="op">=</span> <span class="dv">5</span><span class="op">,</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    LOG_INFO    <span class="op">=</span> <span class="dv">6</span><span class="op">,</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    LOG_DEBUG   <span class="op">=</span> <span class="dv">7</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> log_level_t<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="co">/* Console log threshold: messages with level &lt;= console_level go to console */</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> log_level_t console_level <span class="op">=</span> LOG_WARNING<span class="op">;</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> serial_write<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>s<span class="op">);</span>  <span class="co">/* provided by UART driver */</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> log_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* placeholder: push character to ring buffer and maybe serial */</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    ring_buffer_put<span class="op">(</span>c<span class="op">);</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>console_level <span class="op">&lt;=</span> LOG_WARNING<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>        serial_write<span class="op">(&amp;</span>c<span class="op">);</span>  <span class="co">/* caution: serial_write expects null-terminated */</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_log<span class="op">(</span>log_level_t level<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* in real code, use vsnprintf; here simplified */</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">va_list</span> args<span class="op">;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    va_start<span class="op">(</span>args<span class="op">,</span> fmt<span class="op">);</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* vsnprintf(buf, sizeof(buf), fmt, args) must be implemented */</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    va_end<span class="op">(</span>args<span class="op">);</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> buf<span class="op">;</span> <span class="op">*</span>p<span class="op">;</span> p<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        log_putc<span class="op">(*</span>p<span class="op">);</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti vázlatban a <code>ring_buffer_put</code> és a
+<code>serial_write</code> függvényeket a hardver réteg biztosítja. A
+<code>serial_write</code> a soros portra ír, ami a legegyszerűbb konzol.
+A <code>vsnprintf</code> kényelmi függvény a formázáshoz, de a
+legkorábbi boot fázisban sok kernel saját, minimalista implementációt
+használ.</p>
+<p>A log szintek használatakor alapelv, hogy a fejlesztő ne használjon
+magasabb prioritást a szükségesnél. A <code>KERN_ERR</code> szint a
+tényleges hibáké, a <code>KERN_DEBUG</code> a fejlesztői nyomkövetésé. A
+túlzottan magas szintű üzenetek elrejthetik a valódi problémákat, míg a
+túl alacsony szintűek hamis riasztást kelthetnek.</p>
+<h3 data-number="28.4.3" id="ring-buffer-és-naplófogyasztás"><span
+class="header-section-number">28.4.3</span> Ring buffer és
+naplófogyasztás</h3>
+<p>A kernel naplózásának központi adatszerkezete a körkörös puffer.
+Ennek fix mérete van, és a régebbi üzenetek felülíródnak, ha a puffer
+megtelik. Ez a kialakítás garantálja, hogy a naplózás soha nem blokkol,
+és nem fogyaszt dinamikus memóriát – ami hibakezelés közben kritikus. A
+ring buffer tipikusan néhány KiB-tól néhány MiB-ig terjed; mérete
+konfigurálható.</p>
+<p>A Linux kernelben a ring bufferben minden üzenet egy rekord, amely a
+következő mezőket tartalmazza:</p>
+<ul>
+<li>időbélyeg (timestamp),</li>
+<li>processzorazonosító,</li>
+<li>log szint,</li>
+<li>a formázott szöveg,</li>
+<li>sorozatszám.</li>
+</ul>
+<p>A rekordokat egy olvasó (például a <code>dmesg</code> parancs)
+olvashatja ki a felhasználói térből. A kernel a <code>/dev/kmsg</code>
+eszközön keresztül teszi lehetővé a valós idejű olvasást, ahol minden
+rekord egyszer olvasható. A <code>syslog</code> rendszerhívás a
+klasszikus interfész, amely a ring buffer tartalmát másolja a
+felhasználói térbe.</p>
+<p>A ring buffer fontos tulajdonsága, hogy lehetővé teszi a napló
+megőrzését akkor is, ha a rendszer összeomlik. Ha a kernel
+<code>panic</code> állapotba kerül, a ring buffer tartalma a memóriában
+marad, és a következő boot után a rendszerindítási folyamat
+visszaolvashatja, vagy a <code>kdump</code> mechanizmus a memóriaképet
+mentheti. Emiatt a ring buffernek a <code>panic</code> előtt
+flush-elhetőnek kell lennie, de ez nem garantált, ha a hardveres konzol
+nem elérhető.</p>
+<p>A naplófogyasztás szempontjából a ring buffernek két mutatója van: az
+író (writer) és az olvasó (reader) pozíció. Az író mindig a legújabb
+szabad helyre ír, és ha eléri a végét, visszaugrik az elejére, esetleg
+felülírva a legrégebbi, még nem olvasott rekordot. Az olvasó az utolsó
+olvasott pozíciótól halad előre. Ezzel a struktúrával a napló elvesztése
+akkor következik be, ha a termelő sebessége tartósan meghaladja a
+fogyasztóét.</p>
+<p>A tipikus hibrid megoldás: a ring buffer a teljes naplót tárolja, a
+soros konzol pedig csak a szűrt üzeneteket kapja. Ha a ring buffer túl
+kicsi, a hibakereséshez szükséges korai üzenetek elveszhetnek, de a
+konzol kimenet megőrizheti a legfontosabb eseményeket. A tervezésnél
+ezért a <code>panic</code> diagnózishoz elegendő naplót kell
+biztosítani: a hiba bekövetkezése előtti néhány száz üzenet általában
+elegendő a kontextus rekonstruálásához.</p>
+<h3 data-number="28.4.4" id="panic-oops-és-helyreállítás"><span
+class="header-section-number">28.4.4</span> Panic, oops és
+helyreállítás</h3>
+<p>A kernelben a hibák két nagy kategóriába sorolhatók:
+<strong>fatális</strong> és <strong>nem fatális</strong>. A fatális hiba
+azt jelenti, hogy a kernel állapota nem megbízható, és a további futás
+nagyobb kockázatot jelent, mint a leállás. A nem fatális hiba esetén a
+rendszer tovább működhet, de a hibát naplózni kell.</p>
+<h3 data-number="28.4.5" id="oops"><span
+class="header-section-number">28.4.5</span> Oops</h3>
+<p>A Linux kernelben az <code>oops</code> egy nem fatális, de súlyos
+hiba. Olyan helyeken fordul elő, ahol a kernel hibás állapotot észlel,
+például <code>NULL</code> pointer dereferencia egy olyan kontextusban,
+ahol a hiba visszaadható. Az <code>oops</code> kiírja a hibaüzenetet, a
+processzor regisztereit, a verem nyomkövetést és a releváns
+kernelmodulokat, majd a rendszer megpróbál folytatódni. A
+<code>oops</code> után a kernel megjelöli az érintett folyamatot, hogy
+az ne folytathassa, de a rendszer többi része fut tovább.</p>
+<p>Az <code>oops</code> legfontosabb jellemzője, hogy a hibát tartalmazó
+művelet (például egy rendszerhívás) visszatérhet <code>-EFAULT</code>
+hibakóddal, vagy a folyamat <code>SIGSEGV</code> jelzést kaphat. A
+kernel saját adatstruktúrái azonban sérülhetnek, ezért az
+<code>oops</code> után a rendszer állapota gyanús. A Linux
+konfigurálható úgy, hogy az első <code>oops</code> után
+<code>panic</code>-et váltson ki (<code>panic_on_oops</code>), így
+elkerülve a további adatkorrupciót.</p>
+<h3 data-number="28.4.6" id="panic"><span
+class="header-section-number">28.4.6</span> Panic</h3>
+<p>A <code>panic</code> a kernel szándékos leállítása. A
+<code>panic</code> függvény akkor hívódik, amikor a kernel olyan hibát
+észlel, amelyből nincs biztonságos visszatérés – például a scheduler
+adatstruktúrája sérült, egy <code>BUG()</code> makró aktiválódott, vagy
+a hardver végzetes hibát jelzett. A <code>panic</code> feladata:</p>
+<ol type="1">
+<li><strong>Megállítani a többi CPU-t</strong> – SMP rendszerben a többi
+processzor megszakításokkal leállítható, hogy ne módosítsa tovább az
+állapotot.</li>
+<li><strong>Kiírni a panic üzenetet</strong> – a hiba leírása, a
+processzor és a folyamat azonosítója, a verem.</li>
+<li><strong>Kiírni a regisztereket és a memóriát</strong> – a
+hibakereséshez szükséges nyers adat.</li>
+<li><strong>Végrehajtani a konfigurált kilépési műveletet</strong> –
+alapértelmezésben a rendszer leáll; beállítható újraindítás, magasabb
+szintű hibakezelőnek való átadás (például hardveres watchdog), vagy hiba
+utáni kernelbe való átugrás (kexec).</li>
+</ol>
+<p>A <code>panic</code> pszudokódja:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_panic<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Disable interrupts on this CPU */</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    local_irq_disable<span class="op">();</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Stop other CPUs (SMP platform) */</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    smp_send_stop<span class="op">();</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Print panic header */</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    kernel_log<span class="op">(</span>LOG_EMERG<span class="op">,</span> <span class="st">&quot;Kernel panic - not syncing: &quot;</span><span class="op">);</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">va_list</span> args<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    va_start<span class="op">(</span>args<span class="op">,</span> fmt<span class="op">);</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* print formatted message to console and ring buffer */</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    va_end<span class="op">(</span>args<span class="op">);</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Dump registers and stack */</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    dump_stack<span class="op">();</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    dump_registers<span class="op">();</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Optional: flush ring buffer to console */</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    console_flush<span class="op">();</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Execute configured action */</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>panic_timeout <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Hang forever */</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>            cpu_halt<span class="op">();</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>panic_timeout <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Reboot after timeout */</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        machine_restart<span class="op">();</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Hand over to debugger or crash dump */</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>        machine_halt<span class="op">();</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti pszudokód a <code>panic_timeout</code> változóval
+konfigurálhatóvá teszi a viselkedést. A <code>local_irq_disable</code>
+és <code>smp_send_stop</code> platformfüggő; a <code>dump_stack</code>
+és <code>dump_registers</code> a <a href="os108.html">QEMU, GDB és
+kernel debugging</a> fejezetben tárgyalt hibakereső eszközökre épül.</p>
+<p>Fontos, hogy a <code>panic</code> kódjának minimálisnak és
+robusztusnak kell lennie. Nem szabad olyan függvényeket hívnia, amelyek
+maguk is hibát okozhatnak. Például a <code>printk</code> a
+<code>panic</code> közben nem foglalhat zárat, mert a hiba éppen egy zár
+miatt következhetett be. A kernel ezért a <code>panic</code> útvonalon
+közvetlenül a soros portra ír, megkerülve a normál naplózási
+réteget.</p>
+<h3 data-number="28.4.7" id="helyreállítási-stratégiák"><span
+class="header-section-number">28.4.7</span> Helyreállítási
+stratégiák</h3>
+<p>A <code>panic</code> a végső eszköz, de bizonyos rendszerekben –
+különösen beágyazott vagy biztonság-kritikus környezetben – megengedett
+a részleges helyreállítás. Ilyen lehet:</p>
+<ul>
+<li><strong>Watchdog alapú újraindítás</strong> – a hardveres vagy
+szoftveres watchdog figyeli a rendszer életjelét. Ha a
+<code>panic</code> bekövetkezik, a rendszer leáll, és a watchdog
+újraindítja. Ez a leggyakoribb beágyazott megoldás.</li>
+<li><strong>Crash dump és elemzés</strong> – a <code>kdump</code>
+mechanizmus a <code>panic</code> előtt egy másik kernelbe ugrik, amely
+elmenti a memória tartalmát. A mentett kép később debuggerrel
+elemezhető.</li>
+<li><strong>Részleges hibatűrés</strong> – egyes mikrokernel
+architektúrákban a hibás szolgáltatás újraindítható anélkül, hogy az
+egész kernel leállna. Ez a megközelítés azonban a hibahatárok gondos
+tervezését igényli.</li>
+<li><strong><code>oops</code> utáni korlátozott folytatás</strong> – ha
+a hiba nem érinti a központi állapotot, a kernel folytathatja, de a
+hibás modul letiltható.</li>
+</ul>
+<p>A helyreállítási stratégia megválasztása a rendszer követelményeitől
+függ. Egy szerveren a <code>panic</code> utáni automatikus újraindítás
+elfogadható. Egy orvosi eszközön a leállás elfogadhatatlan, ezért a
+tervezésnek eleve el kell kerülnie a fatális hibákat.</p>
+<h3 data-number="28.4.8" id="hibakezelési-minták-a-kernelben"><span
+class="header-section-number">28.4.8</span> Hibakezelési minták a
+kernelben</h3>
+<p>A kernelben a hibák jelzésére több makró és konvenció létezik:</p>
+<ul>
+<li><code>BUG()</code> – feltétel nélküli fatális hiba; hatása
+<code>panic</code>, hacsak nincs beállítva <code>panic_on_oops</code>.
+Az <code>BUG()</code> utasítás gyakran egy olyan utasításra fordítódik,
+amely a debuggert hívja.</li>
+<li><code>BUG_ON(condition)</code> – ha a feltétel igaz,
+<code>BUG()</code>-ot hív.</li>
+<li><code>WARN()</code> – hasonló az <code>oops</code>-hoz, de a
+rendszer folytatódik. A <code>WARN()</code> üzenetet naplóz, és
+opcionálisan stack trace-t ír.</li>
+<li><code>WARN_ON(condition)</code> – feltételes
+<code>WARN()</code>.</li>
+<li><code>assert()</code> a kernelben általában nem használatos, mert a
+hiba súlyossága és a feloldás nem egyértelmű; helyette a fenti makrók
+szerepelnek.</li>
+</ul>
+<p>A makrókat okosan kell használni. A <code>BUG</code> akkor indokolt,
+ha a feltétel megsértése garantáltan adatkorrupcióhoz vezet, és a
+továbbhaladás veszélyesebb, mint a leállás. A <code>WARN</code> akkor
+megfelelő, ha a hiba nem fatális, de jelezni kell a fejlesztőnek, mert
+váratlan állapotot tükröz. A <code>WARN</code>-t gyakran követi hibakód
+visszaadása, így a hívó fél tisztességesen kezelheti a helyzetet.</p>
+<p>A hibakódok visszaadása a kernelben a <code>-errno</code> hagyományt
+követi: a függvények negatív hibakódot adnak vissza, pozitív értéket
+siker esetén. A pointert visszaadó függvények az <code>ERR_PTR</code>
+makróval hibakódot kódolnak pointerbe, a <code>IS_ERR</code> és
+<code>PTR_ERR</code> makrókkal ellenőrizhető.</p>
+<p>Példa egy tipikus hibaellenőrzési mintára:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> my_data <span class="op">*</span>p <span class="op">=</span> kmalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>p<span class="op">),</span> GFP_KERNEL<span class="op">);</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(!</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    pr_err<span class="op">(</span><span class="st">&quot;my_data allocation failed</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>some_condition<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    WARN_ON<span class="op">(</span><span class="dv">1</span><span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    kfree<span class="op">(</span>p<span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>pr_err</code> a <code>printk(KERN_ERR ...)</code>
+rövidítése. A <code>WARN_ON</code> naplózza a hibát, de a függvény mégis
+visszatér.</p>
+<h3 data-number="28.4.9"
+id="gyakorlati-minta-minimális-log-és-panic"><span
+class="header-section-number">28.4.9</span> Gyakorlati minta: minimális
+log és panic</h3>
+<p>A következő C kód egy egyszerű, de működőképes keretet mutat be egy
+tanulási célú kernelhez. A kód freestanding, tehát nem használ libc-t,
+és a hardverhez való hozzáférést a <code>serial_write</code> és hasonló
+függvények absztrahálják. A példa célja a naplózás és a
+<code>panic</code> működésének megértése, nem pedig éles rendszerben
+való használat.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* minimal_log.h - illustrative kernel logging */</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#ifndef MINIMAL_LOG_H</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINIMAL_LOG_H</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">enum</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    LOG_EMERG   <span class="op">=</span> <span class="dv">0</span><span class="op">,</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    LOG_ALERT   <span class="op">=</span> <span class="dv">1</span><span class="op">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    LOG_CRIT    <span class="op">=</span> <span class="dv">2</span><span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    LOG_ERR     <span class="op">=</span> <span class="dv">3</span><span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    LOG_WARNING <span class="op">=</span> <span class="dv">4</span><span class="op">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    LOG_NOTICE  <span class="op">=</span> <span class="dv">5</span><span class="op">,</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>    LOG_INFO    <span class="op">=</span> <span class="dv">6</span><span class="op">,</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    LOG_DEBUG   <span class="op">=</span> <span class="dv">7</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> log_level_t<span class="op">;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_log_init<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_log<span class="op">(</span>log_level_t level<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_panic<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_oops<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...);</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="pp">#endif</span></span></code></pre></div>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* minimal_log.c - simplified implementation */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdarg.h&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;minimal_log.h&quot;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="co">/* Platform-specific functions provided by UART or early console */</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> serial_putchar<span class="op">(</span><span class="dt">char</span> c<span class="op">);</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> machine_halt<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> machine_restart<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> local_irq_disable<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> local_irq_enable<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="kw">extern</span> <span class="dt">void</span> dump_stack<span class="op">(</span><span class="dt">void</span><span class="op">);</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="co">/* Ring buffer configuration */</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#define LOG_BUFFER_SIZE </span><span class="dv">4096</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">char</span> log_buffer<span class="op">[</span>LOG_BUFFER_SIZE<span class="op">];</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> log_wr <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> log_rd <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> log_lock <span class="op">=</span> <span class="dv">0</span><span class="op">;</span>  <span class="co">/* simple spinlock placeholder */</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> log_level_t console_level <span class="op">=</span> LOG_INFO<span class="op">;</span> <span class="co">/* show INFO and above */</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> spin_lock<span class="op">(</span><span class="dt">int</span> <span class="op">*</span>lock<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* atomic test-and-set; actual implementation platform-specific */</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>__sync_lock_test_and_set<span class="op">(</span>lock<span class="op">,</span> <span class="dv">1</span><span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* spin */</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> spin_unlock<span class="op">(</span><span class="dt">int</span> <span class="op">*</span>lock<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    __sync_lock_release<span class="op">(</span>lock<span class="op">);</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> log_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Write to ring buffer */</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>    log_buffer<span class="op">[</span>log_wr<span class="op">]</span> <span class="op">=</span> c<span class="op">;</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>    log_wr <span class="op">=</span> <span class="op">(</span>log_wr <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> LOG_BUFFER_SIZE<span class="op">;</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>log_wr <span class="op">==</span> log_rd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Buffer full: advance reader to drop oldest */</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>        log_rd <span class="op">=</span> <span class="op">(</span>log_rd <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> LOG_BUFFER_SIZE<span class="op">;</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Echo to console if level allows; we use a global current level? */</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* The level check is done in kernel_log, not here. */</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_log<span class="op">(</span>log_level_t level<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>level <span class="op">&gt;</span> console_level<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Message suppressed from console, but still stored? */</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* In a real system, suppression usually means not printed at all,</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a><span class="co">           but for learning we still add to ring buffer with metadata. */</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Here we ignore completely; see note below. */</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>    spin_lock<span class="op">(&amp;</span>log_lock<span class="op">);</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true" tabindex="-1"></a>    <span class="dt">va_list</span> args<span class="op">;</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true" tabindex="-1"></a>    va_start<span class="op">(</span>args<span class="op">,</span> fmt<span class="op">);</span></span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Simplified formatting: just copy the string; assume fmt is plain text */</span></span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>fmt<span class="op">[</span>i<span class="op">]</span> <span class="op">&amp;&amp;</span> i <span class="op">&lt;</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> fmt<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true" tabindex="-1"></a>        i<span class="op">++;</span></span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-67"><a href="#cb6-67" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb6-68"><a href="#cb6-68" aria-hidden="true" tabindex="-1"></a>    va_end<span class="op">(</span>args<span class="op">);</span></span>
+<span id="cb6-69"><a href="#cb6-69" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-70"><a href="#cb6-70" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> buf<span class="op">;</span> <span class="op">*</span>p<span class="op">;</span> p<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb6-71"><a href="#cb6-71" aria-hidden="true" tabindex="-1"></a>        log_putc<span class="op">(*</span>p<span class="op">);</span></span>
+<span id="cb6-72"><a href="#cb6-72" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-73"><a href="#cb6-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-74"><a href="#cb6-74" aria-hidden="true" tabindex="-1"></a>    spin_unlock<span class="op">(&amp;</span>log_lock<span class="op">);</span></span>
+<span id="cb6-75"><a href="#cb6-75" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-76"><a href="#cb6-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-77"><a href="#cb6-77" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_panic<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb6-78"><a href="#cb6-78" aria-hidden="true" tabindex="-1"></a>    local_irq_disable<span class="op">();</span></span>
+<span id="cb6-79"><a href="#cb6-79" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-80"><a href="#cb6-80" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Try to print directly to console without lock */</span></span>
+<span id="cb6-81"><a href="#cb6-81" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb6-82"><a href="#cb6-82" aria-hidden="true" tabindex="-1"></a>    <span class="dt">va_list</span> args<span class="op">;</span></span>
+<span id="cb6-83"><a href="#cb6-83" aria-hidden="true" tabindex="-1"></a>    va_start<span class="op">(</span>args<span class="op">,</span> fmt<span class="op">);</span></span>
+<span id="cb6-84"><a href="#cb6-84" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-85"><a href="#cb6-85" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>fmt<span class="op">[</span>i<span class="op">]</span> <span class="op">&amp;&amp;</span> i <span class="op">&lt;</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-86"><a href="#cb6-86" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> fmt<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb6-87"><a href="#cb6-87" aria-hidden="true" tabindex="-1"></a>        i<span class="op">++;</span></span>
+<span id="cb6-88"><a href="#cb6-88" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-89"><a href="#cb6-89" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb6-90"><a href="#cb6-90" aria-hidden="true" tabindex="-1"></a>    va_end<span class="op">(</span>args<span class="op">);</span></span>
+<span id="cb6-91"><a href="#cb6-91" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-92"><a href="#cb6-92" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> <span class="st">&quot;KERNEL PANIC: &quot;</span><span class="op">;</span> <span class="op">*</span>p<span class="op">;</span> p<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb6-93"><a href="#cb6-93" aria-hidden="true" tabindex="-1"></a>        serial_putchar<span class="op">(*</span>p<span class="op">);</span></span>
+<span id="cb6-94"><a href="#cb6-94" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-95"><a href="#cb6-95" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>p <span class="op">=</span> buf<span class="op">;</span> <span class="op">*</span>p<span class="op">;</span> p<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb6-96"><a href="#cb6-96" aria-hidden="true" tabindex="-1"></a>        serial_putchar<span class="op">(*</span>p<span class="op">);</span></span>
+<span id="cb6-97"><a href="#cb6-97" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-98"><a href="#cb6-98" aria-hidden="true" tabindex="-1"></a>    serial_putchar<span class="op">(</span><span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">);</span></span>
+<span id="cb6-99"><a href="#cb6-99" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-100"><a href="#cb6-100" aria-hidden="true" tabindex="-1"></a>    dump_stack<span class="op">();</span></span>
+<span id="cb6-101"><a href="#cb6-101" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Optionally flush ring buffer to console */</span></span>
+<span id="cb6-102"><a href="#cb6-102" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">uint32_t</span> i <span class="op">=</span> log_rd<span class="op">;</span> i <span class="op">!=</span> log_wr<span class="op">;</span> i <span class="op">=</span> <span class="op">(</span>i <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">%</span> LOG_BUFFER_SIZE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-103"><a href="#cb6-103" aria-hidden="true" tabindex="-1"></a>        serial_putchar<span class="op">(</span>log_buffer<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb6-104"><a href="#cb6-104" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-105"><a href="#cb6-105" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-106"><a href="#cb6-106" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Decide action */</span></span>
+<span id="cb6-107"><a href="#cb6-107" aria-hidden="true" tabindex="-1"></a>    machine_halt<span class="op">();</span>  <span class="co">/* or machine_restart() */</span></span>
+<span id="cb6-108"><a href="#cb6-108" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-109"><a href="#cb6-109" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-110"><a href="#cb6-110" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_oops<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>fmt<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb6-111"><a href="#cb6-111" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Non-fatal error: log and continue */</span></span>
+<span id="cb6-112"><a href="#cb6-112" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb6-113"><a href="#cb6-113" aria-hidden="true" tabindex="-1"></a>    <span class="dt">va_list</span> args<span class="op">;</span></span>
+<span id="cb6-114"><a href="#cb6-114" aria-hidden="true" tabindex="-1"></a>    va_start<span class="op">(</span>args<span class="op">,</span> fmt<span class="op">);</span></span>
+<span id="cb6-115"><a href="#cb6-115" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-116"><a href="#cb6-116" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>fmt<span class="op">[</span>i<span class="op">]</span> <span class="op">&amp;&amp;</span> i <span class="op">&lt;</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-117"><a href="#cb6-117" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> fmt<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb6-118"><a href="#cb6-118" aria-hidden="true" tabindex="-1"></a>        i<span class="op">++;</span></span>
+<span id="cb6-119"><a href="#cb6-119" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-120"><a href="#cb6-120" aria-hidden="true" tabindex="-1"></a>    buf<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb6-121"><a href="#cb6-121" aria-hidden="true" tabindex="-1"></a>    va_end<span class="op">(</span>args<span class="op">);</span></span>
+<span id="cb6-122"><a href="#cb6-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-123"><a href="#cb6-123" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Use kernel_log with LOG_ERR level */</span></span>
+<span id="cb6-124"><a href="#cb6-124" aria-hidden="true" tabindex="-1"></a>    kernel_log<span class="op">(</span>LOG_ERR<span class="op">,</span> <span class="st">&quot;Oops: &quot;</span><span class="op">);</span></span>
+<span id="cb6-125"><a href="#cb6-125" aria-hidden="true" tabindex="-1"></a>    kernel_log<span class="op">(</span>LOG_ERR<span class="op">,</span> buf<span class="op">);</span></span>
+<span id="cb6-126"><a href="#cb6-126" aria-hidden="true" tabindex="-1"></a>    kernel_log<span class="op">(</span>LOG_ERR<span class="op">,</span> <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb6-127"><a href="#cb6-127" aria-hidden="true" tabindex="-1"></a>    dump_stack<span class="op">();</span></span>
+<span id="cb6-128"><a href="#cb6-128" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kód több egyszerűsítést tartalmaz. A <code>kernel_log</code>
+formázása nem valódi <code>vsnprintf</code>; a gyakorlatban ezt a részt
+ki kell cserélni egy saját <code>vsnprintf</code> implementációra. A
+<code>console_level</code> ellenőrzése a <code>kernel_log</code> elején
+történik, és ha a szint alacsonyabb, az üzenet egyáltalán nem kerül a
+ring bufferbe. Ez leegyszerűsítés; a valódi kernelben a ring buffer
+minden üzenetet tárol, a konzolra csak a szűrt rész kerül. A tanulási
+verzióban ez elfogadható, de a laborban finomítható.</p>
+<p>A <code>panic</code> függvény megszakítások letiltása után
+közvetlenül a soros portra ír, megkerülve a ring buffert és a zárat. A
+<code>dump_stack</code> függvény a verem tartalmát írja ki, amit a <a
+href="os108.html">QEMU, GDB és kernel debugging</a> fejezetben
+tárgyaltunk. A <code>machine_halt</code> platformfüggő; QEMU-ban például
+a <code>hlt</code> utasítás vagy a <code>shutdown</code> regiszter írása
+lehet.</p>
+<h3 data-number="28.4.10"
+id="labor-kernel-log--és-panic-terv-készítése"><span
+class="header-section-number">28.4.10</span> Labor: kernel log- és
+panic-terv készítése</h3>
+<p>Ebben a laborban a feladat egy saját, minimális kernel naplózási és
+<code>panic</code> tervének elkészítése és emulált környezetben való
+tesztelése. A labor célja, hogy a fejlesztő megtapasztalja a naplózási
+réteg működését, és megtervezze a <code>panic</code> viselkedését. A
+reprodukálhatóság érdekében minden lépést dokumentálni kell, és a
+méréseket rögzíteni.</p>
+<h3 data-number="28.4.11" id="előkészítés"><span
+class="header-section-number">28.4.11</span> Előkészítés</h3>
+<p>Az emulált környezet QEMU, a vendég kernel a korábbi fejezetekben
+készített minimális rendszer. A konfiguráció rögzített:</p>
+<ul>
+<li>CPU: <code>-cpu cortex-a9</code> (vagy x86_64, a választott
+architektúra szerint)</li>
+<li>Memória: 128 MiB</li>
+<li>Soros konzol: <code>-serial mon:stdio</code></li>
+<li>Kernel: saját, freestanding ELF</li>
+</ul>
+<p>A build parancsok a reprodukciós csomag részét képezik, például:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> clean</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> CFLAGS=<span class="st">&quot;-O0 -g -fno-omit-frame-pointer&quot;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-arm</span> <span class="at">-M</span> virt <span class="at">-cpu</span> cortex-a9 <span class="at">-m</span> 128M <span class="at">-nographic</span> <span class="at">-kernel</span> kernel.elf</span></code></pre></div>
+<p>A GDB csatlakoztatásához:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-arm</span> <span class="at">-M</span> virt <span class="at">-cpu</span> cortex-a9 <span class="at">-m</span> 128M <span class="at">-nographic</span> <span class="at">-s</span> <span class="at">-S</span> <span class="at">-kernel</span> kernel.elf</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">gdb-multiarch</span> kernel.elf</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">gdb</span><span class="kw">)</span> <span class="ex">target</span> remote :1234</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">(</span><span class="fu">gdb</span><span class="kw">)</span> <span class="cf">continue</span></span></code></pre></div>
+<h3 data-number="28.4.12" id="feladatok"><span
+class="header-section-number">28.4.12</span> Feladatok</h3>
+<ol type="1">
+<li><p><strong>Ring buffer implementációának tesztelése.</strong> Írj
+egy tesztfüggvényt, amely 200 darab <code>LOG_INFO</code> szintű
+üzenetet generál, mindegyik egy sorszámmal. A ring buffer mérete legyen
+256 bájt. Indítsd el a kernelt, és figyeld a soros kimenetet. Mérd
+meg:</p>
+<ul>
+<li>hány üzenet jutott el a konzolra,</li>
+<li>hány üzenet maradt meg a ring bufferben,</li>
+<li>az üzenetvesztés arányát.</li>
+</ul>
+<p>A várt eredmény: a konzolra a beállított szint miatt minden
+<code>LOG_INFO</code> üzenet eljut, de a ring buffer csak az utolsó
+néhányat őrzi meg, a korábbiak felülíródnak. A mért eredményt
+naplózd.</p></li>
+<li><p><strong>Log szintek szűrésének tesztje.</strong> Állítsd a
+<code>console_level</code> értékét <code>LOG_WARNING</code>-ra. Generálj
+50 <code>LOG_INFO</code> és 10 <code>LOG_ERR</code> üzenetet.
+Ellenőrizd, hogy a konzolon csak a <code>LOG_ERR</code> üzenetek
+jelennek meg, míg a ring bufferben mindkettő megtalálható (ha a
+pufferméret elegendő). A mérés: a konzol kimenet sorainak száma, a ring
+bufferben lévő rekordok száma.</p></li>
+<li><p><strong>Panic teszt.</strong> Szándékosan hívj
+<code>kernel_panic("test panic from timer\n")</code>-t egy időzítő
+megszakításból. Figyeld meg, hogy a <code>panic</code> üzenet
+megjelenik-e a soros konzolon, a regiszterek és a verem kiíródnak-e, és
+a rendszer leáll-e (nem folytatódik a futás). Mérd a <code>panic</code>
+hívásától a leállásig eltelt időt (például a QEMU napló időbélyegei
+alapján). Várt eredmény: a <code>panic</code> azonnal leállítja a
+rendszert, a kimenet tartalmazza a
+<code>"KERNEL PANIC: test panic from timer"</code> szöveget és a verem
+nyomkövetést.</p></li>
+<li><p><strong>Naplóterv dokumentálása.</strong> Készíts egy rövid (1
+oldalas) tervet, amely meghatározza:</p>
+<ul>
+<li>a támogatott log szinteket és azok használati politikáját,</li>
+<li>a ring buffer méretét és a felülírási stratégiát,</li>
+<li>a <code>panic</code> viselkedését (újraindítás, leállás,
+watchdog),</li>
+<li>a crash utáni diagnosztikai adatok mentésének módját (ha van ilyen).
+A tervet helyezd a labor jegyzetfüzetbe.</li>
+</ul></li>
+</ol>
+<h3 data-number="28.4.13" id="dokumentáció-és-mérési-napló"><span
+class="header-section-number">28.4.13</span> Dokumentáció és mérési
+napló</h3>
+<p>A labor jegyzetfüzet (például Markdown vagy Jupyter notebook)
+tartalmazza:</p>
+<ul>
+<li>a használt QEMU parancsot és kernel build opciókat,</li>
+<li>a módosított forráskódot (diff),</li>
+<li>a mérések eszközét (például <code>grep</code> a QEMU naplón,
+<code>wc -l</code> sorok számolására, <code>time</code> a futási
+időhöz),</li>
+<li>a mért értékeket táblázatban,</li>
+<li>a várt értékeket, és a kettő eltérésének elemzését.</li>
+</ul>
+<p>Példa mérési táblázat:</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 30%" />
+<col style="width: 30%" />
+<col style="width: 24%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Teszt</th>
+<th>Várt eredmény</th>
+<th>Mért eredmény</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Ring buffer telítődés</td>
+<td>200 üzenetből ~30 marad</td>
+<td>28 üzenet maradt</td>
+<td>A buffer mérete miatt várható</td>
+</tr>
+<tr class="even">
+<td>Konzol szűrés</td>
+<td>50 INFO-ból 0, 10 ERR-ből 10 jelenik meg</td>
+<td>10 sor jelent meg</td>
+<td>Megfelel</td>
+</tr>
+<tr class="odd">
+<td>Panic késleltetés</td>
+<td>&lt; 1 ms</td>
+<td>0,4 ms (QEMU)</td>
+<td>A soros port sebessége dominál</td>
+</tr>
+</tbody>
+</table>
+<p>A mérésnél a hardver, a fordítási beállítások, az órajelfrekvencia és
+a mérési módszer is megadandó. A QEMU-ban a virtuális órajel és a soros
+port sebessége nem feltétlenül tükrözi a valós hardvert, ezért a mért
+időket fenntartással kell kezelni. A labor eredménye így elsősorban a
+relatív viselkedést mutatja.</p>
+<h3 data-number="28.4.14" id="önellenőrző-kérdések"><span
+class="header-section-number">28.4.14</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Mi a különbség a kernel <code>panic</code> és az <code>oops</code>
+között? Melyik esetben folytatódhat a rendszer, és miért kockázatos
+ez?</li>
+<li>Miért használ a kernel körkörös puffert a naplózáshoz? Milyen
+előnyei vannak a dinamikus memóriaallokációval szemben?</li>
+<li>Tegyük fel, hogy a <code>console_level</code> értéke
+<code>LOG_WARNING</code>, és a kernel 100 <code>LOG_DEBUG</code>
+üzenetet generál. Mi történik ezekkel az üzenetekkel, ha a ring buffer
+mérete 1 KiB, és minden üzenet átlagosan 64 bájt?</li>
+<li>A <code>panic</code> függvény miért nem használhat normál
+kernelzárakat? Magyarázd el, milyen problémát okozhat egy zár használata
+a <code>panic</code> kódjában.</li>
+</ol>
+<h3 data-number="28.4.15" id="összegzés"><span
+class="header-section-number">28.4.15</span> Összegzés</h3>
+<p>A kernel naplózás, a <code>panic</code> és a hibakezelés egymással
+szorosan összefüggő területek. A jól megtervezett naplózás lehetővé
+teszi a hibák gyors diagnosztizálását, míg a <code>panic</code> gondos
+implementációja biztosítja, hogy a rendszer a hibás állapotból ne
+okozzon további károkat. A gyakorlatban a <code>printk</code>, a log
+szintek és a ring buffer a leggyakoribb eszközök, amelyeket minden
+kernel fejlesztőjének ismernie kell.</p>
+<p>A következő fejezet (<a href="os110.html">Egyszerű fájlrendszer
+tervezése</a>) az egyszerű fájlrendszer tervezésére épít, ahol a
+naplózás és hibakezelés elveit a fájlrendszer rétegben is alkalmazni
+fogjuk. A fájlrendszer-műveletek során fellépő hibákat ugyanúgy
+láthatóvá kell tenni, és a <code>panic</code>-re okot adó állapotokat
+gondosan el kell kerülni. A naplózási réteg kialakítása tehát nem
+öncélú, hanem a kernel további komponenseinek megbízhatóságát alapozza
+meg.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os108.html">← 28.3 QEMU, GDB és kernel debugging</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os110.html">29.1 Egyszerű fájlrendszer tervezése →</a></div>
+</nav>
+</body>
+</html>

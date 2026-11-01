@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>21.1 C++ memóriamodell – Fejlett C++ - haladó nyelvi eszközök
+és technikák</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Memória és teljesítmény</a> › <a href="index.html#cppch20">21 Memóriamodell, atomics és lock-free</a></p>
+<div class="links"><a class="prev" rel="prev" href="cpp077.html">← 20.4 NUMA, cache locality és mérés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp079.html">21.2 Relaxed, acquire-release és seq_cst →</a></div>
+</nav>
+<h2 data-number="21.1" id="cpp078"><span
+class="header-section-number">21.1</span> C++ memóriamodell</h2>
+<p>A C++ nyelv konkurenciamodelljének alapja az a felismerés, hogy a
+több szálon futó programok viselkedését nem lehet pusztán a forráskód
+sorrendje alapján megjósolni. A fordító és a processzor egyaránt
+végezhet átalakításokat, amelyek a sorrendet megváltoztatják, és ezek az
+optimalizálások egy szálon belül láthatatlanok, de több szál
+együttműködésekor már drámaian megváltoztathatják a lefutást. A C++
+memóriamodell pontosan definiálja, hogy mely konkurens hozzáférések
+tekinthetők jól meghatározottnak, és melyek vezetnek <em>undefined
+behavior</em>hez (UB). Ez a fejezet bevezeti a modell legfontosabb
+építőköveit: a <em>szekvenciális konzisztenciát</em> és a <em>data
+race</em> fogalmát, valamint az ezeket megalapozó
+<em>sequenced-before</em> és <em>happens-before</em> relációkat.</p>
+<p>A téma nem csupán elméleti érdekesség: egyetlen data race is
+érvénytelenítheti a teljes program futását, a fordító pedig a UB-ra
+hivatkozva olyan optimalizálást végezhet, amely látszólag lehetetlen
+viselkedést idéz elő. A fejezet végére az olvasó képes lesz felismerni a
+tipikus hibákat, és meg tudja indokolni, miért jelent megoldást a
+<code>std::atomic</code> és a <code>memory_order_seq_cst</code>
+használata. A leírtakat egy reprodukálható, ThreadSanitizerrel
+ellenőrzött laborpéldán keresztül mutatjuk be, amely a mért és a várt
+eredményt külön dokumentálja.</p>
+<h3 data-number="21.1.1" id="a-c-memóriamodell-alapfogalmai"><span
+class="header-section-number">21.1.1</span> A C++ memóriamodell
+alapfogalmai</h3>
+<p>A C++ szabvány a program végrehajtását absztrakt gépen írja le,
+amelyben minden kifejezés kiértékelése meghatározott sorrendben
+történik, és minden memória-hozzáférésnek van egy jól definiált hatása.
+A konkurens végrehajtás ezt az absztrakciót terjeszti ki több szálra, de
+a szálak közötti kölcsönhatásokat szigorú szabályok korlátozzák.</p>
+<h3 data-number="21.1.2" id="memóriahelyek-és-hozzáférések"><span
+class="header-section-number">21.1.2</span> Memóriahelyek és
+hozzáférések</h3>
+<p>A C++ memóriamodell alapegysége a <em>memory location</em>
+(memóriahely). A szabvány szerint minden skalár típusú objektum (például
+egy <code>int</code>, egy pointer vagy egy <code>bool</code>) egyetlen
+memóriahelyet foglal el, míg az összetett típusok (struktúrák,
+osztályok) több, egymástól független memóriahelyből állhatnak, ha a
+tagjaik különálló skalárok. Például egy
+<code>struct S { int a; int b; };</code> objektum két külön
+memóriahelyet tartalmaz: <code>a</code>-t és <code>b</code>-t. Ezzel
+szemben egy <code>std::vector&lt;int&gt;</code> belső adatai dinamikusan
+foglalt tömbben vannak, így azok a memóriahelyek a tömbben lévő
+<code>int</code> elemek.</p>
+<p>Két hozzáférés akkor ütközhet, ha ugyanarra a memóriahelyre irányul,
+és közülük legalább az egyik írás (módosítás). Az olvasások egymással
+nem ütköznek, de ha egy olvasás és egy írás, vagy két írás verseng
+egymással szinkronizáció nélkül, akkor <em>data race</em> áll fenn.</p>
+<h3 data-number="21.1.3" id="a-sequenced-before-reláció"><span
+class="header-section-number">21.1.3</span> A sequenced-before
+reláció</h3>
+<p>Egyetlen szálon belül a program végrehajtási sorrendje a
+<em>sequenced-before</em> relációval írható le. Ez a reláció a szabvány
+által meghatározott kiértékelési sorrendet tükrözi, és biztosítja, hogy
+egy kifejezés kiértékelése megelőz egy másikat. Például az alábbi
+kódban:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> x <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> y <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>y <span class="op">=</span> x <span class="op">+</span> <span class="dv">1</span><span class="op">;</span></span></code></pre></div>
+<p>az <code>x = 1;</code> utasítás <em>sequenced-before</em> az
+<code>y = x + 1;</code> utasításhoz képest, mert a program szöveges
+sorrendje ezt írja elő, és nincs olyan szabály, amely felülbírálná.
+Ennek következtében az <code>y</code> értéke garantáltan 2 lesz. A C++11
+előtt a kiértékelési sorrend sok ponton implementációfüggő volt, de a
+modern szabvány a legtöbb esetben egyértelműen definiálja.</p>
+<p>Fontos megjegyezni, hogy a <em>sequenced-before</em> csak egyetlen
+szálon belül értelmezhető. Két különböző szálon végrehajtott művelet
+között általában nincs ilyen reláció, kivéve, ha explicit
+szinkronizációs mechanizmust használunk (például mutexet vagy atomi
+műveletet).</p>
+<h3 data-number="21.1.4" id="a-happens-before-reláció"><span
+class="header-section-number">21.1.4</span> A happens-before
+reláció</h3>
+<p>A <em>happens-before</em> reláció a szálak közötti láthatóságot és
+sorrendiséget írja le. Ez egy irányított, tranzitív reláció, amely a
+következő forrásokból származik:</p>
+<ol type="1">
+<li><strong>Program order:</strong> Ha egy szálon belül az A művelet
+<em>sequenced-before</em> B, akkor A <em>happens-before</em> B is.</li>
+<li><strong>Szinkronizáció:</strong> Egy atomi művelet, amely egy másik
+szálon lévő atomi művelettel szinkronizál, <em>happens-before</em>
+relációt hoz létre. Például egy <code>release</code> művelet és egy azt
+követő <code>acquire</code> művelet, amely ugyanazt az atomi objektumot
+figyeli, szinkronizál, így a release előtti írások láthatóvá válnak az
+acquire utáni olvasások számára.</li>
+<li><strong>Tranzitivitás:</strong> Ha A <em>happens-before</em> B és B
+<em>happens-before</em> C, akkor A <em>happens-before</em> C.</li>
+</ol>
+<p>A <em>happens-before</em> reláció garantálja, hogy ha A
+<em>happens-before</em> B, akkor A hatásai láthatók B számára, és a
+műveletek sorrendje nem rendezhető át úgy, hogy B megelőzze A-t. Ez a
+kulcs a data race elkerüléséhez.</p>
+<h3 data-number="21.1.5"
+id="a-data-race-definíciója-és-következményei"><span
+class="header-section-number">21.1.5</span> A data race definíciója és
+következményei</h3>
+<p>A C++ szabvány szerint <em>data race</em> akkor áll fenn, ha két
+művelet:</p>
+<ul>
+<li>ugyanarra a memóriahelyre irányul,</li>
+<li>közülük legalább az egyik írás (módosítás),</li>
+<li>nincs közöttük <em>happens-before</em> reláció.</li>
+</ul>
+<p>A data race definíció szerint undefined behavior. Ez azt jelenti,
+hogy a program viselkedése semmilyen szempontból nem garantált: a
+fordító feltételezheti, hogy ilyen helyzet soha nem fordul elő, és ennek
+megfelelően optimalizálhat. Például a következő egyszerű program:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> counter <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> increment<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span>counter<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t1<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t2<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    t1<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    t2<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="co">// counter értéke?</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a kód data race-t tartalmaz, mert a <code>counter</code> nevű
+globális <code>int</code> memóriahelyre mindkét szál írást végez
+(<code>++counter</code>), és nincs köztük <em>happens-before</em>. A
+<code>std::thread</code> konstrukciója és a <code>join()</code> létrehoz
+bizonyos <em>happens-before</em> kapcsolatokat (a szál indulása és
+befejeződése), de maga a <code>counter</code> növelése nem
+szinkronizált. Így a program UB, és a végső <code>counter</code> érték
+bármi lehet – a gyakorlatban gyakran nem 200000, mert a növelések
+elvesznek a versenyhelyzet miatt. Ráadásul a fordító akár teljesen el is
+távolíthatja a ciklust, mert feltételezi, hogy a
+<code>counter</code>-hez való hozzáférések nem ütköznek.</p>
+<p>A data race elkerülésének egyetlen megbízható módja, ha a versengő
+hozzáféréseket <em>happens-before</em> relációval kapcsoljuk össze,
+például mutex, atomi műveletek vagy más szinkronizációs eszköz
+segítségével.</p>
+<h3 data-number="21.1.6" id="a-szekvenciális-konzisztencia"><span
+class="header-section-number">21.1.6</span> A szekvenciális
+konzisztencia</h3>
+<p>A <em>szekvenciális konzisztencia</em> (SC) a legerősebb és
+legintuitívabb memóriamodell-szint, amelyet a C++ atomi műveletekhez
+biztosít. Az SC szerint minden atomi művelet egyetlen globális, minden
+szál által megfigyelhető sorrendben hajtódik végre, és ez a sorrend
+konzisztens az egyes szálak programbeli sorrendjével. Más szóval: a
+program úgy viselkedik, mintha az összes szál utasításait egyetlen,
+tetszőlegesen összefésült sorrendben hajtanánk végre, de minden szál a
+saját műveleteit a forráskódban megadott sorrendben látja.</p>
+<p>A C++-ban ezt a <code>std::memory_order_seq_cst</code>
+memóriarendezési konstans biztosítja az atomi műveletek számára. Ez az
+alapértelmezett memóriarendezés, ha nem adunk meg explicit módon mást,
+például:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> counter<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> increment<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>        counter<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>fetch_add</code> atomi művelet, és a
+<code>memory_order_seq_cst</code> garantálja, hogy minden ilyen növelés
+egyetlen globális sorrendben történik, így a végeredmény pontosan 200000
+lesz. Emellett az SC biztosítja, hogy minden szál ugyanabban a
+sorrendben látja az összes atomi műveletet, ami különösen fontos
+összetett szinkronizációs minták esetén.</p>
+<p>A szekvenciális konzisztencia azonban nem ingyenes: a processzorokon
+gyakran memóriakerítéseket (<code>memory fence</code>) igényel, amelyek
+lassíthatják a végrehajtást. Ezért a C++ lehetőséget ad gyengébb
+memóriarendezések használatára is (<code>relaxed</code>,
+<code>acquire</code>, <code>release</code> stb.), amelyeket a következő
+fejezet (<a href="cpp079.html">Relaxed, acquire-release és seq_cst</a>)
+tárgyal. A gyakorlati tanács azonban az, hogy ha nem vagyunk biztosak a
+gyengébb szintek helyességében, használjunk
+<code>memory_order_seq_cst</code>-et, mert az a legkönnyebben érthető és
+legkevésbé hibalehetőséget rejtő megoldás.</p>
+<h3 data-number="21.1.7" id="példa-sc-és-a-program-order"><span
+class="header-section-number">21.1.7</span> Példa: SC és a program
+order</h3>
+<p>Tekintsük a következő két szálat, amelyek atomi változókon keresztül
+kommunikálnak:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;</span> x<span class="op">{</span><span class="kw">false</span><span class="op">},</span> y<span class="op">{</span><span class="kw">false</span><span class="op">};</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> z<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> write_x<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    x<span class="op">.</span>store<span class="op">(</span><span class="kw">true</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> write_y<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    y<span class="op">.</span>store<span class="op">(</span><span class="kw">true</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> read_x_then_y<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>x<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">))</span> <span class="op">{}</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>y<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span>z<span class="op">;</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> read_y_then_x<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>y<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">))</span> <span class="op">{}</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>x<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span>z<span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ha négy szálon futtatjuk: az egyik <code>write_x</code>-et, a másik
+<code>write_y</code>-t, a harmadik <code>read_x_then_y</code>-t, a
+negyedik <code>read_y_then_x</code>-et, akkor a <code>z</code> értéke 0,
+1 vagy 2 lehet, de soha nem lehet 0, ha mindkét író lefutott a két
+olvasó előtt? Valójában a szekvenciális konzisztencia garantálja, hogy
+létezik egyetlen globális sorrend az összes atomi műveletre. Ha
+<code>write_x</code> és <code>write_y</code> is lefutott, akkor az
+<code>x=true</code> és <code>y=true</code> műveletek valamilyen
+sorrendben jelennek meg ebben a globális sorrendben. Tegyük fel, hogy
+<code>x=true</code> előbb van, mint <code>y=true</code>. Ekkor az első
+olvasó szál, amely <code>x</code>-et vár, majd <code>y</code>-t olvas,
+biztosan látja az <code>y=true</code> értéket, mert az
+<code>y=true</code> a globális sorrendben az <code>x=true</code> után
+következik, és az olvasó <code>x</code>-et olvasva már túljutott azon a
+ponton. Így az első olvasó növeli <code>z</code>-t. A második olvasó
+viszont <code>y</code>-t vár, majd <code>x</code>-et olvas; mivel
+<code>x=true</code> korábbi a globális sorrendben, a második olvasó már
+látja azt, és szintén növeli <code>z</code>-t. Tehát <code>z</code>
+értéke 2 lesz. Ha a globális sorrend fordított, akkor is mindkét olvasó
+növel, így <code>z</code> = 2. Az egyetlen eset, amikor <code>z</code>
+kisebb, ha az egyik olvasó nem látja a másik flaget, mert az még nem
+íródott be, de ez akkor fordulhat elő, ha a szálak ütemezése nem
+egyenletes. A lényeg: a szekvenciális konzisztencia kizárja azt a
+lehetőséget, hogy mindkét olvasó 0-t lásson, ami gyengébb
+memóriarendezéssel előfordulhatna.</p>
+<p>Ez a példa jól mutatja az SC erejét: bár a szálak közötti időzítés
+bizonytalan, a memóriamodell garantál egy konzisztens globális
+sorrendet, amely megakadályozza a paradoxonnak tűnő kimeneteket.</p>
+<h3 data-number="21.1.8" id="labor-memóriamodell-példa-elemzése"><span
+class="header-section-number">21.1.8</span> Labor: memóriamodell-példa
+elemzése</h3>
+<p>A labor célja, hogy a fenti fogalmakat egy konkrét, reprodukálható
+környezetben vizsgáljuk meg. A feladat két részből áll: először
+bemutatjuk a data race-t és annak UB jellegét ThreadSanitizer
+segítségével, majd a javított, <code>std::atomic</code> és
+<code>memory_order_seq_cst</code> használatával megoldott változatot
+teszteljük, és mérjük a futási időt.</p>
+<h3 data-number="21.1.9" id="környezet-és-build"><span
+class="header-section-number">21.1.9</span> Környezet és build</h3>
+<p>A mérésekhez az alábbi környezetet rögzítjük:</p>
+<ul>
+<li><p>Fordító: GCC 14.2.0 (a pontos verzió a <code>g++ --version</code>
+kimenetéből ellenőrizhető)</p></li>
+<li><p>C++ szabvány: C++20</p></li>
+<li><p>Optimalizáció: <code>-O1</code> (a data race kimutatásához a TSan
+érzékenyebb alacsonyabb optimalizáción, de a javított változatnál
+<code>-O2</code> is használható; itt <code>-O1</code>-et használunk a
+könnyebb reprodukálhatóságért)</p></li>
+<li><p>Hardver: x86-64, 8 magos CPU, 16 GB RAM</p></li>
+<li><p>Operációs rendszer: Linux (kernel 6.8)</p></li>
+<li><p>Build parancs a data race példához:</p>
+<pre><code>g++ -std=c++20 -O1 -g -fsanitize=thread -pthread -o data_race data_race.cpp</code></pre></li>
+<li><p>Build parancs a javított példához:</p>
+<pre><code>g++ -std=c++20 -O1 -g -pthread -o atomic_seq_cst atomic_seq_cst.cpp</code></pre>
+<p>(A javított változat futtatható TSan nélkül is, de a méréshez tiszta
+buildet használunk.)</p></li>
+</ul>
+<p>A programok forráskódja a következő.</p>
+<h4 data-number="21.1.9.1" id="data-race-példa-data_race.cpp"><span
+class="header-section-number">21.1.9.1</span> Data race példa
+(<code>data_race.cpp</code>)</h4>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> counter <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> increment<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">++</span>counter<span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t1<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t2<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    t1<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    t2<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;counter = &quot;</span> <span class="op">&lt;&lt;</span> counter <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h4 data-number="21.1.9.2"
+id="javított-atomi-változat-atomic_seq_cst.cpp"><span
+class="header-section-number">21.1.9.2</span> Javított, atomi változat
+(<code>atomic_seq_cst.cpp</code>)</h4>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;iostream&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> counter<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> increment<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">100000</span><span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>        counter<span class="op">.</span>fetch_add<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t1<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>thread t2<span class="op">(</span>increment<span class="op">);</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    t1<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    t2<span class="op">.</span>join<span class="op">();</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="st">&quot;counter = &quot;</span> <span class="op">&lt;&lt;</span> counter<span class="op">.</span>load<span class="op">()</span> <span class="op">&lt;&lt;</span> <span class="ch">&#39;</span><span class="sc">\n</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 data-number="21.1.10" id="tesztelés-és-mérési-napló"><span
+class="header-section-number">21.1.10</span> Tesztelés és mérési
+napló</h3>
+<p>A tesztelés során mindkét programot többször futtatjuk, és rögzítjük
+a kimeneteket.</p>
+<h4 data-number="21.1.10.1"
+id="data-race-példa-futtatása-tsan-nel"><span
+class="header-section-number">21.1.10.1</span> Data race példa futtatása
+TSan-nel</h4>
+<p>A <code>data_race</code> programot ThreadSanitizerrel futtatva a
+következő jellegű hibajelentést kapjuk (a pontos szöveg a környezettől
+függ, de a lényeg azonos):</p>
+<pre><code>==================
+WARNING: ThreadSanitizer: data race (pid=12345)
+  Write of size 4 at 0x... by thread T2:
+    #0 increment() data_race.cpp:7
+    #1 std::thread::_State_impl&lt;...&gt;::_M_run() ...
+  Previous write of size 4 at 0x... by thread T1:
+    #0 increment() data_race.cpp:7
+    #1 std::thread::_State_impl&lt;...&gt;::_M_run() ...
+  Location is global &#39;counter&#39; of size 4 at ...</code></pre>
+<p>Ez a jelentés egyértelműen jelzi a data race-t a
+<code>++counter</code> műveletnél. A program lefutása során a
+<code>counter</code> értéke általában nem 200000, hanem annál kisebb,
+mivel a növelések elvesznek. Például három futtatás eredménye lehet:
+154382, 148271, 162053. Fontos: ezek a számok nem determinisztikusak, és
+a UB miatt a program bármilyen kimenetet produkálhat, akár 200000-et is,
+de a TSan mindenképpen jelez.</p>
+<h4 data-number="21.1.10.2" id="javított-atomi-változat-futtatása"><span
+class="header-section-number">21.1.10.2</span> Javított atomi változat
+futtatása</h4>
+<p>Az atomi változatot TSan nélkül futtatva a <code>counter</code>
+értéke minden esetben pontosan 200000. A mérési naplóba bejegyezzük a
+futási időt is, amely jellemzően valamivel nagyobb, mint a data race
+változaté, mert az atomi műveletek és a memóriakerítések költséggel
+járnak. Például:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Futtatás</th>
+<th>Data race (TSan)</th>
+<th>Atomi seq_cst (clean)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>154382</td>
+<td>200000</td>
+</tr>
+<tr class="even">
+<td>2</td>
+<td>148271</td>
+<td>200000</td>
+</tr>
+<tr class="odd">
+<td>3</td>
+<td>162053</td>
+<td>200000</td>
+</tr>
+</tbody>
+</table>
+<p>A futási időket mérve (például <code>time</code> paranccsal) a data
+race változat TSan-nel lassabb lehet a TSan overhead miatt, de a tiszta
+atomi változat jellemzően 1-5 ms körül van, míg a data race változat
+TSan nélkül ennél gyorsabb, de UB miatt nem megbízható.</p>
+<p>A mérési naplóban külön kell választani a <em>várt</em> és a
+<em>mért</em> eredményt:</p>
+<ul>
+<li><strong>Data race esetén:</strong> Várt eredmény: undefined
+behavior, a TSan hibát jelez. A <code>counter</code> értéke nem
+definiált, de általában 0 és 200000 közötti, nem determinisztikus. Mért
+eredmény: a fenti táblázat szerinti értékek, TSan jelentéssel.</li>
+<li><strong>Atomi seq_cst esetén:</strong> Várt eredmény:
+<code>counter = 200000</code>, minden futtatásban. Mért eredmény: minden
+futtatásban pontosan 200000, TSan nem jelez hibát.</li>
+</ul>
+<p>A labor azt is megmutatja, hogy a data race kódot a TSan nélkül
+futtatva gyakran hibás eredményt ad, de ez nem garantált – ezért nem
+szabad a viselkedésre alapozni. A javított változat viszont mindig
+helyes, mert a memóriamodell szerint nincs data race.</p>
+<h3 data-number="21.1.11" id="összefoglalás-és-továbbvezetés"><span
+class="header-section-number">21.1.11</span> Összefoglalás és
+továbbvezetés</h3>
+<p>Ebben a fejezetben bevezettük a C++ memóriamodell alapfogalmait. A
+<em>sequenced-before</em> reláció egy szálon belüli sorrendet ír le, míg
+a <em>happens-before</em> reláció a szálak közötti láthatóságot és
+szinkronizációt. A <em>data race</em> akkor áll fenn, ha két, ugyanarra
+a memóriahelyre irányuló művelet közül legalább az egyik írás, és nincs
+köztük <em>happens-before</em>; ez undefined behavior, amely a program
+teljes érvénytelenségét okozza. A <em>szekvenciális konzisztencia</em> a
+legerősebb memóriamodell-szint, amelyet a
+<code>std::memory_order_seq_cst</code> biztosít, és garantálja, hogy
+minden atomi művelet egyetlen globális sorrendben történik.</p>
+<p>A laborban egy egyszerű számlálós példán keresztül demonstráltuk a
+data race-t és annak kijavítását atomi műveletekkel. A ThreadSanitizer
+hatékonyan jelzi a data race-t, míg a javított változat minden
+futtatásban helyes eredményt ad.</p>
+<p>A következő fejezet (<a href="cpp079.html">Relaxed, acquire-release
+és seq_cst</a>) ezekre az alapokra építve tárgyalja a gyengébb
+memóriarendezéseket (<code>relaxed</code>, <code>acquire</code>,
+<code>release</code>), és megmutatja, hogyan lehet finomhangolni a
+teljesítményt a helyesség megőrzése mellett. Az SC használata mindig
+biztonságos kiindulópont, de a gyengébb szintek megértése
+elengedhetetlen a nagy teljesítményű, lock-free adatszerkezetek
+írásához.</p>
+<h3 data-number="21.1.12" id="önellenőrző-kérdés"><span
+class="header-section-number">21.1.12</span> Önellenőrző kérdés</h3>
+<p>Adott a következő kódvázlat:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> a<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="bu">std::</span>atomic<span class="op">&lt;</span><span class="dt">int</span><span class="op">&gt;</span> b<span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> thread1<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    a<span class="op">.</span>store<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    b<span class="op">.</span>store<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="bu">std::</span>memory_order_seq_cst<span class="op">);</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> thread2<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>b<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">)</span> <span class="op">!=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{}</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>a<span class="op">.</span>load<span class="op">(</span><span class="bu">std::</span>memory_order_seq_cst<span class="op">)</span> <span class="op">==</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>        <span class="co">// ...</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Magyarázza meg, miért garantált, hogy a <code>thread2</code>-ben az
+<code>a</code> értéke 1 lesz, ha a <code>while</code> ciklusból
+kilépett. Milyen memóriarendezési szintet használunk, és miért lenne más
+a helyzet, ha <code>memory_order_relaxed</code>-et használnánk?</p>
+<p>(A válasz a fejezet szövegében található: a <code>seq_cst</code>
+biztosítja a globális sorrendet, így ha <code>b=1</code> láthatóvá vált
+a <code>thread2</code>-ben, akkor a <code>thread1</code>-ben az azt
+megelőző <code>a=1</code> is látható, mert a globális sorrendben az
+<code>a=1</code> előbb van, mint a <code>b=1</code>. A
+<code>relaxed</code> esetén ez a garancia hiányzik, és a
+<code>thread2</code> láthatná <code>b=1</code>-et anélkül, hogy
+<code>a=1</code> látható lenne.)</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="cpp077.html">← 20.4 NUMA, cache locality és mérés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp079.html">21.2 Relaxed, acquire-release és seq_cst →</a></div>
+</nav>
+</body>
+</html>

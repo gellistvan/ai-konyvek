@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.3 RCU, epoch-alapú visszanyerés és skálázható szinkronizáció
+– Operációs rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Folyamatok, szálak és ütemezés</a> › <a href="index.html#osch09">10 Haladó konkurencia</a></p>
+<div class="links"><a class="prev" rel="prev" href="os035.html">← 10.2 Lock-free és wait-free struktúrák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os037.html">10.4 Többmagos és heterogén rendszerek kihívásai →</a></div>
+</nav>
+<h2 data-number="10.3" id="os036"><span
+class="header-section-number">10.3</span> RCU, epoch-alapú visszanyerés
+és skálázható szinkronizáció</h2>
+<p>A fejezet az olvasó-optimális szinkronizáció és a skálázhatóság
+kapcsolatát tárgyalja, középpontban a read-copy-update (RCU)
+mechanizmussal, az epoch-alapú visszanyeréssel és a per-CPU adatokra
+épülő skálázható számlálással. Az előző egység (<a
+href="os035.html">Lock-free és wait-free struktúrák</a>) bevezette a
+lock-free és wait-free struktúrák alapjait; itt azt vizsgáljuk, hogyan
+érhető el nagy olvasási párhuzamosság anélkül, hogy az írók és az
+olvasók közös zárakon versengenének, és hogyan lehet a
+memória-visszanyerést biztonságosan megoldani akkor is, ha az olvasók
+nem használnak explicit lockot.</p>
+<h3 data-number="10.3.1"
+id="olvasó-optimális-szinkronizáció-és-skálázhatóság"><span
+class="header-section-number">10.3.1</span> 1. Olvasó-optimális
+szinkronizáció és skálázhatóság</h3>
+<p>A klasszikus szinkronizáció, például a reader-writer lock (rwlock),
+engedélyezi ugyan a többszörös párhuzamos olvasást, de az olvasók minden
+belépéskor növelik és kilépéskor csökkentik a lock belső számlálóját. Ez
+a művelet atomi, és a gyakorlatban a számláló cache-vonala a
+processzorok között folyamatosan ide-oda vándorol. Nagyszámú olvasó
+esetén a lock-számláló körüli cache-line bouncing lesz a szűk
+keresztmetszet, nem pedig a tényleges adatfeldolgozás. Hasonló jelenség
+figyelhető meg a mutex, spinlock és szemafór esetén is: a közös
+lock-változó minden olvasónál írást generál, ami a cache-koherencia
+protokoll szintjén drága.</p>
+<p>Az olvasó-optimális szinkronizáció célja, hogy az olvasók egyáltalán
+ne végezzenek írást a közös szinkronizációs állapoton, sőt lehetőleg ne
+férjenek hozzá megosztott írásra jelölt cache-vonalhoz sem. Az ideális
+esetben egy olvasó csak olvassa az adatszerkezetet, semmilyen atomi
+utasítást nem hajt végre, és nem kell várakoznia. Az írók viszont
+vállalják a nagyobb költséget: másolják a módosítandó objektumot,
+frissítik a pointert, majd megvárják, amíg minden régi olvasó befejezi a
+munkáját, és csak ezután szabadítják fel a régi memóriát. Ez a trade-off
+akkor előnyös, ha az olvasási terhelés sokkal nagyobb, mint az
+írási.</p>
+<p>A skálázhatóság azt méri, hogyan változik a teljesítmény a
+processzormagok számának növelésével. Egy jó skálázhatóságú
+szinkronizációs mechanizmusban az olvasási teljesítmény közel lineárisan
+nő a magok számával, mert az olvasók nem versengenek közös erőforrásért.
+Az írói oldal természetesen nem skálázódik ugyanígy, de mivel az írás
+ritka, a teljes rendszer áteresztőképessége jelentősen javul. A per-CPU
+adat és a skálázható számlálás további eszközöket ad arra, hogy a
+gyakran növelt számlálókat, statisztikákat és hasonló változókat se
+közös cache-vonalon tartsuk, hanem processzoronként elkülönítve.</p>
+<h3 data-number="10.3.2" id="a-read-copy-update-alapötlete"><span
+class="header-section-number">10.3.2</span> 2. A read-copy-update
+alapötlete</h3>
+<p>Az RCU három alappillére:</p>
+<ol type="1">
+<li><strong>Publish-subscribe (közzététel–feliratkozás):</strong> az író
+először elkészíti az új adatot, majd egyetlen pointer-cserével
+közzéteszi. Az olvasók mindig a régi vagy az új pointert látják, soha
+nem látnak félig frissített állapotot. A pointer-csere atomi kell
+legyen; a gyakorlatban ez egy egyszerű, megfelelően látható írás,
+például az <code>rcu_assign_pointer</code> a Linux kernelben.</li>
+<li><strong>Grace period (türelmi időszak):</strong> az író a
+pointer-csere után megvárja, hogy minden olyan olvasó befejezze a régi
+adat használatát, aki a csere előtt kezdett olvasni. Ez az időtartam a
+grace period. Amikor a grace period lejár, garantált, hogy senki sem
+hivatkozik többé a régi objektumra.</li>
+<li><strong>Reclaim (visszanyerés):</strong> a grace period után az író
+felszabadíthatja a régi objektumot.</li>
+</ol>
+<p>A grace period meghatározásához az RCU figyeli a processzorok
+úgynevezett <strong>quiescent state</strong> (nyugalmi állapot)
+eseményeit. Egy CPU akkor van quiescent state-ben egy RCU olvasási
+kritikus szakasz szempontjából, ha nem tartózkodik ilyen szakaszban. A
+gyakorlatban a quiescent state jellemzően a felhasználói térbe való
+visszatérés, a kontextusváltás vagy az idle állapot. Ha minden CPU
+áthaladt egy quiescent state-en, és azóta nem lépett be újra RCU
+olvasási kritikus szakaszba, akkor a grace period lejárt.</p>
+<p>Az RCU olvasói kritikus szakasza nagyon olcsó: az olvasó belép egy
+<code>rcu_read_lock()</code> hívásba, elvégzi az olvasást, majd kilép
+<code>rcu_read_unlock()</code> hívással. Ezek a hívások a legtöbb
+megvalósításban nem csinálnak mást, mint egy per-CPU vagy per-thread
+jelző beállítását, sokszor még csak nem is atomi műveletet. A kritikus
+szakaszban az olvasó <strong>nem blokkolhat</strong>, nem alhat el, nem
+végezhet ütemezést, mert az meggátolná a grace period befejeződését.</p>
+<p>Az írói oldal ezzel szemben drágább:</p>
+<ul>
+<li><code>synchronize_rcu()</code>: blokkol, amíg a grace period le nem
+jár.</li>
+<li><code>call_rcu(head, callback)</code>: regisztrál egy callbacket,
+amelyet a grace period után hívnak meg; az író nem blokkol.</li>
+</ul>
+<p>A Linux kernelben az RCU-t széles körben használják: a dentry cache,
+a routing table, a fájlleíró táblák, a socket lookupek és sok más
+olvasás-nehéz adatszerkezet esetén.</p>
+<h3 data-number="10.3.3" id="egyszerű-példa-rcu-védett-lista"><span
+class="header-section-number">10.3.3</span> 2.1. Egyszerű példa:
+RCU-védett lista</h3>
+<p>Képzeljünk el egy linkelt listát, amelyet sok szál olvas, és ritkán
+módosítanak. A hagyományos megoldás egy rwlock lenne:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Hagyományos, szemléltető példa */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>rwlock_t list_lock<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">*</span>head<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">*</span>list_lookup<span class="op">(</span><span class="dt">int</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    read_lock<span class="op">(&amp;</span>list_lock<span class="op">);</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> head<span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>            read_unlock<span class="op">(&amp;</span>list_lock<span class="op">);</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> p<span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> p<span class="op">-&gt;</span>next<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    read_unlock<span class="op">(&amp;</span>list_lock<span class="op">);</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az olvasók itt a <code>read_lock</code>/<code>read_unlock</code>
+miatt közös lock-változót írnak, ami cache-line tranzakciókat
+generál.</p>
+<p>RCU-val ugyanez:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* RCU-alapú, szemléltető példa (pszeudokód) */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">*</span>head<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">*</span>list_lookup_rcu<span class="op">(</span><span class="dt">int</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    rcu_read_lock<span class="op">();</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> rcu_dereference<span class="op">(</span>head<span class="op">);</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>            rcu_read_unlock<span class="op">();</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> p<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> rcu_dereference<span class="op">(</span>p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    rcu_read_unlock<span class="op">();</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az olvasó itt <code>rcu_dereference</code> makrókat használ a
+pointerek olvasására, ami a compiler és a hardver memóriamodell
+szempontjából garantálja a megfelelő láthatóságot, de nem jár atomi
+utasítással. A <code>rcu_read_lock</code> és
+<code>rcu_read_unlock</code> a gyakorlatban gyakran egy-egy per-CPU
+maszkbit beállítása és törlése.</p>
+<p>Az írói oldal:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Írói oldal: új elem beszúrása */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> list_insert_rcu<span class="op">(</span><span class="dt">int</span> key<span class="op">,</span> <span class="dt">int</span> value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>new <span class="op">=</span> kmalloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>new<span class="op">));</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    new<span class="op">-&gt;</span>key <span class="op">=</span> key<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    new<span class="op">-&gt;</span>value <span class="op">=</span> value<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    new<span class="op">-&gt;</span>next <span class="op">=</span> head<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    rcu_assign_pointer<span class="op">(</span>head<span class="op">,</span> new<span class="op">);</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Nincs szükség grace periodra, mert a régi head még használatban van,</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co">       de az új elem már elérhető. A régi objektumot csak akkor szabadítjuk fel,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">       ha már senki sem olvashatja, például törléskor. */</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Törléskor az író először kicsatolja az elemet a listából, majd
+megvárja a grace periodot, és csak azután szabadítja fel:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Írói oldal: elem törlése (pszeudokód) */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> list_delete_rcu<span class="op">(</span><span class="dt">int</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> head<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>prev <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>prev<span class="op">)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>prev<span class="op">-&gt;</span>next<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>head<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>            synchronize_rcu<span class="op">();</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>            kfree<span class="op">(</span>p<span class="op">);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>        prev <span class="op">=</span> p<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> p<span class="op">-&gt;</span>next<span class="op">;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>synchronize_rcu()</code> hívás biztosítja, hogy a kicsatolás
+előtt indult olvasók befejezzék a munkájukat. Miután visszatért,
+garantált, hogy senki sem éri el a <code>p</code> pointert, így a
+<code>kfree</code> biztonságos. A gyakorlatban a
+<code>synchronize_rcu()</code> blokkolja az írót, ezért gyakran
+aszinkron <code>call_rcu</code> callbacket használnak.</p>
+<h3 data-number="10.3.4" id="az-rcu-api-és-a-szemantika"><span
+class="header-section-number">10.3.4</span> 3. Az RCU API és a
+szemantika</h3>
+<p>Bár a pontos API a Linux kernel verziójától és a felhasználói tér
+megvalósításától függ, a legfontosabb elemek a következők (a verziókat a
+felhasznált kernel vagy könyvtár dokumentációjában ellenőrizni
+kell):</p>
+<ul>
+<li><code>rcu_read_lock()</code> / <code>rcu_read_unlock()</code>:
+olvasói kritikus szakasz kezdete és vége. Nem blokkolhat, nem válthat
+kontextust, nem alhat.</li>
+<li><code>rcu_dereference(p)</code>: az <code>p</code> pointer olvasása
+olyan módon, amely a compiler és a CPU számára megtiltja a nemkívánatos
+átmozgatást a kritikus szakasz fölé, és garantálja a megfelelő függőségi
+sorrendet.</li>
+<li><code>rcu_assign_pointer(p, v)</code>: az <code>v</code> érték
+közzététele az <code>p</code> pointeren keresztül, megfelelő
+memória-sorompóval, hogy az olvasók a pointer frissítése előtt ne
+láthassák az adat korai inicializálását.</li>
+<li><code>synchronize_rcu()</code>: blokkol, amíg a grace period le nem
+jár. Alvó folyamatban hívható, de nem hívható atomikus
+kontextusból.</li>
+<li><code>call_rcu(head, func)</code>: regisztrálja a <code>func</code>
+callbacket, amely a grace period után fut le. Aszinkron visszanyerésre
+való.</li>
+</ul>
+<p>Az olvasói kritikus szakaszban csak olyan művelet szabad, amely nem
+szakítja meg a CPU-t, azaz nincs alvás, nincs preemptív ütemezés, nincs
+fájlrendszer-művelet, nincs olyan hívás, amely blokkolhat. A kernelben
+ezért az RCU olvasói szakaszokat gyakran úgy írják, hogy csak
+memóriaolvasásokat és egyszerű aritmetikát végeznek.</p>
+<p>A grace period implementációja a Linux kernelben bonyolult, és
+többféle RCU-variáns létezik: Classic RCU, Tree RCU, Tiny RCU,
+Preemptible RCU, SRCU (sleepable RCU). A lényeg mindegyikben az, hogy a
+kernel nyilvántartja a processzorok quiescent state-jeit, és amikor
+minden CPU kilépett az RCU olvasói szakaszból, a grace period lezárul. A
+processzorfüggő maszkok per-CPU adatok, így maga a nyilvántartás is
+skálázható.</p>
+<h3 data-number="10.3.5"
+id="példa-elem-visszanyerése-call_rcu-val"><span
+class="header-section-number">10.3.5</span> 3.1. Példa: elem
+visszanyerése <code>call_rcu</code>-val</h3>
+<p>A <code>synchronize_rcu()</code> hívás blokkol, ami egy író szálat
+hosszú időre megállíthat. Ha az író nem akar várni, a
+<code>call_rcu</code> mechanizmust választja:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* RCU callback-es törlés (pszeudokód) */</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> key<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> value<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>next<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> rcu_head rcu<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> node_free_callback<span class="op">(</span><span class="kw">struct</span> rcu_head <span class="op">*</span>rh<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> container_of<span class="op">(</span>rh<span class="op">,</span> <span class="kw">struct</span> node<span class="op">,</span> rcu<span class="op">);</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    kfree<span class="op">(</span>p<span class="op">);</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> list_delete_async_rcu<span class="op">(</span><span class="dt">int</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> head<span class="op">;</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>prev <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>prev<span class="op">)</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>prev<span class="op">-&gt;</span>next<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>head<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>            call_rcu<span class="op">(&amp;</span>p<span class="op">-&gt;</span>rcu<span class="op">,</span> node_free_callback<span class="op">);</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>        prev <span class="op">=</span> p<span class="op">;</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> p<span class="op">-&gt;</span>next<span class="op">;</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt az <code>rcu_head</code> mezőt minden elembe be kell ágyazni, és
+a callback a <code>container_of</code> makróval nyeri vissza a teljes
+objektumot. Ez a minta szinte minden RCU-t használó adatszerkezetben
+megjelenik.</p>
+<h3 data-number="10.3.6" id="epoch-alapú-visszanyerés"><span
+class="header-section-number">10.3.6</span> 4. Epoch-alapú
+visszanyerés</h3>
+<p>Az RCU grace periodja egy kernel-szintű, de nem mindig elérhető
+mechanizmus. Felhasználói térben a liburcu valósítja meg az RCU-t, de
+létezik egy egyszerűbb, általánosabb séma is, amelyet
+<strong>epoch-based reclamation</strong> (EBR) néven ismerünk. Az EBR az
+RCU-hoz hasonlóan a lock-free adatszerkezetek biztonságos
+memória-visszanyerését oldja meg úgy, hogy az olvasók nem használnak
+lockot, csak egy globális vagy per-thread epoch-számlálót.</p>
+<p>Az EBR alapötlete:</p>
+<ol type="1">
+<li>A rendszer fenntart egy globális epoch-értéket (általában 0, 1, 2
+közötti körforgásban).</li>
+<li>Az olvasó belép egy kritikus szakaszba, amikor rögzíti az aktuális
+epochot a saját per-thread változójában.</li>
+<li>Az író, amikor törölni akar egy elemet, a régi elemet egy
+visszavonási listára helyezi, és megjelöli az aktuális epochhal.</li>
+<li>Amikor az összes olvasó elhagyta az adott epochot, az ehhez az
+epochhoz tartozó visszavonási listán lévő elemeket fel lehet
+szabadítani.</li>
+<li>Az epochok körben járnak, és az író csak akkor tud felszabadítani,
+ha a megfelelő epoch már nincs használatban.</li>
+</ol>
+<p>Az EBR nem adja meg az RCU azon előnyét, hogy az olvasó valóban nulla
+overheadű; itt az olvasóknak is per-thread epoch-jelölőt kell írniuk.
+Azonban az írás per-thread, nem közös cache-vonal, ezért skálázódik. Az
+EBR-t gyakran használják lock-free listák és hash-táblák felhasználói
+térben.</p>
+<p>Egyszerű pszeudokód:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* EBR pszeudokód, szemléltetés */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define EPOCH_COUNT </span><span class="dv">3</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">_Atomic</span> <span class="dt">int</span> global_epoch <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">_Thread_local</span> <span class="dt">int</span> local_epoch <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ebr_read_lock<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    local_epoch <span class="op">=</span> atomic_load<span class="op">(&amp;</span>global_epoch<span class="op">);</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ebr_read_unlock<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    local_epoch <span class="op">=</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> ebr_retire<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>ptr<span class="op">,</span> <span class="dt">void</span> <span class="op">(*</span>reclaim<span class="op">)(</span><span class="dt">void</span> <span class="op">*))</span> <span class="op">{</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> e <span class="op">=</span> atomic_load<span class="op">(&amp;</span>global_epoch<span class="op">);</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    retire_list<span class="op">[</span>e<span class="op">].</span>push<span class="op">(</span>ptr<span class="op">,</span> reclaim<span class="op">);</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Ha minden szál kilépett az e epochból, felszabadítjuk a listát */</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>all_threads_unused_epoch<span class="op">(</span>e<span class="op">))</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        reclaim_retire_list<span class="op">(</span>e<span class="op">);</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az <code>all_threads_unused_epoch</code> ellenőrzéséhez a szálak
+epoch-jelölőit kell végignézni. Mivel ez ritkán történik, elfogadható a
+lineáris ellenőrzés. Az EBR tehát egyfajta könnyű alternatíva, ahol a
+grace period fogalmát az epochok váltása helyettesíti.</p>
+<p>Az RCU és az EBR közös elve: <strong>az olvasó soha nem blokkol, és
+nem tartozik felelősséggel a memória-visszanyerésért</strong>; a
+visszanyerést az író oldal végzi, miután bizonyos, hogy nincs több
+olvasó. A különbség főleg a skálázhatóságban és a kernel/user tér
+elérhetőségében van.</p>
+<h3 data-number="10.3.7" id="per-cpu-adat-és-skálázható-számlálás"><span
+class="header-section-number">10.3.7</span> 5. Per-CPU adat és
+skálázható számlálás</h3>
+<p>A skálázhatóság másik fontos eszköze a <strong>per-CPU adat</strong>.
+Ahelyett, hogy minden processzor ugyanazt a globális változót írná,
+minden CPU saját példányt kap, és a saját példányán végez írást. A
+globális olvasás összegzi a per-CPU értékeket. Ez a minta drámaian
+csökkenti a cache-coherency forgalmat, mert minden CPU a saját
+cache-vonalát írja, amely ritkán kerül más CPU-hoz.</p>
+<p>A Linux kernelben a per-CPU változókat a <code>DEFINE_PER_CPU</code>
+makróval lehet deklarálni, és a <code>get_cpu_var()</code> /
+<code>put_cpu_var()</code> vagy a <code>this_cpu_inc()</code> típusú
+műveletekkel elérni. A <code>this_cpu_inc()</code> például a futó CPU
+saját példányát növeli atomi utasítás nélkül, mert a preemptiót letiltja
+rövid időre. Az olvasáshoz a kernel <code>for_each_possible_cpu</code>
+ciklussal összegez.</p>
+<p>Vegyünk egy egyszerű skálázható számlálót, amely egy adott esemény
+(pl. csomagszámláló) gyakoriságát méri:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Per-CPU számláló pszeudokód, C nyelv */</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> percpu_counter <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> __percpu <span class="op">*</span>counters<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> threshold<span class="op">;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> sum<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> percpu_counter_inc<span class="op">(</span><span class="kw">struct</span> percpu_counter <span class="op">*</span>c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    this_cpu_inc<span class="op">(</span>c<span class="op">-&gt;</span>counters<span class="op">);</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>this_cpu_read<span class="op">(</span>c<span class="op">-&gt;</span>counters<span class="op">)</span> <span class="op">&gt;</span> c<span class="op">-&gt;</span>threshold<span class="op">)</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>        percpu_counter_sync<span class="op">(</span>c<span class="op">);</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> percpu_counter_sync<span class="op">(</span><span class="kw">struct</span> percpu_counter <span class="op">*</span>c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> cpu<span class="op">;</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> total <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    for_each_possible_cpu<span class="op">(</span>cpu<span class="op">)</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>        total <span class="op">+=</span> per_cpu<span class="op">(</span>c<span class="op">-&gt;</span>counters<span class="op">,</span> cpu<span class="op">);</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    c<span class="op">-&gt;</span>sum <span class="op">=</span> total<span class="op">;</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az alapötlet az, hogy a triviaális növelés csak a saját CPU-t érinti,
+és csak a küszöb túllépésekor történik globális szinkronizáció. Ez a
+megközelítés az úgynevezett <strong>approximate counter</strong>
+(közelítő számláló) általánosítása. A pontosság és a globális
+szinkronizáció gyakorisága közötti trade-off a <code>threshold</code>
+paraméterrel hangolható. Ha a threshold 1, akkor minden növelés globális
+szinkronizációt vált ki, ami valójában egy hagyományos atomi számlálót
+eredményez. Ha a threshold nagy, a számláló ritkán pontos, de az írások
+nagyon olcsók.</p>
+<p>A per-CPU adat nem csak számlálóknál hasznos. Gyakran tárolnak
+per-CPU cache-eket, processzor-specifikus állapotot,
+ütemező-statisztikát, interrupt-számlálót, vagy épp az RCU quiescent
+state nyilvántartását. A tervezésnél figyelni kell a <strong>false
+sharing</strong> elkerülésére: a per-CPU változókat úgy kell elhelyezni,
+hogy minden CPU adata külön cache-vonalra kerüljön. A gyakorlatban ezt a
+kernel- vagy a liburcu implementációk cache-line alignmenttel oldják
+meg.</p>
+<p>A per-CPU adat és az RCU kombinációja erőteljes: például egy
+RCU-védett listába bejáró olvasó a lista elemeit olvassa, miközben a
+statisztikákat per-CPU számlálókkal gyűjti. Az olvasónak nincs lockja,
+nincs közös írása, és a per-CPU számláló növelése is csak a saját
+cache-vonalát érinti.</p>
+<h3 data-number="10.3.8" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">10.3.8</span> 6. Tipikus hibák és helyes
+megoldások</h3>
+<p>Az RCU és a per-CPU adat használata során a leggyakoribb hibák a
+következők:</p>
+<ol type="1">
+<li><p><strong>Alvás az RCU olvasói kritikus szakaszban.</strong> Ha az
+olvasó <code>rcu_read_lock()</code> és <code>rcu_read_unlock()</code>
+között alvó függvényt hív (pl. <code>kmalloc</code>
+<code>GFP_KERNEL</code> flaggel egy bizonyos környezetben, vagy
+fájlrendszer-művelet), akkor a kernel preemptív kontextusban lehet, és a
+grace period soha nem fejeződik be. Helyes megoldás: csak nem blokkoló
+műveletet végezni; ha blokkolás kell, használjuk az SRCU-t, amely
+engedélyezi az alvást, de drágább.</p></li>
+<li><p><strong>A régi objektum túl korai felszabadítása.</strong> Ha az
+író a pointer-csere után azonnal <code>kfree</code>-t hív anélkül, hogy
+megvárná a grace periodot, akkor a még futó olvasók felszabadított
+memóriát olvashatnak. Helyes megoldás: <code>synchronize_rcu()</code>
+vagy <code>call_rcu()</code>.</p></li>
+<li><p><strong>A pointer-közzététel hiányos memória-sorompója.</strong>
+Ha az író közönséges C-pointerírást használ az
+<code>rcu_assign_pointer</code> helyett, a compiler vagy a CPU
+átrendezheti a műveleteket, és az olvasó félig inicializált objektumot
+láthat. Helyes megoldás: mindig a megfelelő RCU makrót
+használni.</p></li>
+<li><p><strong>Per-CPU adat atomitásának feltételezése.</strong> A
+per-CPU adat csak a saját CPU-ján érhető el atomosan; ha egy másik CPU
+közvetlenül írja, versenyhelyzet keletkezik. Helyes megoldás: minden CPU
+csak a saját per-CPU példányát módosítsa, a globális metszeteket pedig
+short lockkal vagy atomi művelettel védjük.</p></li>
+<li><p><strong>False sharing a per-CPU adatnál.</strong> Ha a per-CPU
+változók osztoznak egy cache-vonalon, akkor hiába van per-CPU, a közös
+cache-vonal miatt mégis cache-line bouncing lép fel. Helyes megoldás:
+cache-line alignment, <code>____cacheline_aligned</code> típusú
+attribútum.</p></li>
+<li><p><strong>A grace period hosszának alulbecslése.</strong> Az írók a
+<code>synchronize_rcu()</code> hívás alatt blokkolnak, ami hosszú lehet,
+ha sok olvasó van lassú kritikus szakaszban. Helyes megoldás: aszinkron
+<code>call_rcu</code> callback használata, vagy az adatszerkezet
+módosításának olyan szervezése, hogy a grace periodra ritkán legyen
+szükség.</p></li>
+</ol>
+<h3 data-number="10.3.9"
+id="labor-rcu-alapú-lista-tervezése-és-mérése"><span
+class="header-section-number">10.3.9</span> 7. Labor: RCU-alapú lista
+tervezése és mérése</h3>
+<p>Ez a labor egy felhasználói térben futó RCU-védett linkelt lista
+tervezését és teljesítménymérését írja le. A környezet QEMU-ban
+futtatott minimalista Linux, amelyben a liburcu könyvtár elérhető. A cél
+az olvasó-optimális szinkronizáció és a skálázhatóság bemutatása. A
+labor során mért és várt eredményt külön kell kezelni, és a mérési
+naplóban rögzíteni.</p>
+<h3 data-number="10.3.10" id="kiinduló-állapot-és-eszközök"><span
+class="header-section-number">10.3.10</span> 7.1. Kiinduló állapot és
+eszközök</h3>
+<ul>
+<li>Emulált környezet: QEMU 7.x (a pontos verzió a reprodukciós
+csomagban ellenőrizendő), 4 vCPU, 4 GiB RAM, virtio-blk háttértár.</li>
+<li>Operációs rendszer: Linux 6.1 (a pontos verzió ellenőrizendő),
+<code>liburcu-dev</code> csomag telepítve.</li>
+<li>Fordító: GCC 12, <code>-O2 -march=native</code> (az emulált CPU
+esetén a natív itt az emulált CPU-t jelenti),
+<code>-pthread -lurcu -lurcu-qsbr</code> szükség szerint.</li>
+<li>A labor kódja egy eldobható könyvtárban készül, a hoszt valódi
+fájljait nem módosítjuk.</li>
+</ul>
+<h3 data-number="10.3.11" id="az-adatszerkezet"><span
+class="header-section-number">10.3.11</span> 7.2. Az adatszerkezet</h3>
+<p>Egy egyirányú linkelt lista, amelyet a szálak keresnek. A lista
+elemei RCU-védettek. A benchmark három változatot hasonlít össze:</p>
+<ul>
+<li><strong>rwlock lista:</strong> hagyományos
+<code>pthread_rwlock_t</code>-vel védett lista.</li>
+<li><strong>RCU lista:</strong> liburcu <code>urcu</code> API-val védett
+lista.</li>
+<li><strong>RCU-perCPU számlálóval kiegészített lista:</strong> az RCU
+lista mellett minden olvasó egy per-thread számlálót is növel, a
+skálázható számlálás demonstrálására.</li>
+</ul>
+<p>A lista inicializálása 1000 elemmel történik, majd 4 olvasó szál
+(minden vCPU-n egy) egy adott ideig kereséseket hajt végre. Az írók
+ritkán (pl. 10 ms-onként) beszúrnak és törölnek, hogy az RCU grace
+period aktiválódjon.</p>
+<h3 data-number="10.3.12" id="a-kód-vázlata"><span
+class="header-section-number">10.3.12</span> 7.3. A kód vázlata</h3>
+<p>A következő pszeudokód a liburcu API-t használja. A pontos
+függvényneveket és fejlécet a telepített liburcu verziójához igazítva
+ellenőrizni kell.</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* RCU-védett lista, liburcu példa (pszeudokód, verziófüggő) */</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;urcu.h&gt;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;pthread.h&gt;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdatomic.h&gt;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">{</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> key<span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> value<span class="op">;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>next<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> rcu_head rcu<span class="op">;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> node <span class="op">*</span>head <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> rcu_free_cb<span class="op">(</span><span class="kw">struct</span> rcu_head <span class="op">*</span>rh<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> caa_container_of<span class="op">(</span>rh<span class="op">,</span> <span class="kw">struct</span> node<span class="op">,</span> rcu<span class="op">);</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    free<span class="op">(</span>p<span class="op">);</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> list_insert<span class="op">(</span><span class="dt">int</span> key<span class="op">,</span> <span class="dt">int</span> value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>n <span class="op">=</span> malloc<span class="op">(</span><span class="kw">sizeof</span><span class="op">(*</span>n<span class="op">));</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>    n<span class="op">-&gt;</span>key <span class="op">=</span> key<span class="op">;</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>    n<span class="op">-&gt;</span>value <span class="op">=</span> value<span class="op">;</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>    n<span class="op">-&gt;</span>next <span class="op">=</span> rcu_dereference<span class="op">(</span>head<span class="op">);</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>    rcu_assign_pointer<span class="op">(</span>head<span class="op">,</span> n<span class="op">);</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> list_delete<span class="op">(</span><span class="dt">int</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> rcu_dereference<span class="op">(</span>head<span class="op">);</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> node <span class="op">*</span>prev <span class="op">=</span> NULL<span class="op">;</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> key<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>prev<span class="op">)</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>prev<span class="op">-&gt;</span>next<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>            <span class="cf">else</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>                rcu_assign_pointer<span class="op">(</span>head<span class="op">,</span> p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>            call_rcu<span class="op">(&amp;</span>p<span class="op">-&gt;</span>rcu<span class="op">,</span> rcu_free_cb<span class="op">);</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-42"><a href="#cb8-42" aria-hidden="true" tabindex="-1"></a>        prev <span class="op">=</span> p<span class="op">;</span></span>
+<span id="cb8-43"><a href="#cb8-43" aria-hidden="true" tabindex="-1"></a>        p <span class="op">=</span> rcu_dereference<span class="op">(</span>p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb8-44"><a href="#cb8-44" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-45"><a href="#cb8-45" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-46"><a href="#cb8-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-47"><a href="#cb8-47" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>reader_thread<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>arg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-48"><a href="#cb8-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">(</span><span class="dt">void</span><span class="op">)</span>arg<span class="op">;</span></span>
+<span id="cb8-49"><a href="#cb8-49" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> <span class="dv">1000000</span><span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb8-50"><a href="#cb8-50" aria-hidden="true" tabindex="-1"></a>        rcu_read_lock<span class="op">();</span></span>
+<span id="cb8-51"><a href="#cb8-51" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> node <span class="op">*</span>p <span class="op">=</span> rcu_dereference<span class="op">(</span>head<span class="op">);</span></span>
+<span id="cb8-52"><a href="#cb8-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">while</span> <span class="op">(</span>p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-53"><a href="#cb8-53" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">(</span>p<span class="op">-&gt;</span>key <span class="op">==</span> i <span class="op">%</span> <span class="dv">1000</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-54"><a href="#cb8-54" aria-hidden="true" tabindex="-1"></a>                rcu_read_unlock<span class="op">();</span></span>
+<span id="cb8-55"><a href="#cb8-55" aria-hidden="true" tabindex="-1"></a>                <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb8-56"><a href="#cb8-56" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb8-57"><a href="#cb8-57" aria-hidden="true" tabindex="-1"></a>            p <span class="op">=</span> rcu_dereference<span class="op">(</span>p<span class="op">-&gt;</span>next<span class="op">);</span></span>
+<span id="cb8-58"><a href="#cb8-58" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-59"><a href="#cb8-59" aria-hidden="true" tabindex="-1"></a>        rcu_read_unlock<span class="op">();</span></span>
+<span id="cb8-60"><a href="#cb8-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-61"><a href="#cb8-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb8-62"><a href="#cb8-62" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A többi szál hasonló. A per-thread számláló bevezetéséhez egy
+<code>_Thread_local</code> változót használunk, amelyet az olvasó
+kritikus szakaszon kívül növelünk.</p>
+<h3 data-number="10.3.13" id="build-és-futtatás"><span
+class="header-section-number">10.3.13</span> 7.4. Build és futtatás</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Build parancsok</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-O2</span> <span class="at">-pthread</span> rcu_list.c <span class="at">-lurcu</span> <span class="at">-o</span> rcu_list</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="fu">gcc</span> <span class="at">-O2</span> <span class="at">-pthread</span> rwlock_list.c <span class="at">-lurcu</span> <span class="at">-o</span> rwlock_list</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Futtatás 4 vCPU-hoz kötött szálakkal</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">taskset</span> <span class="at">-c</span> 0-3 ./rcu_list <span class="op">&gt;</span> rcu_measured.log</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">taskset</span> <span class="at">-c</span> 0-3 ./rwlock_list <span class="op">&gt;</span> rwlock_measured.log</span></code></pre></div>
+<p>A mérési napló tartalmazza a CPU-t, a memóriát, a kernel verziót, a
+liburcu verziót, a GCC verziót és a buildek idejét. A futási időt a
+program belső <code>clock_gettime()</code> hívása méri, és a végén
+átbocsátási sebességet számol (művelet/másodperc) minden változatra.</p>
+<h3 data-number="10.3.14" id="elvárt-és-mért-eredmény"><span
+class="header-section-number">10.3.14</span> 7.5. Elvárt és mért
+eredmény</h3>
+<p>A várt eredmény az, hogy az RCU lista olvasási sebessége jelentősen
+meghaladja az rwlock lista sebességét, mert az RCU olvasók nem írják a
+közös lockot. 4 magon a skálázhatóság közel lineáris, míg az rwlock
+esetében a cache-line bouncing korlátozza a párhuzamosságot. A mérés ezt
+vagy megerősíti, vagy eltérést mutat, amelyet a naplóban dokumentálni
+kell. A per-thread számláló további kis javulást hozhat a statisztikai
+utakban.</p>
+<p>A reprodukciós csomag a következőket tartalmazza: kiinduló állapot,
+build parancsok, konfiguráció, futtatási parancs, mérési napló, a kapott
+átbocsátási értékek, és a visszaállítási útmutató. A labor nem módosít
+semmilyen hosztállapotot, minden az emulált környezetben történik.</p>
+<h3 data-number="10.3.15" id="önellenőrző-kérdés"><span
+class="header-section-number">10.3.15</span> 7.6. Önellenőrző
+kérdés</h3>
+<p>Miért nem szabad aludni az RCU olvasói kritikus szakaszban, és milyen
+alternatíva létezik, ha az olvasónak blokkolnia kell? Válaszoljon
+indoklással, és nevezze meg a megfelelő RCU-variánst.</p>
+<h3 data-number="10.3.16" id="összefoglalás"><span
+class="header-section-number">10.3.16</span> 8. Összefoglalás</h3>
+<p>Az RCU, az epoch-alapú visszanyerés és a per-CPU adat az
+olvasó-optimális szinkronizáció és a skálázhatóság három alappillére. Az
+RCU lehetővé teszi, hogy az olvasók szinte nulla költséggel férjenek
+hozzá a megosztott adatszerkezethez, miközben az írók a grace period
+lejárta után biztonságosan visszanyerik a memóriát. Az EBR hasonló célt
+szolgál felhasználói térben, epochok és per-thread jelölők segítségével.
+A per-CPU adat és a skálázható számlálás további skálázhatósági
+nyereséget ad azáltal, hogy elkerüli a globális cache-vonalak írását. A
+tipikus hibák, mint az alvás a kritikus szakaszban, a túl korai
+visszanyerés vagy a false sharing, mind elkerülhetők a megfelelő makrók
+és cache-line alignment következetes használatával. A következő egység
+(<a href="os037.html">Többmagos és heterogén rendszerek kihívásai</a>)
+ezeket az elveket alkalmazza többmagos és heterogén rendszerekre, ahol a
+skálázhatóság és a hardver-specifikus kihívások még hangsúlyosabbá
+válnak.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os035.html">← 10.2 Lock-free és wait-free struktúrák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os037.html">10.4 Többmagos és heterogén rendszerek kihívásai →</a></div>
+</nav>
+</body>
+</html>

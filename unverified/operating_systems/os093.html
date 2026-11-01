@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>24.4 RTOS-minták: watchdog, queue és event flag – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz6">VI. RÉSZ – Valós idejű, beágyazott és elosztott rendszerek</a> › <a href="index.html#osch23">24 RTOS-példák és minták</a></p>
+<div class="links"><a class="prev" rel="prev" href="os092.html">← 24.3 AUTOSAR és járműipari architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os094.html">25.1 Beágyazott Linux és firmware →</a></div>
+</nav>
+<h2 data-number="24.4" id="os093"><span
+class="header-section-number">24.4</span> RTOS-minták: watchdog, queue
+és event flag</h2>
+<p>Az RTOS-alapú beágyazott fejlesztésben a hangsúly ritkán magán a
+kernel belső implementációján van, sokkal inkább azon, hogy a fejlesztő
+hogyan bontja feladatokra a rendszert, és hogyan szervezi a feladatok
+közötti együttműködést. A watchdog, az üzenetsor, az eseménybit-csoport
+és a mailbox olyan újrafelhasználható minták, amelyek a legtöbb valós
+idejű rendszerben megjelennek. A watchdog a rendszer életben maradását
+felügyeli, az üzenetsor a termelő–fogyasztó láncokat szervezi, az
+eseménybit-csoport több feltétel együttes teljesülését kezeli, a mailbox
+pedig vezérlő jellegű, általában egyetlen üzenet továbbítására szolgál.
+Ebben az alfejezetben ezeket a mintákat a tervezési döntésekkel, a
+tipikus hibákkal és egy reprodukálható laborgyakorlattal együtt mutatjuk
+be.</p>
+<p><strong>A beágyazott feladatok tipikus mintái</strong></p>
+<p>Egy RTOS-alkalmazás tervezésekor a feladatok nem egyszerűen
+„funkcionális blokkok”, hanem időzítési, szinkronizációs és
+erőforrás-tulajdonjogi szerepekkel is rendelkeznek. A gyakori minták a
+következők:</p>
+<ol type="1">
+<li><strong>Periodikus feladat</strong> – időzítő vagy
+<code>vTaskDelayUntil</code> szerint fut, fix periódussal. Például egy
+érzékelő 10 ms-enként mintát vesz és üzenetsorba ír.</li>
+<li><strong>Eseményvezérelt feladat</strong> – nem periódus, hanem
+esemény, például megszakítás, üzenetsor-érkezés vagy event flag bit
+ébreszti. Például egy UART-vevő feladat blokkolva vár a
+RX-queue-ra.</li>
+<li><strong>Termelő–fogyasztó</strong> – egy vagy több termelő
+üzenetsoron vagy osztott memórián keresztül ad át adatot egy
+fogyasztónak. Az üzenetsor pufferként telítődési és kiürülési
+viselkedést is mutat.</li>
+<li><strong>Állapotgép</strong> – a feladat egy állapotváltozót tart
+karban, és az események hatására vált állapotot. Ez különösen hasznos
+protokoll- és eszközvezérlőkben.</li>
+<li><strong>Watchdog monitor</strong> – egy külön feladat gyűjti a többi
+feladat liveness jelzéseit, és csak akkor frissíti a hardveres
+watchdogot, ha minden kritikus jel megérkezett.</li>
+<li><strong>Erőforrás-őr</strong> – egy feladat vagy könyvtári réteg
+kizárólagos hozzáférést ad egy perifériához, például SPI buszhoz, és
+mutex/szemaforral sorosítja a hozzáférést.</li>
+<li><strong>Megszakítás + halasztott feldolgozás</strong> – az ISR csak
+a minimális hardverkezelést végzi, az adatot üzenetsorba vagy event
+flaggel jelzett pufferbe teszi, a tényleges feldolgozás pedig egy normál
+feladatban történik.</li>
+</ol>
+<p>Ezek a minták gyakran kombinálódnak. Egy tipikus érzékelőrendszerben
+a periodikus termelők üzenetsorba írnak, egy fogyasztó szűri és
+továbbítja az adatot, egy watchdog feladat pedig a periodikus termelők
+szívveréseit figyeli. A tervezés első lépése ezért nem a konkrét
+API-hívás, hanem annak eldöntése, hogy melyik feladat milyen
+időzítéssel, milyen prioritással és milyen kommunikációs csatornán
+keresztül működik.</p>
+<p><strong>Watchdog: az életben tartás őre</strong></p>
+<p>A watchdog timer (WDT) egy hardveres számláló, amelyet a szoftvernek
+rendszeresen frissítenie kell. Ha a frissítés elmarad, a WDT túlcsordul,
+és általában rendszer-resetelést vagy megszakítást vált ki. A watchdog
+célja az, hogy a szoftver akkor is visszakerüljön egy ismert állapotba,
+ha egy feladat végtelen ciklusba kerül, egy magasabb prioritású feladat
+kiéhezteti a többit, vagy egy hardverhiba miatt a vezérlés rossz helyre
+kerül.</p>
+<p>A legegyszerűbb, de gyakran hibás megközelítés az, ha egy feladat
+közvetlenül, a saját ciklusában „kutyázza” a hardveres WDT-t. Ez nem véd
+akkor, ha a feladat maga akad el, miközben a WDT-t frissítő kódsor
+továbbra is futhat. Helyesebb egy <strong>szoftveres watchdog
+réteg</strong> bevezetése, amelyben a kritikus feladatok egy-egy
+liveness jelzést adnak, és csak egy központi watchdog feladat frissíti a
+hardveres WDT-t, ha minden jelzés megérkezett.</p>
+<p>Az alábbi pszeudokód FreeRTOS-szerű API-val mutat egy ilyen réteget.
+A <code>system_events</code> eseménycsoport bitjei a feladatok
+szívveréseit jelzik:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* watchdog_task – FreeRTOS-szerű pszeudokód */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> watchdog_task<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>param<span class="op">)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    TickType_t last_wake <span class="op">=</span> xTaskGetTickCount<span class="op">();</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    EventBits_t required <span class="op">=</span> TASK_A_HEALTHY <span class="op">|</span> TASK_B_HEALTHY <span class="op">|</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>                           SENSOR_HEALTHY<span class="op">;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* Várakozás legfeljebb 100 ms-ig minden szükséges bitre.</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="co">           A pdTRUE itt azt jelenti, hogy a biteket kilépéskor töröljük,</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co">           így a következő periódusban újra kell érkezniük. */</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        EventBits_t bits <span class="op">=</span> xEventGroupWaitBits<span class="op">(</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>            system_events<span class="op">,</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>            required<span class="op">,</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>            pdTRUE<span class="op">,</span>              <span class="co">/* clear on exit */</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>            pdTRUE<span class="op">,</span>              <span class="co">/* wait for all bits */</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>            pdMS_TO_TICKS<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">((</span>bits <span class="op">&amp;</span> required<span class="op">)</span> <span class="op">==</span> required<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>            hw_watchdog_kick<span class="op">();</span>  <span class="co">/* hardveres WDT frissítése */</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>            log_error<span class="op">(</span><span class="st">&quot;watchdog: hianyzik legalabb egy heartbeat</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* nincs kick, a hardver WDT resetel, ha a helyzet tartós */</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a>        vTaskDelayUntil<span class="op">(&amp;</span>last_wake<span class="op">,</span> pdMS_TO_TICKS<span class="op">(</span><span class="dv">200</span><span class="op">));</span></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A figyelt feladatok például így adhatnak szívverést:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> sensor_task<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>param<span class="op">)</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* periodikus munka */</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>        sample_sensor<span class="op">();</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* liveness jelzés a watchdog felé */</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        xEventGroupSetBits<span class="op">(</span>system_events<span class="op">,</span> SENSOR_HEALTHY<span class="op">);</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        vTaskDelayUntil<span class="op">(&amp;</span>last_wake<span class="op">,</span> pdMS_TO_TICKS<span class="op">(</span><span class="dv">20</span><span class="op">));</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A watchdog tervezésének legfontosabb paramétere az <strong>időzítési
+ablak</strong>. A hardveres WDT timeout értékét úgy kell megválasztani,
+hogy normál működés közben a watchdog feladat biztosan frissíteni tudja,
+de meghibásodás esetén elég gyorsan reagáljon. Ha a monitorozott lánc
+legrosszabb válaszideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mo>max</mo></msub><annotation encoding="application/x-tex">R_{\max}</annotation></semantics></math>,
+akkor a hardveres timeout
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">T_{wdt}</annotation></semantics></math>
+értékére praktikus felső határ:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><mo>&gt;</mo><mi>k</mi><mo>⋅</mo><msub><mi>R</mi><mo>max</mo></msub><mo>,</mo></mrow><annotation encoding="application/x-tex">T_{wdt} &gt; k \cdot R_{\max},</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+jellemzően
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">1{,}5</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>
+közötti biztonsági tényező. Emellett a watchdog feladat periódusának úgy
+kell illeszkednie, hogy a legrosszabb esetben is legyen ideje a hiányzó
+jelzés észlelésére, mielőtt a hardver lejár. A fenti példában a watchdog
+200 ms-os periódussal fut, 100 ms-os várakozási ablakkal; a hardver WDT
+timeout így nem lehet például 120 ms-nál rövidebb, mert a watchdog
+feladat maga is legfeljebb 100 ms-ig blokkol.</p>
+<p>Két további változatot érdemes ismerni. Az <strong>ablakos
+watchdog</strong> (windowed WDT) megköveteli, hogy a frissítés ne túl
+korán és ne túl későn érkezzen, csak egy adott időablakon belül. Ez
+azért fontos, mert ha egy hibásan gyorsan futó feladat túl gyakran
+frissíti a WDT-t, az elfedheti, hogy a feladat ciklusa összeomlott, és
+például a periódusideje a töredékére csökkent. Az ablakos WDT ezt a
+hibát is leleplezi. A <strong>többszintű watchdog</strong> pedig
+szoftveres és hardveres szinteket kombinál: a szoftveres szint gyűjti a
+liveness jeleket, a hardveres szint a szoftveres réteg működőképességét
+felügyeli. Így a hibák nagyobb osztálya lefedhető.</p>
+<p>A watchdog hibái közé tartozik az, ha a kickelést
+megszakításkezelőből végzik. Ha a fő feladat elakad, de az ISR továbbra
+is fut, a WDT-t az ISR frissítheti, így a hiba nem derül ki. Helyes
+megoldás, ha a kick a feladatkörnyezetből, a liveness jelek ellenőrzése
+után történik. Szintén hibás, ha minden feladat közvetlenül frissíti
+ugyanazt a WDT-t, mert ilyenkor nincs központi döntés arról, hogy a
+rendszer egésze egészséges-e. Végül a túl rövid WDT timeout a normál,
+átmeneti terhelés alatt is resetet okozhat, a túl hosszú pedig
+késlelteti a hibából való kilábalást.</p>
+<p><strong>Üzenetsor (queue) a termelő–fogyasztó mintában</strong></p>
+<p>Az RTOS-ek üzenetsora az egyik leggyakoribb feladatközi kommunikációs
+eszköz. A queue lehetővé teszi, hogy egy vagy több termelő adatokat
+helyezzen egy FIFO-pufferbe, egy vagy több fogyasztó pedig onnan kivegye
+azokat. A legtöbb RTOS a queue-hoz blokkoló és nem blokkoló
+küldési/fogadási változatot is biztosít, timeout paraméterrel. A
+blokkolás azt jelenti, hogy ha a queue tele van, a termelő
+felfüggesztődik, amíg hely nem szabadul; ha üres, a fogyasztó várakozik,
+amíg elem nem érkezik.</p>
+<p>A FreeRTOS-szerű API-ban egy mintaadatokból álló queue például így
+hozható létre:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> sensor_id<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> value<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> timestamp_ms<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> sensor_sample_t<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>QueueHandle_t sensor_queue<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> create_sensor_queue<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    sensor_queue <span class="op">=</span> xQueueCreate<span class="op">(</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="dv">8</span><span class="op">,</span>                       <span class="co">/* elemek maximális száma */</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">sizeof</span><span class="op">(</span>sensor_sample_t<span class="op">)</span>  <span class="co">/* elem mérete */</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">);</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sensor_queue <span class="op">==</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* nem sikerült a memóriafoglalás – hibakezelés */</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        enter_safe_state<span class="op">();</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A termelő lehet egy periodikus feladat vagy egy ISR. Az ISR-ből a
+<code>xQueueSendFromISR</code> változatot kell használni, és a
+<code>portYIELD_FROM_ISR</code> makróval jelezhető, ha a művelet
+magasabb prioritású feladatot ébresztett:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> sensor_isr<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    BaseType_t higher_priority_woken <span class="op">=</span> pdFALSE<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    sensor_sample_t sample <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>sensor_id <span class="op">=</span> <span class="dv">1</span><span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>value <span class="op">=</span> read_adc<span class="op">(),</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>timestamp_ms <span class="op">=</span> get_tick_ms<span class="op">()</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    xQueueSendFromISR<span class="op">(</span>sensor_queue<span class="op">,</span> <span class="op">&amp;</span>sample<span class="op">,</span> <span class="op">&amp;</span>higher_priority_woken<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    portYIELD_FROM_ISR<span class="op">(</span>higher_priority_woken<span class="op">);</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fogyasztó blokkoló fogadással vár az adatokra, és timeouttal kezeli
+a hiányzó mintát:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> aggregator_task<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>param<span class="op">)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    sensor_sample_t sample<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        BaseType_t rc <span class="op">=</span> xQueueReceive<span class="op">(</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>            sensor_queue<span class="op">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>            <span class="op">&amp;</span>sample<span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>            pdMS_TO_TICKS<span class="op">(</span><span class="dv">250</span><span class="op">));</span>  <span class="co">/* legfeljebb 250 ms várakozás */</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>rc <span class="op">==</span> pdTRUE<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>            process_sample<span class="op">(&amp;</span>sample<span class="op">);</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>            log_error<span class="op">(</span><span class="st">&quot;sensor queue timeout</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>            <span class="co">/* itt lehet részleges hibakezelés, pl. hiba-számláló */</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A queue méretezésénél a termelési és fogyasztási sebesség viszonyából
+kell kiindulni. Ha a termelő periodikus és a fogyasztó legrosszabb
+válaszideje nagyobb, mint a termelő periódusa, akkor a queue-nak
+legalább annyi elemet kell tárolnia, amennyi a legrosszabb fogyasztási
+késleltetés alatt keletkezik. Formálisan, ha a termelő periódusa
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi>p</mi></msub><annotation encoding="application/x-tex">T_p</annotation></semantics></math>,
+a fogyasztó legrosszabb feldolgozási ideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>C</mi><mi>c</mi></msub><annotation encoding="application/x-tex">C_c</annotation></semantics></math>,
+és a fogyasztó legrosszabb késleltetése
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mi>c</mi></msub><annotation encoding="application/x-tex">R_c</annotation></semantics></math>,
+akkor a minimális pufferméret:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mrow><mi>m</mi><mi>i</mi><mi>n</mi></mrow></msub><mo>≥</mo><mrow><mo stretchy="true" form="prefix">⌈</mo><mfrac><msub><mi>R</mi><mi>c</mi></msub><msub><mi>T</mi><mi>p</mi></msub></mfrac><mo stretchy="true" form="postfix">⌉</mo></mrow><mo>+</mo><mn>1</mn><mo>,</mo></mrow><annotation encoding="application/x-tex">N_{min} \ge \left\lceil \frac{R_c}{T_p} \right\rceil + 1,</annotation></semantics></math></p>
+<p>ahol a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">+1</annotation></semantics></math>
+biztonsági elem a mérési és ütemezési jittert fedezi. A gyakorlatban
+érdemes a minimumnál nagyobb, például kétszeres puffert választani, de a
+túl nagy queue sem mindig jó: megnöveli a memóriahasználatot és a
+legrosszabb késleltetést, mert a fogyasztó a régi elemeket is fel kell
+dolgozza.</p>
+<p>A queue használatakor tipikus hiba a <strong>tele queue-ba történő
+blokkoló küldés magas prioritású feladatból</strong>. Ha a termelő
+prioritása magasabb, mint a fogyasztóé, a termelő addig fog várakozni,
+amíg a fogyasztó nem fut, de a fogyasztó nem kap CPU-t, mert a magasabb
+prioritású termelő továbbra is fut. A helyzet prioritásinverzióhoz
+vezet. A megoldás lehet timeout használata, a fogyasztó prioritásának
+emelése, vagy a queue méretének növelése. Emellett figyelni kell arra,
+hogy az ISR-ből soha ne használjunk blokkoló küldést, mert
+megszakítás-kontextusból nem lehet felfüggesztődni.</p>
+<p><strong>Event flag: több feltétel együttes kezelése</strong></p>
+<p>Az event flag (eseménybit-csoport) olyan szinkronizációs objektum,
+amely bitek halmazát tárolja. Egy feladat beállíthat egy vagy több
+bitet, egy másik feladat pedig várakozhat arra, hogy a kiválasztott
+bitek együttesen vagy külön-külön be legyenek állítva. A várakozás lehet
+„AND” típusú, amikor az összes megadott bitnek be kell állnia, vagy „OR”
+típusú, amikor elég bármelyiknek. A <code>clear on exit</code> opció azt
+jelenti, hogy a várakozás teljesülésekor a kernel automatikusan törli
+azokat a biteket, amelyekre a feladat várt; így a jelzés nem marad
+„lebegve”.</p>
+<p>Egy tipikus felhasználás a szenzoros rendszerek inicializálása. Három
+különböző szenzor inicializáló feladata eltérő idő alatt végez, de a fő
+adatgyűjtő feladat csak akkor indulhat, ha mindhárom kész. Egyszerű, ha
+a szenzorok bitmapet állítanak be, a fő feladat pedig AND-várakozással
+vár a három bitre:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define GYRO_READY   </span><span class="op">(</span><span class="dv">1</span><span class="bu">u</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">0</span><span class="op">)</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAG_READY    </span><span class="op">(</span><span class="dv">1</span><span class="bu">u</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">1</span><span class="op">)</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BARO_READY   </span><span class="op">(</span><span class="dv">1</span><span class="bu">u</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">2</span><span class="op">)</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define IMU_RUN      </span><span class="op">(</span><span class="dv">1</span><span class="bu">u</span><span class="pp"> </span><span class="op">&lt;&lt;</span><span class="pp"> </span><span class="dv">3</span><span class="op">)</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>EventGroupHandle_t imu_events<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> init_task<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>param<span class="op">)</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    EventBits_t bits <span class="op">=</span> xEventGroupWaitBits<span class="op">(</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        imu_events<span class="op">,</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        GYRO_READY <span class="op">|</span> MAG_READY <span class="op">|</span> BARO_READY<span class="op">,</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        pdTRUE<span class="op">,</span>              <span class="co">/* clear on exit */</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        pdTRUE<span class="op">,</span>              <span class="co">/* wait for all bits */</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        pdMS_TO_TICKS<span class="op">(</span><span class="dv">1000</span><span class="op">));</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span>bits <span class="op">&amp;</span> <span class="op">(</span>GYRO_READY <span class="op">|</span> MAG_READY <span class="op">|</span> BARO_READY<span class="op">))</span> <span class="op">==</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">(</span>GYRO_READY <span class="op">|</span> MAG_READY <span class="op">|</span> BARO_READY<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* mindhárom szenzor inicializálódott */</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        xEventGroupSetBits<span class="op">(</span>imu_events<span class="op">,</span> IMU_RUN<span class="op">);</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>        log_error<span class="op">(</span><span class="st">&quot;szenzor inicializalas timeout</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>        enter_safe_state<span class="op">();</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az egyes szenzor-inicializáló feladatok a végükön beállítják a saját
+bitjüket:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> gyro_init_task<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>param<span class="op">)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* hardver-inicializálás */</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    gyro_reset<span class="op">();</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    gyro_configure<span class="op">();</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    xEventGroupSetBits<span class="op">(</span>imu_events<span class="op">,</span> GYRO_READY<span class="op">);</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    vTaskDelete<span class="op">(</span>NULL<span class="op">);</span>  <span class="co">/* az inicializáló feladat kilép, ha nincs más dolga */</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az event flag fontos tulajdonsága, hogy <strong>nem számlálja az
+eseményeket</strong>. Ha egy termelő kétszer beállítja ugyanazt a bitet,
+mielőtt a fogyasztó várakozna, a fogyasztó csak egyszer látja, és a
+<code>clear on exit</code> törli a bitet. Ezért az event flag nem
+alkalmas olyan jelzések továbbítására, ahol minden egyes esemény számít.
+Például ha egy UART-vevő minden beérkező bájtnál beállítana egy bitet,
+akkor a bájtok közötti különbség elveszne. Ilyenkor üzenetsort kell
+használni. Az event flag erőssége az, hogy több feltételt alacsony
+memóriahasználattal, gyorsan kezel, és egyetlen hívásban több eseményt
+is ellenőriz.</p>
+<p>Gyakori hiba az, ha a fejlesztő elfelejti törölni a biteket, vagy nem
+használja a <code>clear on exit</code> opciót, és a fogyasztó a régi,
+már teljesített feltételt újra érvényesnek látja. Egy másik hiba az, ha
+az event flaget adatszintű kommunikációra használják, és az események
+elvesznek. Végül a timeout nélküli, végtelen ideig tartó várakozás is
+kockázatos, mert ha egy szenzor inicializálása hardverhiba miatt elakad,
+a rendszer soha nem lép tovább. A fenti példa ezért 1000 ms-os timeoutot
+használ, és a hibát biztonságos állapotba lépéssel kezeli.</p>
+<p><strong>Mailbox: egyetlen üzenet, vezérlő szerep</strong></p>
+<p>A mailbox fogalma RTOS-enként kissé eltér. Sok rendszerben a mailbox
+olyan, mint egy <strong>egyelemű üzenetsor</strong>, amely nem
+adatfolyamot, hanem vezérlő üzeneteket továbbít. A termelő egy pointert
+helyez el, és ha a mailbox már foglalt, a régi üzenet felülíródhat vagy
+a termelő blokkolhat. A fogyasztó kiveszi a pointert, és a tartalmát
+feldolgozza. A mailbox ezért elsősorban parancskiadásra, konfigurációra
+vagy erőforrás-átadásra való, nem nagy sebességű adatfolyamra.</p>
+<p>Zephyr környezetben a <code>k_msgq</code> az ajánlott
+üzenetsor-megoldás, míg a <code>k_mbox</code> örökölt, mailbox-szerű
+API-ként ismert; a pontos elnevezés és viselkedés implementációfüggő,
+ezért mindig ellenőrizni kell az adott kernelverzió dokumentációját. A
+lényeg a mintában keresendő: a mailbox üzenet tipikusan egy struktúrára
+mutató pointer, és a tulajdonjog a küldőtől a fogadóhoz kerül.</p>
+<p>Pszeudokódban egy parancs mailbox így nézhet ki:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Zephyr-szerű, mailbox jellegű pszeudokód; az API-név ellenőrizendő */</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> command_message <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> command_id<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> parameter<span class="op">;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> status<span class="op">;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> k_mbox command_mbox<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> command_sender<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">static</span> <span class="kw">struct</span> command_message cmd<span class="op">;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    cmd<span class="op">.</span>command_id <span class="op">=</span> CMD_CONFIGURE<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    cmd<span class="op">.</span>parameter <span class="op">=</span> <span class="bn">0x20</span><span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    k_mbox_put<span class="op">(&amp;</span>command_mbox<span class="op">,</span> <span class="op">&amp;</span>cmd<span class="op">,</span> K_MSEC<span class="op">(</span><span class="dv">100</span><span class="op">));</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> command_executor<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> command_message <span class="op">*</span>cmd <span class="op">=</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>            k_mbox_get<span class="op">(&amp;</span>command_mbox<span class="op">,</span> K_SECONDS<span class="op">(</span><span class="dv">10</span><span class="op">));</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>cmd <span class="op">!=</span> NULL<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>            execute_command<span class="op">(</span>cmd<span class="op">);</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>            handle_mailbox_timeout<span class="op">();</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A mailbox használatánál különösen fontos a <strong>pointer
+érvényességi ideje</strong>. Ha a termelő a saját stackjén lévő objektum
+címet küldi el, akkor a stack tartalma a feladat kontextusváltásakor
+megsemmisülhet, és a fogyasztó érvénytelen memóriát olvashat. A helyes
+megoldás statikus, globális vagy heapről foglalt puffert használni, és a
+tulajdonjogot explicit módon átadni. Ugyancsak ügyelni kell arra, hogy a
+mailbox felülírási szabálya implementációfüggő: van, ahol a régi üzenet
+elveszik, máshol a termelő blokkol. A biztonságos tervezéshez a timeout
+mindig legyen megadva.</p>
+<p><strong>Prioritás, időzítés és hibakezelés</strong></p>
+<p>A fenti minták csak akkor működnek megbízhatóan, ha a prioritásokat
+és az időzítési paramétereket tudatosan választjuk meg. A prioritások
+hozzárendelésének két leggyakoribb alapelve a <strong>sebesség szerinti
+monoton</strong> (rate-monotonic, RMS) és a <strong>kritikusság
+alapú</strong> hozzárendelés.</p>
+<p>A sebesség szerinti monoton szabály szerint a rövidebb periódusú
+feladat magasabb prioritást kap. Ha három periodikus feladatunk van
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mn>1</mn></msub><mo>=</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">T_1=10</annotation></semantics></math>
+ms,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mn>2</mn></msub><mo>=</mo><mn>20</mn></mrow><annotation encoding="application/x-tex">T_2=20</annotation></semantics></math>
+ms,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mn>3</mn></msub><mo>=</mo><mn>50</mn></mrow><annotation encoding="application/x-tex">T_3=50</annotation></semantics></math>
+ms periódussal, akkor a prioritási sorrend
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mn>1</mn></msub><mo>&gt;</mo><msub><mi>P</mi><mn>2</mn></msub><mo>&gt;</mo><msub><mi>P</mi><mn>3</mn></msub></mrow><annotation encoding="application/x-tex">P_1 &gt; P_2 &gt; P_3</annotation></semantics></math>.
+Ez a szabály jól működik, ha a feladatok határideje egyenlő a
+periódussal, és a CPU kihasználtság nem túl magas. A kritikusság alapú
+hozzárendelésnél viszont a biztonsági vagy üzemviteli szempontból
+legfontosabb feladat kapja a legmagasabb prioritást, függetlenül a
+periódustól. Például egy motorvészleállító feladat akkor is magasabb
+prioritású lehet, ha ritkán fut, mert a késleltetése nem
+elfogadható.</p>
+<p>A watchdog tervezésénél a prioritásnak tükröznie kell a felügyeleti
+szerepet: a watchdog feladatot a felügyelt feladatok
+<strong>fölé</strong> érdemes helyezni, vagy legalább olyan szintre,
+hogy a legrosszabb terhelés alatt is időben megkapja a CPU-t. Ha a
+watchdog alacsonyabb prioritású, mint a felügyelt fogyasztó, akkor a
+fogyasztó kiéheztetheti, és a watchdog akkor is lejár, amikor a rendszer
+egyébként nem hibás. A gyakorlatban a watchdog feladat gyakran a
+legmagasabb prioritású feladatok közé kerül, rövid futási idővel.</p>
+<p>Az időzítési paramétereket a következő képletek kötik össze:</p>
+<ul>
+<li>A termelő periódusa
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mi>p</mi></msub><annotation encoding="application/x-tex">T_p</annotation></semantics></math>,
+a fogyasztó legrosszabb válaszideje
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mi>c</mi></msub><annotation encoding="application/x-tex">R_c</annotation></semantics></math>.</li>
+<li>A queue minimális mérete az előzőek szerint
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>N</mi><mrow><mi>m</mi><mi>i</mi><mi>n</mi></mrow></msub><mo>=</mo><mo stretchy="false" form="prefix">⌈</mo><msub><mi>R</mi><mi>c</mi></msub><mi>/</mi><msub><mi>T</mi><mi>p</mi></msub><mo stretchy="false" form="postfix">⌉</mo><mo>+</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">N_{min} = \lceil R_c / T_p \rceil + 1</annotation></semantics></math>.</li>
+<li>A watchdog hardveres timeoutja
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><mo>&gt;</mo><mi>k</mi><mo>⋅</mo><msub><mi>R</mi><mo>max</mo></msub></mrow><annotation encoding="application/x-tex">T_{wdt} &gt; k \cdot R_{\max}</annotation></semantics></math>,
+ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>R</mi><mo>max</mo></msub><annotation encoding="application/x-tex">R_{\max}</annotation></semantics></math>
+a leghosszabb felügyelt válaszidő.</li>
+<li>A watchdog feladat periódusa
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi></mrow></msub><annotation encoding="application/x-tex">T_{wd}</annotation></semantics></math>
+úgy választandó, hogy a legrosszabb esetben is legyen ideje észlelni a
+hiányzó jelzést:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi></mrow></msub><mo>≤</mo><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><mi>/</mi><mn>2</mn></mrow><annotation encoding="application/x-tex">T_{wd} \le T_{wdt} / 2</annotation></semantics></math>
+körüli érték, a gyakorlatban
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi></mrow></msub><annotation encoding="application/x-tex">T_{wd}</annotation></semantics></math>
+tipikusan
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><annotation encoding="application/x-tex">T_{wdt}</annotation></semantics></math>
+fele vagy harmada.</li>
+</ul>
+<p>A hibakezelésben a RTOS-minták több szintet igényelnek:</p>
+<ol type="1">
+<li><strong>Helyi hibakód</strong> – minden API-hívás visszatérési
+értékét ellenőrizni kell. A queue fogadásánál a timeout nem feltétlenül
+végzetes, de jelezni kell.</li>
+<li><strong>Részleges degradáció</strong> – ha egy szenzor nem válaszol,
+a rendszer tovább működhet a többi szenzorral, de ezt explicit
+állapotban kell nyilvántartani.</li>
+<li><strong>Biztonságos állapot</strong> – súlyos hiba esetén a rendszer
+egy előre definiált, biztonságos állapotba lép, például leállítja az
+aktuátorokat, majd megkísérli a helyreállítást.</li>
+<li><strong>Watchdog általi reset</strong> – ha a szoftver hibakezelés
+sem tudja helyreállítani a rendszert, a hardveres WDT resetje az utolsó
+védelmi vonal.</li>
+<li><strong>Naplózás és reprodukció</strong> – a hiba bekövetkezésekor a
+naplónak tartalmaznia kell a feladatállapotot, a queue töltöttségét, az
+event flag biteket és az időbélyeget.</li>
+</ol>
+<p>A következő táblázat a leggyakoribb hibákat és a helyes megoldásokat
+foglalja össze:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hiba</th>
+<th>Következmény</th>
+<th>Helyes megoldás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Watchdog kickelés ISR-ből</td>
+<td>A fő feladat elakadása nem derül ki</td>
+<td>Kickelés csak feladatkörnyezetből, liveness ellenőrzés után</td>
+</tr>
+<tr class="even">
+<td>Watchdog timeout túl rövid</td>
+<td>Normál terhelés alatt is reset</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mrow><mi>w</mi><mi>d</mi><mi>t</mi></mrow></msub><mo>&gt;</mo><mn>1</mn><mo>,</mo><mn>5</mn><mo>⋅</mo><msub><mi>R</mi><mo>max</mo></msub></mrow><annotation encoding="application/x-tex">T_{wdt} &gt; 1{,}5 \cdot R_{\max}</annotation></semantics></math>
+biztonsági tényező</td>
+</tr>
+<tr class="odd">
+<td>Blokkoló queue-küldés magas prioritású termelőből</td>
+<td>Prioritásinverzió, kiéheztetés</td>
+<td>Timeout, nagyobb queue, fogyasztó prioritásának emelése</td>
+</tr>
+<tr class="even">
+<td>Event flag adatfolyamra</td>
+<td>Események elvesznek, nem számlál</td>
+<td>Queue használata minden esemény továbbítására</td>
+</tr>
+<tr class="odd">
+<td>Event flag <code>clear</code> elfelejtése</td>
+<td>Régi jelzés folyamatosan érvényes marad</td>
+<td><code>clear on exit</code> opció, bitcsoportok tudatos kezelése</td>
+</tr>
+<tr class="even">
+<td>Mailbox pointer stackről</td>
+<td>Érvénytelen memória a fogyasztónál</td>
+<td>Statikus/heap puffer, tulajdonjog átadása</td>
+</tr>
+<tr class="odd">
+<td>Watchdog prioritás túl alacsony</td>
+<td>Watchdog kiéheztetése</td>
+<td>A watchdog feladatot a felügyelt feladatok fölé helyezzük</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Labor: watchdog- és eseményvezérelt feladatterv</strong></p>
+<p>A labor célja, hogy az olvasó egy emulált, FreeRTOS-alapú
+környezetben megvalósítsa a fenti mintákat, és mérje a watchdog
+frissítési periódusát, valamint az üzenetsor késleltetését. A labor
+<strong>nem éles rendszeren</strong>, nem valós vasakon fut, hanem
+QEMU-ban emulált Cortex-M3 processzoron, ezért a memória- és időzítési
+értékek a reprodukciós csomag részét képezik.</p>
+<p><strong>Kiinduló állapot.</strong> A labor egy előre elkészített,
+letisztított projektet feltételez, amely tartalmazza a FreeRTOS kernelt,
+a QEMU indítószkriptet és a <code>FreeRTOSConfig.h</code> konfigurációs
+állományt. A projekt a <code>/tmp/rtos_lab</code> munkakönyvtárba kerül,
+és semmilyen valós lemezt nem módosít. A konfiguráció:</p>
+<ul>
+<li>CPU: ARM Cortex-M3, emulált órajel 25 MHz</li>
+<li>RAM: 128 KiB</li>
+<li>Flash: 512 KiB</li>
+<li>RTOS: FreeRTOS 10.x (a pontos verziót a reprodukciós csomag
+rögzíti)</li>
+<li>Fordító: <code>arm-none-eabi-gcc</code>, optimalizálás
+<code>-O2</code></li>
+<li>Tick periódus: 1 ms (<code>configTICK_RATE_HZ</code> = 1000)</li>
+<li>Hardveres WDT timeout a példában: 500 ms, ablak: 100–400 ms</li>
+<li>Mérési hardver: DWT ciklusszámláló (Data Watchpoint and Trace) a
+Cortex-M3 magban</li>
+</ul>
+<p><strong>Architektúra.</strong> A rendszer a következő feladatokat
+tartalmazza:</p>
+<ul>
+<li><code>sensor_t1</code>: periodikus termelő, periódus 10 ms,
+prioritás 3.</li>
+<li><code>sensor_t2</code>: periodikus termelő, periódus 20 ms,
+prioritás 2.</li>
+<li><code>sensor_t3</code>: periodikus termelő, periódus 50 ms,
+prioritás 1.</li>
+<li><code>aggregator</code>: fogyasztó, üzenetsorból olvas, prioritás
+2.</li>
+<li><code>watchdog</code>: liveness figyelő, periódus 200 ms, prioritás
+4.</li>
+<li><code>init</code>: inicializáló feladat, prioritás 5, az indulás
+után event flaggel vár a három szenzor inicializálására.</li>
+</ul>
+<p>A termelők egy <code>sensor_sample_t</code> típusú struktúrát
+küldenek a <code>sensor_queue</code> üzenetsorba, amelynek mérete 8
+elem. Minden termelő ciklusa végén beállítja a saját
+<code>*_HEALTHY</code> bitjét a <code>system_events</code>
+eseménycsoportban. Az <code>aggregator</code> fogadja az üzeneteket, és
+a feldolgozási időt mesterségesen <code>C_c=5</code> ms-ben tartja. A
+<code>watchdog</code> feladat a <code>system_events</code> bitjeit
+AND-kapcsolatban várja, 100 ms-os timeouttal, és ha minden bit
+megérkezett, meghívja a hardveres WDT frissítését. Az inicializáló
+feladat a <code>GYRO_READY</code>, <code>MAG_READY</code> és
+<code>BARO_READY</code> biteket várja, majd beállítja az
+<code>IMU_RUN</code> bitet.</p>
+<p><strong>Megvalósítási lépések.</strong> A labor elvégzéséhez az
+alábbi vázlatot kell követni:</p>
+<ol type="1">
+<li>Hozzuk létre a <code>sensor_queue</code> üzenetsort az
+<code>xQueueCreate(8, sizeof(sensor_sample_t))</code> hívással.</li>
+<li>Hozzuk létre a <code>system_events</code> eseménycsoportot az
+<code>xEventGroupCreate()</code> hívással.</li>
+<li>Indítsuk el a három termelő feladatot a megadott periódusokkal.</li>
+<li>Indítsuk el az <code>aggregator</code> feladatot, amely blokkoló
+<code>xQueueReceive</code> hívással vár, és 250 ms timeoutot
+használ.</li>
+<li>Indítsuk el a <code>watchdog</code> feladatot, amely a fenti logika
+szerint figyel.</li>
+<li>Az inicializáló feladatot indítsuk el legmagasabb prioritással, hogy
+az eseménybitek és az indulási feltétel előbb álljon össze.</li>
+<li>Futtassuk a rendszert QEMU-ban 10 másodpercig, és rögzítsük a
+naplót.</li>
+</ol>
+<p>A build és futtatás parancsai:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Fordítás az emulált célra</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">arm-none-eabi-gcc</span> <span class="at">-O2</span> <span class="at">-mcpu</span><span class="op">=</span>cortex-m3 <span class="at">-mthumb</span> <span class="dt">\</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-I</span> FreeRTOS-Kernel/include <span class="dt">\</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-I</span> . <span class="dt">\</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-o</span> build/rtos_lab.elf <span class="dt">\</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>  src/<span class="pp">*</span>.c FreeRTOS-Kernel/<span class="pp">*</span>.c</span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co"># QEMU futtatás</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-arm</span> <span class="at">-M</span> lm3s6965evb <span class="dt">\</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-cpu</span> cortex-m3 <span class="dt">\</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">-kernel</span> build/rtos_lab.elf <span class="dt">\</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">-nographic</span> <span class="dt">\</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> guest_errors,unimp <span class="dt">\</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>  <span class="op">&gt;</span> lab_naplo.txt <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span></span></code></pre></div>
+<p>A fenti parancsok illusztrációk, a pontos eszközlánc- és
+QEMU-verziókat a reprodukciós csomag tartalmazza. A labor során a hoszt
+rendszerét nem módosíthatjuk; a munkakönyvtár a
+<code>/tmp/rtos_lab</code>, amely a labor végén törölhető.</p>
+<p><strong>Mérési napló.</strong> A naplóban külön kell választani a
+várt és a mért értékeket. A mérési módszer a DWT ciklusszámláló, amelyet
+minden <code>aggregator</code> fogadásnál és <code>watchdog</code>
+kicknél olvasunk ki. A ciklusokat 25 MHz-es órajellel számítjuk át
+időre. A következő táblázat a kitöltendő mérési napló szerkezetét
+mutatja:</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mért jellemző</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+<th>Mérési módszer</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>sensor_t1</code> periódus jitter</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>&lt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">&lt; 1</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>DWT időbélyeg a ciklus elején</td>
+</tr>
+<tr class="even">
+<td><code>sensor_t2</code> periódus jitter</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>&lt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">&lt; 1</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>DWT időbélyeg a ciklus elején</td>
+</tr>
+<tr class="odd">
+<td><code>sensor_t3</code> periódus jitter</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>&lt;</mo><mn>1</mn></mrow><annotation encoding="application/x-tex">&lt; 1</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>DWT időbélyeg a ciklus elején</td>
+</tr>
+<tr class="even">
+<td><code>aggregator</code> queue-késleltetés</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>0</mn><annotation encoding="application/x-tex">0</annotation></semantics></math>–<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>5</mn><annotation encoding="application/x-tex">5</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>termelési időbélyeg és fogadási idő különbsége</td>
+</tr>
+<tr class="odd">
+<td><code>watchdog</code> frissítési periódus</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>200</mn><mo>±</mo><mn>10</mn></mrow><annotation encoding="application/x-tex">200 \pm 10</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>egymást követő kickek időbélyegei</td>
+</tr>
+<tr class="even">
+<td>Hardveres WDT timeout</td>
+<td><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>500</mn><annotation encoding="application/x-tex">500</annotation></semantics></math>
+ms</td>
+<td>(kitöltendő)</td>
+<td>hibainjektálás után a reset ideje</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>watchdog</code> frissítési periódusánál a várt 200 ms a
+<code>vTaskDelayUntil</code> periódusából adódik; a tolerancia a
+tick-felbontásból és az ütemezési jitterből fakad. A
+queue-késleltetésnél a várt felső korlát 5 ms, mivel a fogyasztó
+legrosszabb válaszideje a tervezés szerint legfeljebb 5 ms. Ha a mért
+érték tartósan e fölé emelkedik, a prioritás-hozzárendelést vagy a queue
+méretét módosítani kell.</p>
+<p><strong>Hibainjektálás.</strong> A labor második felében szándékosan
+akasszuk el az <code>aggregator</code> feladatot úgy, hogy egy
+<code>if (fault_inject)</code> feltétel mögött végtelen ciklusba lépjen.
+Ekkor a termelők továbbra is beállítják a szívverés-biteket, de a
+<code>watchdog</code> is lefut, mert az event flaget független bitten
+kezelik. A helyes konfigurációban azonban a watchdog nem kapja meg az
+aggregátor liveness bitjét, mert az aggregátor elakadt. Ezért a watchdog
+nem frissíti a hardveres WDT-t, és a hardver 500 ms után reseteli a
+rendszert. A naplóban a reset előtti utolsó bejegyzésnek tartalmaznia
+kell a hiányzó heartbeat üzenetet.</p>
+<p>Ha a watchdog kickelését hibásan, az aggregátor ciklusából hajtanánk
+végre, akkor az elakadáskor a kick is elmaradna, és a hiba detektálható
+lenne, de a tervezési cél éppen az, hogy a watchdog akkor is működjön,
+ha több feladat közül csak egy hibásodik meg. A központi watchdog réteg
+ezt a tulajdonságot biztosítja.</p>
+<p><strong>Elvárt eredmény és visszaállítás.</strong> A labor sikeres,
+ha:</p>
+<ul>
+<li>a rendszer normál futásban 10 másodpercig stabilan működik reset
+nélkül;</li>
+<li>a watchdog frissítési periódus a várt tartományban marad;</li>
+<li>a queue-késleltetés nem haladja meg a felső korlátot;</li>
+<li>a hibainjektálás után a rendszer a WDT resetjével reagál, és a napló
+tartalmazza a hiányzó liveness jelzést.</li>
+</ul>
+<p>A labor végén a <code>/tmp/rtos_lab</code> törölhető, a hoszt
+rendszeren semmilyen maradandó változás nem történik. A reprodukciós
+csomag mellékleteként a <code>FreeRTOSConfig.h</code>, a linker script
+és a kapott napló is megőrzendő.</p>
+<p><strong>Összefoglalás és önellenőrző kérdések</strong></p>
+<p>A watchdog, az üzenetsor, az event flag és a mailbox négy olyan
+RTOS-építőkő, amelyek különböző, de egymást kiegészítő szerepet töltenek
+be. A watchdog a rendszer életben maradását felügyeli, és akkor
+hatékony, ha központi feladat gyűjti a liveness jeleket. Az üzenetsor a
+termelő–fogyasztó adatfolyamot szervezi, és minden egyes üzenet számít.
+Az event flag több feltétel együttes teljesülését kezeli, de nem számlál
+eseményeket. A mailbox vezérlő üzenetekhez, pointer-átadáshoz alkalmas,
+ahol a tulajdonjog explicit.</p>
+<p>A prioritás és az időzítés megválasztása nélkül a minták nem
+működnek. A watchdog timeout, a queue méret és a feladatok periódusai
+összefüggő rendszert alkotnak, ezért a tervezést nem lehet utólag,
+próbálgatással pótolni. A hibakezelésnek rétegzettnek kell lennie: a
+helyi API-hibától a részleges degradáción át a biztonságos állapotig és
+a hardveres resetig.</p>
+<p>Önellenőrző kérdések:</p>
+<ol type="1">
+<li><p>Miért nem elég az event flag egy nagy sebességű
+szenzor-adatfolyam továbbítására?<br />
+Válasz: mert az event flag nem számlál eseményeket, csak bitet állít. Ha
+a fogyasztó lassabb, mint a termelő, egyes események elvesznek.</p></li>
+<li><p>Hogyan választja meg a hardveres watchdog timeout értékét?<br />
+Válasz: a felügyelt feladatok legrosszabb válaszidejének legalább
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mo>,</mo><mn>5</mn></mrow><annotation encoding="application/x-tex">1{,}5</annotation></semantics></math>–<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mn>2</mn><annotation encoding="application/x-tex">2</annotation></semantics></math>-szeresére,
+és a watchdog feladat periódusát úgy, hogy a hiányzó jelzést időben
+észlelje.</p></li>
+<li><p>Mi történik, ha a watchdog feladat prioritása alacsonyabb, mint a
+felügyelt fogyasztóé?<br />
+Válasz: a fogyasztó kiéheztetheti a watchdog feladatot, így a WDT akkor
+is lejárhat, amikor a rendszer nem hibás. A watchdog feladatot a
+felügyelt feladatok fölé kell helyezni.</p></li>
+<li><p>Miért tilos a watchdog kickelése megszakításkezelőből?<br />
+Válasz: mert ha a fő feladat elakad, az ISR továbbra is futhat, és a WDT
+frissítése elfedné a hibát. A kicknek a feladatkörnyezetből, a liveness
+jelek ellenőrzése után kell történnie.</p></li>
+<li><p>Milyen hibát okozhat, ha a mailbox üzenet pointerét egy feladat a
+saját stackjén lévő struktúrára mutatva adja át?<br />
+Válasz: a stack tartalma a kontextusváltás után érvénytelenné válhat, és
+a fogyasztó korrupt adatot olvashat. Statikus vagy heap puffert kell
+használni.</p></li>
+</ol>
+<p>Ezek a minták közvetlenül továbbvihetők a következő egységbe, ahol a
+beágyazott Linux és a firmware-rétegek felépítését vizsgáljuk. Az itt
+bevezetett watchdog, queue és event flag fogalmak ott is megjelennek,
+akár kernelmodulok, akár userland szolgáltatások formájában.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os092.html">← 24.3 AUTOSAR és járműipari architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os094.html">25.1 Beágyazott Linux és firmware →</a></div>
+</nav>
+</body>
+</html>

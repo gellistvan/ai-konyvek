@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.3 Csomagfeldolgozás, netfilter és eBPF – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Hálózat, biztonság és virtualizáció</a> › <a href="index.html#osch18">19 Hálózati stack</a></p>
+<div class="links"><a class="prev" rel="prev" href="os071.html">← 19.2 Socket API és hálózati rendszerhívások</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os073.html">19.4 Zero-copy, offload és hálózati teljesítmény →</a></div>
+</nav>
+<h2 data-number="19.3" id="os072"><span
+class="header-section-number">19.3</span> Csomagfeldolgozás, netfilter
+és eBPF</h2>
+<p>A hálózati csomagok feldolgozása az operációs rendszer egyik
+legkritikusabb útvonala. Egy csomag beérkezésétől a kézbesítésig,
+illetve egy kimenő csomag esetén a socketből a hálózati kártyáig számos
+kernelkomponens vesz részt. Ebben a fejezetben azt vizsgáljuk, hol és
+hogyan lehet beavatkozni ebbe a folyamatba: hogyan működik a netfilter
+csomagszűrő keretrendszere, hogyan követi a connection tracking a
+kapcsolatok állapotát, és hogyan ad az eBPF és az XDP lehetőséget a
+lehető legkorábbi, rugalmas csomagfeldolgozásra.</p>
+<p>A fejezet előfeltételezi a socket API és a hálózati rendszerhívások
+alapjait (<a href="os071.html">Socket API és hálózati
+rendszerhívások</a>). A cél az alapfogalmak és a gyakorlati minták
+együttes bemutatása, valamint egy ellenőrizhető tűzfal- és csomagszűrési
+szabályterv elkészítése. A példák Linux kernel 5.x/6.x és nftables 1.x
+környezetet feltételeznek; a pontos verziófüggő szintaxist a helyi
+kézikönyvben ellenőrizni kell.</p>
+<h3 data-number="19.3.1" id="a-kernel-hálózati-útvonala"><span
+class="header-section-number">19.3.1</span> A kernel hálózati
+útvonala</h3>
+<p>A bejövő (ingress) csomag útja a hálózati kártyától a felhasználói
+folyamatig több fázisból áll. Az egyszerűség kedvéért a modern Linux
+kernelben a következő lépések figyelhetők meg:</p>
+<ol type="1">
+<li>A hálózati kártya (NIC) megszakítást vált ki, vagy a kernel a NAPI
+(New API) mechanizmussal pollozza a csomaggyűrűt. A feldolgozás softirq
+kontextusban (NET_RX) történik.</li>
+<li>A meghajtó létrehoz egy <code>sk_buff</code> struktúrát, amely a
+csomag metaadatait (protokoll, bejövő interfész, időbélyeg,
+fejlécmutatók) és magát a puffert tartalmazza.</li>
+<li>Az illesztőprogram meghívja a <code>netif_receive_skb()</code>
+függvényt, amely a csomagot átadja a protokoll-veremnek: Ethernet, IP,
+majd TCP/UDP.</li>
+<li>A netfilter hookok a feldolgozási útvonal meghatározott pontjain
+vannak elhelyezve. A hookok előtt és után a kernel további feldolgozást
+végez, például routing döntést.</li>
+</ol>
+<p>A netfilter öt alapvető hookpontot definiál:</p>
+<ul>
+<li><code>NF_INET_PRE_ROUTING</code>: minden bejövő csomag, közvetlenül
+a routing döntés előtt.</li>
+<li><code>NF_INET_LOCAL_IN</code>: a helyi gépre szánt csomagok, a
+routing döntés után.</li>
+<li><code>NF_INET_FORWARD</code>: a továbbítandó (forwardolt) csomagok,
+a routing döntés után.</li>
+<li><code>NF_INET_LOCAL_OUT</code>: a helyi folyamat által generált
+kimenő csomagok, a routing döntés előtt.</li>
+<li><code>NF_INET_POST_ROUTING</code>: minden kimenő csomag, közvetlenül
+a hálózati kártyára adás előtt.</li>
+</ul>
+<p>A hookok sorrendjét az alábbi folyamatábra szemlélteti:</p>
+<pre><code>        bejövő csomag
+             |
+    [PRE_ROUTING]  (minden bejövő)
+             |
+       routing döntés
+        /            \
+  helyi cím          továbbítandó
+        \            /
+    [LOCAL_IN]    [FORWARD]
+        |            |
+      socket        |
+        |            |
+    [LOCAL_OUT]     |
+        \          /
+    [POST_ROUTING]  (minden kimenő)
+             |
+        kimenő csomag</code></pre>
+<p>A routing döntés a cél IP-cím alapján határozza meg, hogy a csomagot
+a helyi gépnek kell-e kézbesíteni, vagy továbbítani kell egy másik
+interfészre. A <code>PRE_ROUTING</code> hookban a csomag még az eredeti
+címeket hordozza; a <code>POST_ROUTING</code> hookban viszont már a
+kimenő interfész és a végső címek ismertek. Ez a sorrend kulcsfontosságú
+a szűrés és a NAT szempontjából.</p>
+<p>A kimenő csomag útja hasonló: a socket rétegből indul, áthalad a
+<code>LOCAL_OUT</code> hookon, majd a <code>POST_ROUTING</code> hookon,
+végül a meghajtó elküldi a csomagot. A <code>LOCAL_OUT</code> azért
+fontos, mert itt még a helyi folyamat által generált forgalmat is meg
+lehet szűrni, például egy rosszindulatú program kimenő kapcsolatait.</p>
+<h3 data-number="19.3.2" id="netfilter-hookok-és-szűrés"><span
+class="header-section-number">19.3.2</span> Netfilter hookok és
+szűrés</h3>
+<p>A netfilter a Linux kernel csomagszűrő és -manipuláló keretrendszere.
+A hookokhoz úgynevezett <strong>táblák</strong> (table) és
+<strong>láncok</strong> (chain) csatlakoznak. A tábla határozza meg,
+hogy milyen típusú műveleteket végezhetnek a szabályok: szűrés (filter),
+címfordítás (nat), csomagmódosítás (mangle), kapcsolatkövetés
+kikapcsolása (raw), biztonsági házirend (security). A lánc egy adott
+hookponthoz kötött szabálylista, amelyet a kernel a csomag feldolgozása
+során sorban kiértékel.</p>
+<p>A klasszikus <strong>iptables</strong> eszközben a
+<code>filter</code> tábla három láncot tartalmaz: <code>INPUT</code>,
+<code>FORWARD</code>, <code>OUTPUT</code>. A <code>nat</code> tábla
+láncai: <code>PREROUTING</code>, <code>INPUT</code>,
+<code>OUTPUT</code>, <code>POSTROUTING</code>. A <code>mangle</code>
+tábla mind az öt hookponton jelen lehet. A láncokhoz tartozik egy
+<strong>alapértelmezett szabály</strong> (policy), amelyet akkor
+alkalmaz a kernel, ha egyetlen szabály sem illeszkedik a csomagra. A
+policy lehet <code>ACCEPT</code> vagy <code>DROP</code>.</p>
+<p>Egy iptables szabály két részből áll: <strong>illeszkedési
+feltétel</strong> (match) és <strong>cél</strong> (target). A feltétel
+lehet például a protokoll (<code>-p tcp</code>), a forrás vagy cél IP, a
+port (<code>--dport</code>), az interfész (<code>-i eth0</code>), vagy
+egy modul által biztosított komplexebb vizsgálat, például a kapcsolat
+állapota (<code>-m state --state ESTABLISHED</code>). A cél határozza
+meg, mi történjen a csomaggal: <code>ACCEPT</code> (továbbenged),
+<code>DROP</code> (csendben eldob), <code>REJECT</code> (eldob és
+hibaüzenetet küld), <code>LOG</code> (naplózza), <code>DNAT</code>,
+<code>SNAT</code>, <code>MASQUERADE</code> stb.</p>
+<p>Egy tipikus, állapotalapú bejövő szűrést iptables-ben a következő
+parancsokkal lehet felépíteni:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Alapértelmezés: mindent eldobunk, amit nem engedélyezünk</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-P</span> INPUT DROP</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-P</span> FORWARD DROP</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-P</span> OUTPUT ACCEPT</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co"># A már kialakult kapcsolatok visszatérő csomagjait engedjük</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-A</span> INPUT <span class="at">-m</span> state <span class="at">--state</span> ESTABLISHED,RELATED <span class="at">-j</span> ACCEPT</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># A loopback interfész forgalmát mindig engedjük</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-A</span> INPUT <span class="at">-i</span> lo <span class="at">-j</span> ACCEPT</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># SSH bejövő forgalom engedélyezése</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-A</span> INPUT <span class="at">-p</span> tcp <span class="at">--dport</span> 22 <span class="at">-m</span> state <span class="at">--state</span> NEW <span class="at">-j</span> ACCEPT</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co"># Minden más bejövő csomagot eldobunk és naplózunk</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-A</span> INPUT <span class="at">-j</span> LOG <span class="at">--log-prefix</span> <span class="st">&quot;input-drop: &quot;</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-A</span> INPUT <span class="at">-j</span> DROP</span></code></pre></div>
+<p>A szabályok sorrendje kritikus: a kernel az első illeszkedő szabály
+célját alkalmazza, és nem vizsgálja tovább a láncot. Ha a
+<code>-P INPUT DROP</code> után rögtön egy engedő szabályt helyezünk el,
+az nem érvényesül, mert a policy csak akkor lép életbe, ha nincs
+találat. Ezért a gyakori forgalmat engedő szabályokat előre kell tenni,
+a tiltást pedig a lánc végére.</p>
+<p>A modern <strong>nftables</strong> a netfilter új felülete, amely az
+iptables, ip6tables, arptables és ebtables funkcióit egyesíti. A
+szintaxis egységes, a szabálykészlet atomikusan frissíthető, és a
+teljesítmény is jobb, mert a kernel egyetlen belső reprezentációt
+használ. Az nftables-ben a táblák és láncok explicit módon jönnek létre,
+a hook és a priority a lánc definíciójában szerepel.</p>
+<h3 data-number="19.3.3" id="connection-tracking-conntrack"><span
+class="header-section-number">19.3.3</span> Connection tracking
+(conntrack)</h3>
+<p>A connection tracking (magyarul kapcsolatkövetés) a netfilter azon
+alrendszere, amely a csomagok alapján nyomon követi a hálózati
+kapcsolatokat. Nem szűrési mechanizmus, hanem olyan
+<strong>állapotinformációt</strong> szolgáltat, amelyre a szűrő és a NAT
+szabályok építhetnek. A conntrack minden kapcsolathoz egy bejegyzést hoz
+létre a kernelben, amely tartalmazza a kapcsolat azonosítóit (protokoll,
+forrás IP, forrás port, cél IP, cél port – az úgynevezett 5-tuple) és az
+aktuális állapotot.</p>
+<p>A conntrack által használt állapotok:</p>
+<ul>
+<li><strong>NEW</strong>: a csomag új kapcsolatot kezdeményez, például a
+TCP SYN csomag.</li>
+<li><strong>ESTABLISHED</strong>: a csomag egy már létező, mindkét
+irányban felismert kapcsolathoz tartozik.</li>
+<li><strong>RELATED</strong>: a csomag egy másik, már meglévő
+kapcsolathoz kapcsolódik, például az FTP adatkapcsolat vagy egy ICMP
+hibaüzenet.</li>
+<li><strong>INVALID</strong>: a csomag nem illeszthető be egyetlen
+ismert kapcsolatba sem, például sérült fejléc vagy lejárt
+bejegyzés.</li>
+</ul>
+<p>Az állapotalapú szűrés alapelve: engedjük a kimenő forgalmat, és a
+bejövő forgalomból csak azokat a csomagokat fogadjuk el, amelyek egy
+általunk kezdeményezett kapcsolat visszatérő csomagjai, illetve az
+ezekhez kapcsolódó csomagok. Ez gyakorlatilag az
+<code>ESTABLISHED,RELATED</code> állapotok elfogadását jelenti a bejövő
+láncban, míg az új kapcsolatokat csak a kívánt szolgáltatásokra (például
+SSH, HTTP) engedjük.</p>
+<p>A conntrack szoros kapcsolatban áll a NAT-tal. Amikor a NAT szabály
+módosítja a forrás vagy cél címet, a conntrack bejegyzés eltárolja az
+eredeti és a leképezett cím közötti megfeleltetést. Így a visszairányú
+csomag automatikusan visszafordítható anélkül, hogy külön szabályt
+kellene írni. A conntrack nélkül a NAT nem tudná, melyik belső géphez
+tartozik egy visszatérő csomag.</p>
+<p>A conntrack működéséhez a <code>nf_conntrack</code> kernelmodul
+betöltésére van szükség. A modul betöltése után a kernel automatikusan
+követi a kapcsolatokat. A conntrack tábla mérete korlátozott; ha
+megtelik, az új kapcsolatok <code>INVALID</code> állapotba kerülhetnek,
+és a szabályok nem a várt módon működnek. A tábla mérete a
+<code>nf_conntrack_max</code> rendszerparaméterrel állítható, a
+telítettség pedig a <code>/proc/net/nf_conntrack</code> vagy a
+<code>conntrack</code> eszköz segítségével ellenőrizhető.</p>
+<h3 data-number="19.3.4" id="nat-és-masquerade"><span
+class="header-section-number">19.3.4</span> NAT és masquerade</h3>
+<p>A NAT (Network Address Translation, hálózati címfordítás) a csomagok
+forrás vagy cél IP-címének (és gyakran a portjának) megváltoztatása. Két
+fő típusa van:</p>
+<ul>
+<li><strong>SNAT</strong> (Source NAT): a forrás címet cseréli le,
+tipikusan akkor, amikor egy belső hálózat gépei egy nyilvános címen
+keresztül kommunikálnak az internettel. A válaszcsomagot a conntrack
+automatikusan visszafordítja.</li>
+<li><strong>DNAT</strong> (Destination NAT): a cél címet cseréli le,
+tipikusan porttovábbítás (port forwarding) esetén, amikor egy külső
+címre érkező forgalmat egy belső szerverre irányítunk.</li>
+</ul>
+<p>A <strong>MASQUERADE</strong> (álcázás) az SNAT speciális változata,
+amely nem igényel rögzített nyilvános IP-címet, hanem a kimenő interfész
+aktuális IP-címét használja. Ez különösen hasznos DHCP-vel konfigurált,
+változó IP-című kapcsolatok esetén, például otthoni routereknél.</p>
+<p>Egy tipikus NAT-konfiguráció iptables-ben:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Kimenő forgalom álcázása az eth0 interfészen</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-t</span> nat <span class="at">-A</span> POSTROUTING <span class="at">-o</span> eth0 <span class="at">-j</span> MASQUERADE</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Bejövő 80-as port átirányítása a belső 192.0.2.10-es szerverre</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">iptables</span> <span class="at">-t</span> nat <span class="at">-A</span> PREROUTING <span class="at">-i</span> eth0 <span class="at">-p</span> tcp <span class="at">--dport</span> 80 <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">-j</span> DNAT <span class="at">--to-destination</span> 192.0.2.10:80</span></code></pre></div>
+<p>A NAT és a szűrés együttműködésekor figyelembe kell venni a hookok
+sorrendjét. A <code>PREROUTING</code> hookban a DNAT már megtörténik,
+mielőtt a routing döntés és a <code>FORWARD</code> vagy
+<code>INPUT</code> lánc lefut. Ezért a szűrő szabályokban a <strong>DNAT
+utáni</strong> célcímet kell használni. Például ha a fenti DNAT szabály
+a 80-as portot a 192.0.2.10-es szerverre irányítja, akkor a
+<code>FORWARD</code> láncban a 192.0.2.10-es címre kell engedélyezni a
+forgalmat, nem a külső címre.</p>
+<h3 data-number="19.3.5" id="nftables-a-gyakorlatban"><span
+class="header-section-number">19.3.5</span> nftables a gyakorlatban</h3>
+<p>Az nftables a modern Linux rendszerekben az ajánlott tűzfal- és
+NAT-eszköz. A konfigurációt deklaratív módon, táblákba és láncokba
+szervezve lehet leírni. Az alábbi példa egy állapotalapú tűzfalat és
+NAT-ot mutat be egy átjáró (gateway) szerepű gépen:</p>
+<pre class="nft"><code>table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        ct state established,related accept
+        iif &quot;lo&quot; accept
+        tcp dport 22 accept
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname &quot;eth1&quot; oifname &quot;eth0&quot; accept
+        counter drop
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname &quot;eth0&quot; masquerade
+    }
+
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+        iifname &quot;eth0&quot; tcp dport 8080 dnat to 192.0.2.10:80
+    }
+}</code></pre>
+<p>A fenti szabálykészlet a következőket teszi:</p>
+<ul>
+<li>A bejövő forgalomból csak a már kialakult kapcsolatokhoz tartozó
+csomagokat fogadja el, valamint a loopback forgalmat és az SSH-t
+(22/TCP).</li>
+<li>A továbbított forgalomból csak a belső hálózatból
+(<code>eth1</code>) a külső interfész (<code>eth0</code>) felé haladó új
+kapcsolatokat engedi, a visszatérő csomagokat a conntrack állapota
+alapján.</li>
+<li>A kimenő forgalmat nem korlátozza.</li>
+<li>A kimenő forgalmat a <code>POSTROUTING</code> láncban álcázza az
+<code>eth0</code> interfész IP-címére.</li>
+<li>A bejövő 8080-as portot a belső 192.0.2.10-es gép 80-as portjára
+irányítja.</li>
+</ul>
+<p>A szabálykészlet betöltése például a következő paranccsal
+történhet:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nft</span> <span class="at">-f</span> /etc/nftables.conf</span></code></pre></div>
+<p>Az nftables előnye, hogy a teljes szabálykészlet egyetlen atomikus
+művelettel cserélhető, így a hibás konfiguráció nem hagy nyitott
+időablakot. A szabályok ellenőrzésére a <code>nft list ruleset</code>
+parancs szolgál.</p>
+<h3 data-number="19.3.6" id="ebpf-és-xdp"><span
+class="header-section-number">19.3.6</span> eBPF és XDP</h3>
+<p>Az eBPF (extended Berkeley Packet Filter) egy olyan virtuális gép a
+Linux kernelben, amely biztonságos, felügyelt módon hajt végre
+felhasználó által megírt programokat. Az eBPF programokat C nyelvhez
+hasonló szintaxissal lehet megírni, majd clang segítségével bpf
+bytecode-ra fordítani. A kernel <strong>verifier</strong> (ellenőrző)
+komponense a betöltés előtt statikusan elemzi a programot: ellenőrzi,
+hogy a program nem tartalmaz végtelen ciklust, minden memória-hozzáférés
+határellenőrzött, és a program nem fér hozzá tiltott kernelmemóriához. A
+programok ezután biztonságosan futhatnak kernelkontextusban.</p>
+<p>A csomagfeldolgozás szempontjából az eBPF két fontos belépési pontot
+kínál:</p>
+<ol type="1">
+<li><strong>XDP</strong> (eXpress Data Path): a lehető legkorábbi pont,
+közvetlenül a hálózati kártya meghajtójában, még az <code>sk_buff</code>
+allokáció előtt. Az XDP program a nyers csomagpufferhez fér hozzá, és
+dönthet a csomag sorsáról. Mivel a feldolgozás a driverben történik, az
+overhead minimális.</li>
+<li><strong>tc</strong> (traffic control) hook: a hálózati verembe már
+bekerült csomagokra alkalmazható, mind bejövő (ingress), mind kimenő
+(egress) irányban. A tc később fut, mint az XDP, de rugalmasabb, mert a
+teljes kernel-hálózati stack rendelkezésére áll.</li>
+</ol>
+<p>Az XDP program visszatérési értékei:</p>
+<ul>
+<li><code>XDP_DROP</code>: a csomagot eldobja.</li>
+<li><code>XDP_PASS</code>: a csomagot továbbítja a hagyományos hálózati
+verembe.</li>
+<li><code>XDP_TX</code>: a csomagot visszaküldi ugyanazon az
+interfészen.</li>
+<li><code>XDP_REDIRECT</code>: a csomagot egy másik interfészre
+irányítja.</li>
+<li><code>XDP_ABORTED</code>: hibát jelez (általában nem használt).</li>
+</ul>
+<p>Az alábbi egyszerű XDP program egy adott forrás IP-címről érkező
+csomagokat dob el:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/bpf.h&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;bpf/bpf_helpers.h&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/if_ether.h&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;linux/ip.h&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>SEC<span class="op">(</span><span class="st">&quot;xdp_drop_ip&quot;</span><span class="op">)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> xdp_drop_ip<span class="op">(</span><span class="kw">struct</span> xdp_md <span class="op">*</span>ctx<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>data_end <span class="op">=</span> <span class="op">(</span><span class="dt">void</span> <span class="op">*)(</span><span class="dt">long</span><span class="op">)</span>ctx<span class="op">-&gt;</span>data_end<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">*</span>data <span class="op">=</span> <span class="op">(</span><span class="dt">void</span> <span class="op">*)(</span><span class="dt">long</span><span class="op">)</span>ctx<span class="op">-&gt;</span>data<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> ethhdr <span class="op">*</span>eth <span class="op">=</span> data<span class="op">;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span><span class="dt">void</span> <span class="op">*)(</span>eth <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&gt;</span> data_end<span class="op">)</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> XDP_PASS<span class="op">;</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> iphdr <span class="op">*</span>ip <span class="op">=</span> <span class="op">(</span><span class="kw">struct</span> iphdr <span class="op">*)(</span>eth <span class="op">+</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">((</span><span class="dt">void</span> <span class="op">*)(</span>ip <span class="op">+</span> <span class="dv">1</span><span class="op">)</span> <span class="op">&gt;</span> data_end<span class="op">)</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> XDP_PASS<span class="op">;</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Példa: 192.0.2.10 forrás cím eldobása</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    __be32 drop_ip <span class="op">=</span> bpf_htonl<span class="op">(</span><span class="bn">0xc000020a</span><span class="op">);</span> <span class="co">// 192.0.2.10</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ip<span class="op">-&gt;</span>saddr <span class="op">==</span> drop_ip<span class="op">)</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> XDP_DROP<span class="op">;</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> XDP_PASS<span class="op">;</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> _license<span class="op">[]</span> SEC<span class="op">(</span><span class="st">&quot;license&quot;</span><span class="op">)</span> <span class="op">=</span> <span class="st">&quot;GPL&quot;</span><span class="op">;</span></span></code></pre></div>
+<p>A programot a következőképpen lehet lefordítani és betölteni (emulált
+környezetben):</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">clang</span> <span class="at">-O2</span> <span class="at">-target</span> bpf <span class="at">-c</span> xdp_drop_ip_kern.c <span class="at">-o</span> xdp_drop_ip_kern.o</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link set dev eth0 xdp obj xdp_drop_ip_kern.o sec xdp_drop_ip</span></code></pre></div>
+<p>Az <code>ip link set ... xdp</code> parancs az <code>eth0</code>
+interfészhez csatolja a programot. A betöltést a kernel verifier
+ellenőrzi, és csak akkor engedi meg, ha a program megfelel a biztonsági
+követelményeknek. A program a <code>bpf_htonl()</code> segédfüggvényt
+használja a bájtsorrend átalakítására; a <code>XDP_DROP</code> és
+<code>XDP_PASS</code> értékeket a <code>bpf_helpers.h</code>
+definiálja.</p>
+<p>Az eBPF programok gyakran <strong>map</strong>-eket használnak,
+amelyek a felhasználói tér és a kernel között osztanak meg adatokat.
+Például egy XDP program egy map-ből olvashatja ki a tiltott IP-címek
+listáját, így a szűrés dinamikusan frissíthető anélkül, hogy a programot
+újra kellene fordítani. A map-ek létrehozása és kezelése a
+<code>bpf()</code> rendszerhíváson keresztül történik, de a gyakorlatban
+a libbpf könyvtár vagy a <code>bpftool</code> eszköz egyszerűsíti a
+folyamatot.</p>
+<p>A tc hookhoz csatolt eBPF programok hasonlóak, de a belépési pont a
+<code>tc</code> osztályozó (classifier) vagy akció (action)
+mechanizmusa. A tc hook lehetővé teszi a kimenő forgalom szűrését is,
+ami XDP-vel nem megoldható.</p>
+<h3 data-number="19.3.7" id="gyakori-hibák-és-buktatók"><span
+class="header-section-number">19.3.7</span> Gyakori hibák és
+buktatók</h3>
+<p>A csomagfeldolgozás és a szűrés során a következő tipikus hibákat
+érdemes elkerülni:</p>
+<ol type="1">
+<li><p><strong>Hook sorrend félreértése.</strong> Gyakori hiba, hogy a
+fejlesztő a <code>PREROUTING</code> hookban szeretné eldobni a helyi
+gépre szánt csomagot, de a szabályt a <code>FORWARD</code> láncba teszi,
+vagy fordítva. A hookok sorrendjének ismerete nélkül a szabályok nem a
+várt ponton avatkoznak be.</p></li>
+<li><p><strong>Conntrack állapot hiánya.</strong> Ha a conntrack modul
+nincs betöltve, az állapotalapú szabályok nem működnek, mert minden
+csomag <code>INVALID</code> állapotba kerül. A <code>nf_conntrack</code>
+modul betöltése és a szabályok <code>ct state</code> használata előtt
+ellenőrizni kell a modul állapotát.</p></li>
+<li><p><strong>NAT és szűrés interakciója.</strong> A DNAT után a szűrő
+láncokban a módosított célcímet kell használni, nem az eredetit. Ha a
+szabályt a külső címre írják, a forgalom nem lesz engedélyezve, vagy
+éppen tiltva marad.</p></li>
+<li><p><strong>eBPF verifier korlátok.</strong> Az eBPF programokban
+minden memória-hozzáférést határellenőrzéssel kell védeni, különben a
+verifier elutasítja a betöltést. A program nem tartalmazhat
+bizonyítottan végtelen ciklust, és nem hívhat tetszőleges kernel
+függvényeket, csak engedélyezett helpereket.</p></li>
+<li><p><strong>Teljesítmény félreértése.</strong> Az XDP valóban
+alacsony overheadet kínál, de csak a bejövő forgalomra. A tc hook később
+fut, és nagyobb a feldolgozási költsége. A szabályok sorrendje a
+netfilterben is számít: a gyakran illeszkedő szabályokat előre kell
+tenni, különben minden csomag végigszalad a láncon.</p></li>
+<li><p><strong>Tesztelés hiánya.</strong> A tűzfalszabályokat
+rendszeresen tesztelni kell, mert egy rosszul megírt szabály akár a
+teljes hálózati forgalmat blokkolhatja, vagy éppen nyitva hagyhat egy
+szolgáltatást. A laborban ezért hangsúlyos a mért és várt eredmények
+elkülönítése.</p></li>
+</ol>
+<h3 data-number="19.3.8"
+id="labor-tűzfal--és-csomagszűrési-szabályterv"><span
+class="header-section-number">19.3.8</span> Labor: tűzfal- és
+csomagszűrési szabályterv</h3>
+<p>A labor célja egy állapotalapú tűzfal és NAT szabályterv elkészítése,
+tesztelése és dokumentálása emulált környezetben. A feladat nem éles
+rendszeren fut, hanem hálózati névterekben vagy virtuális gépen.</p>
+<p><strong>Kiinduló állapot.</strong> Hozzunk létre három hálózati
+névteret: <code>ns1</code> (belső kliens), <code>ns2</code> (belső
+szerver) és <code>rtr</code> (router). A névtereket veth párokkal kötjük
+össze: <code>ns1</code> a <code>rtr</code> <code>eth1</code>
+interfészéhez, <code>ns2</code> a <code>rtr</code> <code>eth2</code>
+interfészéhez kapcsolódik. A <code>rtr</code> rendelkezik egy
+<code>eth0</code> interfésszel, amely a külvilágot szimulálja. A címek a
+dokumentációs tartományból származnak: <code>ns1</code> IP-címe
+<code>192.0.2.10/24</code>, <code>ns2</code> IP-címe
+<code>192.0.2.20/24</code>, a <code>rtr</code> <code>eth1</code> címe
+<code>192.0.2.1/24</code>, <code>eth2</code> címe
+<code>192.0.2.2/24</code>, <code>eth0</code> címe
+<code>198.51.100.1/24</code>. A <code>ns1</code> és <code>ns2</code>
+alapértelmezett átjárója a <code>rtr</code> megfelelő interfészcíme. A
+névterekben a szükséges szolgáltatások: <code>ns2</code>-n SSH (22/TCP)
+és HTTP (80/TCP) szerver fut, <code>ns1</code>-ről ezeket kívánjuk
+elérni, de más forgalmat tiltani.</p>
+<p><strong>Szabályterv.</strong> A <code>rtr</code> névtérben nftables
+szabálykészletet hozunk létre az alábbi követelményekkel:</p>
+<ul>
+<li>A <code>ns1</code> csak a <code>ns2</code> SSH (22/TCP) és HTTP
+(80/TCP) szolgáltatásait érheti el.</li>
+<li>A <code>ns2</code> kimenő forgalma az <code>eth0</code> irányába
+engedélyezett, és a <code>POSTROUTING</code> láncban masquerade szabályt
+alkalmazunk.</li>
+<li>A <code>rtr</code> saját bejövő forgalma közül csak a már kialakult
+kapcsolatok és a loopback engedett.</li>
+<li>Minden más továbbított forgalom eldobandó.</li>
+</ul>
+<p>A szabálykészlet nftables szintaxissal:</p>
+<pre class="nft"><code>table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        ct state established,related accept
+        iif &quot;lo&quot; accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname &quot;eth1&quot; oifname &quot;eth2&quot; ip protocol tcp tcp dport { 22, 80 } accept
+        iifname &quot;eth2&quot; oifname &quot;eth0&quot; accept
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        oifname &quot;eth0&quot; masquerade
+    }
+}</code></pre>
+<p><strong>Tesztelés és mérési napló.</strong> A szabályterv betöltése
+után a következő teszteket futtatjuk le, és az eredményeket táblázatban
+rögzítjük:</p>
+<table>
+<colgroup>
+<col style="width: 14%" />
+<col style="width: 30%" />
+<col style="width: 30%" />
+<col style="width: 24%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Teszt</th>
+<th>Várt eredmény</th>
+<th>Mért eredmény</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ns1</code> → <code>ns2</code> SSH (22/TCP)</td>
+<td>kapcsolat létrejön</td>
+<td>sikeres bejelentkezés</td>
+<td>conntrack NEW + ACCEPT</td>
+</tr>
+<tr class="even">
+<td><code>ns1</code> → <code>ns2</code> HTTP (80/TCP)</td>
+<td>HTTP 200 válasz</td>
+<td>HTTP 200</td>
+<td>conntrack NEW + ACCEPT</td>
+</tr>
+<tr class="odd">
+<td><code>ns1</code> → <code>ns2</code> egyéb port (pl. 3306)</td>
+<td>csomag eldobva, timeout</td>
+<td>timeout</td>
+<td>policy drop</td>
+</tr>
+<tr class="even">
+<td><code>ns2</code> → külső cím (<code>198.51.100.10</code>) ICMP</td>
+<td>válasz érkezik</td>
+<td>0% csomagvesztés</td>
+<td>masquerade működik</td>
+</tr>
+<tr class="odd">
+<td><code>ns1</code> → külső cím</td>
+<td>eldobva</td>
+<td>timeout</td>
+<td>nincs engedélyező szabály</td>
+</tr>
+<tr class="even">
+<td><code>rtr</code> bejövő SSH</td>
+<td>eldobva</td>
+<td>timeout</td>
+<td>input policy drop, nincs engedély</td>
+</tr>
+</tbody>
+</table>
+<p>A ping késleltetést is megmérjük szűrés nélkül és szűréssel, hogy
+lássuk a netfilter overheadjét. A mérési naplóban külön oszlopban
+jelöljük a mért és a várt értéket. Például:</p>
+<ul>
+<li>Várt késleltetés szűrés nélkül: &lt; 1 ms</li>
+<li>Mért késleltetés szűrés nélkül: 0,3 ms</li>
+<li>Várt késleltetés szűréssel: &lt; 1 ms</li>
+<li>Mért késleltetés szűréssel: 0,4 ms</li>
+</ul>
+<p><strong>Visszaállítás.</strong> A labor végén a szabályokat töröljük,
+a névtereket megszüntetjük:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nft</span> flush ruleset</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns del ns1</span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns del ns2</span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> netns del rtr</span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link del veth1 <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">ip</span> link del veth2 <span class="dv">2</span><span class="op">&gt;</span>/dev/null</span></code></pre></div>
+<p><strong>Mérőszámok.</strong> A laborban a következő mérőszámokat
+rögzítjük: a szabályok száma, a csomagvesztés aránya, a késleltetés
+növekedése a szűrés hatására, és a tesztelt esetek száma.</p>
+<h3 data-number="19.3.9" id="önellenőrző-kérdések"><span
+class="header-section-number">19.3.9</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Nevezze meg a netfilter öt hookpontját, és írja le, hogy egy bejövő,
+helyi címre szánt csomag milyen sorrendben halad át rajtuk.</li>
+<li>Miért van szükség a connection trackingre a NAT működéséhez? Mi
+történik, ha a conntrack modul nincs betöltve?</li>
+<li>Milyen visszatérési értékeket adhat egy XDP program, és mi a
+különbség az <code>XDP_DROP</code> és az <code>XDP_PASS</code>
+között?</li>
+</ol>
+<p>Ezek a kérdések a fejezet tanulási céljait ellenőrzik: a kernel
+hálózati útvonalának és a szűrésnek a megértését, a gyakorlati eszközök
+alkalmazását, valamint a tipikus hibák felismerését.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os071.html">← 19.2 Socket API és hálózati rendszerhívások</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os073.html">19.4 Zero-copy, offload és hálózati teljesítmény →</a></div>
+</nav>
+</body>
+</html>

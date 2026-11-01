@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>27.4 Rendszerhívások és userland tervezése – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch26">27 Egyszerű OS tervezése</a></p>
+<div class="links"><a class="prev" rel="prev" href="os104.html">← 27.3 Memóriakezelés és ütemező tervezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os106.html">28.1 C és assembly alapok, fordítás és linkelés →</a></div>
+</nav>
+<h2 data-number="27.4" id="os105"><span
+class="header-section-number">27.4</span> Rendszerhívások és userland
+tervezése</h2>
+<h3 data-number="27.4.1"
+id="a-kernel-és-a-felhasználói-programok-interfésze"><span
+class="header-section-number">27.4.1</span> 1. A kernel és a
+felhasználói programok interfésze</h3>
+<p>Az operációs rendszer kernelje két különböző végrehajtási világot
+választ el: a privilegizált kernelmódot és a korlátozott felhasználói
+módot. A felhasználói programok nem érhetik el közvetlenül a hardvert,
+nem módosíthatják a lapasztalokat, és nem hívhatják meg a kernel belső
+függvényeit. Ha egy felhasználói program fájlt szeretne olvasni,
+memóriát igényel, vagy új folyamatot indít, akkor ellenőrzött átjárón
+kell átlépnie a kernel területére. Ezt az átjárót
+<strong>rendszerhívásnak</strong> (system call, syscall) nevezzük.</p>
+<p>A rendszerhívás nem egyszerű függvényhívás. Egy közönséges C
+függvényhívás ugyanazon a privilegizáltsági szinten marad, és a hívó
+által ismert memóriacímeken dolgozik. A syscall viszont
+processzormód-váltással jár, és a kernelnek feltételeznie kell, hogy a
+felhasználó által átadott minden cím és méret hibás, rosszindulatú vagy
+következetlen. Ezért a rendszerhívás felületét
+<strong>szerződésként</strong> kell megtervezni.</p>
+<p>A szerződés elemei:</p>
+<ol type="1">
+<li><strong>A rendszerhívás neve és száma.</strong> A kernel és a
+felhasználói oldal ugyanazt a numerikus azonosítót rendeli a művelethez.
+A szám nem változhat egy kiadott ABI-ban.</li>
+<li><strong>A paraméterek típusa, sorrendje és átadási módja.</strong>
+Skalár értékek regiszterekben, pufferek esetén a felhasználói memóriacím
+és a hossz.</li>
+<li><strong>A visszatérési érték.</strong> Siker esetén általában
+nemnegatív érték, például a beolvasott bájtok száma. Hiba esetén a
+kernel negatív hibakódot ad vissza, amelyet a felhasználói könyvtár
+<code>errno</code> értékké alakít.</li>
+<li><strong>A mellékhatások és az erőforrás-tulajdonjog.</strong>
+Például egy megnyitott fájlleírót a hívónak kell bezárnia.</li>
+</ol>
+<p>Az interfész tervezésekor el kell különítenünk az
+<strong>API-t</strong> (application programming interface) és az
+<strong>ABI-t</strong> (application binary interface). Az API a C
+fejlécfájlokban deklarált függvények szintjét jelenti:
+<code>int open(const char *path, int flags);</code>. Az ABI az a bináris
+szintű megállapodás, amely meghatározza, hogy a <code>syscall</code>
+utasítás előtt mely regiszterek mit tartalmaznak, hogyan kódolják a
+hibát, és hogyan kell a veremmutatót beállítani. Az ABI-t akkor is be
+kell tartani, ha a programot más fordítóval vagy más nyelvből
+fordították.</p>
+<p>A fejezetben egy oktatókernelhez tervezünk ABI-t. A konkrét
+regiszterkiosztás az x86-64 architektúra egy lehetséges egyszerűsített
+változata; a valós rendszerben az adott processzorcsalád privilegizált
+specifikációjának aktuális verzióját kell alapul venni.</p>
+<h3 data-number="27.4.2" id="syscall-dispatcher-tervezése"><span
+class="header-section-number">27.4.2</span> 2. Syscall dispatcher
+tervezése</h3>
+<p>A <strong>dispatcher</strong> az a kernelbeli belépési pont, amely a
+felhasználói hívásokat szétosztja a megfelelő kernel függvényeknek.
+Feladatai:</p>
+<ul>
+<li>a processzorkontextus mentése,</li>
+<li>a syscall szám ellenőrzése,</li>
+<li>az argumentumok kinyerése a regiszterekből,</li>
+<li>a hívott kernel függvény végrehajtása,</li>
+<li>a visszatérési érték beállítása,</li>
+<li>a felhasználói módba való visszatérés.</li>
+</ul>
+<p>Az oktatókernelben a syscall táblát egy függvénymutató-tömbként
+valósítjuk meg. A tábla méretét fordítási időben rögzítjük, így a nem
+definiált syscall számokra az <code>ENOSYS</code> hibakódot adhatjuk
+vissza.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* syscall_table.c - szemléltető kód, nem éles rendszerre */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">long</span> <span class="op">(*</span>syscall_fn_t<span class="op">)(</span><span class="dt">long</span><span class="op">,</span> <span class="dt">long</span><span class="op">,</span> <span class="dt">long</span><span class="op">,</span> <span class="dt">long</span><span class="op">,</span> <span class="dt">long</span><span class="op">,</span> <span class="dt">long</span><span class="op">);</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define NR_SYSCALLS </span><span class="dv">32</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> syscall_fn_t syscall_table<span class="op">[</span>NR_SYSCALLS<span class="op">];</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> syscall_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_EXIT<span class="op">]</span>   <span class="op">=</span> sys_exit<span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_WRITE<span class="op">]</span>  <span class="op">=</span> sys_write<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_READ<span class="op">]</span>   <span class="op">=</span> sys_read<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_OPEN<span class="op">]</span>   <span class="op">=</span> sys_open<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_CLOSE<span class="op">]</span>  <span class="op">=</span> sys_close<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_GETPID<span class="op">]</span> <span class="op">=</span> sys_getpid<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_SBRK<span class="op">]</span>   <span class="op">=</span> sys_sbrk<span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_FORK<span class="op">]</span>   <span class="op">=</span> sys_fork<span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_EXECVE<span class="op">]</span> <span class="op">=</span> sys_execve<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_WAITPID<span class="op">]=</span> sys_waitpid<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_YIELD<span class="op">]</span>  <span class="op">=</span> sys_yield<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    syscall_table<span class="op">[</span>SYS_SLEEP<span class="op">]</span>  <span class="op">=</span> sys_sleep<span class="op">;</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kernel belépési pontját assemblyben írjuk. Az x86-64
+<code>syscall</code> utasítás hatására a processzor a <code>LSTAR</code>
+modell-specifikus regiszterben tárolt címre ugrik, és kernelmódba vált.
+A belépéskor a felhasználói regisztereket egy <strong>trap
+frame</strong> struktúrába mentjük, hogy a dispatcher és a hívott
+függvény ne sérthesse a felhasználói állapotot.</p>
+<p>Egy lehetséges trap frame vázlat:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rax<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rdi<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rsi<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rdx<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> r10<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> r8<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> r9<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rip<span class="op">;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rflags<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> rsp<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> trap_frame_t<span class="op">;</span></span></code></pre></div>
+<p>A dispatcher C nyelvű váza a következő:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> syscall_entry<span class="op">(</span>trap_frame_t <span class="op">*</span>tf<span class="op">)</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> nr <span class="op">=</span> tf<span class="op">-&gt;</span>rax<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>nr <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span> nr <span class="op">&gt;=</span> NR_SYSCALLS<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>        tf<span class="op">-&gt;</span>rax <span class="op">=</span> <span class="op">-</span>ENOSYS<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a0 <span class="op">=</span> tf<span class="op">-&gt;</span>rdi<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a1 <span class="op">=</span> tf<span class="op">-&gt;</span>rsi<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a2 <span class="op">=</span> tf<span class="op">-&gt;</span>rdx<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a3 <span class="op">=</span> tf<span class="op">-&gt;</span>r10<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a4 <span class="op">=</span> tf<span class="op">-&gt;</span>r8<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">long</span> a5 <span class="op">=</span> tf<span class="op">-&gt;</span>r9<span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    tf<span class="op">-&gt;</span>rax <span class="op">=</span> syscall_table<span class="op">[</span>nr<span class="op">](</span>a0<span class="op">,</span> a1<span class="op">,</span> a2<span class="op">,</span> a3<span class="op">,</span> a4<span class="op">,</span> a5<span class="op">);</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A visszatérés a <code>sysret</code> utasítással történik, amely
+visszaállítja a felhasználói <code>RIP</code>-t, <code>RSP</code>-t és
+<code>RFLAGS</code>-et. A dispatchernek ezért nem kell külön
+kontextusváltást végeznie; a processzor és a belépési assembly kód
+együtt gondoskodik a megfelelő állapotról.</p>
+<p>Fontos, hogy a dispatcherben semmilyen felhasználói címre mutató
+értéket ne használjunk közvetlenül. A <code>tf</code> maga a kernel
+veremben van, ezért az biztonságos. A felhasználói regiszterekből kapott
+mutatókat a <code>sys_call</code> függvényekben ellenőrizni kell.</p>
+<h3 data-number="27.4.3" id="argumentumátadás-és-visszatérés"><span
+class="header-section-number">27.4.3</span> 3. Argumentumátadás és
+visszatérés</h3>
+<p>A rendszerhívások argumentumait az ABI szerint regiszterekben adjuk
+át. Az oktatókernel x86-64 konvenciója:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Regiszter</th>
+<th>Szerep</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>rax</code></td>
+<td>syscall szám, majd visszatérési érték</td>
+</tr>
+<tr class="even">
+<td><code>rdi</code></td>
+<td>1. argumentum</td>
+</tr>
+<tr class="odd">
+<td><code>rsi</code></td>
+<td>2. argumentum</td>
+</tr>
+<tr class="even">
+<td><code>rdx</code></td>
+<td>3. argumentum</td>
+</tr>
+<tr class="odd">
+<td><code>r10</code></td>
+<td>4. argumentum</td>
+</tr>
+<tr class="even">
+<td><code>r8</code></td>
+<td>5. argumentum</td>
+</tr>
+<tr class="odd">
+<td><code>r9</code></td>
+<td>6. argumentum</td>
+</tr>
+</tbody>
+</table>
+<p>A felhasználói oldalon egy <code>syscall()</code> wrapper függvény
+tölti be ezeket a regisztereket. Egy lehetséges assembly
+implementáció:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode asm"><code class="sourceCode fasm"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>/* syscall_wrapper<span class="op">.</span>S <span class="op">-</span> szemléltető kód <span class="op">*/</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>.global syscall</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="fu">syscall:</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">rdi</span><span class="op">,</span> <span class="op">%</span><span class="kw">rax</span>   <span class="op">/*</span> <span class="fl">1.</span> paraméter<span class="op">:</span> syscall szám <span class="op">*/</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">rsi</span><span class="op">,</span> <span class="op">%</span><span class="kw">rdi</span>   <span class="op">/*</span> <span class="fl">2.</span> paraméter<span class="op">:</span> <span class="fl">1.</span> arg <span class="op">*/</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">rdx</span><span class="op">,</span> <span class="op">%</span><span class="kw">rsi</span>   <span class="op">/*</span> <span class="fl">3.</span> paraméter<span class="op">:</span> <span class="fl">2.</span> arg <span class="op">*/</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">mov</span> <span class="op">%</span><span class="kw">rcx</span><span class="op">,</span> <span class="op">%</span><span class="kw">rdx</span>   <span class="op">/*</span> <span class="fl">4.</span> paraméter<span class="op">:</span> <span class="fl">3.</span> arg <span class="op">*/</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">syscall</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">ret</span></span></code></pre></div>
+<p>A C oldalon a hívás így néz ki:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">long</span> syscall<span class="op">(</span><span class="dt">long</span> number<span class="op">,</span> <span class="dt">long</span> a0<span class="op">,</span> <span class="dt">long</span> a1<span class="op">,</span> <span class="dt">long</span> a2<span class="op">);</span></span></code></pre></div>
+<p>A kernel a rendszerhívásból visszatérve a <code>rax</code>-ben adja
+vissza az eredményt. Ha a visszatérési érték negatív, akkor az hibakódot
+jelent. A felhasználói C könyvtár ezt a következőképpen alakítja
+<code>errno</code>-vá:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="dt">long</span> result <span class="op">=</span> syscall<span class="op">(</span>SYS_WRITE<span class="op">,</span> fd<span class="op">,</span> buf<span class="op">,</span> len<span class="op">);</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="op">(</span>result <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    errno <span class="op">=</span> <span class="op">-</span>result<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> result<span class="op">;</span></span></code></pre></div>
+<h3 data-number="27.4.4" id="mutatók-és-pufferek-ellenőrzése"><span
+class="header-section-number">27.4.4</span> 3.1. Mutatók és pufferek
+ellenőrzése</h3>
+<p>A legnagyobb biztonsági kockázatot a felhasználói memóriacímek
+jelentik. A kernel <strong>soha nem dereferálhat felhasználói mutatót
+közvetlenül</strong>, mert:</p>
+<ul>
+<li>a cím a kernel címtartományba eshet,</li>
+<li>a cím nem leképezett lapra mutathat,</li>
+<li>a cím mögötti memória egy másik folyamathoz tartozhat,</li>
+<li>a felhasználó a hívás után megváltoztathatja a puffert
+(TOCTOU).</li>
+</ul>
+<p>A megoldás a <strong>felhasználói és kernel közötti másolás</strong>.
+Definiálunk két segédfüggvényt: <code>copy_from_user()</code> és
+<code>copy_to_user()</code>. Ezek először ellenőrzik, hogy a teljes
+tartomány a felhasználói címtartományon belül van-e, laponként
+leképezett-e, és csak ezután másolják az adatokat.</p>
+<p>Az oktatókernelben a felhasználói címtartomány felső határa
+<code>USER_TOP</code>, például <code>0x80000000</code>. A legegyszerűbb
+ellenőrzés:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">long</span> check_user_range<span class="op">(</span><span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>uptr<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uintptr_t</span> addr <span class="op">=</span> <span class="op">(</span><span class="dt">uintptr_t</span><span class="op">)</span>uptr<span class="op">;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>addr <span class="op">&gt;=</span> USER_TOP <span class="op">||</span> addr <span class="op">+</span> len <span class="op">&gt;</span> USER_TOP<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EFAULT<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Lap-alapú ellenőrzés: minden oldal user mapping legyen */</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>copy_from_user</code> ezután bájtonként vagy szavanként
+másol, és minden elérhetetlen lapnál <code>-EFAULT</code> hibával tér
+vissza.</p>
+<h3 data-number="27.4.5" id="példa-a-write-rendszerhívás"><span
+class="header-section-number">27.4.5</span> 3.2. Példa: a write
+rendszerhívás</h3>
+<p>A <code>write</code> syscall a felhasználói puffert írja ki egy
+fájlleíróra. Az oktatókernelben először csak a szabványos kimenetet
+támogatjuk:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">long</span> sys_write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">!=</span> STDOUT_FILENO <span class="op">&amp;&amp;</span> fd <span class="op">!=</span> STDERR_FILENO<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EBADF<span class="op">;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>len <span class="op">&gt;</span> <span class="dv">128</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EINVAL<span class="op">;</span>   <span class="co">/* az oktatókernel kis puffert használ */</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> kbuf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>copy_from_user<span class="op">(</span>kbuf<span class="op">,</span> buf<span class="op">,</span> len<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span>EFAULT<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    console_write<span class="op">(</span>kbuf<span class="op">,</span> len<span class="op">);</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">(</span><span class="dt">long</span><span class="op">)</span>len<span class="op">;</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A függvény ellenőrzi a fájlleírót, a pufferméretet, majd a kernel
+saját veremén lévő pufferré másol. A <code>console_write</code> már csak
+kernelbeli címet kap, így biztonságos.</p>
+<p>A visszatérési érték a kiírt bájtok száma. Ha a felhasználó rossz
+mutatót ad meg, a függvény <code>-EFAULT</code> értékkel tér vissza,
+amelyből a userland <code>errno = EFAULT</code> lesz.</p>
+<h3 data-number="27.4.6"
+id="tipikus-hibák-az-argumentumkezelésben"><span
+class="header-section-number">27.4.6</span> 3.3. Tipikus hibák az
+argumentumkezelésben</h3>
+<ul>
+<li><strong>Hiányzó tartományellenőrzés:</strong> ha a kernel a
+<code>buf + len</code> számítást végzi el a felhasználói mutatón, az
+túlcsordulás miatt kernel címet érhet el.</li>
+<li><strong>A hossz nem illeszkedik a pufferhez:</strong> ha a kernel
+fix méretű <code>kbuf</code>-ot használ, de a felhasználói
+<code>len</code> nagyobb, verem-túlcsordulás következhet be.</li>
+<li><strong>TOCTOU (time-of-check to time-of-use):</strong> ha a kernel
+először ellenőrzi a puffert, majd később ismét a felhasználói memóriát
+olvassa, a felhasználó közben megváltoztathatja azt. A másolásnak
+egyszer kell megtörténnie.</li>
+<li><strong>Nem kezelt hibakód:</strong> ha a hívott függvény negatív
+<code>errno</code>-t ad vissza, de a dispatcher ezt pozitív értékként
+adja tovább, a userland hibát nem érzékeli.</li>
+<li><strong>A regiszterek felülírása a kontextusmentés előtt:</strong>
+ha az assembly belépő nem menti el az összes hívó által használt
+regisztert, a visszatérés után a felhasználói program sérülhet.</li>
+</ul>
+<h3 data-number="27.4.7" id="init-shell-és-programbetöltés"><span
+class="header-section-number">27.4.7</span> 4. Init, shell és
+programbetöltés</h3>
+<p>A kernel inicializálása után az első felhasználói módban futó
+folyamat az <strong>init</strong>, amelynek PID-je 1. Az init felelős a
+rendszer alapszolgáltatásainak elindításáért; az oktatókernelben ez
+egyetlen shell folyamat indítását jelenti.</p>
+<p>Az init programot vagy beépítjük a kernel képfájljába, vagy a
+bootolás során betöltjük egy kezdeti fájlrendszerből. Az utóbbi
+rugalmasabb, de a beépített változat egyszerűbb, és az első lépésekhez
+elegendő.</p>
+<h3 data-number="27.4.8" id="programbetöltés"><span
+class="header-section-number">27.4.8</span> 4.1. Programbetöltés</h3>
+<p>A programbetöltő feladata, hogy a lemezen vagy a memóriában tárolt
+programképből felhasználói folyamatot hozzon létre. A folyamat a
+következő lépésekkel jön létre:</p>
+<ol type="1">
+<li><strong>Képfájl elemzése.</strong> Az oktatókernel egy egyszerű,
+saját programformátumot használhat, amely szegmenseket, belépési pontot
+és méretet tartalmaz. A valós rendszerekben az ELF formátum használata a
+megszokott, de annak részletes elemzése a későbbi fejezetekre
+tartozik.</li>
+<li><strong>Lapok lefoglalása.</strong> A kernel a folyamat számára új
+lapokat rendel a programkép szegmenseihez.</li>
+<li><strong>Szegmensek betöltése.</strong> A kód- és adatszegmenseket a
+megfelelő virtuális címekre másoljuk.</li>
+<li><strong>Verem inicializálása.</strong> A kernel a felhasználói verem
+tetejére helyezi a program argumentumait és környezeti változóit.</li>
+<li><strong>Regiszterek beállítása.</strong> A <code>RIP</code> a
+belépési pontra, a <code>RSP</code> a verem tetejére mutat, a
+<code>RFLAGS</code> pedig felhasználói módot állít be.</li>
+<li><strong>Visszatérés felhasználói módba.</strong> A kernel a
+<code>sysret</code> vagy <code>iret</code> utasítással elindítja a
+folyamatot.</li>
+</ol>
+<p>A betöltőnek figyelnie kell arra, hogy a folyamat ne kaphasson kernel
+lapokat, és a verem ne lógjon túl a lefoglalt tartományon. A
+felhasználói <code>RSP</code>-nek a lefoglalt verem tetejére kell
+mutatnia, és a verem méretét a folyamat struktúrájában rögzíteni
+kell.</p>
+<h3 data-number="27.4.9" id="init-folyamat"><span
+class="header-section-number">27.4.9</span> 4.2. Init folyamat</h3>
+<p>Az oktatókernel <code>init</code> programja először meghívja a
+<code>write</code> syscall-t, hogy üzenetet írjon a konzolra, majd
+végtelen ciklusban olvas a szabványos bemenetről és egyszerű parancsokat
+hajt végre:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* init.c - szemléltető userland program */</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&quot;syscall.h&quot;</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> msg<span class="op">[]</span> <span class="op">=</span> <span class="st">&quot;init: shell started</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    syscall<span class="op">(</span>SYS_WRITE<span class="op">,</span> STDOUT_FILENO<span class="op">,</span> msg<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>msg<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">char</span> cmd<span class="op">[</span><span class="dv">64</span><span class="op">];</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>        <span class="dt">long</span> n <span class="op">=</span> syscall<span class="op">(</span>SYS_READ<span class="op">,</span> STDIN_FILENO<span class="op">,</span> cmd<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>cmd<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>            syscall<span class="op">(</span>SYS_YIELD<span class="op">);</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>        cmd<span class="op">[</span>n<span class="op">]</span> <span class="op">=</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>strncmp<span class="op">(</span>cmd<span class="op">,</span> <span class="st">&quot;hello&quot;</span><span class="op">,</span> <span class="dv">5</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>            <span class="dt">const</span> <span class="dt">char</span> hello<span class="op">[]</span> <span class="op">=</span> <span class="st">&quot;hello from userland</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">;</span></span>
+<span id="cb9-20"><a href="#cb9-20" aria-hidden="true" tabindex="-1"></a>            syscall<span class="op">(</span>SYS_WRITE<span class="op">,</span> STDOUT_FILENO<span class="op">,</span> hello<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>hello<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb9-21"><a href="#cb9-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strncmp<span class="op">(</span>cmd<span class="op">,</span> <span class="st">&quot;pid&quot;</span><span class="op">,</span> <span class="dv">3</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-22"><a href="#cb9-22" aria-hidden="true" tabindex="-1"></a>            <span class="dt">long</span> pid <span class="op">=</span> syscall<span class="op">(</span>SYS_GETPID<span class="op">);</span></span>
+<span id="cb9-23"><a href="#cb9-23" aria-hidden="true" tabindex="-1"></a>            syscall<span class="op">(</span>SYS_WRITE<span class="op">,</span> STDOUT_FILENO<span class="op">,</span> <span class="op">&amp;</span>pid<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>pid<span class="op">));</span></span>
+<span id="cb9-24"><a href="#cb9-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-25"><a href="#cb9-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-26"><a href="#cb9-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb9-27"><a href="#cb9-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a program nem teljes shell, de bemutatja a userland és a kernel
+közötti együttműködést. Egy valódi shell a beolvasott sort parancsokra
+bontja, majd a <code>fork</code> és <code>execve</code> syscall-okkal új
+folyamatot indít.</p>
+<h3 data-number="27.4.10" id="a-shell-mint-felhasználói-program"><span
+class="header-section-number">27.4.10</span> 4.3. A shell mint
+felhasználói program</h3>
+<p>A shell azért felhasználói program, mert nem igényel
+kerneljogosultságot. A parancsok értelmezése, a fájlnevek kiegészítése
+és a feladatvezérlés mind userland feladat. A kernel csak a
+folyamatkezeléshez és a fájl I/O-hoz biztosít rendszerhívásokat.</p>
+<p>A minimális shell fő hurka:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">((</span>n <span class="op">=</span> read<span class="op">(</span><span class="dv">0</span><span class="op">,</span> line<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>line<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">))</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    line<span class="op">[</span>n<span class="op">]</span> <span class="op">=</span> <span class="ch">&#39;</span><span class="sc">\0</span><span class="ch">&#39;</span><span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>parse_and_execute<span class="op">(</span>line<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>        write<span class="op">(</span><span class="dv">2</span><span class="op">,</span> <span class="st">&quot;sh: command not found</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> <span class="dv">22</span><span class="op">);</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>parse_and_execute</code> egy egyszerű változatban a parancs
+nevét és argumentumait bontja szét, majd <code>fork</code> segítségével
+új folyamatot hoz létre, és a gyermekben <code>execve</code>-vel betölti
+a kért programot. A szülő <code>waitpid</code>-del vár a gyermek
+befejezésére.</p>
+<p>Ehhez a következő syscall-ok szükségesek:</p>
+<ul>
+<li><code>fork</code>: új folyamat létrehozása,</li>
+<li><code>execve</code>: új programkép betöltése,</li>
+<li><code>waitpid</code>: gyermek állapotának lekérdezése,</li>
+<li><code>read</code> és <code>write</code>: konzol I/O,</li>
+<li><code>exit</code>: folyamat befejezése.</li>
+</ul>
+<p>Az oktatókernelben a <code>fork</code> és <code>execve</code>
+kombinációja helyett bevezethetünk egy egyszerűbb <code>spawn</code>
+syscall-t is, amely egyetlen hívásban létrehozza az új folyamatot és
+betölti a programot. Ez csökkenti a kernel bonyolultságát, de eltér a
+POSIX szemantikától. A fejezetben a fogalmi modell ismertetéséhez a
+klasszikus <code>fork</code> + <code>execve</code> párt használjuk, a
+konkrét oktatókernel implementáció dönthet a <code>spawn</code>
+mellett.</p>
+<h3 data-number="27.4.11" id="minimális-syscall-készlet-tervezése"><span
+class="header-section-number">27.4.11</span> 5. Minimális syscall
+készlet tervezése</h3>
+<p>A következő táblázat egy lehetséges minimális syscall-listát mutat az
+oktatókernelhez. A számok és a paraméterek a saját ABI-nk részét
+képezik, és nem feltétlenül egyeznek a Linux vagy más rendszerek
+számaival.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 5%" />
+<col style="width: 10%" />
+<col style="width: 36%" />
+<col style="width: 29%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Szám</th>
+<th>Név</th>
+<th>Paraméterek</th>
+<th>Visszatérés siker esetén</th>
+<th>Hibakód (<code>errno</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0</td>
+<td><code>exit</code></td>
+<td><code>int status</code></td>
+<td>nem tér vissza</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>1</td>
+<td><code>write</code></td>
+<td><code>int fd, const char *buf, size_t len</code></td>
+<td>kiírt bájtok száma</td>
+<td><code>EBADF</code>, <code>EFAULT</code>, <code>EINVAL</code></td>
+</tr>
+<tr class="odd">
+<td>2</td>
+<td><code>read</code></td>
+<td><code>int fd, char *buf, size_t len</code></td>
+<td>beolvasott bájtok száma</td>
+<td><code>EBADF</code>, <code>EFAULT</code>, <code>EINVAL</code></td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td><code>open</code></td>
+<td><code>const char *path, int flags</code></td>
+<td>fájlleíró</td>
+<td><code>ENOENT</code>, <code>EACCES</code>, <code>EFAULT</code></td>
+</tr>
+<tr class="odd">
+<td>4</td>
+<td><code>close</code></td>
+<td><code>int fd</code></td>
+<td>0</td>
+<td><code>EBADF</code></td>
+</tr>
+<tr class="even">
+<td>5</td>
+<td><code>getpid</code></td>
+<td>—</td>
+<td>folyamatazonosító</td>
+<td>—</td>
+</tr>
+<tr class="odd">
+<td>6</td>
+<td><code>sbrk</code></td>
+<td><code>intptr_t increment</code></td>
+<td>régi programtörés</td>
+<td><code>ENOMEM</code></td>
+</tr>
+<tr class="even">
+<td>7</td>
+<td><code>fork</code></td>
+<td>—</td>
+<td>0 a gyermekben, PID a szülőben</td>
+<td><code>EAGAIN</code></td>
+</tr>
+<tr class="odd">
+<td>8</td>
+<td><code>execve</code></td>
+<td><code>const char *path, char *const argv[], char *const envp[]</code></td>
+<td>nem tér vissza siker esetén</td>
+<td><code>ENOENT</code>, <code>EACCES</code>, <code>EFAULT</code></td>
+</tr>
+<tr class="even">
+<td>9</td>
+<td><code>waitpid</code></td>
+<td><code>pid_t pid, int *status, int options</code></td>
+<td>gyermek PID</td>
+<td><code>ECHILD</code>, <code>EFAULT</code></td>
+</tr>
+<tr class="odd">
+<td>10</td>
+<td><code>yield</code></td>
+<td>—</td>
+<td>0</td>
+<td>—</td>
+</tr>
+<tr class="even">
+<td>11</td>
+<td><code>sleep</code></td>
+<td><code>unsigned long ms</code></td>
+<td>0</td>
+<td><code>EINVAL</code></td>
+</tr>
+</tbody>
+</table>
+<p>Ez a készlet elegendő ahhoz, hogy egy felhasználói program
+elinduljon, konzolon kommunikáljon, dinamikus memóriát foglaljon, és új
+folyamatokat hozzon létre. A listát a kernel <code>syscall_table</code>
+méretének növelésével és az új függvények regisztrálásával
+bővíthetjük.</p>
+<h3 data-number="27.4.12"
+id="labor-syscall-lista-és-minimális-userland-tervezése"><span
+class="header-section-number">27.4.12</span> 6. Labor: syscall-lista és
+minimális userland tervezése</h3>
+<p>Ez a labor a <a href="os105.html">Rendszerhívások és userland
+tervezése</a> tanulási céljainak gyakorlati ellenőrzésére szolgál. A
+feladat egy dokumentált syscall-lista elkészítése és egy minimális
+userland futtatása emulált környezetben.</p>
+<h3 data-number="27.4.13" id="kiinduló-állapot-és-konfiguráció"><span
+class="header-section-number">27.4.13</span> 6.1. Kiinduló állapot és
+konfiguráció</h3>
+<ul>
+<li><strong>Emulátor:</strong> QEMU, <code>qemu-system-i386</code>.</li>
+<li><strong>CPU:</strong> <code>qemu32</code>, védett mód, lapozás
+engedélyezve.</li>
+<li><strong>Memória:</strong> 32 MiB fizikai RAM.</li>
+<li><strong>Konzol:</strong> soros port
+(<code>-serial stdio</code>).</li>
+<li><strong>Kernel:</strong> a <a href="os104.html">Memóriakezelés és
+ütemező tervezése</a> fejezetben megtervezett monolitikus kernel, amely
+már tartalmazza az ütemezőt és a lapkezelést.</li>
+<li><strong>Mentési pont:</strong> a labor előtt a kernel forrásfáját
+verziókezelőbe kell menteni, és a buildkönyvtárat tiszta állapotból kell
+létrehozni. A labor nem nyúl a hoszt bootloaderéhez vagy lemezéhez.</li>
+</ul>
+<h3 data-number="27.4.14" id="lépések"><span
+class="header-section-number">27.4.14</span> 6.2. Lépések</h3>
+<ol type="1">
+<li><strong>Syscall tábla definiálása.</strong> Hozzuk létre a
+<code>syscall_table.c</code> fájlt a fenti táblázat alapján. Minden
+syscall-hoz írjunk egy váz függvényt, amely egyelőre
+<code>-ENOSYS</code> értékkel tér vissza.</li>
+<li><strong>ABI fejléc készítése.</strong> Hozzuk létre a
+<code>syscall.h</code> felhasználói fejlécet, amelyben a syscall
+számokat <code>#define</code> direktívákkal rögzítjük, és deklaráljuk a
+<code>syscall()</code> wrapper függvényt.</li>
+<li><strong>Belépési pont és dispatcher.</strong> Írjuk meg az assembly
+belépőt, amely elmenti a trap frame-et, és ugorjon a
+<code>syscall_entry</code> C függvényre. A <code>syscall_init</code>
+regisztrálja a táblát.</li>
+<li><strong>Init program.</strong> Készítsünk egy <code>init.c</code>
+felhasználói programot, amely a beépített <code>syscall()</code> wrapper
+segítségével kiír egy üzenetet, majd beolvas egy parancsot, és a
+<code>hello</code> parancsra válaszol.</li>
+<li><strong>Betöltés.</strong> A kernel boot után hozza létre az init
+folyamatot, állítsa be a veremmutatót, és adja át a vezérlést a user
+programnak.</li>
+<li><strong>Teszt.</strong> Indítsuk el a QEMU-t, és a soros konzolon
+ellenőrizzük, hogy megjelenik az init üzenet, a <code>hello</code>
+parancs pedig a <code>hello from userland</code> választ írja ki.</li>
+</ol>
+<h3 data-number="27.4.15" id="mérési-napló"><span
+class="header-section-number">27.4.15</span> 6.3. Mérési napló</h3>
+<p>A mérésekhez a felhasználói programban egy ciklusban hívjuk meg a
+<code>write</code> syscall-t, és a <code>rdtsc</code> utasítással mérjük
+a hívás előtti és utáni időbélyeget. A mérési módszert és a
+hardverkörnyezetet rögzíteni kell.</p>
+<p><strong>Várt eredmények:</strong></p>
+<table>
+<colgroup>
+<col style="width: 51%" />
+<col style="width: 48%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Művelet</th>
+<th>Várt eredmény</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Boot idő az init első kiírásáig</td>
+<td>kevesebb mint 100 ms</td>
+</tr>
+<tr class="even">
+<td><code>write</code> syscall hívás 1 bájt kiírásával</td>
+<td>kevesebb mint 500 ciklus</td>
+</tr>
+<tr class="odd">
+<td><code>hello</code> parancs válaszideje</td>
+<td>kevesebb mint 10 ms</td>
+</tr>
+<tr class="even">
+<td>Hibás syscall szám (<code>nr = 99</code>) hibakód</td>
+<td><code>-ENOSYS</code></td>
+</tr>
+<tr class="odd">
+<td>Érvénytelen mutató a <code>write</code>-ban</td>
+<td><code>-EFAULT</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Mért eredmények:</strong> (a labor során kitöltendő)</p>
+<table>
+<colgroup>
+<col style="width: 51%" />
+<col style="width: 48%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Művelet</th>
+<th>Mért eredmény</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Boot idő</td>
+<td><code>……</code> ms</td>
+</tr>
+<tr class="even">
+<td><code>write</code> syscall ciklusszám</td>
+<td><code>……</code> ciklus</td>
+</tr>
+<tr class="odd">
+<td><code>hello</code> válaszidő</td>
+<td><code>……</code> ms</td>
+</tr>
+<tr class="even">
+<td>Hibás syscall szám</td>
+<td><code>……</code></td>
+</tr>
+<tr class="odd">
+<td>Érvénytelen mutató</td>
+<td><code>……</code></td>
+</tr>
+</tbody>
+</table>
+<p>A mért értékeket a labor jegyzőkönyvében fel kell tüntetni, és el
+kell különíteni a várt értékektől. A mérésnél ugyanazt a QEMU
+konfigurációt és ugyanazt a fordítási beállítást kell használni, mint a
+reprodukció során.</p>
+<h3 data-number="27.4.16" id="ellenőrzési-pontok-a-kódminőséghez"><span
+class="header-section-number">27.4.16</span> 6.4. Ellenőrzési pontok a
+kódminőséghez</h3>
+<ul>
+<li>A dispatcher nem dereferál felhasználói mutatót.</li>
+<li>A <code>copy_from_user</code> ellenőrzi a tartományt és a
+leképezést.</li>
+<li>A <code>sys_write</code> a kernel veremben lévő puffert használ, nem
+a felhasználóit.</li>
+<li>A trap frame mentése az összes hívó által használt regisztert
+tartalmazza.</li>
+<li>A syscall tábla indexelése a <code>nr</code> egészértékű ellenőrzése
+után történik.</li>
+<li>A felhasználói verem mérete rögzített és a folyamat struktúrában
+dokumentált.</li>
+</ul>
+<h3 data-number="27.4.17" id="tipikus-hibák-és-indoklásuk"><span
+class="header-section-number">27.4.17</span> 7. Tipikus hibák és
+indoklásuk</h3>
+<p>A fejezetben bemutatott tervezési döntések leggyakoribb hibái és azok
+következményei:</p>
+<ol type="1">
+<li><p><strong>Közvetlen user pointer dereferálás.</strong> Ha a kernel
+a felhasználói <code>buf</code> címet használja anélkül, hogy
+<code>copy_from_user</code>-t hívna, a rendszer egy érvénytelen vagy
+kernelbeli címre mutató hivatkozással page fault-ot okozhat
+kernelmódban. Ez a kernel leállásához vezethet. A helyes megoldás a
+másolás és a tartományellenőrzés.</p></li>
+<li><p><strong>A hossz ellenőrzésének elmulasztása a másolás
+előtt.</strong> Ha a kernel a <code>len</code> értéket először a
+<code>kbuf</code> méretével hasonlítja össze, de a
+<code>copy_from_user</code> hívásakor a felhasználói puffer rövidebb,
+mint <code>len</code>, a másolás túlcsordulhat. A
+<code>copy_from_user</code>-nek a <code>len</code> minden bájtjára
+érvényes leképezést kell ellenőriznie.</p></li>
+<li><p><strong>A TOCTOU figyelmen kívül hagyása.</strong> Ha a kernel
+először ellenőrzi a puffert, majd később újra a felhasználói memóriát
+olvassa, a felhasználó a két lépés között megváltoztathatja a memóriát.
+Ez adatszivárgáshoz vagy jogosultság-megkerüléshez vezethet. A megoldás
+az, hogy minden felhasználói adatot egyszer, atomi módon másolunk a
+kernelbe.</p></li>
+<li><p><strong>Hibakódok helytelen kezelése.</strong> Ha a syscall
+függvény pozitív <code>errno</code> értéket ad vissza, vagy a dispatcher
+a negatív visszatérést nem alakítja át, a felhasználói program téves
+eredményt kap. Az ABI-t pontosan dokumentálni kell: a kernel negatív
+hibakódot ad, a userland wrapper ezt <code>errno</code>-vá
+alakítja.</p></li>
+<li><p><strong>Nem mentett regiszterek.</strong> Ha az assembly belépő
+nem menti el az összes regisztert, amelyet a C hívási konvenció a
+hívóhoz köt, akkor a felhasználói program regiszterei a syscall után
+sérülhetnek. A trap frame-nek a teljes felhasználói állapotot kell
+tartalmaznia.</p></li>
+<li><p><strong>A felhasználói verem helytelen beállítása.</strong> Ha az
+init program <code>RSP</code>-je nem a lefoglalt verem tetejére mutat,
+vagy a verem túl kicsi, a program az első verem műveletnél összeomlik. A
+verem méretét és a <code>RSP</code> kezdeti értékét a betöltőnek
+egyszerre kell kezelnie.</p></li>
+</ol>
+<h3 data-number="27.4.18" id="összefoglalás"><span
+class="header-section-number">27.4.18</span> 8. Összefoglalás</h3>
+<p>Ebben a fejezetben megterveztük az oktatókernel rendszerhívási
+interfészét és a minimális felhasználói teret. A következő fogalmakat
+vezettük be:</p>
+<ul>
+<li>A rendszerhívás a kernel és a userland közötti ellenőrzött,
+ABI-szintű szerződés.</li>
+<li>A syscall dispatcher egy függvénymutató-tábla segítségével osztja
+szét a hívásokat, és a trap frame-ben menti a felhasználói
+állapotot.</li>
+<li>Az argumentumok regiszterekben érkeznek, a mutatókat és puffereket a
+kernelnek mindig ellenőriznie és másolnia kell.</li>
+<li>A hibakódokat negatív <code>errno</code> értékként adjuk vissza,
+amelyet a userland wrapper alakít át.</li>
+<li>Az init az első userland folyamat, amely egy shellt indíthat; a
+programbetöltő felel a szegmensek, a verem és a regiszterek
+inicializálásáért.</li>
+<li>A laborban egy konkrét syscall-listát és egy minimális init
+programot valósítunk meg, méréssel és hibakezeléssel.</li>
+</ul>
+<p>A következő fejezet (<a href="os106.html">C és assembly alapok,
+fordítás és linkelés</a>) erre az interfészre építve bemutatja a C és
+assembly nyelvű kernelkód fordítását, linkelését, valamint az eszközök
+és a megszakításkezelés alapjait. Az itt bevezetett ABI és userland
+betöltő lesz az alapja a későbbi fájlrendszer- és
+shellfejlesztéseknek.</p>
+<h3 data-number="27.4.19" id="önellenőrző-kérdések"><span
+class="header-section-number">27.4.19</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért nem szabad a kernelnek közvetlenül használni a felhasználói
+mutatókat? Soroljon fel legalább három okot.</li>
+<li>Írjon egy <code>read</code> rendszerhívás vázat, amely a
+<code>copy_to_user</code> segítségével ad vissza adatot a felhasználói
+pufferbe. Milyen ellenőrzéseket kell elvégezni?</li>
+<li>Mi a különbség az API és az ABI között? Adjon példát mindkettőre a
+<code>write</code> syscall esetében.</li>
+<li>Tervezzen egy új syscall-t, amely egy folyamat prioritását állítja
+be. Milyen jogosultsági ellenőrzésre van szükség? Hogyan dokumentálná a
+paramétereket és a hibakódokat?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os104.html">← 27.3 Memóriakezelés és ütemező tervezése</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os106.html">28.1 C és assembly alapok, fordítás és linkelés →</a></div>
+</nav>
+</body>
+</html>

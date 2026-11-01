@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>11.3 Saját type erasure és interface-ek – Fejlett C++ - haladó
+nyelvi eszközök és technikák</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Sablonok és compile-time programozás</a> › <a href="index.html#cppch10">11 Type erasure és dinamikus polimorfizmus</a></p>
+<div class="links"><a class="prev" rel="prev" href="cpp039.html">← 11.2 std::any, std::variant és std::function</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp041.html">11.4 Statikus vs. dinamikus polimorfizmus →</a></div>
+</nav>
+<h2 data-number="11.3" id="cpp040"><span
+class="header-section-number">11.3</span> Saját type erasure és
+interface-ek</h2>
+<p>A <code>std::function</code>, a <code>std::any</code> és a
+<code>std::variant</code> mögött ugyanaz az alapgondolat húzódik:
+egyetlen statikus típus képes heterogén, futásidőben meghatározott
+értékeket tárolni és kezelni. A szabványos eszközök kényelmesek, de nem
+mindig elég rugalmasak. Amikor saját, testreszabott erasure rétegre van
+szükség – például egyedi műveletekkel, garantált kis buffer
+optimalizációval vagy speciális allokátorhasználattal – a kézi type
+erasure a helyes út. Ez a rész bemutatja a testreszabott type erasure
+felépítését, a kézi vtable és manual dispatch technikáját, a kis buffer
+optimalizáció (SBO) megvalósítását, valamint a copy/move és
+allokátor-szemantika kezelését.</p>
+<h3 data-number="11.3.1" id="miért-írjunk-saját-type-erasure-t"><span
+class="header-section-number">11.3.1</span> Miért írjunk saját type
+erasure-t?</h3>
+<p>A szabványos <code>std::any</code> típus tetszőleges másolható
+értéket tárol, de a benne rejlő konkrét típus kinyeréséhez
+<code>any_cast</code>-re van szükség, és a műveletek köre korlátozott
+(csak tárolás és visszanyerés). A <code>std::function</code> egy adott
+hívási szignatúrához kötött, és a hívás mellett csak a másolást,
+mozgatást és a target vizsgálatát támogatja. A <code>std::variant</code>
+zárt típushalmazzal dolgozik, nem igazi type erasure. Ha olyan
+absztrakciót akarunk, amely tetszőleges típust fogad, de közben egy jól
+definiált interfészt exponál – például egy <code>draw()</code>,
+<code>serialize()</code> vagy <code>invoke()</code> műveletet –, akkor
+saját erasure típust érdemes építeni.</p>
+<p>A testreszabott type erasure klasszikus mintája a következő:</p>
+<ol type="1">
+<li>Definiálunk egy belső, tisztán virtuális interfészt (concept), amely
+a kívánt műveleteket írja le.</li>
+<li>Készítünk egy sablonos burkolót (<code>model&lt;T&gt;</code>), amely
+a konkrét <code>T</code> típusra implementálja ezt az interfészt.</li>
+<li>A publikus erasure típus egy <code>unique_ptr</code>-hez hasonló
+módon birtokol egy ilyen interfészre mutató pointert, és a műveleteket
+rajta keresztül hívja.</li>
+</ol>
+<p>Ez az ún. <em>external polymorphism</em>: a polimorfizmust nem a
+tárolt típus örökli, hanem egy külső sablonos réteg vezeti be. Ezzel
+bármilyen típus beilleszthető anélkül, hogy közös ősosztállyal kellene
+rendelkeznie, illetve anélkül, hogy a tárolt típusnak bármit is tudnia
+kellene az interfészről.</p>
+<h3 data-number="11.3.2" id="kézi-vtable-és-manual-dispatch"><span
+class="header-section-number">11.3.2</span> Kézi vtable és manual
+dispatch</h3>
+<p>A virtuális függvények mögött a fordító egy vtable-t (virtuális
+metódustáblát) generál. A type erasure esetében mi magunk is
+felépíthetünk egy explicit vtable-t, amely függvénymutatókat tartalmaz.
+Ez a megközelítés nagyobb kontrollt ad, mert pontosan meghatározhatjuk a
+műveletek halmazát, és elkerülhetjük a virtuális öröklésből adódó
+esetleges pluszköltségeket. Ráadásul a függvénymutatók táblája
+statikusan, a sablonpéldányosításkor jön létre, így nincs szükség külön
+virtuális osztályokra.</p>
+<p>Egy jellemző vtable-szerkezet így néz ki:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> vtable <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>destroy<span class="op">)(</span><span class="dt">void</span><span class="op">*)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>copy<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">);</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>move<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>print<span class="op">)(</span><span class="at">const</span> <span class="dt">void</span><span class="op">*);</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>model&lt;T&gt;</code> sablon minden egyes <code>T</code>-re
+létrehoz egy statikus <code>vtable</code> példányt, amely a megfelelő
+függvényekre mutat. Az erasure osztály csak egy <code>void*</code>-ot
+tárol a konkrét objektumra, és egy pointert a <code>vtable</code>-re. A
+dispatch mindig a vtable-n keresztül történik:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>obj<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>print<span class="op">(</span>obj<span class="op">.</span><span class="va">ptr_</span><span class="op">);</span></span></code></pre></div>
+<p>Ez a technika gyakran gyorsabb is, mint a többszörös virtuális hívás,
+mert egyetlen indirekciót jelent, és a függvény pointere közvetlenül
+hívható. Természetesen a gyakorlatban a különbség gyakran
+elhanyagolható, de a fő előny a rugalmasság: könnyen hozzáadhatunk olyan
+műveleteket, amelyek nem részei egyetlen virtuális interfésznek sem, és
+a táblát akár futásidőben is módosíthatjuk (bár ezt ritkán tesszük).</p>
+<h3 data-number="11.3.3" id="kis-buffer-optimalizáció-sbo"><span
+class="header-section-number">11.3.3</span> Kis buffer optimalizáció
+(SBO)</h3>
+<p>A fenti vtable-alapú megközelítés egyik hátránya, hogy minden egyes
+konstruáláskor heap allokációt igényel a tárolt objektum számára. Ezt
+elkerülhetjük, ha az erasure objektumon belül egy rögzített méretű, jól
+igazított puffert tartunk fenn, és a kis objektumokat közvetlenül ebbe a
+pufferbe konstruáljuk. Ezt nevezzük <em>small buffer
+optimization</em>-nek (SBO) vagy <em>small object optimization</em>-nek
+(SOO).</p>
+<p>Az alapelv:</p>
+<ul>
+<li>Definiálunk egy belső, <code>std::aligned_storage</code>-hoz hasonló
+puffert, például
+<code>alignas(std::max_align_t) std::byte buffer_[N];</code></li>
+<li>Ha a tárolandó objektum mérete ≤ <code>N</code> és az igazítása ≤ a
+puffer igazítása, akkor a puffert használjuk, és nem allokálunk.</li>
+<li>Ha nem fér be, akkor heap allokációra váltunk, és a puffert nem
+használjuk.</li>
+</ul>
+<p>A vtable függvényei mindkét esetet kezelni tudják: a
+<code>destroy</code> például megvizsgálja, hogy az objektum a pufferben
+van-e, és ha igen, explicit destruktort hív, különben
+<code>delete</code>-et. A legtöbb implementáció egy külön
+<code>bool</code>-t vagy egy enumot tárol erre a célra.</p>
+<p>A puffer méretét gondosan kell megválasztani. Ha túl kicsi, a legtöbb
+valós típus nem fér be, és elveszítjük az SBO előnyét; ha túl nagy, az
+erasure objektum mérete megnő, ami ronthatja a cache-hatékonyságot és a
+másolási költséget. Gyakori választás a két-három pointer mérete, vagy
+például 16–32 bájt. A <code>std::function</code> egyes implementációkban
+ennél nagyobb puffert használ, de a pontos méret implementációfüggő.</p>
+<h3 data-number="11.3.4" id="a-saját-any_sbo-tervezése"><span
+class="header-section-number">11.3.4</span> A saját <code>any_sbo</code>
+tervezése</h3>
+<p>Készítsünk egy gyakorlati példát: egy <code>any_sbo</code> nevű
+típust, amely tetszőleges másolható típust tárol, és egy
+<code>print()</code> műveletet biztosít. A cél a type erasure és az SBO
+együttes bemutatása. A teljes, fordítható kód a következőképpen épül
+fel.</p>
+<p>Először a belső vtable:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> vtable <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>destroy<span class="op">)(</span><span class="dt">void</span><span class="op">*)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>copy<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">);</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>move<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>print<span class="op">)(</span><span class="at">const</span> <span class="dt">void</span><span class="op">*);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>model&lt;T&gt;</code> sablon minden egyes <code>T</code>-re
+implementálja a vtable-t:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> model <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> destroy<span class="op">(</span><span class="dt">void</span><span class="op">*</span> p<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>p<span class="op">)-&gt;~</span>T<span class="op">();</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> copy<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">::</span><span class="kw">new</span> <span class="op">(</span>dest<span class="op">)</span> T<span class="op">(*</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="at">const</span> T<span class="op">*&gt;(</span>src<span class="op">));</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> move<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">::</span><span class="kw">new</span> <span class="op">(</span>dest<span class="op">)</span> T<span class="op">(</span><span class="bu">std::</span>move<span class="op">(*</span><span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>src<span class="op">)));</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>        <span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>src<span class="op">)-&gt;~</span>T<span class="op">();</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> print<span class="op">(</span><span class="at">const</span> <span class="dt">void</span><span class="op">*</span> p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="op">*</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="at">const</span> T<span class="op">*&gt;(</span>p<span class="op">);</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="kw">constexpr</span> vtable value<span class="op">{</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>        destroy<span class="op">,</span> copy<span class="op">,</span> move<span class="op">,</span> print</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Figyeljük meg, hogy a <code>copy</code> és <code>move</code>
+függvények placement new-t használnak, és a <code>move</code> a forrás
+objektumot is destruálja. A <code>print</code> feltételezi, hogy a
+<code>T</code> típus rendelkezik <code>operator&lt;&lt;</code>-vel, de
+ez a korlátozás a használat során derül ki.</p>
+<p>Most a publikus <code>any_sbo</code> osztály. A puffer méretét
+sablonparaméterként adhatjuk meg, alapértelmezésként mondjuk 32
+bájtot:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="bu">std::</span>size_t BufferSize <span class="op">=</span> <span class="dv">32</span><span class="op">&gt;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">class</span> any_sbo <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span><span class="op">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">private</span><span class="op">:</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">alignas</span><span class="op">(</span><span class="bu">std::</span>max_align_t<span class="op">)</span> <span class="bu">std::</span>byte <span class="va">buffer_</span><span class="op">[</span>BufferSize<span class="op">];</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> vtable<span class="op">*</span> <span class="va">vtable_</span> <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span><span class="op">*</span> <span class="va">ptr_</span> <span class="op">=</span> <span class="kw">nullptr</span><span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">bool</span> <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A konstruktorok és a destruktor kezelik az élettartamot. A sablonos
+konstruktor:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">,</span> <span class="kw">typename</span> Decayed <span class="op">=</span> <span class="bu">std::</span>decay_t<span class="op">&lt;</span>T<span class="op">&gt;&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">requires</span> <span class="op">(!</span><span class="bu">std::</span>is_same_v<span class="op">&lt;</span>Decayed<span class="op">,</span> any_sbo<span class="op">&gt;)</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>any_sbo<span class="op">(</span>T<span class="op">&amp;&amp;</span> value<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">using</span> ValueType <span class="op">=</span> Decayed<span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="kw">constexpr</span> <span class="op">(</span><span class="kw">sizeof</span><span class="op">(</span>ValueType<span class="op">)</span> <span class="op">&lt;=</span> BufferSize <span class="op">&amp;&amp;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>                  <span class="kw">alignof</span><span class="op">(</span>ValueType<span class="op">)</span> <span class="op">&lt;=</span> <span class="kw">alignof</span><span class="op">(</span><span class="bu">std::</span>max_align_t<span class="op">)</span> <span class="op">&amp;&amp;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>                  <span class="bu">std::</span>is_nothrow_move_constructible_v<span class="op">&lt;</span>ValueType<span class="op">&gt;)</span> <span class="op">{</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        <span class="va">ptr_</span> <span class="op">=</span> <span class="op">::</span><span class="kw">new</span> <span class="op">(</span><span class="va">buffer_</span><span class="op">)</span> ValueType<span class="op">(</span><span class="bu">std::</span>forward<span class="op">&lt;</span>T<span class="op">&gt;(</span>value<span class="op">));</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>        <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>        <span class="va">ptr_</span> <span class="op">=</span> <span class="kw">new</span> ValueType<span class="op">(</span><span class="bu">std::</span>forward<span class="op">&lt;</span>T<span class="op">&gt;(</span>value<span class="op">));</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>    <span class="va">vtable_</span> <span class="op">=</span> <span class="op">&amp;</span>model<span class="op">&lt;</span>ValueType<span class="op">&gt;::</span>value<span class="op">;</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt a <code>requires</code> feltétel kizárja a másoló konstruktort a
+sablonból, hogy ne lopja el a másolást. A <code>std::decay_t</code>
+eltávolítja a referenciát és a cv minősítőket, hogy a tárolt típus érték
+típus legyen. A <code>std::is_nothrow_move_constructible</code>
+ellenőrzése azért fontos, hogy a move konstruktor kivételbiztos
+lehessen; ha a típus move konstruktora dobhat, akkor inkább heap
+allokációt használunk, ahol a kivétel esetén a memória
+felszabadítható.</p>
+<p>A copy konstruktor:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>any_sbo<span class="op">(</span><span class="at">const</span> any_sbo<span class="op">&amp;</span> other<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>other<span class="op">.</span><span class="va">vtable_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>other<span class="op">.</span><span class="va">in_buffer_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>            other<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>copy<span class="op">(</span><span class="va">buffer_</span><span class="op">,</span> other<span class="op">.</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>            <span class="va">ptr_</span> <span class="op">=</span> <span class="va">buffer_</span><span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>            <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>            <span class="co">// heap allokáció másoláshoz: egyszerűen hívjuk a copy-t egy új heap objektumra</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>            <span class="va">ptr_</span> <span class="op">=</span> <span class="op">::</span><span class="kw">operator</span> <span class="kw">new</span><span class="op">(</span>sizeof_placeholder<span class="op">);</span> <span class="co">// Itt kellene a méret!</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>            other<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>copy<span class="op">(</span><span class="va">ptr_</span><span class="op">,</span> other<span class="op">.</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>            <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>        <span class="va">vtable_</span> <span class="op">=</span> other<span class="op">.</span><span class="va">vtable_</span><span class="op">;</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt egy fontos hiányosság látható: a heap másolásnál szükségünk van a
+tárolt objektum méretére. Ezt a vtable-be is fel kell venni, például egy
+<code>size</code> függvényt. A teljes implementációban a vtable bővül
+egy <code>std::size_t (*size)();</code> taggal, és a
+<code>model&lt;T&gt;</code> hozzáad egy <code>size()</code> függvényt,
+amely <code>sizeof(T)</code>-t ad vissza. Ezt a példát az egyszerűség
+kedvéért most nem részletezzük, de a laborban fontos lesz.</p>
+<p>A move konstruktor hasonló, de a <code>move</code> függvényt hívja,
+és a forrást nullázza. A destruktor:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="op">~</span>any_sbo<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">vtable_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>        <span class="va">vtable_</span><span class="op">-&gt;</span>destroy<span class="op">(</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!</span><span class="va">in_buffer_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>            <span class="op">::</span><span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Az assignment operátorok a copy-and-swap idiómát követhetik, vagy
+külön kezelhetők. A <code>print</code> művelet:</p>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> print<span class="op">()</span> <span class="at">const</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span><span class="va">vtable_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>        <span class="va">vtable_</span><span class="op">-&gt;</span>print<span class="op">(</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Ez a vázlat jól mutatja a lényeget. A laborban a diákoknak egy
+teljes, hibamentes implementációt kell készíteniük, beleértve a
+copy/move assignmentet, a size függvényt és a kivételbiztonságot.</p>
+<h3 data-number="11.3.5" id="copymove-és-allocator-kezelés"><span
+class="header-section-number">11.3.5</span> Copy/move és allocator
+kezelés</h3>
+<p>A fenti példában a heap allokáció <code>new</code>-t és
+<code>delete</code>-et használ. Ez a legegyszerűbb, de nem teszi
+lehetővé egyedi allokátor használatát. A testreszabott type erasure
+gyakran igényel allokátor-támogatást, különösen beágyazott vagy
+játékfejlesztői környezetben. Ilyenkor a vtable-be fel kell venni egy
+<code>clone</code> és <code>destroy</code> műveletet, amelyek az
+allokátort is megkapják, vagy a vtable-t az allokátor típusával együtt
+sablonosítjuk.</p>
+<p>Egy lehetséges megoldás, ha az erasure típus egy
+<code>std::pmr::polymorphic_allocator</code>-t tárol, és a
+<code>model&lt;T&gt;</code> vtable-függvényei ezt használják a
+memóriakezelésre. Például:</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> vtable <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>destroy<span class="op">)(</span><span class="dt">void</span><span class="op">*,</span> <span class="bu">std::</span>pmr::memory_resource<span class="op">*)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>copy<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">,</span> <span class="bu">std::</span>pmr::memory_resource<span class="op">*);</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// ...</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Ekkor a <code>destroy</code> a <code>memory_resource</code>-on
+keresztül szabadítja fel a heap memóriát. A pufferben tárolt
+objektumoknál értelemszerűen nincs szükség az allokátorra.</p>
+<p>A copy/move szemantika kulcskérdése, hogy a másolás során meg kell
+őrizni az allokátort. Ha az erasure objektum másolása megtörténik, akkor
+a célobjektum ugyanazt az allokátort kell, hogy használja (vagy egy
+azzal kompatibilis allokátort). Ezért a copy konstruktor általában
+átmásolja az allokátort is. A move konstruktor pedig általában ellopja
+az allokátort, ha az allokátor ezt támogatja, különben másol.</p>
+<p>A kivételbiztonság szempontjából a copy konstruktorban a
+<code>copy</code> hívás dobhat. Ilyenkor biztosítani kell, hogy a már
+lefoglalt memória felszabaduljon. Ezért a <code>copy</code> függvénynek
+úgy kell működnie, hogy ha a konstruktor dob, akkor a foglalt memóriát
+felszabadítja (vagy a hívó kezeli). Az SBO puffernél nincs ilyen gond,
+mert a memória már a miénk.</p>
+<h3 data-number="11.3.6"
+id="a-vtable-alapú-type-erasure-előnyei-és-hátrányai"><span
+class="header-section-number">11.3.6</span> A vtable alapú type erasure
+előnyei és hátrányai</h3>
+<p><strong>Előnyök:</strong></p>
+<ul>
+<li>Nincs szükség virtuális öröklésre a tárolt típusok részéről.</li>
+<li>A műveletek halmaza tetszőlegesen bővíthető.</li>
+<li>A vtable statikus, így nincs külön objektumonkénti
+memóriahasználat.</li>
+<li>Az SBO révén a legtöbb kis objektum heap allokáció nélkül
+tárolható.</li>
+<li>A dispatch egyetlen függvénymutató-indirekció, ami gyors.</li>
+</ul>
+<p><strong>Hátrányok:</strong></p>
+<ul>
+<li>A megvalósítás bonyolultabb, mint a <code>std::any</code> vagy
+<code>std::function</code> használata.</li>
+<li>A vtable mérete a műveletek számával nő, ami nagyobb kódméretet
+eredményezhet.</li>
+<li>A típusbiztonságért mi felelünk; a <code>print</code> például
+fordítási hibát ad, ha a típus nem streamelhető, de ez a hiba a
+sablonpéldányosításkor jön elő, nem az erasure típus
+definiálásakor.</li>
+<li>Az SBO puffer mérete kompromisszum; ha rosszul választjuk, nem
+hatékony.</li>
+</ul>
+<h3 data-number="11.3.7" id="labor-saját-any_sbo-típus-tervezése"><span
+class="header-section-number">11.3.7</span> Labor: saját
+<code>any_sbo</code> típus tervezése</h3>
+<p>A gyakorlat célja egy működő, tesztelt, mérésekkel alátámasztott
+<code>any_sbo</code> implementáció elkészítése. A labor a következő
+lépéseket foglalja magában:</p>
+<ol type="1">
+<li><p><strong>Implementáció:</strong> Készíts egy <code>any_sbo</code>
+osztálysablont, amely a fenti vtable + SBO mintát követi. A vtable
+tartalmazzon legalább a következő függvényeket: <code>destroy</code>,
+<code>copy</code>, <code>move</code>, <code>print</code> és
+<code>size</code>. A puffer mérete legyen sablonparaméter,
+alapértelmezés 32 bájt. A típus támogassa a másolást, mozgatást, és
+legyen kivételbiztos.</p></li>
+<li><p><strong>Build rendszer:</strong> Használj CMake-et vagy más build
+eszközt. A következő fordítási kapcsolókkal dolgozz: GCC 13 vagy Clang
+18, C++20 szabvány, <code>-Wall -Wextra -Wpedantic -Werror</code>.
+Használj AddressSanitizert és UndefinedBehaviorSanitizert a
+teszteléshez: <code>-fsanitize=address,undefined</code>.</p></li>
+<li><p><strong>Tesztesetek:</strong> Írj legalább három tesztet:</p>
+<ul>
+<li>Tárolj egy <code>int</code> értéket, és ellenőrizd a
+<code>print</code> kimenetét.</li>
+<li>Tárolj egy <code>std::string</code>-et, másold le az
+<code>any_sbo</code>-t, és ellenőrizd, hogy a másolat független.</li>
+<li>Tárolj egy nagyobb objektumot (pl. egy 100 bájtos struktúra), amely
+nem fér a pufferbe, és ellenőrizd a heap allokációt (pl. egy globális
+számlálóval a <code>new</code>/<code>delete</code> hívásokra). A
+tesztekhez használj <code>assert</code>-et vagy egy egyszerű
+tesztkeretet (pl. Catch2, doctest).</li>
+</ul></li>
+<li><p><strong>Mérési napló:</strong> Mérd meg a konstruálási és
+destruálási időt, valamint a heap allokációk számát a következő
+esetekre:</p>
+<ul>
+<li>Kis objektum (pl. <code>int</code>) SBO-val.</li>
+<li>Nagy objektum (pl. 100 bájtos struct) heap allokációval.</li>
+<li>Összehasonlításként ugyanez a <code>std::any</code>-vel. A méréshez
+használj <code>std::chrono::steady_clock</code>-ot, és futtass legalább
+100 000 iterációt. Rögzítsd a fordító verzióját, az optimalizációs
+szintet (<code>-O2</code>), a hardver modelljét és az operációs
+rendszert. A mért értékeket foglald táblázatba, és külön jelöld a várt
+értékeket (pl. „0 heap allokáció kis objektum esetén”).</li>
+</ul></li>
+<li><p><strong>Dokumentáció:</strong> Írj egy rövid README-t, amely
+leírja a típus használatát, a korlátait (pl. a <code>print</code> csak
+streamelhető típusokra működik), és a mérési eredményeket.</p></li>
+</ol>
+<h3 data-number="11.3.8" id="példa-a-teljes-vtable-re"><span
+class="header-section-number">11.3.8</span> Példa a teljes
+vtable-re</h3>
+<p>A teljesség kedvéért álljon itt egy vtable, amely a <code>size</code>
+függvényt is tartalmazza:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> vtable <span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>destroy<span class="op">)(</span><span class="dt">void</span><span class="op">*)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>copy<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">);</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>move<span class="op">)(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="kw">noexcept</span><span class="op">;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">void</span> <span class="op">(*</span>print<span class="op">)(</span><span class="at">const</span> <span class="dt">void</span><span class="op">*);</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">std::</span>size_t <span class="op">(*</span>size<span class="op">)();</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="kw">template</span><span class="op">&lt;</span><span class="kw">typename</span> T<span class="op">&gt;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> model <span class="op">{</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> destroy<span class="op">(</span><span class="dt">void</span><span class="op">*</span> p<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span> <span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>p<span class="op">)-&gt;~</span>T<span class="op">();</span> <span class="op">}</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> copy<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="at">const</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">::</span><span class="kw">new</span> <span class="op">(</span>dest<span class="op">)</span> T<span class="op">(*</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="at">const</span> T<span class="op">*&gt;(</span>src<span class="op">));</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> move<span class="op">(</span><span class="dt">void</span><span class="op">*</span> dest<span class="op">,</span> <span class="dt">void</span><span class="op">*</span> src<span class="op">)</span> <span class="kw">noexcept</span> <span class="op">{</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">::</span><span class="kw">new</span> <span class="op">(</span>dest<span class="op">)</span> T<span class="op">(</span><span class="bu">std::</span>move<span class="op">(*</span><span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>src<span class="op">)));</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>        <span class="kw">static_cast</span><span class="op">&lt;</span>T<span class="op">*&gt;(</span>src<span class="op">)-&gt;~</span>T<span class="op">();</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="dt">void</span> print<span class="op">(</span><span class="at">const</span> <span class="dt">void</span><span class="op">*</span> p<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>        <span class="bu">std::</span>cout <span class="op">&lt;&lt;</span> <span class="op">*</span><span class="kw">static_cast</span><span class="op">&lt;</span><span class="at">const</span> T<span class="op">*&gt;(</span>p<span class="op">);</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="bu">std::</span>size_t size<span class="op">()</span> <span class="op">{</span> <span class="cf">return</span> <span class="kw">sizeof</span><span class="op">(</span>T<span class="op">);</span> <span class="op">}</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>    <span class="at">static</span> <span class="kw">constexpr</span> vtable value<span class="op">{</span> destroy<span class="op">,</span> copy<span class="op">,</span> move<span class="op">,</span> print<span class="op">,</span> size <span class="op">};</span></span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A heap másolás most már így oldható meg a copy konstruktorban:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>any_sbo<span class="op">(</span><span class="at">const</span> any_sbo<span class="op">&amp;</span> other<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>other<span class="op">.</span><span class="va">vtable_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>other<span class="op">.</span><span class="va">in_buffer_</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>            other<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>copy<span class="op">(</span><span class="va">buffer_</span><span class="op">,</span> other<span class="op">.</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>            <span class="va">ptr_</span> <span class="op">=</span> <span class="va">buffer_</span><span class="op">;</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>            <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>            <span class="va">ptr_</span> <span class="op">=</span> <span class="op">::</span><span class="kw">operator</span> <span class="kw">new</span><span class="op">(</span>other<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>size<span class="op">());</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">try</span> <span class="op">{</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>                other<span class="op">.</span><span class="va">vtable_</span><span class="op">-&gt;</span>copy<span class="op">(</span><span class="va">ptr_</span><span class="op">,</span> other<span class="op">.</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span> <span class="cf">catch</span> <span class="op">(...)</span> <span class="op">{</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>                <span class="op">::</span><span class="kw">operator</span> <span class="kw">delete</span><span class="op">(</span><span class="va">ptr_</span><span class="op">);</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>                <span class="cf">throw</span><span class="op">;</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>            <span class="va">in_buffer_</span> <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>        <span class="va">vtable_</span> <span class="op">=</span> other<span class="op">.</span><span class="va">vtable_</span><span class="op">;</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Figyeljük meg a kivételbiztos másolást: ha a <code>copy</code> dob, a
+lefoglalt memóriát felszabadítjuk, és a kivételt továbbengedjük.</p>
+<h3 data-number="11.3.9" id="önellenőrző-kérdés"><span
+class="header-section-number">11.3.9</span> Önellenőrző kérdés</h3>
+<p>Miért szükséges a vtable-be felvenni a tárolt objektum méretét, ha az
+erasure típus SBO-t használ? Gondolja végig, mi történne, ha a heap
+allokáció méretét nem ismernénk a copy konstruktorban.</p>
+<p>&lt;details&gt; &lt;summary&gt;Válasz&lt;/summary&gt; A heap
+allokációhoz a copy konstruktorban pontosan akkora memóriát kell
+lefoglalni, amekkora a tárolt objektum mérete. Ha a vtable nem
+tartalmazná a méretet, akkor nem tudnánk helyesen allokálni, és a copy
+művelet memóriahibát vagy helytelen viselkedést okozna. Az SBO puffer
+esetében a méretet a fordítási időben ismerjük (a puffer mérete fix), de
+a heap esetben futásidőben kell lekérdezni. Ezért a vtable-nek
+tartalmaznia kell egy <code>size()</code> függvényt.
+&lt;/details&gt;</p>
+<p>Ezzel a fejezet bemutatta a testreszabott type erasure alapelveit, a
+kézi vtable és manual dispatch technikáját, a kis buffer optimalizációt,
+valamint a copy/move és allokátor-kezelés fő kérdéseit. A következő
+alfejezet a statikus és dinamikus polimorfizmus közötti választást
+tárgyalja részletesen.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="cpp039.html">← 11.2 std::any, std::variant és std::function</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="cpp041.html">11.4 Statikus vs. dinamikus polimorfizmus →</a></div>
+</nav>
+</body>
+</html>

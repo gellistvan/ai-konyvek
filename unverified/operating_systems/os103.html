@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>27.2 Bootfolyamat és kernel inicializálás – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch26">27 Egyszerű OS tervezése</a></p>
+<div class="links"><a class="prev" rel="prev" href="os102.html">← 27.1 Követelmények, célok és architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os104.html">27.3 Memóriakezelés és ütemező tervezése →</a></div>
+</nav>
+<h2 data-number="27.2" id="os103"><span
+class="header-section-number">27.2</span> Bootfolyamat és kernel
+inicializálás</h2>
+<p>A bootfolyamat első pillanataiban a gép még nem operációs rendszert
+futtat, hanem egy többlépcsős, hardverközeli inicializálási láncot. Ez a
+szakasz határozza meg, hogy a kernel egyáltalán képes-e a CPU-t, a
+memóriát és az alapvető eszközöket olyan állapotba hozni, amelyben a
+későbbi absztrakciók – folyamatok, ütemező, fájlrendszer – egyáltalán
+értelmezhetők. A jelen fejezet ezt az utat járja végig a bootloadertől a
+kernel fő ciklusáig, és bevezeti a minimálisan szükséges hardverközeli
+elemeket: a boot interfészt, a memóriatérképet, a GDT/IDT párost, a
+korai konzolt és a <code>panic</code> mechanizmust.</p>
+<p>A fejezet célja nem egyetlen konkrét bootloader vagy architektúra
+teljes leírása. Ehelyett olyan ellenőrizhető mintát adunk, amely emulált
+környezetben reprodukálható, és amelynek minden lépése magyarázható. A
+kódok szemléltető jellegűek; az éles gépen való futtatás nem cél, és a
+labor kizárólag QEMU-ban vagy hasonló, eldobható virtuális gépben
+végezhető el.</p>
+<h3 data-number="27.2.1"
+id="a-boot-útja-firmware-bootloader-kernel"><span
+class="header-section-number">27.2.1</span> A boot útja: firmware,
+bootloader, kernel</h3>
+<p>A bootfolyamat általános értelemben három nagy szakaszra bontható,
+bár a határok architektúránként eltérnek:</p>
+<ol type="1">
+<li><strong>Firmware-szakasz:</strong> a hardver bekapcsolás után
+futtatja a platform firmware-ét. x86-on ez BIOS vagy UEFI, RISC-V
+platformokon gyakran egy M-mode-ban futó firmware (például OpenSBI),
+amely betölti a következő fázist. A firmware feladata az alapvető CPU-
+és memória-inicializálás, az eszközök felfedezése, valamint a bootolható
+eszköz kiválasztása.</li>
+<li><strong>Bootloader-szakasz:</strong> a bootloader (GRUB, U-Boot,
+Limine, vagy egy saját, minimális második fázis) betölti a kernel
+image-et a memóriába, átadja a szükséges hardverinformációkat, majd
+átadja a vezérlést a kernel belépési pontjára. A bootloader gyakran
+saját meghajtókkal rendelkezik, és képes fájlrendszerből, hálózatról
+vagy nyers blokkról olvasni.</li>
+<li><strong>Kernel-szakasz:</strong> a kernel belépési pontjától kezdve
+a rendszer saját maga inicializálja a hardvert, a memóriát és a
+szoftveres absztrakciókat, végül belép a fő ciklusba.</li>
+</ol>
+<p>Ezt a láncot a következő folyamat mutatja:</p>
+<pre class="text"><code>[firmware]
+    |
+    v
+[bootloader]  --&gt; kernel image betöltése, paraméterek átadása
+    |
+    v
+[kernel _start]  --&gt; stack, BSS, CPU-alapállapot
+    |
+    v
+[early console]  --&gt; soros port / framebuffer
+    |
+    v
+[panic infrastruktúra]
+    |
+    v
+[memóriatérkép feldolgozása]
+    |
+    v
+[IDT/GDT, időzítő, interrupt-vezérlő]
+    |
+    v
+[kernel fő ciklus / idle]</code></pre>
+<p>A sorrend tudatosan úgy van felépítve, hogy a lehető legkorábban
+legyen megfigyelhető kimenetünk. Amíg nincs konzol, a kernel néma; ha
+bármilyen hiba történik, nem tudjuk megkülönböztetni a sikeres futást a
+korai lefagyástól. Ezért a korai konzolt a lehető leghamarabb
+inicializáljuk, még a bonyolultabb memóriakezelés előtt.</p>
+<h3 data-number="27.2.2" id="kernel-image-és-belépési-állapot"><span
+class="header-section-number">27.2.2</span> Kernel image és belépési
+állapot</h3>
+<p>A bootloader egy kernel image-et tölt be, amely jellemzően ELF
+formátumú. Az ELF szakaszai közül a kernel inicializálása szempontjából
+négy fontos:</p>
+<ul>
+<li><code>.text</code>: végrehajtható kód.</li>
+<li><code>.rodata</code>: csak olvasható adatok, például konstans
+stringek.</li>
+<li><code>.data</code>: inicializált globális és statikus változók.</li>
+<li><code>.bss</code>: nullázatlan globális változók; ezek a memóriában
+helyet foglalnak, de a képfájlban nem tartalmaznak adatot, ezért a
+kernelnek futási időben nulláznia kell őket.</li>
+</ul>
+<p>A kernel belépési pontja általában egy assembly rutin, gyakran
+<code>_start</code> néven. A bootloader ezen a címen adja át a
+vezérlést, jellemzően úgy, hogy a CPU még olyan állapotban van, amit a
+boot-specifikáció meghatároz. x86-64 Multiboot2 esetén például a
+bootloader 32 bites vagy 64 bites védett módban adhatja át a vezérlést,
+letiltott megszakításokkal. RISC-V SBI esetén a kernel S-mode-ban indul,
+és a firmware SBI hívásokat biztosít.</p>
+<p>A belépési pontnak az első dolga a minimális futási környezet
+megteremtése:</p>
+<ol type="1">
+<li><strong>Stack beállítása:</strong> az assembly kód egy kisméretű,
+statikus boot stacket használ, például 16 KiB méretben. A stack pointer
+beállítása nélkül semmilyen C függvény nem hívható.</li>
+<li><strong>A CPU flags mentése és normalizálása:</strong> megszakítások
+letiltása, a direction flag törlése x86-on, valamint a bootloader által
+átadott regiszterek mentése.</li>
+<li><strong>BSS nullázása:</strong> a <code>.bss_start</code> és
+<code>.bss_end</code> közötti területet a kernel nullázza, hogy a C
+statikus változók a szabvány által elvárt kezdeti értéket kapják.</li>
+<li><strong>Átadott adatok mentése:</strong> a bootloader paramétereket,
+például a Multiboot2 info struktúra pointerét vagy a device tree címét,
+egy C változóba kell menteni, mielőtt a regisztereket felülírjuk.</li>
+</ol>
+<p>Egy minimális x86-64 belépési kód vázlata:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode asm"><code class="sourceCode fasm"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">section</span> <span class="op">.</span>boot<span class="op">.</span>text<span class="op">,</span> <span class="st">&quot;ax&quot;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    .global _start</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">_start:</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="bu">cli</span>                         <span class="op">#</span> megszakítások tiltása</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="bu">cld</span>                         <span class="op">#</span> <span class="dt">DF</span> <span class="op">=</span> <span class="dv">0</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="bu">movq</span> <span class="op">%</span><span class="kw">rbx</span><span class="op">,</span> boot_info_ptr    <span class="op">#</span> Multiboot2 info mentése</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    leaq boot_stack_top<span class="op">(%</span>rip<span class="op">),</span> <span class="op">%</span><span class="kw">rsp</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    # BSS nullázás</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    leaq __bss_start<span class="op">(%</span>rip<span class="op">),</span> <span class="op">%</span><span class="kw">rdi</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    leaq __bss_end<span class="op">(%</span>rip<span class="op">),</span> <span class="op">%</span><span class="kw">rcx</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    subq <span class="op">%</span><span class="kw">rdi</span><span class="op">,</span> <span class="op">%</span><span class="kw">rcx</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    shrq <span class="op">$</span><span class="bn">3</span><span class="op">,</span> <span class="op">%</span><span class="kw">rcx</span>               <span class="op">#</span> <span class="dv">8</span> <span class="dt">byte</span><span class="op">-</span>os lépések</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    xorl <span class="op">%</span><span class="kw">eax</span><span class="op">,</span> <span class="op">%</span><span class="kw">eax</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="bu">rep</span> <span class="bu">stosq</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">call</span> kmain</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="fu">.halt:</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="bu">hlt</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">jmp</span> <span class="op">.</span>halt</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">section</span> <span class="op">.</span>bss</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">align</span> <span class="dv">16</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="fu">boot_stack:</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    .skip <span class="dv">16384</span>                 <span class="op">#</span> <span class="dv">16</span> KiB boot stack</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a><span class="fu">boot_stack_top:</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    .<span class="bu">section</span> <span class="op">.</span>data</span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    .global boot_info_ptr</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a><span class="fu">boot_info_ptr:</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    .quad <span class="dv">0</span></span></code></pre></div>
+<p>A fenti kódban a <code>call kmain</code> előtt már van stack és
+nullázott BSS. A <code>kmain</code> C függvény ezután futhat. A
+<code>boot_info_ptr</code> egy globális változó, amelyet a bootloader
+által átadott paraméter tárol.</p>
+<h3 data-number="27.2.3"
+id="bootloader-interfész-és-memóriatérkép"><span
+class="header-section-number">27.2.3</span> Bootloader interfész és
+memóriatérkép</h3>
+<p>A bootloader nem csupán betölti a kernelt, hanem leírást is ad arról,
+hogy milyen hardver áll rendelkezésre. A kernel ezt az információt
+használja arra, hogy ne kelljen minden eszközt a nulláról
+felderítenie.</p>
+<p>A leggyakoribb átadott adatok:</p>
+<ul>
+<li><strong>Memóriatérkép:</strong> mely fizikai címtartományok
+használhatók RAM-ként, melyek fenntartottak, és hol vannak
+eszközregiszterek.</li>
+<li><strong>Kernel parancssor:</strong> indítási paraméterek, például
+<code>console=uart0</code> vagy <code>debug=1</code>.</li>
+<li><strong>Bootloader által lefoglalt területek:</strong> például a
+kernel image, a ramdisk, a device tree vagy az ACPI táblák.</li>
+<li><strong>Kijelző- és sorosport-információ:</strong> framebuffer cím,
+felbontás, UART portcím.</li>
+</ul>
+<p>Egy lehetséges memóriatérkép x86-64 QEMU környezetben a
+következőképpen nézhet ki:</p>
+<pre class="text"><code>Fizikai címtartomány        Méret        Típus
+0x00000000 – 0x0009FFFF    640 KiB      RAM (low memory)
+0x000A0000 – 0x000BFFFF    128 KiB      VGA memória / ROM
+0x000C0000 – 0x000FFFFF    256 KiB      BIOS ROM / fenntartott
+0x00100000 – 0x03FFFFFF    63 MiB       RAM (kernel és heap)
+0x04000000 – 0x043FFFFF    4 MiB        fenntartott (eszköz)
+0xFE000000 – 0xFFFFFFFF    32 MiB       APIC / fenntartott</code></pre>
+<p>A virtuális címtartomány ebben a korai szakaszban még általában
+megegyezik a fizikaival, vagy identitás-leképezést használunk. A későbbi
+fejezetben (<a href="os104.html">Memóriakezelés és ütemező
+tervezése</a>) térünk rá arra, hogy a kernel saját lapozási struktúrákat
+építsen. A laborban a fejezet végén csak az identitás-leképezésű
+szakaszt használjuk.</p>
+<p>A Multiboot2 például egy memóriatérkép-tömböt ad át, amelynek elemei
+egy-egy címtartományt írnak le:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> base<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> length<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> type<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> reserved<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> mb2_mmap_entry_t<span class="op">;</span></span></code></pre></div>
+<p>A kernel ezt bejárja, és egy belső, könnyebben kezelhető listát épít.
+A memóriatérkép feldolgozása nélkül a kernel nem tudja, mely területekre
+írhat, és melyeket kell érintetlenül hagynia. A tipikus hiba, hogy a
+kernel a BIOS ROM vagy az eszközregiszterek fölé ír, ami azonnali
+lefagyást vagy furcsa mellékhatást okoz.</p>
+<h3 data-number="27.2.4"
+id="gdt-és-idt-a-cpu-védelmi-és-megszakítási-alapjai"><span
+class="header-section-number">27.2.4</span> GDT és IDT: a CPU védelmi és
+megszakítási alapjai</h3>
+<p>A kernel inicializálásának következő lépése a CPU védelmi és
+kivételkezelési mechanizmusainak beállítása. A pontos regiszterek és
+struktúrák architektúránként eltérnek, de a szerep azonos: a kernel
+meghatározza, milyen jogosultsági szinteken futhat kód, és mi történik
+megszakítás vagy kivétel esetén.</p>
+<h3 data-number="27.2.5" id="gdt-global-descriptor-table-x86-on"><span
+class="header-section-number">27.2.5</span> GDT (Global Descriptor
+Table) x86-on</h3>
+<p>Az x86-os védett módban a memóriaszegmenseket szegmensleírók írják
+le. A GDT egy táblázat, amely legalább a kernel kód- és adatszegmensét
+tartalmazza. A szegmensleírók meghatározzák a báziscímet, a limitet, a
+jogosultsági szintet és a szegmens típusát. A kernel beállítja a GDT-t,
+majd a <code>lgdt</code> utasítással betölti annak címét és méretét.</p>
+<p>A modern 64 bites módban a szegmentálás erősen leegyszerűsödött: a
+bázis és limit a legtöbb szegmens esetében figyelmen kívül marad, de a
+GDT továbbra is kötelező a jogosultsági szintek és a kód/adat szegmens
+kiválasztásához. Egy tipikus minimális GDT:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> limit_low<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> base_low<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  base_mid<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  access<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  limit_high <span class="op">:</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  flags <span class="op">:</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  base_high<span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">))</span> gdt_entry_t<span class="op">;</span></span></code></pre></div>
+<p>A kernel kód szegmense <code>access</code> értéke például
+<code>0x9A</code> (present, code, ring 0), az adatszegmensé
+<code>0x92</code> (present, data, ring 0). A betöltés előtt a kernel
+feltölti a táblát, majd meghívja a <code>lgdt</code> utasítást.</p>
+<p>A GDT betöltése után a kernel frissíti a szegmensregisztereket, hogy
+az új szelektorokra mutassanak. A kód szegmens frissítése általában egy
+távoli ugrással történik, mert közvetlen <code>mov</code> a CS
+regiszterbe nem lehetséges.</p>
+<h3 data-number="27.2.6"
+id="idt-interrupt-descriptor-table-x86-on"><span
+class="header-section-number">27.2.6</span> IDT (Interrupt Descriptor
+Table) x86-on</h3>
+<p>Az IDT hasonló felépítésű táblázat, de bejegyzései megszakítás- és
+kivételkezelőkre mutatnak. Minden bejegyzés egy kapu, amely leírja, hogy
+egy adott vektor (0–255) melyik kezelő rutinra mutat, és milyen
+jogosultsági szinten futtatható.</p>
+<p>A kernel inicializáláskor legalább a kivételkezelőket beállítja. A 0.
+vektor a <code>#DE</code> (divide error), a 13. a <code>#GP</code>
+(general protection fault), a 14. a <code>#PF</code> (page fault), és
+így tovább. A bejegyzések típusa lehet interrupt gate vagy trap gate; az
+interrupt gate automatikusan letiltja a megszakításokat a kezelő futása
+alatt, ami a korai szakaszban egyszerűbb.</p>
+<p>A betöltés a <code>lidt</code> utasítással történik. Egy IDT
+bejegyzés x86-64-en 16 byte hosszú:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> offset_low<span class="op">;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> selector<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  ist <span class="op">:</span> <span class="dv">3</span><span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  reserved0 <span class="op">:</span> <span class="dv">5</span><span class="op">;</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  type <span class="op">:</span> <span class="dv">4</span><span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  zero <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  dpl <span class="op">:</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  p <span class="op">:</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> offset_mid<span class="op">;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> offset_high<span class="op">;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> reserved1<span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">))</span> idt_entry_t<span class="op">;</span></span></code></pre></div>
+<p>A kezelő rutinok kezdetben egyszerű, assemblyben írt stubok, amelyek
+elmentik a regisztereket, és meghívnak egy C függvényt. A cél itt nem a
+teljes kivételkezelés, hanem az, hogy bármilyen korai kivétel esetén
+legyen egy kontrollált leállítás, ne pedig a CPU álljon meg
+megmagyarázhatatlan módon.</p>
+<h3 data-number="27.2.7" id="risc-v-trap-tábla"><span
+class="header-section-number">27.2.7</span> RISC-V trap tábla</h3>
+<p>RISC-V rendszereken az x86 GDT/IDT pár helyett a trap tábla tölti be
+a kivételkezelés szerepét. A kernel a <code>stvec</code> CSR-be írja a
+trap tábla címét. A tábla bejegyzései a kivétel okától függően eltérő
+kezelőkre mutatnak. A jogosultsági szinteket itt a M/S/U módok adják; a
+GDT-hez hasonló szegmenstábla nem létezik. A fejezet további példái
+x86-64-et feltételeznek, de a fogalmak RISC-V-n is megfeleltethetők.</p>
+<h3 data-number="27.2.8" id="korai-konzol"><span
+class="header-section-number">27.2.8</span> Korai konzol</h3>
+<p>A korai konzol az első olyan eszköz, amely kifelé kommunikál. A
+célja, hogy a kernel naplóüzeneteket írjon ki, amint a belépési pont
+után lehetséges. A leggyakoribb választás emulált környezetben egy UART
+16550 soros port, mert kevés inicializálást igényel, és a QEMU a
+<code>-serial stdio</code> opcióval a terminálra irányítja a
+kimenetet.</p>
+<p>A 16550 UART az x86 platformon hagyományosan a <code>0x3F8</code>
+portcímen található (COM1). A minimális inicializálás a következő
+lépéseket foglalja magában:</p>
+<ol type="1">
+<li>Az interrupt engedélyező regisztert nullázni kell, hogy a soros port
+ne generáljon interruptot.</li>
+<li>A baudráta-osztó beállítása, például 38400 baud.</li>
+<li>A vonalvezérlő regiszter beállítása: 8 bit, nincs paritás, 1
+stopbit.</li>
+<li>A modemvezérlő regiszter beállítása: DTR és RTS engedélyezése.</li>
+</ol>
+<p>Egy egyszerű C függvény az UART írásra:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define COM1 </span><span class="bn">0x3F8</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> uart_putc<span class="op">(</span><span class="dt">char</span> c<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">((</span>inb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">5</span><span class="op">)</span> <span class="op">&amp;</span> <span class="bn">0x20</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">;</span> <span class="co">/* várj, amíg a THR üres */</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1<span class="op">,</span> c<span class="op">);</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> uart_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">1</span><span class="op">,</span> <span class="bn">0x00</span><span class="op">);</span>   <span class="co">/* interrupt tiltás */</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">3</span><span class="op">,</span> <span class="bn">0x80</span><span class="op">);</span>   <span class="co">/* DLAB = 1 */</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">0</span><span class="op">,</span> <span class="bn">0x03</span><span class="op">);</span>   <span class="co">/* osztó alsó byte (38400) */</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">1</span><span class="op">,</span> <span class="bn">0x00</span><span class="op">);</span>   <span class="co">/* osztó felső byte */</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">3</span><span class="op">,</span> <span class="bn">0x03</span><span class="op">);</span>   <span class="co">/* 8N1, DLAB = 0 */</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    outb<span class="op">(</span>COM1 <span class="op">+</span> <span class="dv">4</span><span class="op">,</span> <span class="bn">0x0B</span><span class="op">);</span>   <span class="co">/* OUT2, RTS, DTR */</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>inb</code> és <code>outb</code> függvényeket assemblyben vagy
+beágyazott assemblyben kell megvalósítani. A kernel ezután egy minimális
+<code>printk</code>-szerű függvényt építhet, amely a formázott stringet
+karakterenként küldi az UART-ra. A korai szakaszban nincs szükség teljes
+<code>printf</code> implementációra; elegendő a stringek kiírása,
+valamint hex és decimális számok formázása a diagnosztikához.</p>
+<p>A korai konzol másik előnye, hogy a bootfolyamat minden fontos
+lépését naplózni lehet. A napló a későbbi hibakeresés alapja, ezért a
+kimenetet a laborban mindig rögzíteni kell.</p>
+<h3 data-number="27.2.9" id="panic-a-korai-szakaszban"><span
+class="header-section-number">27.2.9</span> Panic a korai
+szakaszban</h3>
+<p>A <code>panic</code> a kernel kontrollált leállási mechanizmusa.
+Akkor hívjuk, ha a rendszer olyan állapotba kerül, amelyből nem lehet
+vagy nem érdemes tovább futni. A korai bootban a <code>panic</code> még
+egyszerűbb: csak kiír egy üzenetet, és megállítja a CPU-t.</p>
+<p>Egy minimális <code>panic</code> implementációja:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>__attribute__<span class="op">((</span>noreturn<span class="op">))</span> <span class="dt">void</span> panic<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>msg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;PANIC: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> msg<span class="op">);</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;Halting CPU.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    disable_interrupts<span class="op">();</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        hlt<span class="op">();</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A későbbi fejezetekben a <code>panic</code> kiegészül
+regiszter-dumppal, stack trace-szel és a napló átmeneti pufferének
+kiírásával. A bootfolyamat során azonban már az is hatalmas segítség, ha
+a kernel megbízhatóan kiírja a hibaüzenetet, mielőtt leállna.</p>
+<p>A <code>panic</code> használatának tipikus esetei a korai
+szakaszban:</p>
+<ul>
+<li>A bootloader által átadott memóriatérkép üres vagy érvénytelen.</li>
+<li>A GDT vagy IDT betöltése előtt a CPU kivételt váltott ki.</li>
+<li>A kernel image linkelési címe és a tényleges betöltési cím nem
+egyezik.</li>
+<li>A konzol inicializálása sikertelen.</li>
+<li>A memóriatérképben nincs elegendő szabad RAM.</li>
+</ul>
+<p>A <code>panic</code> üzenet legyen tömör, de egyértelmű. A korai
+szakaszban a napló lehet a soros konzolra írt szöveg, amelyet a labor
+során rögzítünk. A <code>hlt</code> utasítás addig állítja le a CPU-t,
+amíg egy megszakítás fel nem ébreszti, ezért előtte a megszakításokat le
+kell tiltani.</p>
+<h3 data-number="27.2.10" id="a-kernel-fő-ciklusa"><span
+class="header-section-number">27.2.10</span> A kernel fő ciklusa</h3>
+<p>Miután a kernel elvégezte az alapvető inicializálást, belép egy
+várakozó ciklusba, amelyet <code>idle loop</code>-nak is nevezünk. Ebben
+a szakaszban még nincs ütemező, nincsenek folyamatok, ezért a kernel
+tétlenül várakozik megszakításokra.</p>
+<p>Egy egyszerű fő ciklus:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> kernel_main_loop<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    printk<span class="op">(</span><span class="st">&quot;Kernel elindult. Várakozás megszakításokra.</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(;;)</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>        enable_interrupts<span class="op">();</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>        hlt<span class="op">();</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>        disable_interrupts<span class="op">();</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>hlt</code> utasítás a CPU-t alacsony fogyasztású várakozó
+állapotba helyezi. Amikor egy megszakítás érkezik, a CPU felébred, a
+megszakításkezelő lefut, majd a vezérlés visszatér a <code>hlt</code>
+utáni utasításra. A ciklus itt egyszerűen újra várakozik.</p>
+<p>Ez a ciklus a későbbiekben az ütemező üresjárati feladata lesz. A <a
+href="os104.html">Memóriakezelés és ütemező tervezése</a> fejezetben a
+memóriakezelő és az ütemező inicializálása után a <code>hlt</code>
+ciklus helyére egy olyan ütemező lép, amely a futásra kész folyamatok
+közül választ. A most bevezetett fő ciklus tehát nem a végleges állapot,
+hanem egy olyan köztes lépés, amely lehetővé teszi a megszakítások
+tesztelését.</p>
+<h3 data-number="27.2.11"
+id="inicializálási-sorrend-összeállítása"><span
+class="header-section-number">27.2.11</span> Inicializálási sorrend
+összeállítása</h3>
+<p>A fenti elemeket egyetlen, jól definiált sorrendbe kell rendezni. A
+javasolt sorrend a következő:</p>
+<ol type="1">
+<li><code>_start</code> assembly belépési pont: stack, BSS nullázás,
+bootloader paraméter mentése.</li>
+<li>Korai konzol inicializálása.</li>
+<li>Kezdeti üzenet kiírása (a kernel verziója vagy neve).</li>
+<li><code>panic</code> infrastruktúra elérhetővé tétele.</li>
+<li>GDT beállítása és betöltése.</li>
+<li>IDT beállítása és betöltése.</li>
+<li>Bootloader memóriatérkép feldolgozása.</li>
+<li>A rendelkezésre álló RAM összesítése és naplózása.</li>
+<li>Időzítő és interrupt-vezérlő minimális beállítása.</li>
+<li>Belépés a fő ciklusba.</li>
+</ol>
+<p>A sorrend fontos tulajdonsága, hogy a konzol már a 2. lépésben
+rendelkezésre áll, így minden későbbi hiba diagnosztizálható. A GDT/IDT
+beállítása a memóriatérkép feldolgozása előtt történik, mert a
+memóriatérkép bejárása közben fellépő kivételeknek már legyen kezelője.
+A memóriatérkép feldolgozása azért fontos, mert a kernel csak ezután
+tudja, hogy hol vannak a szabad és fenntartott területek.</p>
+<p>A sorrend nem abszolút törvény; bizonyos architektúrákon a sorrend
+eltérhet. Például RISC-V-en a trap tábla beállítása megelőzheti a konzol
+inicializálását, ha a firmware már biztosít kimenetet. Az azonban
+általános elv, hogy a konzolt minél hamarabb el kell érni, és a
+<code>panic</code> mechanizmusnak már az elején készen kell lennie.</p>
+<h3 data-number="27.2.12" id="gyakori-hibák-és-ellenőrzések"><span
+class="header-section-number">27.2.12</span> Gyakori hibák és
+ellenőrzések</h3>
+<p>A bootfolyamat során a hibák gyakran azonnali leálláshoz vagy néma
+lefagyáshoz vezetnek. A következő lista a leggyakoribb hibákat és a
+hozzájuk tartozó ellenőrzési pontokat foglalja össze.</p>
+<ol type="1">
+<li><strong>A stack nincs beállítva.</strong> Ha a C kód a stack pointer
+inicializálása előtt fut, a függvényhívások egy véletlen címre írnak.
+Megoldás: a belépési pont első utasításai között be kell állítani a
+stacket.</li>
+<li><strong>A BSS nincs nullázva.</strong> A C szabvány szerint a
+globális változók kezdeti értéke nulla. Ha a BSS-t nem nullázzuk, a
+változók szemét értéket kapnak. Megoldás: a belépési kód nullázza a
+<code>.bss_start</code> és <code>.bss_end</code> közötti területet.</li>
+<li><strong>A GDT/IDT betöltése hibás.</strong> Ha a GDT bejegyzése
+rossz, a szegmens betöltésekor a CPU <code>#GP</code> kivételt vált ki.
+Ha az IDT nincs beállítva, az első kivétel háromszoros hibát okoz, és a
+CPU újraindul. Megoldás: a GDT és IDT struktúrákat byte-pontosan
+ellenőrizni, és a betöltés előtt egy <code>lidt</code>-tel és
+<code>lgdt</code>-vel tesztelni.</li>
+<li><strong>A memóriatérkép érvénytelen.</strong> Ha a kernel nem
+ellenőrzi a memóriatérkép-tömb hosszát vagy a típusokat, a nem szabad
+területekre is írhat. Megoldás: minden bejegyzést validálni, és a
+<code>panic</code> hívni, ha a térkép üres vagy sérült.</li>
+<li><strong>A konzol inizializálása késik.</strong> Ha a kernel a konzol
+beállítása előtt hibába ütközik, nincs diagnosztikai kimenet. Megoldás:
+a konzolt a boot-szekvencia legelső lépései közé tenni.</li>
+<li><strong>A megszakítások túl korán engedélyezve lesznek.</strong> Ha
+a megszakításokat az IDT és az interrupt-vezérlő inicializálása előtt
+engedélyezzük, egy váratlan interrupt kontrollálhatatlan állapotba
+viheti a rendszert. Megoldás: a megszakításokat csak az IDT, az
+interrupt-vezérlő és az időzítő beállítása után engedélyezni.</li>
+<li><strong>A bootloader által átadott regiszterek
+felülíródnak.</strong> A <code>kmain</code> hívása előtt a bootloader
+által átadott pointereket el kell menteni. Ha elvesznek, a kernel nem
+fér hozzá a memóriatérképhez. Megoldás: a belépési kódban a
+paramétereket globális változókba menteni.</li>
+</ol>
+<h3 data-number="27.2.13"
+id="labor-boot--és-inicializálási-sorrend-tervezése"><span
+class="header-section-number">27.2.13</span> Labor: boot- és
+inicializálási sorrend tervezése</h3>
+<p>A labor célja, hogy a fenti fogalmakat egy emulált környezetben,
+QEMU-ban kipróbáljuk. A labor nem igényel valós hardvert, és az éles gép
+bootloaderét, lemezét nem módosítjuk.</p>
+<h3 data-number="27.2.14" id="kiinduló-állapot-és-konfiguráció"><span
+class="header-section-number">27.2.14</span> Kiinduló állapot és
+konfiguráció</h3>
+<p>A reprodukciós csomag a következőket tartalmazza:</p>
+<ul>
+<li>Fordítás: <code>gcc</code> freestanding módban, <code>ld</code>
+linker scripttel.</li>
+<li>Architektúra: x86-64.</li>
+<li>Emulátor: QEMU 8.2, <code>qemu-system-x86_64</code>.</li>
+<li>Konfiguráció: 64 MiB RAM, <code>-serial stdio</code>,
+<code>-no-reboot</code>, <code>-no-shutdown</code>.</li>
+<li>Bootloader: GRUB Multiboot2 vagy egy minimális saját második fázis;
+a laborban a kernel image-et a QEMU <code>-kernel</code> opciója
+közvetlenül betöltheti, ha a kép Multiboot2 fejléccel rendelkezik.</li>
+</ul>
+<p>A link script meghatározza a kernel belépési címét:</p>
+<pre class="ld"><code>OUTPUT_FORMAT(elf64-x86-64)
+ENTRY(_start)
+
+SECTIONS {
+    . = 0x00100000;          /* 1 MiB fizikai cím */
+    .boot.text : { *(.boot.text*) }
+    .text : { *(.text*) }
+    .rodata : { *(.rodata*) }
+    .data : { *(.data*) }
+    .bss : {
+        __bss_start = .;
+        *(.bss*)
+        __bss_end = .;
+    }
+}</code></pre>
+<p>A kernel image 1 MiB-re kerül, a hagyományos x86-os alsó 1 MiB
+fölé.</p>
+<h3 data-number="27.2.15" id="build-és-futtatás"><span
+class="header-section-number">27.2.15</span> Build és futtatás</h3>
+<p>A build parancs:</p>
+<pre class="text"><code>x86_64-elf-gcc -ffreestanding -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+    -c kernel.c -o kernel.o
+x86_64-elf-as --64 boot.s -o boot.o
+x86_64-elf-ld -T linker.ld -o kernel.elf boot.o kernel.o</code></pre>
+<p>A futtatási parancs:</p>
+<pre class="text"><code>qemu-system-x86_64 -m 64M -serial stdio -kernel kernel.elf \
+    -no-reboot -no-shutdown</code></pre>
+<h3 data-number="27.2.16" id="elvárt-eredmény"><span
+class="header-section-number">27.2.16</span> Elvárt eredmény</h3>
+<p>A labor elvárt kimenete a következő sorokat tartalmazza:</p>
+<pre class="text"><code>[BOOT] Kernel betöltődött, belépési pont elérve.
+[BOOT] BSS nullázva, stack inicializálva.
+[BOOT] Korai konzol inicializálva (com1, 38400 8N1).
+[BOOT] GDT betöltve.
+[BOOT] IDT betöltve.
+[BOOT] Memóriatérkép: 64 MiB RAM található.
+[BOOT] Belépés a fő ciklusba.</code></pre>
+<p>A labor során a mért kimenetet a fenti elvárt kimenettel össze kell
+hasonlítani. A naplóban a mért és várt értékeket külön oszlopban kell
+rögzíteni.</p>
+<h3 data-number="27.2.17" id="mérési-napló"><span
+class="header-section-number">27.2.17</span> Mérési napló</h3>
+<p>A mérési napló a következő adatokat tartalmazza:</p>
+<ul>
+<li>A futás dátuma és a QEMU verziója.</li>
+<li>A CPU típusa (például <code>-cpu qemu64</code>).</li>
+<li>A memória mérete.</li>
+<li>A kernel image mérete bájtban.</li>
+<li>A betöltési cím (0x00100000).</li>
+<li>A konzol kimenet teljes szövege.</li>
+<li>A megfigyelt indulási idő a QEMU indításától az első konzol
+karakterig, ha a hoszt képes mérni.</li>
+<li>A <code>panic</code> teszt eredménye (lásd alább).</li>
+</ul>
+<p>A boot idő méréséhez a hoszt <code>time</code> parancsát vagy a QEMU
+beépített időzítőjét használhatjuk. Fontos megkülönböztetni a mért
+fal-időt a kernel által érzékelt belső időtől. A laborban a fal-idő
+elegendő, de a mérési módszert pontosan rögzíteni kell.</p>
+<h3 data-number="27.2.18" id="panic-teszt"><span
+class="header-section-number">27.2.18</span> Panic teszt</h3>
+<p>A labor részeként szándékosan hívjunk <code>panic</code>-et egy hibás
+ágon, például üres memóriatérkép esetén. Ehhez a kernel kódjában egy
+<code>if (mmap_entries == 0) panic("empty memory map");</code> hívást
+helyezünk el. Az elvárt kimenet:</p>
+<pre class="text"><code>PANIC: empty memory map
+Halting CPU.</code></pre>
+<p>A mért kimenetet rögzítsük, és hasonlítsuk össze a várt kimenettel. A
+teszt után a kernel leáll, ezért a QEMU-t a <code>Ctrl-A X</code>
+kombinációval lehet kilépni.</p>
+<h3 data-number="27.2.19" id="visszaállítás"><span
+class="header-section-number">27.2.19</span> Visszaállítás</h3>
+<p>A labor elvégzése után a munkakönyvtárat vissza kell állítani a
+kiinduló állapotba. Mivel a labor csak az emulátorban fut, nincs szükség
+hoszt-lemez-helyreállításra. A reprodukciós csomagot tömörítve el kell
+menteni, hogy a jövőben ugyanaz a build pontosan megismételhető
+legyen.</p>
+<h3 data-number="27.2.20" id="összefoglalás"><span
+class="header-section-number">27.2.20</span> Összefoglalás</h3>
+<p>A bootfolyamat és a kernel inicializálás célja, hogy a hardvert és a
+szoftvert egy olyan ismert állapotba hozza, amelyre a későbbi
+absztrakciók építhetnek. A fejezet bemutatta a bootloader és a kernel
+közötti interfészt, a memóriatérkép szerepét, a GDT/IDT párost, a korai
+konzolt és a <code>panic</code> mechanizmust. A laborban mindez egy
+QEMU-ban futtatott minimális kernelben ellenőrizhető.</p>
+<p>A következő fejezet (<a href="os104.html">Memóriakezelés és ütemező
+tervezése</a>) erre az alapra épít, amikor a memóriakezelést és az
+ütemező tervezését tárgyalja. Az itt bevezetett konzol,
+<code>panic</code> és fő ciklus azok az építőelemek, amelyekre a
+lapozás, a heapallokáció és a folyamatkezelés ráépül.</p>
+<h3 data-number="27.2.21" id="önellenőrző-kérdések"><span
+class="header-section-number">27.2.21</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért kell a korai konzolt a bootfolyamat legelején
+inicializálni?</li>
+<li>Mi a különbség a <code>.data</code> és a <code>.bss</code> szakasz
+között, és miért kell a BSS-t nullázni?</li>
+<li>Mi a szerepe a GDT-nek és az IDT-nek x86-on? Mi történik, ha az IDT
+nincs betöltve, és a CPU kivételt vált ki?</li>
+<li>Soroljon fel három tipikus boothibát, és adja meg mindegyikhez a
+helyes megoldást.</li>
+<li>Mi a <code>panic</code> feladata, és miért fontos, hogy már a korai
+szakaszban elérhető legyen?</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os102.html">← 27.1 Követelmények, célok és architektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os104.html">27.3 Memóriakezelés és ütemező tervezése →</a></div>
+</nav>
+</body>
+</html>

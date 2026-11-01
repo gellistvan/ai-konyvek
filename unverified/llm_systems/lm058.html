@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>16.2 Lekérdezés-átírás, multi-hop és reranking – LLM-ek és
+domain-specifikus kis modellek programozóknak</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Alkalmazásépítés</a> › <a href="index.html#lmch15">16 RAG rendszerek</a></p>
+<div class="links"><a class="prev" rel="prev" href="lm057.html">← 16.1 RAG alaparchitektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm059.html">16.3 Forráshűség, citation és hallucination →</a></div>
+</nav>
+<h2 data-number="16.2" id="lm058"><span
+class="header-section-number">16.2</span> Lekérdezés-átírás, multi-hop
+és reranking</h2>
+<p>A RAG-alapú rendszerekben a beágyazás alapú visszakeresés gyakran az
+első számú szűk keresztmetszet, ha nem triviális feladatot adunk a
+modellnek. Egy egyszerű kérdésre, mint például „Mi a cégünk
+MSSQL-szabályzata a mentésekről?”, a vektoros hasonlóság rendszerint
+azonnal megtalálja a megfelelő bekezdést. Amint azonban a kérdés
+bonyolultabbá válik, a vektor-térbeli távolság és a felhasználó valódi
+szándéka közötti szakadék megnő. Ebben az alfejezetben azt vizsgáljuk
+meg, hogyan tudjuk a lekérdezési oldalt és a visszakeresett jelöltek
+rangsorolását úgy módosítani, hogy a rendszer akkor is megbízhatóan
+működjön, ha a bemenet összetett.</p>
+<h3 data-number="16.2.1" id="a-bonyolult-lekérdezések-anatómiája"><span
+class="header-section-number">16.2.1</span> A bonyolult lekérdezések
+anatómiája</h3>
+<p>Mielőtt a technikákat bevezetnénk, érdemes definiálni, mit értünk
+„bonyolult” lekérdezés alatt a RAG szempontjából. A gyakorlatban három
+fő csapdával találkozunk:</p>
+<ol type="1">
+<li><strong>Szemantikai szakadék (semantic gap):</strong> A felhasználó
+nem ugyanazt a szókincset használja, mint a tudásbázis dokumentumai. Egy
+laikus úgy kérdez: „Mit tegyek, ha kidob a program egy 0xC0000005
+hibát?” A dokumentáció viszont így fogalmaz: „A folyamat hozzáférési
+sértése (access violation) miatt meghiúsult…” A kulcsszó- vagy beágyazás
+alapú keresés elvérezhet a laikus kifejezés és a szakmai nyelvezet
+közötti réstől.</li>
+<li><strong>Többlépcsős (multi-hop) kérdések:</strong> A válaszhoz több,
+egymástól független szövegrészből vagy dokumentumból kell következtetni.
+Például: „Ki volt annak a projektnek a vezetője, amelyik a legnagyobb
+költségtúllépést produkálta tavaly?” Az első lépés azonosítani a
+projektet (pénzügyi riport), a második lépés kikeresni a projekt
+vezetőjét (HR-nyilvántartás vagy projektdokumentáció). Egyetlen vektoros
+lekérdezés gyakran csak az első lépésre tud koncentrálni.</li>
+<li><strong>Rövid, kétértelmű kifejezések:</strong> Az „Apple” vagy a
+„Jaguar” típusú entitások kontextus nélkül több dokumentumhalmazba is
+tartozhatnak. A kontextus hiánya miatt a hasonlósági rangsor zajossá
+válik.</li>
+</ol>
+<p>A közös nevező az, hogy a nyers felhasználói utasítás
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>q</mi><mrow><mi>r</mi><mi>a</mi><mi>w</mi></mrow></msub><annotation encoding="application/x-tex">q_{raw}</annotation></semantics></math>)
+rosszul kondicionált a visszakereső rendszer számára. Ahelyett, hogy
+elfogadnánk ezt, aktívan át kell alakítanunk a lekérdezést
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>q</mi><mo>→</mo><mi>q</mi><mi>′</mi></mrow><annotation encoding="application/x-tex">q \rightarrow q&#39;</annotation></semantics></math>)
+vagy a keresési teret.</p>
+<h3 data-number="16.2.2" id="lekérdezés-átírás-és-kiterjesztés"><span
+class="header-section-number">16.2.2</span> Lekérdezés-átírás és
+kiterjesztés</h3>
+<p>Az első beavatkozási terület a retriever elé kerülő szűk
+keresztmetszet oldása. Ahelyett, hogy a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>q</mi><mrow><mi>r</mi><mi>a</mi><mi>w</mi></mrow></msub><annotation encoding="application/x-tex">q_{raw}</annotation></semantics></math>
+szöveget öntenénk be változtatás nélkül, a nyelvi modellt használjuk a
+szándék tisztázására és több párhuzamos keresési útvonal generálására.
+Ez a megközelítés olcsó, mert nem igényli az adatbázis újraindexelését,
+csak a futásidőben generált lekérdezéseket módosítja.</p>
+<h4 data-number="16.2.2.1"
+id="multi-query-a-párhuzamos-perspektívák"><span
+class="header-section-number">16.2.2.1</span> Multi-query: a párhuzamos
+perspektívák</h4>
+<p>A legkézenfekvőbb trükk a <strong>multi-query</strong> (több
+lekérdezés) generálása. Az alapötlet szerint ahelyett, hogy egyetlen
+vektorral keresnénk, megkérünk egy LLM-et, hogy írjon át egy az egyben
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+darab különböző, de szándékában azonos lekérdezést. Ezzel lefedjük a
+lehetséges szinonimákat és a dokumentumok eltérő
+megfogalmazásmódjait.</p>
+<p><strong>Prompt minta:</strong> &gt; „Írj 3 különböző keresőkérdést,
+amelyek ugyanarra a felhasználói szándékra kérdeznek rá, de más
+szavakkal és perspektívából fogalmaznak. A felhasználó kérdése:
+{query}.”</p>
+<p>A kapott
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo stretchy="false" form="prefix">{</mo><msub><mi>q</mi><mn>1</mn></msub><mo>,</mo><msub><mi>q</mi><mn>2</mn></msub><mo>,</mo><msub><mi>q</mi><mn>3</mn></msub><mo stretchy="false" form="postfix">}</mo></mrow><annotation encoding="application/x-tex">\{q_1, q_2, q_3\}</annotation></semantics></math>
+halmaz minden elemét beágyazzuk, és külön-külön lefuttatjuk a
+hasonlósági keresést. A kapott listákat ezután össze kell fésülnünk. Az
+egyik legelterjedtebb módszer a <strong>Reciprocal Rank Fusion
+(RRF)</strong>:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mi>R</mi><mi>F</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><munder><mo>∑</mo><mrow><msub><mi>q</mi><mi>i</mi></msub><mo>∈</mo><mi>Q</mi></mrow></munder><mfrac><mn>1</mn><mrow><mn>60</mn><mo>+</mo><mi>r</mi><mi>a</mi><mi>n</mi><msub><mi>k</mi><msub><mi>q</mi><mi>i</mi></msub></msub><mrow><mo stretchy="true" form="prefix">(</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow></mfrac></mrow><annotation encoding="application/x-tex">RRF(d) = \sum_{q_i \in Q} \frac{1}{60 + rank_{q_i}(d)}</annotation></semantics></math></p>
+<p>Itt a 60 egy tapasztalati konstans (enyhén elnyomja a lista végi
+elemeket), a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mi>a</mi><mi>n</mi><msub><mi>k</mi><msub><mi>q</mi><mi>i</mi></msub></msub><mrow><mo stretchy="true" form="prefix">(</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">rank_{q_i}(d)</annotation></semantics></math>
+pedig a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>d</mi><annotation encoding="application/x-tex">d</annotation></semantics></math>
+dokumentum pozíciója az
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>i</mi><annotation encoding="application/x-tex">i</annotation></semantics></math>-edik
+lekérdezésre adott találati listában. A multi-query ereje abban rejlik,
+hogy ha az egyik átírt kérdés megtalálja a szakmai kifejezést (pl.
+„access violation”), akkor az RRF ezt a dokumentumot az összevont lista
+elejére hozza, annak ellenére, hogy a másik két lekérdezésre nem
+szerepelt jól.</p>
+<h4 data-number="16.2.2.2"
+id="hyde-a-hipotetikus-dokumentumok-ereje"><span
+class="header-section-number">16.2.2.2</span> HyDE: a hipotetikus
+dokumentumok ereje</h4>
+<p>A másik nagy hatású technika a <strong>HyDE (Hypothetical Document
+Embeddings)</strong>. Ennek alapja egy pszichológiai-pragmatikai
+felismerés: egy kérdés beágyazása nagyon különbözik egy válasz
+beágyazásától. A vektoros adatbázisunk tele van <em>válaszokat</em>
+tartalmazó dokumentumokkal. Ha tehát egy rövid, kérdő formájú vektorral
+keresünk, a koszinusz-távolság nagyobb lesz, mintha egy kijelentő,
+kifejtő szöveg vektorával próbálkoznánk.</p>
+<p>Itt lép be a HyDE. A módszer a következő: 1. Kérjük meg az LLM-et,
+hogy generáljon egy <strong>hipotetikus dokumentumot</strong> (egy
+rövid, lényegi választ), amely megválaszolja a kérdést. Nem baj, ha az
+LLM hallucinál, mert nem ezt a szöveget adjuk vissza a felhasználónak,
+hanem csak a kereséshez használjuk. 2. Ezt a generált szöveget
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>d</mi><mrow><mi>h</mi><mi>y</mi><mi>p</mi></mrow></msub><annotation encoding="application/x-tex">d_{hyp}</annotation></semantics></math>)
+ágyazzuk be. 3. Ezzel a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>d</mi><mrow><mi>h</mi><mi>y</mi><mi>p</mi></mrow></msub><annotation encoding="application/x-tex">d_{hyp}</annotation></semantics></math>
+vektorral keresünk a tudásbázisban.</p>
+<p>Miért működik ez? Az LLM által generált hipotetikus válasz
+stilisztikailag és szókincsében közelebb áll a valós, indexelt
+dokumentumokhoz, mint a tömör kérdés. Ha például a kérdés az, hogy
+„Miért melegszik túl a szerver?”, a HyDE ezt generálja: „A szerver
+túlmelegedésének leggyakoribb okai a nem megfelelő légáramlás, a
+hűtőventilátor meghibásodása vagy a processzorra felvitt hőpaszt
+elöregedése.” Ez a szöveg látványosan közelebb van a
+szerverterem-karbantartási kézikönyv nyelvéhez.</p>
+<p>A megvalósítás rendkívül egyszerű, mivel a meglévő vektoros
+adatbázishoz nem kell hozzányúlni:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Feltételezve: embedding_model, db_index (pl. FAISS), llm (pl. HF pipeline)</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sentence_transformers <span class="im">import</span> SentenceTransformer</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>embedding_model <span class="op">=</span> SentenceTransformer(<span class="st">&quot;BAAI/bge-small-hu-v1.5&quot;</span>) <span class="co"># Verzióellenőrzés szükséges</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> hyde_search(query: <span class="bu">str</span>, k: <span class="bu">int</span> <span class="op">=</span> <span class="dv">5</span>):</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 1. Létrehozzuk a hipotetikus dokumentumot (LLM hívás)</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    prompt <span class="op">=</span> <span class="ss">f&quot;Írj egy rövid szakmai összefoglalót, amely tömören megválaszolja ezt a kérdést: </span><span class="sc">{</span>query<span class="sc">}</span><span class="ss">&quot;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    hyp_doc <span class="op">=</span> llm(prompt) <span class="co"># pl. &quot;A szerver túlmelegedésének okai...&quot; </span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 2. Beágyazzuk a hipotetikus dokumentumot, NEM a kérdést</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Shape: (1, hidden_dim), pl. (1, 768)</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    hyp_emb <span class="op">=</span> embedding_model.encode(hyp_doc, normalize_embeddings<span class="op">=</span><span class="va">True</span>)</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="co"># 3. Hasonlósági keresés</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="co"># Shape: (k,), a top-k dokumentum indexei</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    scores, indices <span class="op">=</span> db_index.search(np.array(hyp_emb), k) </span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> indices</span></code></pre></div>
+<p>A HyDE hátránya, hogy ha a hipotetikus válasz erősen hallucinál és
+fiktív entitásokat tartalmaz, a vektor elviheti a keresést egy rossz
+irányba. Emiatt a gyakorlatban érdemes a HyDE és az eredeti lekérdezés
+eredményét összefésülni (pl. RRF segítségével).</p>
+<h4 data-number="16.2.2.3"
+id="step-back-prompting-az-absztrakció-szintjének-emelése"><span
+class="header-section-number">16.2.2.3</span> Step-back prompting: az
+absztrakció szintjének emelése</h4>
+<p>Bizonyos esetekben a kérdés túl specifikus ahhoz, hogy a
+tudásbázisban közvetlen találatot adjon. Ilyenkor érdemes a „lépj
+hátrébb” (step-back) módszert használni, amelyet eredetileg a fizika és
+kémia területén mutattak be. A kérdést először egy magasabb absztrakciós
+szintre emeljük, erre futtatjuk a keresést, és az így kapott
+kontextusból dedukáljuk a konkrét választ.</p>
+<p><strong>Példa:</strong> - <em>Eredeti kérdés:</em> „Miért használ a
+2023-as jelentésünk 128 bites AES-t a 256 bites SSL helyett?” -
+<em>Step-back kérdés:</em> „Mik a 128 és 256 bites titkosítás közötti
+különbségek és kompromisszumok?”</p>
+<p>A step-back lekérdezés segít a retrievernek megtalálni a
+kriptográfiai hatékonyságot tárgyaló fejezeteket, ahelyett, hogy a
+konkrét 2023-as jelentésre fókuszálva elakadna valamelyik iratkezelési
+metainformációban.</p>
+<h3 data-number="16.2.3"
+id="reranking-a-pontosság-visszaállítása-cross-encoderekkel"><span
+class="header-section-number">16.2.3</span> Reranking: a pontosság
+visszaállítása cross-encoderekkel</h3>
+<p>Miután a retriever visszaadott egy viszonylag nagy jelölthalmazt
+(például top-50 vagy top-100), a második kritikus beavatkozási pont a
+<strong>reranking</strong>. A klasszikus vektoros keresés ún.
+<strong>bi-encoder</strong> architektúrával történik: a dokumentumot és
+a lekérdezést egymástól függetlenül ágyazzuk be, és a hasonlóságot egy
+vektoros művelettel (pl. koszinusz) számoljuk.</p>
+<p>Ennek matematikai háttere: Legyen
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>E</mi><mi>q</mi></msub><mo>∈</mo><msup><mi>ℝ</mi><mrow><mn>1</mn><mo>×</mo><mi>d</mi></mrow></msup></mrow><annotation encoding="application/x-tex">E_q \in \mathbb{R}^{1 \times d}</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>E</mi><mi>D</mi></msub><mo>∈</mo><msup><mi>ℝ</mi><mrow><mi>N</mi><mo>×</mo><mi>d</mi></mrow></msup></mrow><annotation encoding="application/x-tex">E_D \in \mathbb{R}^{N \times d}</annotation></semantics></math>.
+A pontozás
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>S</mi><mo>=</mo><msub><mi>E</mi><mi>D</mi></msub><mo>⋅</mo><msubsup><mi>E</mi><mi>q</mi><mi>T</mi></msubsup></mrow><annotation encoding="application/x-tex">S = E_D \cdot E_q^T</annotation></semantics></math>,
+ami
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msup><mi>ℝ</mi><mrow><mi>N</mi><mo>×</mo><mn>1</mn></mrow></msup><annotation encoding="application/x-tex">\mathbb{R}^{N \times 1}</annotation></semantics></math>
+méretű. Ez szörnyen gyors (GPU-n
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>N</mi><mo>=</mo><msup><mn>10</mn><mn>6</mn></msup></mrow><annotation encoding="application/x-tex">N=10^6</annotation></semantics></math>
+dokumentumra is ezredmásodpercek alatt fut), de van egy hatalmas ára: a
+modell <strong>nem látta együtt</strong> a lekérdezést és a
+dokumentumot. A transzformer encoderben nincs kereszt-attention a
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>q</mi><annotation encoding="application/x-tex">q</annotation></semantics></math>
+és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>d</mi><annotation encoding="application/x-tex">d</annotation></semantics></math>
+tokenjei között.</p>
+<p>Itt jön a képbe a <strong>cross-encoder</strong>. A cross-encoder nem
+külön-külön ágyaz be, hanem összefűzi a lekérdezést és a jelölt
+dokumentumot egyetlen bemeneti szekvenciává:
+<code>[CLS] query [SEP] document [SEP]</code>. A transzformer önfigyelme
+így teljes kereszt-interakciót biztosít a lekérdezés és a dokumentum
+tokenjei között.</p>
+<p>A pontozás a következőképpen módosul:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>s</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>q</mi><mo>,</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo>=</mo><mtext mathvariant="normal">Sigmoid</mtext><mrow><mo stretchy="true" form="prefix">(</mo><mtext mathvariant="normal">Linear</mtext><mrow><mo stretchy="true" form="prefix">(</mo><msub><mtext mathvariant="normal">Transformer</mtext><mtext mathvariant="normal">CLS</mtext></msub><mrow><mo stretchy="true" form="prefix">(</mo><mi>q</mi><mo>,</mo><mi>d</mi><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">s(q, d) = \text{Sigmoid}(\text{Linear}(\text{Transformer}_{\text{CLS}}(q, d)))</annotation></semantics></math></p>
+<p>A bemeneti shape: <code>[batch_size, seq_len]</code>, a kimenet pedig
+<code>[batch_size, 1]</code>. Mivel ez a művelet
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo>×</mo><msup><mi>L</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(N \times L^2)</annotation></semantics></math>
+floppol jár (ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>L</mi><annotation encoding="application/x-tex">L</annotation></semantics></math>
+a <code>query+document</code> hossza), rendkívül drága. Ezért
+cross-encodert szinte soha nem futtatunk a teljes adatbázisra, csakis a
+bi-encoder által visszaadott
+top-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
+(pl. top-50) jelöltre.</p>
+<p><strong>Kód példa a rerankingre:</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> sentence_transformers <span class="im">import</span> CrossEncoder</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="co"># Példa modell, a verziószámot itt is ellenőrizni kell a Hugging Face-en!</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>reranker <span class="op">=</span> CrossEncoder(<span class="st">&quot;cross-encoder/ms-marco-MiniLM-L-6-v2&quot;</span>)</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>query <span class="op">=</span> <span class="st">&quot;Hogyan kell hozzáférést kérni a HR rendszerhez?&quot;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>top_k_docs <span class="op">=</span> [...] <span class="co"># A bi-encoder visszaadott 50 szövege</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co"># Párok létrehozása a cross-encoder számára</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>pairs <span class="op">=</span> [(query, doc) <span class="cf">for</span> doc <span class="kw">in</span> top_k_docs]</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># Pontszámok számítása</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Bemenet: list[(str, str)], Kimenet: np.ndarray shape (len(pairs),)</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>scores <span class="op">=</span> reranker.predict(pairs)</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co"># A dokumentumok átrendezése a cross-encoder pontszámai szerint</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>reranked_docs <span class="op">=</span> [doc <span class="cf">for</span> _, doc <span class="kw">in</span> <span class="bu">sorted</span>(<span class="bu">zip</span>(scores, top_k_docs), key<span class="op">=</span><span class="kw">lambda</span> x: x[<span class="dv">0</span>], reverse<span class="op">=</span><span class="va">True</span>)]</span></code></pre></div>
+<p>A cross-encoder hatalmas minőségi ugrást hoz, különösen akkor, ha a
+felhasználó kérdése rövid, és a releváns dokumentum hosszú. Míg a
+bi-encoder elveszítheti a részleteket az átlagolásos beágyazás során, a
+cross-encoder közvetlenül figyel a dokumentumban lévő kulcsszavakra
+is.</p>
+<h4 data-number="16.2.3.1"
+id="melyik-retrievert-és-rerankert-válasszuk"><span
+class="header-section-number">16.2.3.1</span> Melyik retrievert és
+rerankert válasszuk?</h4>
+<p>A korábbi alapokon nyugvó (de itt kontextusba helyezett) döntési fa
+így néz ki a komplex lekérdezéseknél: 1. Ha a lekérdezés rövid és
+rengeteg szinonimát tartalmaz
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mo>→</mo><annotation encoding="application/x-tex">\rightarrow</annotation></semantics></math>
+Multi-query + RRF. 2. Ha a lekérdezés hosszú és kifejtő, de a dokumentum
+nagyon rövid vagy nagyon szakmai
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mo>→</mo><annotation encoding="application/x-tex">\rightarrow</annotation></semantics></math>
+HyDE. 3. Ha a visszakeresés után sok a zaj
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mo>→</mo><annotation encoding="application/x-tex">\rightarrow</annotation></semantics></math>
+Cross-encoder reranking.</p>
+<h3 data-number="16.2.4"
+id="labor-query-rewriting-és-reranking-összehasonlítása"><span
+class="header-section-number">16.2.4</span> Labor: Query rewriting és
+reranking összehasonlítása</h3>
+<p>Ennek a labornak az a célja, hogy kézzel érezze a különbséget a nyers
+visszakeresés, a HyDE-alapú átírás és a cross-encoder reranking között.
+A mérés reprodukálható lesz, és szigorúan elválasztjuk a mérhető és a
+várható (elméleti) eredményeket.</p>
+<h4 data-number="16.2.4.1" id="környezet-és-hardver"><span
+class="header-section-number">16.2.4.1</span> 1. Környezet és
+Hardver</h4>
+<ul>
+<li><strong>Python:</strong> 3.12+</li>
+<li><strong>Könyvtárak:</strong> <code>torch</code>,
+<code>transformers</code>, <code>sentence-transformers</code>,
+<code>datasets</code>, <code>rank_bm25</code>, <code>numpy</code>.</li>
+<li><strong>Hardver:</strong> CPU-only is elegendő a kis méretű
+mintához, de GPU javasolt a gyors beágyazáshoz.</li>
+<li><strong>Reprodukálhatóság:</strong> <code>seed = 42</code>,
+<code>torch.manual_seed(seed)</code>,
+<code>np.random.seed(seed)</code>.</li>
+<li><strong>Modell-verziók:</strong> Mivel a Hugging Face modelljei
+folyamatosan frissülnek, a labor futtatása előtt a
+<code>BAAI/bge-small-hu-v1.5</code> és a
+<code>cross-encoder/ms-marco-MiniLM-L-6-v2</code> legfrissebb, stabil
+revízióját rögzíteni kell a <code>requirements.lock</code> fájlban.</li>
+</ul>
+<h4 data-number="16.2.4.2" id="adatgenerálás"><span
+class="header-section-number">16.2.4.2</span> 2. Adatgenerálás</h4>
+<p>Hozzunk létre egy minimális, 20 dokumentumból álló szintetikus
+tudásbázist. A dokumentumok szóljanak informatikai hibajegyekről és
+HR-szabályzatokról. <em>Példa dokumentumok:</em> &gt; 0: “A szerverterem
+hűtési kapacitása elérte a 75%-ot. A túlmelegedés elkerülése érdekében a
+ventilátorokat negyedévente cserélni kell.” &gt; 1: “A Jira hozzáférési
+szabályzat szerint minden új fejlesztőnek a rendszergazdánál kell
+kérvényeznie a repo hozzáférést.” &gt; 2: “A 0xC0000005 hibakód
+hozzáférési sérelemre (access violation) utal a modulban. Az alkalmazást
+újra kell indítani.”</p>
+<p>A tesztkérdésünk legyen egy kihívást jelentő, szakmai zsargont nem
+használó kérdés: <strong>Kérdés:</strong> “Mit tegyek, ha a gépem kidob
+egy 0xC0000005 hibaüzenetet?”</p>
+<h4 data-number="16.2.4.3" id="mérések-és-metrikák"><span
+class="header-section-number">16.2.4.3</span> 3. Mérések és
+Metrikák</h4>
+<p>A kiértékeléshez <strong>MRR@10</strong> (Mean Reciprocal Rank) és
+<strong>nDCG@10</strong> metrikát használunk. A ground truth (releváns
+dokumentum id-ja) a példánkban a 2-es index.</p>
+<h4 data-number="16.2.4.4" id="a-kísérlet-lépései"><span
+class="header-section-number">16.2.4.4</span> 4. A kísérlet lépései</h4>
+<p><strong>A) Baseline (nyers bi-encoder)</strong></p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. Beágyazás</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>query_emb <span class="op">=</span> embedding_model.encode(query) <span class="co"># shape: (1, dim)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>doc_embs <span class="op">=</span> embedding_model.encode(docs)  <span class="co"># shape: (20, dim)</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. Pontozás (koszinusz)</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"># shape: (20, 1)</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>sims <span class="op">=</span> np.dot(doc_embs, query_emb.T)</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>top_k_indices <span class="op">=</span> np.argsort(sims[:, <span class="dv">0</span>])[::<span class="op">-</span><span class="dv">1</span>][:<span class="dv">10</span>]</span></code></pre></div>
+<p><strong>B) HyDE (hipotetikus dokumentumos keresés)</strong></p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># LLM-et szimuláló függvény (valós esetben OpenAI/HF Inference API hívás)</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> generate_hyp_doc(query: <span class="bu">str</span>) <span class="op">-&gt;</span> <span class="bu">str</span>:</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A példa kedvéért: az LLM kifejti a hibakód jelentését</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="st">&quot;A 0xC0000005 hiba hozzáférési sérelemre utal. A memóriakezelés megsértése történt, ezért a folyamatot újra kell indítani.&quot;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>hyp_doc <span class="op">=</span> generate_hyp_doc(query)</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>hyp_emb <span class="op">=</span> embedding_model.encode(hyp_doc) <span class="co"># shape: (1, dim)</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>sims_hyde <span class="op">=</span> np.dot(doc_embs, hyp_emb.T)</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>top_k_hyde <span class="op">=</span> np.argsort(sims_hyde[:, <span class="dv">0</span>])[::<span class="op">-</span><span class="dv">1</span>][:<span class="dv">10</span>]</span></code></pre></div>
+<p><strong>C) Reranking (Cross-encoder)</strong></p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Először a Baseline top-k elemeit használjuk</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>candidate_docs <span class="op">=</span> [docs[i] <span class="cf">for</span> i <span class="kw">in</span> top_k_indices]</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Párok létrehozása és átpontozás</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>pairs <span class="op">=</span> [(query, doc) <span class="cf">for</span> doc <span class="kw">in</span> candidate_docs]</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>scores <span class="op">=</span> reranker.predict(pairs)</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Átrendezés</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>ranks <span class="op">=</span> np.argsort(scores)[::<span class="op">-</span><span class="dv">1</span>]</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>reranked_indices <span class="op">=</span> [top_k_indices[i] <span class="cf">for</span> i <span class="kw">in</span> ranks]</span></code></pre></div>
+<h4 data-number="16.2.4.5" id="várt-és-mért-eredmények"><span
+class="header-section-number">16.2.4.5</span> 5. Várt és Mért
+eredmények</h4>
+<p><em>(Fontos: a szerző által itt közölt értékek csak oktatási célú
+trendeket jelölnek. A valódi mérés a helyi modellverzióktól és a pontos
+szintetikus korpusztól függ.)</em></p>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Módszer</th>
+<th style="text-align: left;">Várt MRR@10</th>
+<th style="text-align: left;">Mért MRR@10</th>
+<th style="text-align: left;">Várt nDCG@10</th>
+<th style="text-align: left;">Mért nDCG@10</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><strong>Baseline</strong>
+(Bi-encoder)</td>
+<td style="text-align: left;">~0.33</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+<td style="text-align: left;">~0.40</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>HyDE</strong></td>
+<td style="text-align: left;">~1.00</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+<td style="text-align: left;">~1.00</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><strong>Baseline + Reranker</strong></td>
+<td style="text-align: left;">~0.50</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+<td style="text-align: left;">~0.55</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>HyDE + Reranker</strong></td>
+<td style="text-align: left;">~1.00</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+<td style="text-align: left;">~1.00</td>
+<td style="text-align: left;"><code>[MÉRT_ÉRTÉK]</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Miért ezt várjuk?</strong> A Baseline azért alacsony, mert a
+„0xC0000005”, „hibaüzenet” és „gépem” szavak a vektor-térben közelebb
+lehetnek az informatikai hibajegyekhez, de a pontos hibakód-leírás
+(access violation) hiányzik a kérdésből, így a hasonlósági pontszám
+zajos. A HyDE azért ugrik 1.00-ra (első helyre teszi a releváns
+dokumentumot), mert a hipotetikus válasz pontosan tartalmazza a
+„hozzáférési sérelem” kifejezést, ami egy az egyben megegyezik a
+releváns dokumentummal. A reranker a baseline listában is felismeri a
+kulcsszavakat, de ha a 2-es dokumentum kiesett a top 10-ből a
+Baseline-ban, a reranking nem tudja visszahozni a semmiből. Ez mutatja,
+hogy a reranking egy szűrő, ami a meglévő jelölteket rendezi, de a
+recallt nem növeli. A HyDE + Reranker a legstabilabb kombináció.</p>
+<p><strong>Hibaüzenetek és tipikus buktatók:</strong> <em>„A
+cross-encoder lassú, nem fut le a teljes adatbázisra.”</em> -&gt; A
+fenti laborban csak 20 dokumentum van, ezért nem tűnik fel, de éles
+környezetben mindig kétlépcsős rendszerben dolgozzunk: bi-encoder a
+széles merítéshez, cross-encoder a finom rendezéshez. <em>„A HyDE rossz
+irányba viszi a keresést, ha sokat hallucinál.”</em> -&gt; Mindig
+futtassuk le a Baseline-t is, és fuse-oljuk össze az eredményt (pl.
+RRF), hogy a HyDE hibáját a nyers lekérdezés kompenzálja.</p>
+<hr />
+<h3 data-number="16.2.5" id="összefoglalás-és-önellenőrzés"><span
+class="header-section-number">16.2.5</span> Összefoglalás és
+önellenőrzés</h3>
+<p>Ebben az alfejezetben a visszakeresés minőségét javító két fő eszközt
+vizsgáltuk. A <strong>lekérdezés-átírás</strong> (mint a multi-query,
+HyDE és step-back) a felhasználó szándékát hozza közelebb a dokumentumok
+nyelvéhez, még mielőtt a vektor bekerülne az indexbe. A
+<strong>cross-encoder reranking</strong> pedig a már kiválasztott
+jelöltek precíz, token-szintű összehasonlítását teszi lehetővé.</p>
+<p>A helyes mérnöki hozzáállás nem a „legjobb” módszer kiválasztása,
+hanem a hibamódok ismerete. A komplex lekérdezések kezelése során a
+leggyakoribb hiba az, hogy egyetlen prompttrükkre hagyatkozunk, vagy a
+rerankingot tévesen a recall javítására próbáljuk használni. A
+statisztikai alapelv világos: ha a keresési tér nem tartalmazza a
+releváns elemet a top-k-ban, a pontosabb rangsorolás nem fogja
+megmenteni a rendszert.</p>
+<p><strong>Önellenőrző kérdés:</strong> Tegyük fel, hogy van egy 1
+millió dokumentumból álló jogi adatbázisunk. A válaszok megtalálásához
+gyakran kell hosszú, kifejtő magyarázatot adni egy rövid, laikus
+kérdésre. 1. Miért elégtelen csupán egy cross-encoder futtatása a teljes
+adatbázison idő és pontosság szempontjából? 2. Melyik lekérdezés-átírási
+technikát választaná a fenti helyzetben (HyDE vagy multi-query), és
+miért? Indokolja a választ a vektor-tér és a szemantikai szakadék
+szempontjából. 3. Ha a HyDE-t használja, miért nem szabad a hipotetikus
+szöveget közvetlenül válaszként visszaadni a felhasználónak?</p>
+<p><em>(A válaszokhoz gondolja át: a cross-encoder
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo>×</mo><msup><mi>L</mi><mn>2</mn></msup><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(N \times L^2)</annotation></semantics></math>
+komplexitású, a HyDE pedig azért jobb, mert a „jogi magyarázat”
+jellemzőit hozza létre, nem pedig a kérdés tömör jellemzőit.)</em></p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="lm057.html">← 16.1 RAG alaparchitektúra</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="lm059.html">16.3 Forráshűség, citation és hallucination →</a></div>
+</nav>
+</body>
+</html>

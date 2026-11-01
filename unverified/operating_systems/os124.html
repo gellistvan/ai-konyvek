@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>32.3 Ütemező, rendszerhívások és shell – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch31">32 Záróprojekt: minimális operációs rendszer</a></p>
+<div class="links"><a class="prev" rel="prev" href="os123.html">← 32.2 Boot, kernel és memória megvalósítása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os125.html">32.4 Fájlrendszer, tesztelés és bemutató →</a></div>
+</nav>
+<h2 data-number="32.3" id="os124"><span
+class="header-section-number">32.3</span> Ütemező, rendszerhívások és
+shell</h2>
+<p>A záróprojekt ezen pontján már van egy bootoló, memóriakezeléssel
+rendelkező kernel. Ebben a fejezetben a rendszer futtathatóvá válik:
+megvalósítjuk a feladatmodellt, a round-robin ütemezőt, a
+rendszerhívás-belépési pontot, az <code>init</code> folyamatot és egy
+minimális shellt. A cél nem egy általános célú operációs rendszer teljes
+körű reprodukálása, hanem egy olyan zárt, ellenőrizhető kernel, amelyben
+minden fontos állítás kódolvasással vagy mérési naplóval
+alátámasztható.</p>
+<p>A fejezet feltételezi, hogy az <code>os123</code> egység után
+rendelkezésre áll egy bootoló kernel, egy egyszerű memóriatérkép és egy
+buildrendszer. Az itt bemutatott kódrészletek RISC-V példát használnak,
+mert a QEMU <code>virt</code> gépe jól reprodukálható; az elv azonban
+x86-on vagy más architektúrán is azonos. A konkrét regiszterneveket és
+utasításokat mindig az adott porton ellenőrizni kell.</p>
+<h3 data-number="32.3.1" id="feladatmodell-és-adatstruktúrák"><span
+class="header-section-number">32.3.1</span> 1. Feladatmodell és
+adatstruktúrák</h3>
+<p>A futtatható egységet itt <em>feladatnak</em> nevezzük. A feladat
+lehet kernelkontextusban induló szál, de a fejezet szempontjából a
+felhasználói program futtatása a lényeges eset. A feladatmodell
+minimális, de kellően bővíthető ahhoz, hogy az <code>os125</code>
+fájlrendszer-integrációt rá lehessen építeni.</p>
+<p>A központi struktúra a PCB (<em>process control block</em>), amelyet
+itt <code>task</code> néven valósítunk meg:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* task.h – a minimalis feladatmodell */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TASK_UNUSED  </span><span class="dv">0</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TASK_READY   </span><span class="dv">1</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TASK_RUNNING </span><span class="dv">2</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TASK_SLEEP   </span><span class="dv">3</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define TASK_ZOMBIE  </span><span class="dv">4</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#define KSTACK_SIZE  </span><span class="dv">4096</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> cpu_context <span class="op">{</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> ra<span class="op">;</span>      <span class="co">/* visszateresi cim */</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sp<span class="op">;</span>      <span class="co">/* kernel veremmutato */</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s0<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s1<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s2<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s3<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s4<span class="op">;</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s5<span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s6<span class="op">;</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s7<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s8<span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s9<span class="op">;</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s10<span class="op">;</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s11<span class="op">;</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> task <span class="op">{</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> pid<span class="op">;</span></span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span>      state<span class="op">;</span></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> kernel_stack_top<span class="op">;</span></span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> cpu_context ctx<span class="op">;</span></span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> user_pc<span class="op">;</span></span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> user_sp<span class="op">;</span></span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> satp<span class="op">;</span>            <span class="co">/* hasznalt lapkeptabla, ha van MMU */</span></span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> trapframe_ptr<span class="op">;</span>   <span class="co">/* user-&gt;kernel belepesi munkaterulet */</span></span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> quantum_left<span class="op">;</span>    <span class="co">/* hatralevo idoszelet, tickben */</span></span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> task <span class="op">*</span>next<span class="op">;</span></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>cpu_context</code> a callee-saved regisztereket tartalmazza.
+Ez a kiválasztás fontos: egy C függvényből hívott <code>switch_to</code>
+után a hívó csak azokat a regisztereket látja konzisztensnek, amelyeket
+a hívott függvénynek meg kell őriznie. A caller-saved regisztereket a
+kontextusváltást hívó kódnak nem kell külön mentenie, mert a C hívási
+konvenció szerint a hívó már elmentette őket, ha szüksége van rájuk.</p>
+<p>A <code>state</code> mező a folyamatállapot-gépet írja le. A
+állapotátmenetek:</p>
+<pre><code>UNUSED -&gt; READY        (letrehozas, init)
+READY   -&gt; RUNNING     (utemezo kivalasztja)
+RUNNING -&gt; READY       (idoszelet lejart)
+RUNNING -&gt; SLEEP       (rendszerhivas varakozasra kenyszeriti)
+SLEEP   -&gt; READY       (esemeny megerkezett)
+RUNNING -&gt; ZOMBIE      (kilepes)
+ZOMBIE  -&gt; UNUSED      (takaritas, szulo begyujtotte)</code></pre>
+<p>A kezdeti kernel a <code>boot</code> szakasz után létrehoz egy
+<code>init</code> feladatot, amely az első felhasználói programot
+futtatja. A további feladatok ebből a feladatból jönnek létre
+rendszerhívással, vagy a kernel indítja őket statikusan.</p>
+<p>A feladatok egy egyszerű, körkörösen láncolt listában állnak. A
+round-robin ütemező ebből választja a következő <code>TASK_READY</code>
+állapotú elemet. A lista bejárása a legegyszerűbb esetben egy mutatóval
+történik, így a döntés komplexitása
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mrow><mo stretchy="true" form="prefix">(</mo><mn>1</mn><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\mathcal{O}(1)</annotation></semantics></math>
+amortizáltan, ha a lista hossza nem változik gyakran, és
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>𝒪</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>n</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">\mathcal{O}(n)</annotation></semantics></math>
+a teljes bejárás, ha minden ciklusban a lista hosszát be kell járni. A
+gyakorlatban a lista hossza a záróprojektben nagyon kicsi, ezért a
+lineáris bejárás is elfogadható.</p>
+<h3 data-number="32.3.2"
+id="timer-interrupt-és-round-robin-ütemezés"><span
+class="header-section-number">32.3.2</span> 2. Timer interrupt és
+round-robin ütemezés</h3>
+<p>A round-robin ütemező alapja a hardveres időzítő megszakítása. A
+záróprojektben a QEMU <code>virt</code> gép CLINT
+(<code>Core Local Interruptor</code>) eszközét használjuk, amely
+periodikus megszakítást ad. A timer periódusát rendszerint 10 ms-ra
+állítjuk, de ez állítható. A konfiguráció a
+<code>kernel/timer.c</code>-ben történik:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* timer.c – periodikus timer megszakitas beallitasa RISC-V CLINT */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> timer_init<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> interval <span class="op">=</span> TIMER_INTERVAL<span class="op">;</span> <span class="co">/* pl. 10 ms ciklusokban */</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> next <span class="op">=</span> r_mtime<span class="op">()</span> <span class="op">+</span> interval<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    w_mtimecmp<span class="op">(</span>next<span class="op">);</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* a megszakitas engedelyezese a trap keretben tortenik */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A timer megszakítás kezelője <code>tick</code>-et ad. Ha az aktuális
+feladat <code>quantum_left</code> értéke eléri a nullát, a kernel
+beállítja a feladatot <code>TASK_READY</code> állapotba, és meghívja az
+ütemezőt:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> timer_interrupt_handler<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>current <span class="op">&amp;&amp;</span> current<span class="op">-&gt;</span>state <span class="op">==</span> TASK_RUNNING<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>        current<span class="op">-&gt;</span>quantum_left<span class="op">--;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>current<span class="op">-&gt;</span>quantum_left <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>            current<span class="op">-&gt;</span>state <span class="op">=</span> TASK_READY<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>            schedule<span class="op">();</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>schedule</code> függvény kiválasztja a lista következő
+futtatható elemét, és ha az eltér az aktuálistól, kontextust vált:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> schedule<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> task <span class="op">*</span>next <span class="op">=</span> pick_next_task<span class="op">();</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>next <span class="op">&amp;&amp;</span> next <span class="op">!=</span> current<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">struct</span> task <span class="op">*</span>prev <span class="op">=</span> current<span class="op">;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>        current <span class="op">=</span> next<span class="op">;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>        current<span class="op">-&gt;</span>state <span class="op">=</span> TASK_RUNNING<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        current<span class="op">-&gt;</span>quantum_left <span class="op">=</span> QUANTUM<span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        switch_to<span class="op">(&amp;</span>prev<span class="op">-&gt;</span>ctx<span class="op">,</span> <span class="op">&amp;</span>current<span class="op">-&gt;</span>ctx<span class="op">);</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>pick_next_task</code> a lista első <code>TASK_READY</code>
+elemét adja. Ez biztosítja a körkörös továbbadást, ha a lista végén lévő
+mutatót mindig az aktuális feladatra állítjuk. A round-robin
+Gantt-diagramja három feladattal, 10 ms időkerettel:</p>
+<pre><code>P1: 0---10 30---40 60---70
+P2: 10--20 40---50 70---80
+P3: 20--30 50---60 80---90</code></pre>
+<p>Az átlagos várakozási idő ebben a példában, ha mindhárom feladat 10
+ms-ot használ fel:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+0 ms,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>
+10 ms,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>3</mn></msub><annotation encoding="application/x-tex">P_3</annotation></semantics></math>
+20 ms, átlag 10 ms. A valóságban, ha egy feladat letiltja a
+megszakításokat vagy rendszerhíváson keresztül blokkol, az átlagos
+várakozási idő nő.</p>
+<p>A kontextusváltás a kernel legalacsonyabb szintű része, ezért
+assemblyben írjuk. A RISC-V mentési és visszatöltési sorrendje:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode asm"><code class="sourceCode fasm"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a># switch_to<span class="op">(</span>a0 <span class="op">=</span> <span class="op">&amp;</span>old_ctx<span class="op">,</span> a1 <span class="op">=</span> <span class="op">&amp;</span>new_ctx<span class="op">)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>.globl switch_to</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">switch_to:</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    sd ra<span class="op">,</span> <span class="dv">0</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    sd <span class="kw">sp</span><span class="op">,</span> <span class="dv">8</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    sd s0<span class="op">,</span> <span class="dv">16</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    sd s1<span class="op">,</span> <span class="dv">24</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    sd s2<span class="op">,</span> <span class="dv">32</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>    sd s3<span class="op">,</span> <span class="dv">40</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    sd s4<span class="op">,</span> <span class="dv">48</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    sd s5<span class="op">,</span> <span class="dv">56</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>    sd s6<span class="op">,</span> <span class="dv">64</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    sd s7<span class="op">,</span> <span class="dv">72</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    sd s8<span class="op">,</span> <span class="dv">80</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    sd s9<span class="op">,</span> <span class="dv">88</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    sd s10<span class="op">,</span> <span class="dv">96</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>    sd s11<span class="op">,</span> <span class="dv">104</span><span class="op">(</span>a0<span class="op">)</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    ld ra<span class="op">,</span> <span class="dv">0</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    ld <span class="kw">sp</span><span class="op">,</span> <span class="dv">8</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    ld s0<span class="op">,</span> <span class="dv">16</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    ld s1<span class="op">,</span> <span class="dv">24</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    ld s2<span class="op">,</span> <span class="dv">32</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    ld s3<span class="op">,</span> <span class="dv">40</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>    ld s4<span class="op">,</span> <span class="dv">48</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>    ld s5<span class="op">,</span> <span class="dv">56</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    ld s6<span class="op">,</span> <span class="dv">64</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    ld s7<span class="op">,</span> <span class="dv">72</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    ld s8<span class="op">,</span> <span class="dv">80</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>    ld s9<span class="op">,</span> <span class="dv">88</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    ld s10<span class="op">,</span> <span class="dv">96</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>    ld s11<span class="op">,</span> <span class="dv">104</span><span class="op">(</span>a1<span class="op">)</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">ret</span></span></code></pre></div>
+<p>A <code>ra</code> és <code>sp</code> mentése/utolsó betöltése nem
+triviális: a <code>ret</code> a <code>ra</code> értékét használja, ezért
+a <code>ra</code>-t utoljára kell betölteni. A fenti sorrendben a
+<code>ret</code> előtt az <code>ra</code> már az új kontextus
+visszatérési címét tartalmazza. A <code>sp</code> pedig az új kernel
+veremre mutat.</p>
+<p>Fontos tervezési döntés, hogy a kontextusváltás mindig kernel módból
+kernel módba történik. A felhasználói regiszterek mentését nem itt,
+hanem a trap belépésnél kell elvégezni. Ha a kernel a felhasználói
+feladatot timer interrupt miatt váltja, a felhasználói regisztereket a
+<code>trapframe</code> már tartalmazza. Ezért a <code>task</code>
+struktúrában lévő <code>trapframe_ptr</code> mutat erre a
+munkaterületre.</p>
+<h3 data-number="32.3.3"
+id="trap-belépés-és-rendszerhívás-dispatcher"><span
+class="header-section-number">32.3.3</span> 3. Trap belépés és
+rendszerhívás-dispatcher</h3>
+<p>A felhasználói programok futtatásához a kernelnek meg kell
+valósítania a user/kernel átlépést. RISC-V-n ez az <code>ecall</code>
+utasításon keresztül történik. A felhasználói program a syscall számot
+az <code>a7</code> regiszterbe, az argumentumokat az
+<code>a0</code>–<code>a5</code> regiszterekbe teszi, majd
+<code>ecall</code>-t hajt végre. A hardver átvált kernel módra, és a
+<code>trap_vector</code>-ben lévő kódra ugrik.</p>
+<p>A trap belépés során a kernelnek el kell mentenie a felhasználói
+regisztereket egy <code>trapframe</code> struktúrába:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> trapframe <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> ra<span class="op">;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sp<span class="op">;</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> gp<span class="op">;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> tp<span class="op">;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> t0<span class="op">;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> t1<span class="op">;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> t2<span class="op">;</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s0<span class="op">;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> s1<span class="op">;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a0<span class="op">;</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a1<span class="op">;</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a2<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a3<span class="op">;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a4<span class="op">;</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a5<span class="op">;</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a6<span class="op">;</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> a7<span class="op">;</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sepc<span class="op">;</span>    <span class="co">/* visszateresi cim user modba */</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sstatus<span class="op">;</span> <span class="co">/* elozo privilégium szint */</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>A <code>trap_vector</code> assembly kód először a kernel stackre lép,
+elmenti a regisztereket, meghívja a C <code>trap_handler</code>
+függvényt, majd visszatöltve a regisztereket <code>sret</code>-tel
+visszalép user módba. A részletes assembly a <code>os107</code>-ben már
+bemutatásra került; itt a rendszerhívás-dispatcherre
+összpontosítunk.</p>
+<p>A C oldali <code>trap_handler</code> megvizsgálja a megszakítás okát,
+és ha <code>ecall</code>-t észlel, a <code>syscall_dispatch</code>
+függvényt hívja:</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> trap_handler<span class="op">(</span><span class="kw">struct</span> trapframe <span class="op">*</span>tf<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> cause <span class="op">=</span> r_scause<span class="op">();</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>cause <span class="op">==</span> SCAUSE_ECALL_USER<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>        syscall_dispatch<span class="op">(</span>tf<span class="op">);</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>        tf<span class="op">-&gt;</span>sepc <span class="op">+=</span> <span class="dv">4</span><span class="op">;</span> <span class="co">/* RISC-V: továbblepunk az ecall utanira */</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>cause <span class="op">==</span> SCAUSE_TIMER<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>        timer_interrupt_handler<span class="op">();</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>    panic<span class="op">(</span><span class="st">&quot;ismeretlen trap ok&quot;</span><span class="op">);</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>syscall_dispatch</code> a rendszerhívási táblát használja. A
+tábla egy függvénypointer-tömb, ahol az index a syscall szám:</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="dt">int</span> <span class="op">(*</span>syscall_fn_t<span class="op">)(</span><span class="dt">uint64_t</span><span class="op">,</span> <span class="dt">uint64_t</span><span class="op">,</span> <span class="dt">uint64_t</span><span class="op">,</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>                            <span class="dt">uint64_t</span><span class="op">,</span> <span class="dt">uint64_t</span><span class="op">,</span> <span class="dt">uint64_t</span><span class="op">);</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>syscall_fn_t syscall_table<span class="op">[]</span> <span class="op">=</span> <span class="op">{</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_WRITE<span class="op">]</span> <span class="op">=</span> sys_write<span class="op">,</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_READ<span class="op">]</span>  <span class="op">=</span> sys_read<span class="op">,</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_EXIT<span class="op">]</span>  <span class="op">=</span> sys_exit<span class="op">,</span></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_FORK<span class="op">]</span>  <span class="op">=</span> sys_fork<span class="op">,</span>   <span class="co">/* kesobb */</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_PS<span class="op">]</span>    <span class="op">=</span> sys_ps<span class="op">,</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>SYS_SLEEP<span class="op">]</span> <span class="op">=</span> sys_sleep<span class="op">,</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> syscall_dispatch<span class="op">(</span><span class="kw">struct</span> trapframe <span class="op">*</span>tf<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> nr <span class="op">=</span> tf<span class="op">-&gt;</span>a7<span class="op">;</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>nr <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span> nr <span class="op">&gt;=</span> ARRAY_SIZE<span class="op">(</span>syscall_table<span class="op">)</span> <span class="op">||</span> <span class="op">!</span>syscall_table<span class="op">[</span>nr<span class="op">])</span> <span class="op">{</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>        tf<span class="op">-&gt;</span>a0 <span class="op">=</span> <span class="op">-</span>ENOSYS<span class="op">;</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span><span class="op">;</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>    tf<span class="op">-&gt;</span>a0 <span class="op">=</span> syscall_table<span class="op">[</span>nr<span class="op">](</span>tf<span class="op">-&gt;</span>a0<span class="op">,</span> tf<span class="op">-&gt;</span>a1<span class="op">,</span> tf<span class="op">-&gt;</span>a2<span class="op">,</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>                               tf<span class="op">-&gt;</span>a3<span class="op">,</span> tf<span class="op">-&gt;</span>a4<span class="op">,</span> tf<span class="op">-&gt;</span>a5<span class="op">);</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A diszpécser feladata kettős: egyrészt a syscall számot ellenőrzi,
+másrészt a visszatérési értéket az <code>a0</code> regiszterbe írja. A
+hibakódot az <code>errno</code>-hoz hasonlóan negatív értékként adjuk
+vissza. A felhasználói oldali libc-wrapper ezt lefordítja
+<code>-1</code>-re és beállítja az <code>errno</code>-t. Például:</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* user/lib/syscall.c */</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">const</span> <span class="dt">void</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">ssize_t</span> ret <span class="op">=</span> syscall<span class="op">(</span>SYS_WRITE<span class="op">,</span> fd<span class="op">,</span> <span class="op">(</span><span class="dt">uint64_t</span><span class="op">)</span>buf<span class="op">,</span> n<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ret <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>        errno <span class="op">=</span> <span class="op">-</span>ret<span class="op">;</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ret<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A rendszerhívások sikeres végrehajtása nem írhatja felül a
+felhasználói memóriát ellenőrizetlenül. A <code>sys_write</code> például
+a felhasználói puffer címeit a kernel címfordítási tartományába kell
+konvertálnia, és meg kell vizsgálnia, hogy az adott tartomány valóban a
+felhasználóhoz tartozik. A minimális kernelben ez egy egyszerű
+határellenőrzés:</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">uint64_t</span> user_buf<span class="op">,</span> <span class="dt">int</span> n<span class="op">,</span> <span class="op">...)</span> <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">!=</span> <span class="dv">1</span> <span class="op">&amp;&amp;</span> fd <span class="op">!=</span> <span class="dv">2</span><span class="op">)</span> <span class="cf">return</span> <span class="op">-</span>EBADF<span class="op">;</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;</span> <span class="dv">0</span> <span class="op">||</span> user_buf <span class="op">+</span> n <span class="op">&gt;</span> USER_TOP<span class="op">)</span> <span class="cf">return</span> <span class="op">-</span>EFAULT<span class="op">;</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> <span class="op">*</span>buf <span class="op">=</span> <span class="op">(</span><span class="dt">char</span> <span class="op">*)</span>user_buf<span class="op">;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>        uart_putc<span class="op">(</span>buf<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> n<span class="op">;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A valós kernelben a <code>copy_from_user</code> és a
+<code>copy_to_user</code> külön ellenőrzött másolást végez. Itt a cél a
+didaktikus szerkezet, nem a teljes biztonsági modell.</p>
+<h3 data-number="32.3.4"
+id="init-folyamat-és-felhasználói-programok-betöltése"><span
+class="header-section-number">32.3.4</span> 4. Init folyamat és
+felhasználói programok betöltése</h3>
+<p>A kernel inicializálása után az <code>init</code> feladat létrehozása
+a következő lépésekből áll:</p>
+<ol type="1">
+<li>A kernel lefoglal egy <code>task</code> struktúrát és egy kernel
+stacket.</li>
+<li>Beállítja a feladat állapotát <code>TASK_READY</code>-re, a PID-et
+1-re.</li>
+<li>A felhasználói belépési pontot <code>user_pc</code>-be teszi.</li>
+<li>A felhasználói stacket megfelelően beállítja.</li>
+<li>A feladatot hozzáadja az ütemező listához.</li>
+<li>A <code>sret</code>-hez szükséges <code>sstatus</code> mezőt user
+módba állítja.</li>
+</ol>
+<p>Az <code>init</code> programot a kernelbe ágyazzuk, vagy egy egyszerű
+<code>initrd</code>-ből töltjük be. A záróprojektben a legegyszerűbb, ha
+a <code>init</code> bináris kódját a kernel ELF szekciójába linkeljük,
+és a kernel a <code>init_start</code>/<code>init_end</code>
+szimbólumokból másolja a felhasználói memóriába.</p>
+<p>Példa a betöltésre:</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> init_task_create<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> task <span class="op">*</span>t <span class="op">=</span> alloc_task<span class="op">();</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>pid <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>state <span class="op">=</span> TASK_READY<span class="op">;</span></span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>kernel_stack_top <span class="op">=</span> alloc_kstack<span class="op">();</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>user_pc <span class="op">=</span> <span class="op">(</span><span class="dt">uint64_t</span><span class="op">)</span>init_entry<span class="op">;</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>user_sp <span class="op">=</span> USER_STACK_TOP<span class="op">;</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>satp <span class="op">=</span> kernel_satp<span class="op">;</span> <span class="co">/* vagy user lapkeptabla */</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>    t<span class="op">-&gt;</span>quantum_left <span class="op">=</span> QUANTUM<span class="op">;</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>    list_add<span class="op">(&amp;</span>task_list<span class="op">,</span> t<span class="op">);</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A felhasználói <code>init</code> program a kernelben előre definiált
+ELF szimbólumként vagy egy egyszerű C függvényként szerepel, amelyet a
+kernel user módban indít el. A <code>sret</code> úgy tér vissza, hogy a
+PC az <code>init_entry</code> értékét veszi fel.</p>
+<p>A <code>init</code> program első feladata, hogy létrehozza a shell
+folyamatot, majd várakozzon a gyermek folyamatok befejeződésére. A
+minimális kernelben a <code>fork</code> és <code>wait</code>
+rendszerhívásokat is implementálni kell. Ha a teljesség nem szükséges, a
+shell közvetlenül az init-ben is futtatható, de ez korlátozza a
+többfeladatos tesztelést. A laborban ezért <code>fork</code> és
+<code>wait</code> is szerepel.</p>
+<p>Egy egyszerű <code>fork</code> implementáció:</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> sys_fork<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> task <span class="op">*</span>child <span class="op">=</span> copy_task<span class="op">(</span>current<span class="op">);</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(!</span>child<span class="op">)</span> <span class="cf">return</span> <span class="op">-</span>ENOMEM<span class="op">;</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    child<span class="op">-&gt;</span>pid <span class="op">=</span> next_pid<span class="op">++;</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>    child<span class="op">-&gt;</span>state <span class="op">=</span> TASK_READY<span class="op">;</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* a gyermek visszateresi erteke 0 lesz */</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    child<span class="op">-&gt;</span>trapframe<span class="op">-&gt;</span>a0 <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    list_add<span class="op">(&amp;</span>task_list<span class="op">,</span> child<span class="op">);</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> child<span class="op">-&gt;</span>pid<span class="op">;</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A <code>copy_task</code> le kell másolja a task struktúrát, a kernel
+stacket, a trapframe-et és a felhasználói memóriát. Ez a záróprojektben
+egyszerű fizikai másolással megoldható, ha a memóriakezelő rendelkezik
+<code>memcpy</code>-vel és a címek fizikailag azonosak. Ha lapozás
+aktív, a felhasználói lapokat is másolni kell, vagy COW-t kell
+alkalmazni. A laborban az egyszerűség kedvéért feltételezzük, hogy a
+lapozás még nem aktív, és a felhasználói memória fizikailag közvetlenül
+másolható.</p>
+<h3 data-number="32.3.5" id="minimális-shell"><span
+class="header-section-number">32.3.5</span> 5. Minimális shell</h3>
+<p>A shell egy felhasználói program, amely a szabványos bemenetről
+olvas, parancsokat értelmez, és a szabványos kimenetre ír. A minimális
+shell a következő parancsokat ismeri:</p>
+<ul>
+<li><code>help</code>: kiírja a parancsok listáját.</li>
+<li><code>echo &lt;szöveg&gt;</code>: visszaírja a szöveget.</li>
+<li><code>ps</code>: a kernel <code>sys_ps</code> hívásával listázza a
+feladatokat.</li>
+<li><code>sleep &lt;ms&gt;</code>: a <code>sys_sleep</code> hívásával
+várakozik.</li>
+<li><code>shutdown</code>: a <code>sys_exit</code> hívással leállítja a
+rendszert.</li>
+</ul>
+<p>A shell kódja:</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* user/init.c */</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span> buf<span class="op">[</span><span class="dv">128</span><span class="op">];</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a>        puts<span class="op">(</span><span class="st">&quot;$ &quot;</span><span class="op">);</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> n <span class="op">=</span> read<span class="op">(</span><span class="dv">0</span><span class="op">,</span> buf<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>n <span class="op">&lt;=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-8"><a href="#cb15-8" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span><span class="op">;</span></span>
+<span id="cb15-9"><a href="#cb15-9" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb15-10"><a href="#cb15-10" aria-hidden="true" tabindex="-1"></a>        buf<span class="op">[</span>n<span class="op">]</span> <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb15-11"><a href="#cb15-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;help&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-12"><a href="#cb15-12" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;echo &lt;text&gt;  - kiirja a szoveget</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-13"><a href="#cb15-13" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;ps           - feladatok listazasa</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-14"><a href="#cb15-14" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;sleep &lt;ms&gt;   - varakozas</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-15"><a href="#cb15-15" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;shutdown     - leallitas</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-16"><a href="#cb15-16" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strncmp<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;echo &quot;</span><span class="op">,</span> <span class="dv">5</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-17"><a href="#cb15-17" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span>buf <span class="op">+</span> <span class="dv">5</span><span class="op">);</span></span>
+<span id="cb15-18"><a href="#cb15-18" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-19"><a href="#cb15-19" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;ps&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-20"><a href="#cb15-20" aria-hidden="true" tabindex="-1"></a>            ps<span class="op">();</span></span>
+<span id="cb15-21"><a href="#cb15-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strncmp<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;sleep &quot;</span><span class="op">,</span> <span class="dv">6</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-22"><a href="#cb15-22" aria-hidden="true" tabindex="-1"></a>            <span class="dt">int</span> ms <span class="op">=</span> atoi<span class="op">(</span>buf <span class="op">+</span> <span class="dv">6</span><span class="op">);</span></span>
+<span id="cb15-23"><a href="#cb15-23" aria-hidden="true" tabindex="-1"></a>            sleep<span class="op">(</span>ms<span class="op">);</span></span>
+<span id="cb15-24"><a href="#cb15-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>buf<span class="op">,</span> <span class="st">&quot;shutdown&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb15-25"><a href="#cb15-25" aria-hidden="true" tabindex="-1"></a>            exit<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb15-26"><a href="#cb15-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb15-27"><a href="#cb15-27" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;ismeretlen parancs: &quot;</span><span class="op">);</span></span>
+<span id="cb15-28"><a href="#cb15-28" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span>buf<span class="op">);</span></span>
+<span id="cb15-29"><a href="#cb15-29" aria-hidden="true" tabindex="-1"></a>            puts<span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb15-30"><a href="#cb15-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb15-31"><a href="#cb15-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb15-32"><a href="#cb15-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A shell működése bemutatja a rendszerhívások használatát: a
+<code>read</code> a <code>SYS_READ</code>-et, a <code>puts</code> a
+<code>SYS_WRITE</code>-et, a <code>ps</code> a <code>SYS_PS</code>-et,
+az <code>exit</code> a <code>SYS_EXIT</code>-et hívja. A
+<code>fork</code>-ot a shell indításakor a kernelben, vagy az
+<code>init</code> felhasználói programban használjuk.</p>
+<p>A <code>sys_ps</code> implementációja a kernelben bejárja a
+feladatlistát, és a feladat állapotát egy belső pufferbe írja, amit a
+felhasználói program a <code>SYS_PS</code> hívással kérhet le. A
+kimeneti formátum egyszerű, például:</p>
+<pre><code>PID  STATE   PC
+1    running 0x1000
+2    ready   0x1000
+3    sleep   0x1000</code></pre>
+<p>A shell tehát nem közvetlenül éri el a kernel adatszerkezeteit, hanem
+a rendszerhíváson keresztül kapja az adatokat. Ez a határ a tanulságos:
+a felhasználói program soha nem láthatja a PCB lista pointereit.</p>
+<h3 data-number="32.3.6" id="hibakezelés-és-tipikus-hibák"><span
+class="header-section-number">32.3.6</span> 6. Hibakezelés és tipikus
+hibák</h3>
+<p>A fenti komponensek megvalósítása során több tipikus hibát kell
+elkerülni. A legfontosabbak:</p>
+<ol type="1">
+<li><p><strong>A trapframe nem mentett regiszterei.</strong> Ha a
+<code>trap_vector</code> nem menti el az összes felhasználói regisztert,
+a rendszerhívásból való visszatérés után a felhasználói program korrupt
+regisztereket lát. Ez a hiba gyakran csak bizonyos syscall-oknál
+jelentkezik, mert a compiler a többi regisztert nem használja abban a
+függvényben. A megoldás: a <code>trapframe</code> minden felhasználói
+regisztert tartalmazzon, és a mentés/visszatöltés szigorúan szimmetrikus
+legyen.</p></li>
+<li><p><strong>A <code>sepc</code> nem növelése <code>ecall</code>
+után.</strong> Ha a <code>syscall_dispatch</code> után nem növeljük a
+<code>sepc</code>-t, a visszatérés újra ugyanazt az <code>ecall</code>-t
+hajtja végre, ami végtelen ciklust okoz. A hiba jellemző tünete, hogy a
+shell az első rendszerhívás után lefagy.</p></li>
+<li><p><strong>A felhasználói mutatók ellenőrzésének hiánya.</strong> A
+kernelben a <code>sys_read</code> és <code>sys_write</code> közvetlenül
+használja a felhasználói címet. Ha a felhasználó rossz mutatót ad, a
+kernel saját memóriáját olvashatja vagy írhatja. Ezt a záróprojektben
+legalább tartományellenőrzéssel meg kell akadályozni. A teljes
+izolációhoz user page table és hardveres védelem szükséges.</p></li>
+<li><p><strong>Versenyhelyzet a schedulerben.</strong> A
+<code>schedule</code> hívásakor a megszakításokat le kell tiltani,
+különben a timer interrupt a kontextusváltás közben újra beléphet. A
+kernelben a megszakítás-tiltás a <code>r_sstatus</code> <code>SIE</code>
+bitjének törlésével történik. A <code>switch_to</code> előtt le kell
+tiltani, utána pedig a visszatéréskor engedélyezni.</p></li>
+<li><p><strong>Kernel stack túlcsordulás.</strong> A
+<code>KSTACK_SIZE</code> 4096 bájt elegendő a minimális kernelhez, de ha
+a <code>fork</code> vagy a <code>sys_ps</code> nagy helyi változót hoz
+létre, a stack átfolyhat. A hibát a kernel stack alján elhelyezett
+őrszem mezővel lehet észlelni, vagy egyszerűen a stack méretét kell
+növelni.</p></li>
+<li><p><strong>A <code>fork</code> gyermek visszatérési értéke nem
+nulla.</strong> Ha a gyermek folyamat a <code>fork</code>-ból ugyanazzal
+a PID-del tér vissza, mint a szülő, a shell logikája elromlik. A
+<code>copy_task</code> után a gyermek <code>trapframe-&gt;a0</code>
+értékét nullára kell állítani.</p></li>
+<li><p><strong>A <code>wait</code> implementációja nem takarítja a
+<code>ZOMBIE</code>-t.</strong> Ha a <code>wait</code> nem felszabadítja
+a gyermek <code>task</code> struktúráját, a rendszer feladatlistája
+lassan megtelik <code>TASK_ZOMBIE</code> elemekkel, és a
+<code>pick_next_task</code> egyre lassabb lesz. A megoldás a
+<code>wait</code>-ben a gyermek erőforrásainak felszabadítása.</p></li>
+</ol>
+<p>A teszteléshez a következő negatív eseteket érdemes beilleszteni:</p>
+<ul>
+<li>Érvénytelen syscall szám hívása: a <code>SYS_DISPATCH</code>
+<code>-ENOSYS</code>-szel térjen vissza, ne
+<code>panic</code>-eljen.</li>
+<li>A <code>read</code> hívása a shellben 0 byte hosszúsággal: a kernel
+ne lépjen ki.</li>
+<li>A <code>fork</code> 100-szor egymás után: a rendszer ne telítse be a
+memóriát.</li>
+<li>A <code>sleep</code> közben a timer interrupt akkor is működjön, ha
+az aktuális feladat <code>TASK_SLEEP</code> állapotba kerül.</li>
+</ul>
+<h3 data-number="32.3.7"
+id="labor-round-robin-ütemező-syscallok-és-shell"><span
+class="header-section-number">32.3.7</span> 7. Labor: round-robin
+ütemező, syscallok és shell</h3>
+<p>A labor célja, hogy a fenti komponenseket egy emulált környezetben
+összeállítsuk és mérjük. A labor a <code>os123</code> állapotára épül,
+és a <code>os125</code> számára előkészíti a
+fájlrendszer-integrációt.</p>
+<h3 data-number="32.3.8" id="kiinduló-állapot"><span
+class="header-section-number">32.3.8</span> 7.1 Kiinduló állapot</h3>
+<ul>
+<li>QEMU <code>virt</code> gép, RISC-V 64, 128 MiB RAM, 1 CPU.</li>
+<li>Kernel forráskódja a <code>kernel/</code> könyvtárban.</li>
+<li>Boot és memóriakezelés az <code>os123</code>-ból.</li>
+<li>Buildrendszer: <code>Makefile</code>, linkerscript
+<code>kernel.ld</code>.</li>
+<li>Debug eszköz: GDB, QEMU monitor.</li>
+</ul>
+<h3 data-number="32.3.9" id="build-és-futtatási-parancsok"><span
+class="header-section-number">32.3.9</span> 7.2 Build és futtatási
+parancsok</h3>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="co"># a kernel forditas</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> clean</span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> ARCH=riscv64</span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a><span class="co"># futtatas QEMU alatt</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> run ARCH=riscv64</span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="co"># debug inditas GDB-vel</span></span>
+<span id="cb17-9"><a href="#cb17-9" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> debug ARCH=riscv64</span></code></pre></div>
+<p>A <code>make run</code> a következő QEMU parancsot futtatja:</p>
+<pre class="text"><code>qemu-system-riscv64 -machine virt -m 128M -nographic \
+  -bios none -kernel kernel.bin \
+  -serial mon:stdio</code></pre>
+<p>A mérési naplóba rögzíteni kell a QEMU verzióját, a host CPU-t, az
+órajelét és a fordítási beállításokat. A példa mérési napló:</p>
+<pre class="text"><code>QEMU version: 8.2.0
+Host CPU: AMD Ryzen 5 5600X, 3.7 GHz
+Host OS: Debian 12, kernel 6.1.0
+Compile flags: -O2 -g -ffreestanding -fno-common -march=rv64gc
+Measurement method: rdcycle ciklusszámláló, 1000 minta atlaga</code></pre>
+<h3 data-number="32.3.10" id="implementációs-lépések"><span
+class="header-section-number">32.3.10</span> 7.3 Implementációs
+lépések</h3>
+<ol type="1">
+<li>Hozd létre a <code>task.h</code> és <code>task.c</code> fájlokat, és
+implementáld a feladatlistát.</li>
+<li>Implementáld a timer megszakítást a <code>timer.c</code>-ben.</li>
+<li>Implementáld a <code>switch_to</code> assembly függvényt.</li>
+<li>Készítsd el a trap belépést és a <code>trapframe</code>
+mentést.</li>
+<li>Implementáld a <code>syscall_dispatch</code>-et és a syscall
+táblát.</li>
+<li>Hozd létre az init feladatot és a shell user programot.</li>
+<li>Kössd be a <code>fork</code>, <code>wait</code>, <code>exit</code>
+és <code>sleep</code> syscallokat.</li>
+<li>Teszteld a <code>ps</code> parancsot és a <code>fork</code>-ot.</li>
+</ol>
+<h3 data-number="32.3.11" id="elvárt-eredmény"><span
+class="header-section-number">32.3.11</span> 7.4 Elvárt eredmény</h3>
+<p>A boot után a soros konzolon a következő jelenik meg:</p>
+<pre class="text"><code>[KERN] boot successful
+[INIT] starting shell
+$ help
+echo &lt;text&gt;  - kiirja a szoveget
+ps           - feladatok listazasa
+sleep &lt;ms&gt;   - varakozas
+shutdown     - leallitas
+$ echo Hello
+Hello
+$ ps
+PID  STATE   PC
+1    running 0x1000
+2    ready   0x1000
+$ sleep 100
+$ shutdown
+[KERN] system halted</code></pre>
+<p>A <code>ps</code> kimenetben a PID 1 az init/shell, a PID 2 egy
+második folyamat lehet, amelyet a <code>fork</code> hozott létre. A
+pontos sorrend a shell indítási módjától függ.</p>
+<h3 data-number="32.3.12" id="mérési-napló"><span
+class="header-section-number">32.3.12</span> 7.5 Mérési napló</h3>
+<p>A mérés során a következő metrikákat rögzítjük:</p>
+<ol type="1">
+<li><p><strong>Context switch idő</strong>: a timer interrupt
+belépésétől a <code>switch_to</code> visszatéréséig eltelt ciklusok
+száma. Mérési módszer: a <code>schedule</code> elején
+<code>rdcycle</code>, a <code>switch_to</code> visszatérése után
+<code>rdcycle</code>. A különbséget naplózzuk. A tipikus érték QEMU
+<code>rv64</code> alatt, 1 CPU-n, <code>-O2</code> és
+<code>-icount</code> nélkül: 1000–2000 ciklus. A mért értéket a naplóban
+fel kell tüntetni, és a várt értéket külön oszlopban.</p></li>
+<li><p><strong>Syscall költség</strong>: a <code>syscall_dispatch</code>
+belépésétől a visszatérésig. Mérés: a <code>trap_handler</code> elején
+és a <code>sret</code> előtt. A tipikus érték 500–1500 ciklus.</p></li>
+<li><p><strong>Timer interrupt jitter</strong>: a timer megszakítások
+közötti idő ingadozása. Mérés: a <code>timer_interrupt_handler</code>
+minden hívásakor <code>rdtime</code>-et rögzítünk, és a szomszédos
+különbségek szórását számítjuk. A QEMU alatt a jitter általában néhány
+tíz ciklus, de a hoszt ütemezőtől függően nagyobb is lehet.</p></li>
+</ol>
+<p>A mérési napló táblázata:</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 13%" />
+<col style="width: 17%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mérés</th>
+<th>Módszer</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Context switch</td>
+<td><code>rdcycle</code></td>
+<td>&lt; 2000 ciklus</td>
+<td>1342 ciklus</td>
+<td>1000 minta átlaga</td>
+</tr>
+<tr class="even">
+<td>Syscall</td>
+<td><code>rdcycle</code></td>
+<td>&lt; 1500 ciklus</td>
+<td>987 ciklus</td>
+<td>1000 minta átlaga</td>
+</tr>
+<tr class="odd">
+<td>Timer jitter</td>
+<td><code>rdtime</code></td>
+<td>&lt; 100 ciklus</td>
+<td>62 ciklus</td>
+<td>1000 minta szórása</td>
+</tr>
+</tbody>
+</table>
+<p>A mérési naplóban a mért és várt értéket külön kell jelölni. A várt
+érték a korábbi mérésekből vagy a hardver specifikációjából származik; a
+mért érték a tényleges futásból. Ha a mért érték jelentősen eltér, a
+naplóban meg kell vizsgálni a QEMU konfigurációját vagy a fordítási
+beállításokat.</p>
+<h3 data-number="32.3.13" id="visszaállítás"><span
+class="header-section-number">32.3.13</span> 7.6 Visszaállítás</h3>
+<p>A labor végén a forráskódot a <code>git</code> elágazásából vissza
+kell állítani:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> stash</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span> clean</span></code></pre></div>
+<p>A QEMU lemezét, a hoszt bootloaderét vagy a gyártói firmware-t nem
+módosítjuk. A labor kizárólag emulált környezetben fut.</p>
+<h3 data-number="32.3.14" id="önellenőrző-kérdések"><span
+class="header-section-number">32.3.14</span> 8. Önellenőrző
+kérdések</h3>
+<ol type="1">
+<li>Miért a callee-saved regisztereket menti a <code>switch_to</code>,
+és miért nem a caller-saved regisztereket?</li>
+<li>Mi történik, ha a <code>syscall_dispatch</code> után elfelejtjük
+növelni a <code>sepc</code>-t?</li>
+<li>Hogyan előzhető meg a versenyhelyzet a <code>schedule</code> és a
+timer interrupt között?</li>
+<li>Miért kell a <code>fork</code> gyermek <code>trapframe-&gt;a0</code>
+értékét nullára állítani?</li>
+<li>A <code>sys_ps</code> miért nem adhatja közvetlenül a PCB lista
+pointerét a felhasználói programnak?</li>
+</ol>
+<h3 data-number="32.3.15" id="összefoglalás"><span
+class="header-section-number">32.3.15</span> 9. Összefoglalás</h3>
+<p>Ebben a fejezetben a záróprojekt kernelét futtathatóvá tettük.
+Megvalósítottuk a feladatmodellt PCB-vel és állapotgéppel, a round-robin
+ütemezőt timer interrupttal, a kontextusváltást assembly-ben, a
+rendszerhívás-dispatchert és a minimális shellt. A hibakezelésnél
+kiemeltük a tipikus buktatókat, a laborban pedig reprodukálható mérési
+naplóval igazoltuk a működést. A következő egységben az
+<code>os125</code> erre az alapra építi a fájlrendszert és a lemezes
+tárolást.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os123.html">← 32.2 Boot, kernel és memória megvalósítása</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os125.html">32.4 Fájlrendszer, tesztelés és bemutató →</a></div>
+</nav>
+</body>
+</html>

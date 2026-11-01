@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>18.4 Objektumtár, blokk- és fájlszintű tárolás – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Fájlrendszerek és tárolás</a> › <a href="index.html#osch17">18 Tárolás, snapshot és adatvédelem</a></p>
+<div class="links"><a class="prev" rel="prev" href="os068.html">← 18.3 Backup, archiválás és mentési stratégiák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os070.html">19.1 Rétegmodellek és TCP/IP →</a></div>
+</nav>
+<h2 data-number="18.4" id="os069"><span
+class="header-section-number">18.4</span> Objektumtár, blokk- és
+fájlszintű tárolás</h2>
+<p>Amikor egy operációs rendszer adatot ír vagy olvas, a kérés több
+rétegen halad át: a felhasználói folyamat a VFS-en, a fájlrendszeren, a
+blokkrétegen és az eszközmeghajtón keresztül éri el a fizikai
+adathordozót. Ez a hagyományos kép azonban csak a hoszt szempontjából
+teljes. Ha a tárolót hálózaton keresztül, több hosztról vagy
+felhőszolgáltatásként használjuk, három különböző absztrakciós modell
+közül választhatunk: blokk-, fájl- és objektumtárból. A választás nem
+csupán „melyik gyorsabb”, hanem a névtér, a frissítési szemantika, a
+megosztás, a skálázhatóság és az üzemeltetési költség közötti
+kompromisszum. Ez az alfejezet a három modellt, a fájlrendszerhez való
+illesztésüket, az S3 API és az eventual consistency kérdéseit, valamint
+a lifecycle-szabályok gyakorlati használatát mutatja be.</p>
+<h3 data-number="18.4.1" id="a-három-tárolási-modell"><span
+class="header-section-number">18.4.1</span> 1. A három tárolási
+modell</h3>
+<p>A blokk-, fájl- és objektumtár közötti különbség elsősorban az
+absztrakció szintjében és a hálózati hozzáférés módjában ragadható meg.
+Ugyanaz a háttér-hardver többféle modellben is megjelenhet; a kernelben
+azonban más-más réteg kezeli őket.</p>
+<p><strong>Blokktároló.</strong> A blokktároló legalacsonyabb szintű,
+hagyományos modell. A kernel számára a tároló egy lineáris blokkeszköz,
+amelyet fix méretű blokkok (jellemzően 512 vagy 4096 bájt) szerint lehet
+olvasni és írni. A fájlrendszer erre az absztrakcióra épül, és a VFS
+ezen keresztül kap szolgáltatást. Hálózati blokktárolóknál az iSCSI,
+Fibre Channel vagy NVMe-oF protokoll a SCSI/NVMe parancsokat továbbítja
+a távoli eszköznek. Felhő környezetben az attachable volume ugyanezt a
+modellt nyújtja. Az alkalmazás nem közvetlenül blokkokat lát, hanem a
+ráépített fájlrendszert; a blokktároló teljesítményét ezért a
+fájlrendszer overheadjével együtt kell mérni. A blokktároló erőssége az
+alacsony késleltetés, a tetszőleges véletlen hozzáférés és a tranzakciós
+munkaterhelés. Gyenge pontja, hogy önmagában nem osztható meg egyszerre
+több hoszt között anélkül, hogy clustering fájlrendszert (pl. GFS2,
+OCFS2) vagy speciális I/O-szabályozást ne vezetnénk be. A blokktároló
+jellemző példái: helyi NVMe, SAN LUN, felhőben csatolható EBS-kötet.</p>
+<p><strong>Fájltároló.</strong> A fájltároló magasabb szintű
+absztrakció: elnevezett, hierarchikus adatfolyamokat és metaadatot
+kínál, gyakran hálózati protokollon keresztül. A kliens kernel a VFS-be
+mountolja az NFS- vagy SMB-exportot, így a felhasználói folyamat a
+megszokott <code>open</code>, <code>read</code>, <code>write</code>,
+<code>fsync</code>, <code>lock</code> rendszerhívásokat használhatja. A
+fájltároló előnye a kényelem: a jogosultság, a lockolás, a seek és a
+rename a protokoll szemantikájában értelmezve van. Hátránya, hogy a
+központi névtér és a metaadat-kiszolgáló szűk keresztmetszetté válhat, a
+hálózati lockolás a kliensoldali cache koherenciájával együtt nehéz, és
+a skálázódás korlátos. Jellemző példa: NFS home-könyvtár, SMB
+fájlmegosztás, felhőben elérhető file server szolgáltatás.</p>
+<p><strong>Objektumtár.</strong> Az objektumtár a legmagasabb szintű
+absztrakció: nincs szektor, nincs POSIX-hierarchia, helyette lapos
+névtérben (<code>bucket</code> és <code>key</code>) tárolunk
+objektumokat. Az objektum egy bináris adat, hozzá tartozó kulcs,
+metaadatok, storage class és verzióazonosító. Az API tipikusan HTTP
+REST, például S3. Az objektumtár előnye a szinte korlátlan
+skálázhatóság, az erasure coding, a HTTP-alapú elérés és a globális
+CDN-integráció. Hátránya, hogy nem POSIX: nincs hatékony részleges
+felülírás, nincs <code>seek</code>, nincs fájlzár, és a
+konzisztencia-modell implementációfüggő. Jellemző példa: Amazon S3, Ceph
+RGW, MinIO.</p>
+<p>Fontos hangsúlyozni: ezek a modellek egymásra is épülhetnek. Egy
+objektumtár belül blokkeszközöket használhat, egy blokktárolóból
+fájlrendszer válhat, egy fájltároló mögött pedig objektumtár is lehet
+(például S3-gateway). A fejlesztő számára az a kérdés, hogy az
+alkalmazás milyen szemantikát és milyen teljesítményt igényel, és hogy
+ezt a kernel melyik rétegén tudja leghatékonyabban kiszolgálni.</p>
+<h3 data-number="18.4.2" id="illesztés-a-fájlrendszerhez"><span
+class="header-section-number">18.4.2</span> 2. Illesztés a
+fájlrendszerhez</h3>
+<p>A Linux tárolási verem a következő rétegekből áll: alkalmazás → VFS →
+fájlrendszer → blokkréteg → eszközmeghajtó → fizikai eszköz. A blokk- és
+a fájltároló közvetlenül illeszthető ebbe a verembe. A blokktároló a
+blokkréteg alatt jelenik meg, mint egy <code>/dev/sda</code> eszköz; a
+fájltároló a VFS alatt mountolható, és a fájlrendszer fölött ad
+POSIX-nézetet.</p>
+<p>Az objektumtár nem illeszkedik természetesen ebbe a hagyományos
+verembe, mert nem blokk- vagy fájlszemantikát kínál, hanem REST API-t.
+Mégis gyakran szükség van arra, hogy egy objektumtárat fájlrendszerként
+lássunk. Ilyenkor a kernel vagy egy felhasználói térben futó FUSE-modul
+(például <code>s3fs</code>, <code>JuiceFS</code>, <code>Ceph RGW</code>)
+segítségével POSIX-nézetet kapunk az objektumtár fölött. Ez a felületi
+illesztés azonban nem költségmentes. A POSIX-szemantika és az
+objektumtár-szemantika közötti különbségek tipikus hibaforrást
+jelentenek.</p>
+<p>Nézzük meg a legfontosabb eltéréseket:</p>
+<ul>
+<li><strong>Részleges felülírás.</strong> A fájlrendszeren a
+<code>write()</code> a fájl egy tartományát módosíthatja; az
+objektumtárban egy <code>PutObject</code> a teljes objektumot felülírja.
+Ha egy s3fs-kliens 4 KiB-ot módosít egy nagy objektumban, az a teljes
+objektum letöltését és újrafeltöltését jelentheti, ami drasztikus
+teljesítményromlást okoz.</li>
+<li><strong>Atomi rename.</strong> A POSIX <code>rename()</code>
+atomikus ugyanabban a kötetben. Az S3-ban nincs rename: a művelet
+<code>COPY</code> + <code>DELETE</code>, ami nem atomikus. A kliensek
+ezt különböző trükkökkel próbálják elrejteni, de az atomitás
+megszűnik.</li>
+<li><strong>Zárak és megosztás.</strong> A fájltároló támogatja a
+byte-range lockingot, az objektumtár nem. A több kliens egyidejű írása
+leggyakrabban last-writer-wins eredményt ad.</li>
+<li><strong><code>mmap</code>.</strong> A POSIX <code>mmap()</code>
+laphiba-vezérelt I/O-t feltételez, amely blokkméretű visszaírásokkal
+dolgozik. Objektumtár fölött ez legfeljebb korlátozottan, nagy
+puffereléssel szimulálható.</li>
+<li><strong>Konzisztencia.</strong> A fájlrendszeren a
+<code>fsync()</code> garantálja, hogy az adat tartósan tárolódott. Az
+objektumtár <code>PutObject</code> válasza hasonló garanciát ad, de a
+hálózati replikáció és a cache miatt a frissítés más kliensek számára
+később válhat láthatóvá (lásd a konzisztenciáról szóló részt).</li>
+</ul>
+<p>A helyes megoldás általában az, hogy az alkalmazás közvetlenül a
+megfelelő natív API-t használja, nem pedig POSIX-abstrakciót erőltet az
+objektumtár fölé. Ha a program honlapra szánt statikus képeket tárol,
+közvetlenül S3 REST API-t hívjon; ha tranzakciós adatbázist futtat,
+blokktárolóra építsen fájlrendszert; ha felhasználói home-könyvtárat
+oszt meg, fájltárolót használjon.</p>
+<h3 data-number="18.4.3"
+id="az-s3-api-az-eventual-consistency-és-a-lifecycle"><span
+class="header-section-number">18.4.3</span> 3. Az S3 API, az eventual
+consistency és a lifecycle</h3>
+<p>Az S3 a legismertebb objektumtár-protokoll, amelyet számos
+szolgáltatás és szoftver implementál. Alapelemei a <code>bucket</code>
+(tároló) és a <code>key</code> (objektumkulcs). A névtér lapos: a
+kulcsban perjellel tagolt „könyvtárszerű” elnevezés csak konvenció, nem
+valódi hierarchia. A bucket nevek globálisan egyediek, a kulcsok a
+bucketen belül egyediek.</p>
+<h3 data-number="18.4.4" id="alapműveletek"><span
+class="header-section-number">18.4.4</span> 3.1. Alapműveletek</h3>
+<p>Az S3 alapműveletei pszeudokódban:</p>
+<pre class="text"><code>PutObject(bucket, key, data, metadata, storage_class) → version_id
+GetObject(bucket, key, range) → data, metadata
+DeleteObject(bucket, key) → void
+ListObjectsV2(bucket, prefix) → { key, size, etag, last_modified }
+HeadObject(bucket, key) → metadata</code></pre>
+<p>A gyakorlatban az API HTTP-kérésekkel valósul meg. A
+<code>PutObject</code> a teljes objektumot tárolja, és
+<code>ETag</code>-et ad vissza, ami az objektumtartalom ellenőrző
+összege. A <code>GetObject</code> a teljes objektumot adja vissza, de
+<code>Range</code> fejléccel részlet is kérhető. A
+<code>DeleteObject</code> törli a kulcs aktuális verzióját. A
+<code>ListObjectsV2</code> a prefixszel rendelkező kulcsokat lapozva
+listázza; a lista nem fájlrendszeri szintű szinkron metódus, ezért a
+friss feltöltések késleltetve jelenhetnek meg benne.</p>
+<p>Nagy objektumokhoz a multipart upload ajánlott: a feltöltő fél több
+részletben tölt fel, majd egy befejező kéréssel zárja az objektumot. Ez
+lehetővé teszi a párhuzamos átvitelt, a hálózati megszakításokból való
+folytatást és a nagy átviteli sebességet. A multipart részeket először
+függetlenül tárolják, és csak a befejező művelet után válnak láthatóvá a
+tényleges objektumként.</p>
+<h3 data-number="18.4.5" id="verziózás-és-metaadatok"><span
+class="header-section-number">18.4.5</span> 3.2. Verziózás és
+metaadatok</h3>
+<p>A bucket verziózása esetén minden kulcsnak több verziója lehet. Ha a
+<code>PutObject</code> új tartalmat ír egy létező kulcsra, az S3
+létrehozza az új verziót, és a régi verzió elérhető marad a
+verzióazonosítójával. A <code>DeleteObject</code> verziózott bucketen
+csak egy delete-markert helyez el, így a tárgy rejtve marad, de a régi
+verziók helyreállíthatók. Ez a mechanizmus alapja a véletlen törlés
+elleni védelemnek és a snapshotnak.</p>
+<p>Az objektumokhoz metaadatok társíthatók: tartalom típusa,
+cache-vezérlő fejlécek, alkalmazás-specifikus kulcs-érték párok. A
+metaadatok mérete korlátozott, ezért a nagy mennyiségű kereshető
+információt általában külön adatbázisban tárolják, és az objektumtárban
+csak a bináris adatot és a minimális metaadatot tartják.</p>
+<h3 data-number="18.4.6" id="eventual-consistency"><span
+class="header-section-number">18.4.6</span> 3.3. Eventual
+consistency</h3>
+<p>Az elosztott objektumtárak replikálják az adatokat több szerver,
+esetleg több adatközpont között. Az írás után a replikák frissítése
+aszinkron módon, késleltetéssel történik. Az <strong>eventual
+consistency</strong> (végül konzisztens) modell szerint a rendszer
+garantálja, hogy ha nincs további írás, akkor előbb vagy utóbb minden
+olvasó ugyanazt az értéket látja, de egy adott pillanatban az olvasók
+régi és új értéket is kaphatnak.</p>
+<p>Klasszikus példa: egy kliens feltölt egy képet, majd azonnal listázza
+a bucket tartalmát. Ha a lista egy olyan replikától szolgálódik, amely
+még nem kapta meg az új objektumot, a friss kép nem jelenik meg. Ugyanez
+történhet <code>GetObject</code> esetén is: a feltöltés sikeres válasza
+után egy másik kliens még a régi verziót kaphatja.</p>
+<p>Fontos azonban, hogy a nyilvános S3-felhők 2020 végétől a legtöbb
+alapszolgáltatásra erős read-after-write konzisztenciát dokumentálnak.
+Ez azt jelenti, hogy a <code>PutObject</code> sikeres válasza után a
+<code>GetObject</code> és a <code>ListObjects</code> a legfrissebb
+tartalmat adja. A konzisztencia-modell azonban implementációfüggő; a
+saját, emulált vagy régebbi rendszerek gyakran az eventual consistency
+modellt feltételezik. A fejlesztőnek mindig az adott szolgáltatás
+aktuális dokumentációját és az SDK viselkedését kell ellenőriznie.</p>
+<p>A formális definíció segít a kommunikációban. Egy rendszer
+<strong>lineárisan konzisztens</strong> (linearizable), ha minden
+művelet hatása egyetlen, a valós idővel összeegyeztethető sorrendbe
+rendezhető, mintha egyetlen példányon futottak volna. Az
+<strong>eventual consistency</strong> ennél gyengébb: a műveletek
+sorrendje nem szükségszerűen globálisan rendezhető, és az olvasók
+átmenetileg divergens értékeket látnak. Az eventual consistency nem
+hiba, hanem kompromisszum: lehetővé teszi a nagy skálázást, az alacsony
+késleltetést és a nagy rendelkezésre állást, de az alkalmazást úgy kell
+tervezni, hogy elviselje a rövid távú eltéréseket.</p>
+<p>Az alkalmazásokban ezt gyakran úgy kezelik, hogy az író fél nem
+feltételezi az azonnali láthatóságot; idempotens műveleteket használ,
+vagy a feltöltés után egy olyan indexbe (például adatbázisba) írja a
+kulcsot, amely erős konzisztenciát ad. Így az objektumtár aszinkron
+replikációja nem befolyásolja a felhasználói élményt.</p>
+<h3 data-number="18.4.7" id="lifecycle-szabályok"><span
+class="header-section-number">18.4.7</span> 3.4.
+Lifecycle-szabályok</h3>
+<p>Az életciklus-szabályok segítségével az objektumtár automatikusan
+vált storage class-t, vagy törli az objektumokat, időbeli feltételek
+alapján. A szabályok aszinkron módon, háttérfolyamatban futnak; nem
+azonnali műveletek, ezért a törlésre vagy átmenetre építeni nem
+szabad.</p>
+<p>A jellemző átmenetek:</p>
+<ul>
+<li><code>STANDARD</code> – gyors, drágább tárolás, gyakori
+eléréshez.</li>
+<li><code>STANDARD_IA</code> – ritkábban elért adatokhoz, alacsonyabb
+tárolási költség, de magasabb lehívási díj.</li>
+<li><code>GLACIER</code> – archiválás, nagy késleltetésű
+visszaolvasás.</li>
+<li><code>DEEP_ARCHIVE</code> – nagyon olcsó, hosszú távú
+archiválás.</li>
+</ul>
+<p>A lifecycle-szabály például előírhatja: 30 nap után váltson
+<code>STANDARD_IA</code>-ba, 90 nap után <code>GLACIER</code>-be, 365
+nap után törlődjön. Verziózott bucketen a szabály külön vonatkozhat a
+current és a noncurrent verziókra. A nem aktuális verziókat például 7
+nap után törölheti a rendszer.</p>
+<p>A gyakorlatban a lifecycle-szabályoknál a következőkre kell
+figyelni:</p>
+<ul>
+<li>A friss feltöltésű objektumokra a szabály csak a megadott napok
+elteltével érvényesül; a napok az objektum létrehozása vagy utolsó
+módosítása óta számítódnak.</li>
+<li>A storage class váltás költséggel járhat; az IA osztályról való
+visszaváltás lehívási díjat von maga után.</li>
+<li>A <code>GLACIER</code> osztályban az objektum nem olvasható
+közvetlenül; először restore műveletet kell kezdeményezni, ami percekig
+vagy órákig tarthat.</li>
+<li>A törlés nem azonnali, ezért a lifecycle nem helyettesíti a
+biztonsági mentést.</li>
+</ul>
+<h3 data-number="18.4.8"
+id="modell-kiválasztása-egy-alkalmazáshoz"><span
+class="header-section-number">18.4.8</span> 4. Modell kiválasztása egy
+alkalmazáshoz</h3>
+<p>A tárolási modell kiválasztásának központi kérdése: milyen
+hozzáférési mintát mutat az alkalmazás, és milyen szemantikát
+igényel.</p>
+<p>Gyakorlati példa: képfeltöltő szolgáltatás. A felhasználó feltölt egy
+képet, a rendszer három méretű thumbnailt generál, és a webes felület
+visszaolvassa a képeket. A képfájlok nagy méretűek, binárisak, egyszer
+íródnak, sokszor olvasódnak, és nem igényelnek részleges felülírást. Ez
+a minta tökéletesen illeszkedik az objektumtárhoz: a képek
+<code>PutObject</code>-tal kerülnek a bucketbe, a webes kiszolgáló pedig
+<code>GetObject</code>-tal vagy CDN-en keresztül olvassa őket. A
+thumbnail-ek szintén objektumok, mert egyszer keletkeznek, ritkán
+változnak.</p>
+<p>A felhasználói fiókok, jogosultságok, feltöltési naplók
+tranzakciósak, kis sorokból állnak, és erős konzisztenciát igényelnek:
+ezek számára blokktárolóra épített relációs adatbázis az ésszerű
+választás. Az adatbázis adatfájlja számára a fájlrendszer rétegét is ki
+kell választani; a blokktároló feletti ext4 vagy XFS megfelelő, mert a
+DB a <code>fsync</code>-et használja a tartóssághoz, és a
+<code>pwrite</code>-tel részleges frissítést végez.</p>
+<p>A webes kiszolgáló gyorsítótárának (például a már legenerált
+thumbnail-ek ideiglenes tárolása) nincs szüksége tartós tárolóra. Ez
+helyi, efemer fájltároló lehet; ha több kiszolgáló is van, a gyorsítótár
+elosztott megosztást igényel, de a tartósság nem kritikus.</p>
+<p>Ebből a példából is látható, hogy egyetlen alkalmazás gyakran több
+modellt használ ugyanabban az időben, és a modellválasztásnak a workload
+jellegéhez kell igazodnia. A rossz választás tipikus következményei:</p>
+<ul>
+<li>Objektumtárra POSIX-fájlműveleteket írni s3fs-en keresztül, miközben
+az alkalmazás lockot vagy részleges felülírást vár. A teljesítmény
+katasztrofálisan romlik, a szemantika sérül.</li>
+<li>Fájltárolóba terelni nagyszámú, kis bináris fájlt, és a hálózati
+metaadat-forgalom miatt a névtér telítődik.</li>
+<li>Blokktárolót több hoszttal megosztani fájlrendszer nélkül, ami
+korrupcióhoz vezet.</li>
+<li>Csak a GB-költséget figyelni, és nem számolni az IOPS- és
+egress-díjakkal.</li>
+</ul>
+<h3 data-number="18.4.9"
+id="labor-tárolási-modell-kiválasztása-és-mérés"><span
+class="header-section-number">18.4.9</span> 5. Labor: tárolási modell
+kiválasztása és mérés</h3>
+<p>A labor célja, hogy a hallgató reprodukálható, emulált környezetben
+összehasonlítsa a három tárolási modell viselkedését kis fájlokkal, majd
+döntési javaslatot készítsen egy megadott alkalmazáshoz. A labor nem
+éles rendszeren fut, és a host valódi lemezét nem módosítja.</p>
+<h3 data-number="18.4.10" id="kiinduló-állapot-és-konfiguráció"><span
+class="header-section-number">18.4.10</span> 5.1. Kiinduló állapot és
+konfiguráció</h3>
+<p>A méréshez QEMU vendég Linuxot használunk, mert a három modell
+költséghatékonyan összevethető egyetlen virtuális gépen belül. A host
+hardver és a vendég konfiguráció:</p>
+<ul>
+<li>Hoszt: x86-64 CPU, legalább 8 GiB RAM, Linux kernel tetszőleges
+modern verziója.</li>
+<li>QEMU vendég: QEMU 8.0, 2 vCPU, 4 GiB RAM, 20 GiB qcow2 lemez.</li>
+<li>Vendég operációs rendszer: Ubuntu Server 22.04 LTS, kernel 6.2.</li>
+<li>Mérőeszközök: <code>fio</code> 3.35, <code>minio</code> server
+release, <code>mc</code> (MinIO client), <code>curl</code> 8.0.</li>
+</ul>
+<p>A reprodukciós csomag tartalmazza a vendég lemezkép nevet, a QEMU
+indítási parancsot, a kernel és a mérőeszközök verzióját, valamint a
+nyers mérési naplót. A mérési parancsok értékei példaként,
+szemléltetésre szolgálnak; a konkrét mért értékeket a naplóban rögzíteni
+kell.</p>
+<p><strong>Vendég előkészítése:</strong></p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> create <span class="at">-f</span> qcow2 /srv/os069/qemu-disk.qcow2 20G</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-enable-kvm</span> <span class="at">-m</span> 4G <span class="at">-smp</span> 2 <span class="dt">\</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-drive</span> file=/srv/os069/qemu-disk.qcow2,if=virtio <span class="dt">\</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-netdev</span> user,id=n1 <span class="at">-device</span> virtio-net-pci,netdev=n1 <span class="dt">\</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-cdrom</span> /srv/os069/ubuntu-22.04.3-live-server-amd64.iso</span></code></pre></div>
+<p>A telepítés után a vendégben a <code>srv</code> partíció helyett a
+<code>qcow2</code> rendszerlemezt használjuk. A host valódi lemezét nem
+csatoljuk.</p>
+<h3 data-number="18.4.11" id="blokkréteg-mérése"><span
+class="header-section-number">18.4.11</span> 5.2. Blokkréteg mérése</h3>
+<p>A blokktároló tesztjéhez egy extra virtuális lemezt csatolunk, és
+<code>fio</code>-val mérjük a nyers blokkeszköz véletlen olvasási/írási
+teljesítményét:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Vendégben, emulált környezetben</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lsblk</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"># /dev/vdb az új csatolt lemez</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>block <span class="at">--filename</span><span class="op">=</span>/dev/vdb <span class="dt">\</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>4G <span class="at">--rw</span><span class="op">=</span>randwrite <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--iodepth</span><span class="op">=</span>32 <span class="at">--numjobs</span><span class="op">=</span>1 <span class="at">--time_based</span> <span class="at">--runtime</span><span class="op">=</span>30</span></code></pre></div>
+<p>A várt eredmény: a blokkeszköz 4K véletlen írási IOPS értéke a
+virtuális háttér és a QEMU lemez backendétől függően több ezer IOPS
+lehet; a késleltetés tipikusan 0,1–1 ms nagyságrendű. A mért értékeket a
+naplóban külön jelöljük.</p>
+<p>A blokkeszközön nincs fájlrendszer, ezért a nyers mérés az alsó
+határt mutatja: ennél a fájlrendszer overheadje miatt a fájlolvasás sem
+lehet gyorsabb.</p>
+<h3 data-number="18.4.12" id="fájlréteg-mérése"><span
+class="header-section-number">18.4.12</span> 5.3. Fájlréteg mérése</h3>
+<p>A fájltároló szimulálásához a vendégben ugyanarra a blokkeszközre
+ext4 fájlrendszert hozunk létre, és fájlokon keresztül mérünk:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mkfs.ext4 /dev/vdb</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> mount /dev/vdb /mnt/file</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">fio</span> <span class="at">--name</span><span class="op">=</span>file <span class="at">--directory</span><span class="op">=</span>/mnt/file <span class="dt">\</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="at">--size</span><span class="op">=</span>4G <span class="at">--rw</span><span class="op">=</span>randwrite <span class="at">--bs</span><span class="op">=</span>4k <span class="at">--ioengine</span><span class="op">=</span>libaio <span class="dt">\</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="at">--direct</span><span class="op">=</span>1 <span class="at">--iodepth</span><span class="op">=</span>32 <span class="at">--numjobs</span><span class="op">=</span>1 <span class="at">--time_based</span> <span class="at">--runtime</span><span class="op">=</span>30 <span class="dt">\</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="at">--fsync</span><span class="op">=</span>1</span></code></pre></div>
+<p>A <code>--fsync=1</code> minden írás után fsync-et hajt végre, ami a
+tartósságot modellezi. A várt eredmény: az IOPS alacsonyabb, mint a
+nyers blokknál, mert a fájlrendszer metaadatait is írni kell. A mérés
+ezzel a fájlréteg és az <code>fsync</code> költségét mutatja.</p>
+<p>A hálózati fájltároló (NFS) pontosabb modellezéséhez egy NFS-szervert
+is indíthatunk a vendégben, de az alap laborban a helyi fájlrendszer
+elegendő a hierarchikus névtér és a fájl-metaadat overhead
+bemutatására.</p>
+<h3 data-number="18.4.13" id="objektumtár-mérése"><span
+class="header-section-number">18.4.13</span> 5.4. Objektumtár
+mérése</h3>
+<p>Az objektumtár emulálásához MinIO szervert indítunk a vendégben vagy
+a hoszton Dockerben. A laborban a hoszton futó Docker konténer szolgálja
+az S3 API-t, mert a QEMU vendég ezt HTTP-n éri el:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Hoszton, eldobható konténerben; a hitelesítő adatok helyőrzők</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">--rm</span> <span class="at">-d</span> <span class="at">-p</span> 9000:9000 <span class="at">-p</span> 9001:9001 <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-e</span> MINIO_ROOT_USER=labuser <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-e</span> MINIO_ROOT_PASSWORD=labpass <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  quay.io/minio/minio server /data <span class="at">--console-address</span> <span class="st">&quot;:9001&quot;</span></span></code></pre></div>
+<p>A laborban használt hitelesítő adat
+(<code>labuser</code>/<code>labpass</code>) szintetikus, nem valós
+gyártói titok.</p>
+<p>A vendégben konfiguráljuk a klienst, és kis objektumokat töltünk
+fel:</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> alias set lab http://10.0.2.2:9000 labuser labpass</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">mc</span> mb lab/testbucket</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 1000 darab 4 KiB-os objektum feltöltése; a mérési pontok a naplóba kerülnek</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i <span class="kw">in</span> <span class="va">$(</span><span class="fu">seq</span> 1 1000<span class="va">)</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">dd</span> if=/dev/urandom of=/tmp/obj bs=4K count=1 status=none</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">/usr/bin/time</span> <span class="at">-o</span> /tmp/s3_put_latency.txt <span class="at">-a</span> <span class="dt">\</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>    mc cp /tmp/obj lab/testbucket/obj_<span class="va">$i</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+<p>A várt eredmény: az objektumtár késleltetése (HTTP round-trip,
+replikáció, metaadat-írás) nagyobb, mint a blokk- és fájltárolóé,
+jellemzően 2–10 ms nagyságrendű az emulált környezetben. Az átviteli
+sebesség viszont párhuzamos feltöltéssel növelhető, míg a blokkeszköznél
+a hálózati stack overhead hiányzik.</p>
+<p>A mért és a várt értéket külön kell választani: a fenti értékek
+levezetett becslések; a tényleges mérési eredményeket a
+<code>s3_put_latency.txt</code> és az <code>fio</code> kimenetek
+tartalmazzák.</p>
+<h3 data-number="18.4.14" id="döntési-feladat"><span
+class="header-section-number">18.4.14</span> 5.5. Döntési feladat</h3>
+<p>A labor utolsó lépéseként a hallgató írjon egy rövid jegyzetfüzetet,
+amelyben a mért eredmények alapján tárolási modellt választ egy
+képfeltöltő szolgáltatás következő elemeihez:</p>
+<ol type="1">
+<li>Eredeti képek és thumbnail-ek tartós tárolása.</li>
+<li>Felhasználói fiókok és feltöltési naplók erős konzisztenciával.</li>
+<li>A webes kiszolgáló gyorsítótárának ideiglenes tárolása.</li>
+</ol>
+<p>A döntéshez használja a fejezet táblázatát, és a mérési naplóval
+indokolja a választást. Például:</p>
+<ul>
+<li>A képek esetében az objektumtár előnyös, mert a mérés szerint így a
+feltöltés HTTP-vel párhuzamosítható, és a fájl nagy mérete nem okoz
+részleges felülírást.</li>
+<li>Az adatbázis számára blokktároló és fájlrendszer szükséges, mert a
+4K véletlen írási IOPS és a <code>fsync</code> szemantika ott
+teljesül.</li>
+<li>A gyorsítótárhoz nem kell tartós tároló; helyi fájlrendszer vagy
+memória is elegendő.</li>
+</ul>
+<h3 data-number="18.4.15" id="önellenőrző-kérdés"><span
+class="header-section-number">18.4.15</span> 6. Önellenőrző kérdés</h3>
+<p>Adott egy felhőalapú alkalmazás, amely időbélyeges mérési
+adatfájlokat kap, azokat feldolgozza, majd a nyers fájlokat 90 napig
+ritkán kell visszaolvasni, 365 nap után törölni. Melyik tárolási modellt
+választja a nyers fájlokhoz, és milyen lifecycle-szabályt állít be?
+Válaszában térjen ki arra, miért nem elegendő a blokk- vagy fájltároló,
+és hogyan kezeli az esetleges eventual consistency-t a feltöltés utáni
+azonnali visszaolvasáskor.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os068.html">← 18.3 Backup, archiválás és mentési stratégiák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os070.html">19.1 Rétegmodellek és TCP/IP →</a></div>
+</nav>
+</body>
+</html>

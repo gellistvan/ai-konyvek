@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>29.1 Egyszerű fájlrendszer tervezése – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz7">VII. RÉSZ – Tervezés, implementáció és záróprojekt</a> › <a href="index.html#osch28">29 Fájlrendszer és eszközmeghajtó</a></p>
+<div class="links"><a class="prev" rel="prev" href="os109.html">← 28.4 Naplózás, panic és hibakezelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os111.html">29.2 Blokk-eszköz és driver implementáció →</a></div>
+</nav>
+<h2 data-number="29.1" id="os110"><span
+class="header-section-number">29.1</span> Egyszerű fájlrendszer
+tervezése</h2>
+<p>Az egyszerű fájlrendszer tervezésekor a cél nem a teljes
+funkcionalitású, nagyvállalati ext4 vagy ZFS rendszer megalkotása, hanem
+egy olyan minimális, ellenőrizhető és oktatható rendszer felépítése,
+amelyen keresztül kézzelfoghatóvá válnak a korábban a VFS-ről, a
+blokk-eszközökről és a crash-konzisztenciáról tanult elvek. A fejezetben
+ismertetett terv a <code>minfs</code> nevet viseli, és kifejezetten
+emulált QEMU környezetben, eldobható lemezképfájlokon fut. Ez a fejezet
+a bevezetett adatszerkezeteket úgy alapozza meg, hogy a következő egység
+(<a href="os111.html">Blokk-eszköz és driver implementáció</a>)
+blokkmeghajtó-implementációja közvetlenül ezekre az elemekre
+építhessen.</p>
+<h3 data-number="29.1.1" id="a-tervezés-keretei-és-a-blokkmodell"><span
+class="header-section-number">29.1.1</span> 1. A tervezés keretei és a
+blokkmodell</h3>
+<p>Mielőtt az adatszerkezeteket definiálnánk, rögzíteni kell a hardver-
+és tárolási absztrakciókat. A kernel számára a tárolóeszköz (legyen az
+QEMU-ban egy virtuális IDE, SATA vagy NVMe lemez, esetleg egy
+<code>virtio-blk</code> eszköz) szektorok lineáris sorozata. A minfs
+tervezésekor ezt a linearitást emeljük át blokkabsztrakcióvá. A kernel
+I/O rétegének feladata, hogy a felsőbb rétegek felé fix méretű logikai
+blokkokat szolgáltasson, amely adott esetben több fizikai szektort fog
+össze.</p>
+<p>A minfs labor konfigurációja a reprodukálhatóság érdekében
+rögzített:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Paraméter</th>
+<th style="text-align: left;">Érték</th>
+<th style="text-align: left;">Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Eszköz</td>
+<td style="text-align: left;">QEMU <code>virtio-blk</code></td>
+<td style="text-align: left;">emulált, írható eldobható kép</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Lemezkép mérete</td>
+<td style="text-align: left;">16 MiB</td>
+<td style="text-align: left;"><code>dd</code>-vel létrehozva</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Blokkméret</td>
+<td style="text-align: left;">4 KiB (<code>0x1000</code>)</td>
+<td style="text-align: left;">egy blokk = 8 szektor (512 B)</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Összes blokk</td>
+<td style="text-align: left;">4096</td>
+<td style="text-align: left;">16 MiB / 4 KiB</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Inode-ok száma</td>
+<td style="text-align: left;">512</td>
+<td style="text-align: left;">rögzített, statikus tábla</td>
+</tr>
+</tbody>
+</table>
+<p>Egy ilyen kis rendszerben a blokkméret bátran lehet 4 KiB, mert a mai
+processzorok lapmérete is 4 KiB, így a memóriába emelt blokkok és a
+lapok határai szépen illeszkednek. A 16 MiB méret elég nagy ahhoz, hogy
+értelmes fájlokat tároljunk, de elég kicsi ahhoz, hogy a fájlkép
+hexdump-pal vagy saját eszköztárral könnyen átvizsgálható legyen. A
+tervezés első lépése a lemez blokkokra osztása és a régiók
+kijelölése:</p>
+<table>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Régió</th>
+<th style="text-align: left;">Blokktartomány</th>
+<th style="text-align: left;">Méret</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Superblock</td>
+<td style="text-align: left;">0</td>
+<td style="text-align: left;">4 KiB</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Adatblokk-bitmap</td>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">4 KiB</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;">Inode-tábla</td>
+<td style="text-align: left;">2 – 17</td>
+<td style="text-align: left;">64 KiB (16 blokk)</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;">Adatblokkok</td>
+<td style="text-align: left;">18 – 4095</td>
+<td style="text-align: left;">~15,94 MiB (4078 blokk)</td>
+</tr>
+</tbody>
+</table>
+<p>Miért van szükség tehát superblockra, inode-táblára, bitmapre és
+adatblokkokra? Mert a fájlrendszernek egyszerre kell nyilvántartania a
+saját paramétereit (superblock), a fájlok metaadatait (inode), a lemez
+foglaltsági állapotát (bitmap), valamint a tényleges fájltartalmat
+(adatblokk).</p>
+<h3 data-number="29.1.2"
+id="superblock-a-fájlrendszer-önleíró-fejléce"><span
+class="header-section-number">29.1.2</span> 2. Superblock: a
+fájlrendszer önleíró fejléce</h3>
+<p>A superblock a fájlrendszer legfontosabb egyedi adatszerkezete, amely
+a lemez elején, a nullás blokkban található. A kernel a
+<code>mount</code> művelet során ezt olvassa be először. A superblock
+nélkül a többi adatszerkezet helyzete és mérete ismeretlen lenne, hiszen
+a formattól függően változhat a blokkméret vagy a táblák eltolása.</p>
+<p>A minfs superblockja C adatszerkezetként a következőképpen írható le
+(a kód itt és a továbbiakban szemléltetés, nem futtatandó éles
+utasítás):</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* freestanding C, emulált minfs kernelben használt deklaráció */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_MAGIC </span><span class="bn">0x4D494E46</span><span class="pp">  </span><span class="co">/* ASCII: &#39;M&#39; &#39;I&#39; &#39;N&#39; &#39;F&#39; */</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> minfs_superblock <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_magic<span class="op">;</span>          <span class="co">/* 0x4D494E46 */</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_block_size<span class="op">;</span>     <span class="co">/* 0x00001000 */</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_total_blocks<span class="op">;</span>   <span class="co">/* 0x00001000 (4096) */</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_inode_count<span class="op">;</span>    <span class="co">/* 0x00000200 (512) */</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_free_blocks<span class="op">;</span>    <span class="co">/* aktuális szabad blokkok, kezdetben 4078 */</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_first_data_block<span class="op">;</span> <span class="co">/* 0x00000012 (18) */</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_inode_table_start<span class="op">;</span><span class="co">/* 0x00000002 (2) */</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> s_state<span class="op">;</span>          <span class="co">/* 0 = tiszta, 1 = hibás, 2 = ismert hibákkal */</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  s_reserved<span class="op">[</span><span class="dv">4044</span><span class="op">];</span> <span class="co">/* kitöltés a 4096 bájtos blokkhoz */</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">));</span></span></code></pre></div>
+<p>A <code>__attribute__((packed))</code> direktíva fontos szerepet
+játszik. A C fordító alapértelmezés szerint igazíthatja a
+struktúratagokat a natív memóriahatárokhoz, így a struktúra mérete
+nagyobb lehet, mint a tagok összege. A lemezen viszont pontosan
+definiált, bájtpontos elrendezésre van szükség, ezért a kitöltést
+explicit módon kell megadni és a <code>packed</code> attribútummal
+letiltani a fordítói igazítást. A <code>s_magic</code> mező egy egyedi
+bűvös szám. Ha a kernel beolvassa a nullás blokkot, és a
+<code>s_magic</code> értéke nem egyezik a <code>MINFS_MAGIC</code>
+értékkel, akkor a mount műveletnek <code>-ENODATA</code> hibával kell
+visszatérnie, mert a lemezen nagy valószínűséggel nem minfs fájlrendszer
+található. Ez az első számú integritási kapu.</p>
+<p>A <code>s_state</code> mező a crash-konzisztencia alapjait rakja le.
+A tervezett minfsben a mount során a kernel megnézi ezt a mezőt. Ha az
+érték nem 0, akkor a rendszer tisztában van vele, hogy a lemez
+lecsatolás nélkül lett kikapcsolva, és a gyorsított <code>fsck</code>-t
+le kell futtatni, amely ellenőrzi a bitmapet és az inode-okat. A
+superblock mérete pontosan 4096 bájt, tehát kitölti az első blokkot. A
+lemezre íráskor a kernel a teljes memóriapuffert kiírja, így a
+<code>s_reserved</code> terület is a lemezre kerül, ami fenntartja a
+jövőbeli bővítés lehetőségét.</p>
+<h3 data-number="29.1.3"
+id="inode-a-fájl-identitása-és-indexelése"><span
+class="header-section-number">29.1.3</span> 3. Inode: a fájl identitása
+és indexelése</h3>
+<p>A minfs a klasszikus Unix-filozófiát követi: a fájl neve és a fájl
+adatai különválnak. A fájlrendszer a fájlokról az inode-okban tárolja a
+metaadatokat. A minfs tervezésénél az inode-tábla fix méretű, a lemez
+elején (2-től 17-ig terjedő blokkokban) helyezkedik el. A 16 blokk
+méretű tábla 4096 * 16 / 128 = 512 inode-ot képes tárolni, mivel minden
+inode mérete rögzített 128 bájt. A fix, 128 bájtos méret kényelmes, mert
+a ki- és beolvasás gyorsan, eltolásszámítással megoldható. A
+<code>minfs_inode</code> definíciója:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_N_DIRECT  </span><span class="dv">12</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_N_INDIRECT </span><span class="dv">1</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_TYPE_FILE  </span><span class="dv">1</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_TYPE_DIR   </span><span class="dv">2</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_TYPE_SYML  </span><span class="dv">3</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> minfs_inode <span class="op">{</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> i_mode<span class="op">;</span>            <span class="co">/* típus és egyszerű jogosultság bitek */</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> i_links_count<span class="op">;</span>     <span class="co">/* hivatkozások száma */</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_size<span class="op">;</span>            <span class="co">/* fájlméret bájtban */</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_atime<span class="op">;</span>           <span class="co">/* utolsó hozzáférés (epoch másodperc) */</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_ctime<span class="op">;</span>           <span class="co">/* létrehozás / metaadat-változás */</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_mtime<span class="op">;</span>           <span class="co">/* utolsó módosítás */</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_direct<span class="op">[</span>MINFS_N_DIRECT<span class="op">];</span>  <span class="co">/* közvetlen blokkmutatók */</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_indirect<span class="op">[</span>MINFS_N_INDIRECT<span class="op">];</span> <span class="co">/* közvetett blokkmutató */</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> i_padding<span class="op">[</span><span class="dv">4</span><span class="op">];</span>      <span class="co">/* 128 bájtra kiegészítés */</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">));</span></span></code></pre></div>
+<p>A blokkmutatók logikája a minfs teljesítményének és egyszerűségének
+kompromisszuma. Tizenkettő közvetlen blokkmutató 12 * 4 KiB = 48 KiB
+fájlméretet fed le. Ez a legtöbb konfigurációs fájl, shell-szkript és
+kisebb napló számára elegendő. A 13. mutató (az
+<code>i_indirect[0]</code>) egy olyan adatblokkra mutat, amely nem
+fájladatokat, hanem további blokkmutatókat tartalmaz. Mivel egy blokk
+4096 bájt és egy mutató 4 bájt, egyetlen közvetett blokk 1024 további
+blokkra mutathat. Ez 1024 * 4 KiB = 4 MiB további tárterületet nyit meg.
+A maximális fájlméret tehát 48 KiB + 4 MiB = 4,05 MiB, ami a 16 MiB-os
+korlátozott laborlemezen bőséges.</p>
+<p>Fontos tervezési döntés, hogy a minfs első implementációjában nem
+vezetünk be duplán közvetett mutatót. Ennek oka a hibakereshetőség: a
+közvetett blokkok fájljának felépítése az első számú forrása a
+fájlrendszer-hibáknak. Ha a hallgató hibásan indexel, és egy adatblokkot
+értelmez mutatóblokként, az könnyen katasztrofális felülíráshoz vezet.
+Az egyszerű, egy szintű indirekció elég ahhoz, hogy megtanítsa a blokkok
+közötti ugrás logikáját, de elég rövid ahhoz, hogy GDB-vel vagy
+naplózással lépésenként ellenőrizhető legyen.</p>
+<h3 data-number="29.1.4" id="adatblokkok-és-könyvtárstruktúra"><span
+class="header-section-number">29.1.4</span> 4. Adatblokkok és
+könyvtárstruktúra</h3>
+<p>Az adatblokkok alkotják a lemez fennmaradó részét. Amit a felhasználó
+egy fájlban lát, az ezeknek a blokkoknak az összefűzése. Az
+<code>i_size</code> mező dönti el, hogy az utolsó blokkban hány bájt az
+érvényes adat. Ha például egy fájl 5000 bájt méretű, akkor két blokkot
+foglal le: az első blokk 4096 bájtja teljes, a második blokkban pedig
+5000 - 4096 = 904 bájt az érvényes. Tipikus hiba, hogy a kernel a fájl
+beolvasásakor nem veszi figyelembe az <code>i_size</code> értékét, és a
+lemezről beolvasott blokk maradék részét is visszaadja a felhasználónak.
+Ez adatszivárgáshoz vezet, hiszen a blokkban korábban tárolt, törölt
+fájl maradványai is kikerülhetnek. A minfs tervezésekor rögzítenünk
+kell: az adatblokkok tartalmát a lefoglalás pillanatában nullázni kell,
+vagy a beolvasásnál az <code>i_size</code>-on túli területet a kernel
+puffereiben explicit módon nullával kell kitölteni.</p>
+<p>A könyvtárak a minfsben speciális fájlok, amelyeknek az
+<code>i_mode</code> mezője <code>MINFS_TYPE_DIR</code>. A tartalmuk nem
+szabad formátumú szöveg, hanem strukturált rekordok sorozata. A minfs a
+legegyszerűbb, fix hosszúságú bejegyzéseket használja a könnyű
+karbantarthatóságért:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MINFS_NAME_MAX </span><span class="dv">27</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> minfs_dirent <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> d_inode<span class="op">;</span>               <span class="co">/* a fájl inode-száma, 0 = törölt */</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint16_t</span> d_rec_len<span class="op">;</span>             <span class="co">/* rekord hossza (32 bájtra igazítva) */</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  d_type<span class="op">;</span>                <span class="co">/* típus, mint az inode-ban */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span>  d_name_len<span class="op">;</span>            <span class="co">/* a név hossza */</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">char</span>     d_name<span class="op">[</span>MINFS_NAME_MAX<span class="op">];</span><span class="co">/* név, nullával zárva */</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">));</span></span></code></pre></div>
+<p>Ha egy fájlt keresünk egy könyvtárban, a kernel beolvassa a könyvtár
+inode-ját, majd annak adatblokkjaiban lineárisan végigiterál a 32 bájtos
+rekordokon, és összehasonlítja a <code>d_name</code> értékét a keresett
+névvel. Ez egy O(n) komplexitású művelet, ami egy ilyen tanuló
+rendszerben bőven elfogadható. Valós rendszerekben itt B-fákat vagy
+hash-táblákat használnak, de a minfs célja az algoritmus átláthatósága.
+A <code>d_inode = 0</code> érték jelöli a törölt rekordot. Ez
+lehetőséget ad arra, hogy a későbbi létrehozások újra felhasználják a
+helyet anélkül, hogy a könyvtárfájlt tömöríteni kellene.</p>
+<h3 data-number="29.1.5"
+id="szabadhely-kezelés-az-adatblokk-bitmap"><span
+class="header-section-number">29.1.5</span> 5. Szabadhely-kezelés: az
+adatblokk-bitmap</h3>
+<p>A lemez foglaltsági állapotát a minfs az 1. blokkban található bitmap
+segítségével tartja nyilván. A bitmap minden egyes adatblokkhoz
+hozzárendel egy bitet. Ha a bit értéke 1, a blokk foglalt; ha 0, akkor
+szabad. A 4096 blokk kezeléséhez 4096 bitre, azaz 512 bájtra van
+szükség. Mivel a bitmap számára egy teljes 4 KiB-os blokk áll
+rendelkezésre, a fennmaradó 3584 bájt egyelőre kihasználatlan, de
+fenntartott.</p>
+<p>A bitmap választása a free-listtel szemben a tárolás hatékonyságában
+és az allokáció kiszámíthatóságában rejlik. Egy egybites
+nyilvántartásnál a lefoglalás és a felszabadítás konstans időben (O(1))
+elvégezhető, amennyiben a kernel a bitmap blokkját a memóriában
+cache-eli. A lefoglalás algoritmusa:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Pszeudokód: szabad blokk keresése és lefoglalása */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">uint32_t</span> minfs_alloc_block<span class="op">(</span><span class="kw">struct</span> minfs_superblock <span class="op">*</span>sb<span class="op">,</span> <span class="dt">uint8_t</span> <span class="op">*</span>bitmap<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">uint32_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> sb<span class="op">-&gt;</span>s_total_blocks<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> byte_index <span class="op">=</span> i <span class="op">/</span> <span class="dv">8</span><span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint32_t</span> bit_index  <span class="op">=</span> i <span class="op">%</span> <span class="dv">8</span><span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(!(</span>bitmap<span class="op">[</span>byte_index<span class="op">]</span> <span class="op">&amp;</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> bit_index<span class="op">)))</span> <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>            bitmap<span class="op">[</span>byte_index<span class="op">]</span> <span class="op">|=</span> <span class="op">(</span><span class="dv">1</span> <span class="op">&lt;&lt;</span> bit_index<span class="op">);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>            sb<span class="op">-&gt;</span>s_free_blocks<span class="op">--;</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> i <span class="op">+</span> sb<span class="op">-&gt;</span>s_first_data_block<span class="op">;</span> <span class="co">/* valós blokkcím */</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span> <span class="co">/* Nincs több hely */</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A fenti kód a legegyszerűbb first-fit allokátor. A lefoglalás O(n)
+komplexitású, mert a legrosszabb esetben a teljes bitmapet végig kell
+szkennelni. A minfs laborban ennek nincs érzékelhető költsége, de fontos
+felismerni, hogy valós rendszerekben ezért tartanak fenn last-fit vagy
+extent-alapú algoritmusokat a fragmentáció és a késleltetés csökkentése
+érdekében. A minfsben azonban a determinisztikus, lineáris keresés teszi
+lehetővé, hogy a hallgató a QEMU konzolján pontosan nyomon kövesse,
+melyik blokkot kapja a következő fájl.</p>
+<p>A tipikus implementációs hiba itt az off-by-one hiba. A bitmap
+nulladik bitje a 18. blokkra vonatkozik, nem a 0. blokkra. Ha az
+allokátor a 0. blokktól kezdi az indexelést, azzal felülírhatja a
+superblockot. A helyes megoldás az, hogy az allokátor a visszatérési
+értékhez mindig hozzáadja a <code>s_first_data_block</code> értékét, a
+felszabadításnál pedig kivonja azt.</p>
+<p>A szabadhely-kezeléshez hozzátartozik a fél-inode probléma kezelése
+is. Ha mind a 12 közvetlen blokk és az indirekt blokk lefoglalása
+megtörténik, de az indirekt blokk tartalmának beírása előtt a kernel
+összeomlik, a bitmapben foglaltként jelölt blokkok árván maradnak,
+miközben a fájl hossza nulla. Ezt az integritási ellenőrzésnek később
+fel kell fedeznie.</p>
+<h3 data-number="29.1.6" id="integritási-modell-és-konzisztencia"><span
+class="header-section-number">29.1.6</span> 6. Integritási modell és
+konzisztencia</h3>
+<p>A fejezet az adatszerkezetek tervezéséről szól, de az integritást már
+itt be kell tervezni, mert utólagosan nehéz hozzáfűzni. A minfs
+tervezésénél kétféle integritási hibát különböztetünk meg:</p>
+<ol type="1">
+<li><strong>Strukturális inkonzisztencia:</strong> A superblock
+<code>s_free_blocks</code> mezője nem egyezik a bitmap tényleges szabad
+bitjeinek számával, vagy egy inode által hivatkozott blokk a bitmapben
+szabadnak van jelölve.</li>
+<li><strong>Adat-tartalmi hiba:</strong> A lemez blokkja sérült, a
+checksum nem egyezik.</li>
+</ol>
+<p>Az egyszerű minfs az első kategóriát kezeli. A tervezési alapelv a
+<code>s_state</code> mezőben rejlik. A mount során a
+<code>minfs_mount</code> a következő ellenőrzéseket futtatja:</p>
+<ul>
+<li><code>MAGIC</code> egyezik-e?</li>
+<li><code>s_block_size == 4096</code>?</li>
+<li><code>s_total_blocks</code> túl mutat-e a lemez méretén?</li>
+<li><code>s_inode_count * sizeof(inode) &lt;= inode_table_blocks * 4096</code>?</li>
+</ul>
+<p>Ha a <code>s_state</code> hibásan van megjelölve, a kernel lefuttatja
+a <code>minfs_fsck</code> gyorsított verzióját. Ez a gyakorlatban azt
+jelenti, hogy a kernel beolvassa az összes inode-ot, és felépít egy
+ideiglenes memória-bitmapot a ténylegesen hivatkozott blokkokról. Ezt
+összehasonlítja a lemezen lévő bitmap-pel. Ha egy blokk a bitmapen
+foglalt, de egyetlen inode sem hivatkozik rá, akkor az egy elveszett
+blokk. A <code>fsck</code> ezt felszabadítja (a bitet 0-ra állítja) és
+növeli a <code>s_free_blocks</code> értékét. Ha viszont egy inode által
+hivatkozott blokk a bitmapen szabadnak van jelölve, az súlyos hiba, mert
+egy másik fájl esetleg már lefoglalta azt. Ebben az esetben a kernelnek
+meg kell tagadnia az írást és <code>-EROFS</code> (read-only) állapotba
+kell helyeznie a fájlrendszert a felhasználói adatok védelme
+érdekében.</p>
+<p>A törlés tervezése is kulcsfontosságú az integritás szempontjából. A
+fájl törlésekor a kernelnek először az inode <code>i_links_count</code>
+mezőjét kell csökkentenie. Ha az eléri a nullát, akkor fel kell
+szabadítania a blokkokat a bitmapen, majd az inode-ot szabadnak kell
+jelölnie. A helyes sorrend: 1) metaadat-módosítás naplózással vagy
+szinkron írással a biztonságos állapot eléréséig, 2) blokkok
+felszabadítása, 3) inode nullázása. Ha a kernel a blokkok felszabadítása
+előtt nullázza az inode-ot, és közben áramszünet következik be, akkor az
+inode elveszik, de a blokkjai foglaltak maradnak – ez okozza a
+lemezterület lassú “szivárgását”.</p>
+<p>A tipikus hiba az is, hogy a fejlesztő a kereskedelmi
+fájlrendszereknél megszokott, bonyolult journalingot próbálja beépíteni
+a minfsbe. A helyes megoldás az első iterációban az egyszerű, szinkron
+írásokra való támaszkodás. A minfs tervezett működése során a
+metaadat-blokkokat (superblock, inode-tábla releváns blokkja, bitmap) a
+módosítás után azonnal a lemezre kell írni. Ez lassú, de a tanulási
+célhoz mérten nem a sebesség, hanem a megbízhatóság és a
+reprodukálhatóság az elsődleges.</p>
+<h3 data-number="29.1.7"
+id="labor-a-fájlrendszer-terv-ellenőrzése"><span
+class="header-section-number">29.1.7</span> 7. Labor: A fájlrendszer
+terv ellenőrzése</h3>
+<p>A fejezethez tartozó labor nem igényel módosított kernelt a hoszton,
+csupán egy QEMU-t futtató diszkrét, emulált környezetet. A labor célja,
+hogy a hallgató ne csak elméletben lássa az adatszerkezeteket, hanem
+létrehozza, hexdump segítségével ellenőrizze és egy egyszerű
+felhasználói térből (<code>userland</code>) futó eszközzel fel is tárja
+őket.</p>
+<p><strong>Kiinduló állapot:</strong> Egy üres, 16 MiB-os lemezképfájl
+(<code>minfs.img</code>) létrehozása.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># QEMU emulált környezetben, nem a hoszt lemezén</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">dd</span> if=/dev/zero of=minfs.img bs=1M count=16</span></code></pre></div>
+<p><strong>Feladat:</strong> Írjunk egy <code>mkfs.minfs</code> nevű
+eszközprogramot (host-on futtatva vagy cross-compilálva az emulált
+felhasználói térbe), amely a fenti struktúrákat ráírja a képre:
+inicializálja a superblockot (beállítja a <code>MAGIC</code> értéket),
+lenullázza a bitmapet, majd megjelöli a 0..17 blokkokat foglaltként, a
+maradékot pedig szabadként, és létrehoz egy gyökérkönyvtárat a 18.
+blokkban.</p>
+<p><strong>Mérés és ellenőrzés:</strong> A labor kötelező eleme a mérési
+napló vezetése. A hallgatónak a <code>xxd</code> eszközzel ki kell
+olvasnia a kép első 128 bájtját, és igazolnia kell, hogy a
+<code>MAGIC</code> a <code>0x4D494E46</code> értéket tartalmazza. A
+mérési naplóban rögzíteni kell:</p>
+<ul>
+<li><strong>Várt érték:</strong> A superblock <code>s_free_blocks</code>
+mezőjének értéke 4076 (4078 adatblokk mínusz a gyökérkönyvtár 1 blokkja
+mínusz a gyökér inode-hoz esetleg lefoglalt blokk). Ezt a levezetést a
+dokumentációban jelölni kell.</li>
+<li><strong>Mért érték:</strong> Az <code>xxd</code> kimenetéből
+kiszámított tényleges free-block szám.</li>
+</ul>
+<p>A két értéknek pontosan egyeznie kell. Ha eltérés van, az allokátor
+hibásan kezeli a kezdeti foglalt régiókat.</p>
+<p><strong>Tipikus hibák és helyes megoldások:</strong></p>
+<ul>
+<li><em>Hiba:</em> A <code>packed</code> attribútum elhagyása miatt a C
+struktúra mérete 4096 helyett 4104 bájt lesz, így a superblock kiírása
+átcsúszik a bitmap területére.
+<ul>
+<li><em>Megoldás:</em> A struktúra méretét
+<code>sizeof(struct minfs_superblock)</code> segítségével fordítási
+időben (<code>_Static_assert</code> vagy build ellenőrzés) rögzíteni
+kell, amelynek 4096-nak kell lennie.</li>
+</ul></li>
+<li><em>Hiba:</em> Az indirekt blokkba fájladatok kerülnek, mert a
+programozó összekeveri a mutatók típusát.
+<ul>
+<li><em>Megoldás:</em> Külön típusdefiníciót kell létrehozni
+<code>indirect_block_t</code>-ként (1024 darab <code>uint32_t</code>),
+és a fájladatokat mindig <code>data_block_t</code>-ként kezelni. A
+típusrendszerrel meg kell akadályozni a felcserélést.</li>
+</ul></li>
+</ul>
+<h3 data-number="29.1.8" id="összegzés-és-továbblépés"><span
+class="header-section-number">29.1.8</span> 8. Összegzés és
+továbblépés</h3>
+<p>Ebben a fejezetben meghatároztuk a minfs nevű oktatási fájlrendszer
+pontos lemezszervezését. Definiáltuk a superblockot mint a fájlrendszer
+önleíró fejlécét, az inode-ot mint a fájlok metaadatainak otthonát, a
+bitmapet mint a szabad helyek nyilvántartóját, és az adatblokkokat mint
+a fájltartalom letéteményesét. A tervezési döntések mindegyike a
+hibakereshetőséget, a determinisztikus működést és a QEMU-s
+reprodukálhatóságot szolgálta.</p>
+<p>A következő egység (<a href="os111.html">Blokk-eszköz és driver
+implementáció</a>) erre az alapra épít: ott implementáljuk a kernel
+blokkeszköz-rétegét, és megvalósítjuk azokat a <code>bread</code> /
+<code>bwrite</code> típusú függvényeket, amelyek ezeket a most definiált
+struktúrákat a memória és a virtuális lemez között mozgatják. Az itt
+rögzített 4 KiB-os blokkméret és a szektor-blokk leképezés nélkül az a
+fejezet nem lenne megvalósítható.</p>
+<h3 data-number="29.1.9" id="önellenőrző-kérdések"><span
+class="header-section-number">29.1.9</span> Önellenőrző kérdések</h3>
+<ol type="1">
+<li>Miért van szükség a superblockban egy egyedi bűvös számra
+(<code>magic</code>), és mi történik, ha a kernel nem találja azt a
+mount során?</li>
+<li>Mekkora a maximális fájlméret a minfsben a 12 közvetlen és 1
+közvetett blokkmutatóval? Vezesse le a számítást.</li>
+<li>Miért jobb választás a bitmap a szabadhely-kezelésre ebben a kis
+rendszerben, mint egy láncolt lista?</li>
+<li>Ismertesse, hogyan akadályozza meg a <code>packed</code> attribútum
+és a struktúra méretének ellenőrzése a lemezterületek átfedését.</li>
+</ol>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os109.html">← 28.4 Naplózás, panic és hibakezelés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os111.html">29.2 Blokk-eszköz és driver implementáció →</a></div>
+</nav>
+</body>
+</html>

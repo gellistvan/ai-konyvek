@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>10.4 Többmagos és heterogén rendszerek kihívásai – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz2">II. RÉSZ – Folyamatok, szálak és ütemezés</a> › <a href="index.html#osch09">10 Haladó konkurencia</a></p>
+<div class="links"><a class="prev" rel="prev" href="os036.html">← 10.3 RCU, epoch-alapú visszanyerés és skálázható szinkronizáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os038.html">11.1 Címterek, fizikai és virtuális cím →</a></div>
+</nav>
+<h2 data-number="10.4" id="os037"><span
+class="header-section-number">10.4</span> Többmagos és heterogén
+rendszerek kihívásai</h2>
+<p>A korábbi fejezetekben a konkurencia kérdéseit elsősorban egyetlen
+processzor vagy szimmetrikus, azonos magokból álló környezet
+feltételezésével tárgyaltuk. A mai rendszerek azonban gyakran többféle,
+eltérő képességű processzormagot kombinálnak, és a memóriaelrendezés sem
+mindig egyenletes. Ez az egység azt vizsgálja, hogy a párhuzamosság, a
+cache-hierarchia és a heterogén magok hogyan befolyásolják az operációs
+rendszer ütemezési, memória- és energiagazdálkodási döntéseit. Nem
+ismételjük meg a memóriamodell vagy a lock-free programozás alapjait –
+azokat az <code>os034</code>–<code>os036</code> egységek tárgyalták. Itt
+a rendszerszintű következményekre és a gyakorlati tervezési mintákra
+összpontosítunk.</p>
+<p>A tanulási célok eléréséhez először áttekintjük a párhuzamosság és a
+cache kölcsönhatását, majd az SMP- és NUMA-architektúrákat, végül a
+big.LITTLE típusú heterogén rendszereket. A terheléselosztás és az
+energia kérdéseit egy gyakorlati affinitási példán keresztül mutatjuk
+be, amelyet egy reprodukálható labor követ.</p>
+<h3 data-number="10.4.1" id="a-párhuzamosság-és-a-cache-hatása"><span
+class="header-section-number">10.4.1</span> 1. A párhuzamosság és a
+cache hatása</h3>
+<p>A többmagos rendszerek alapvető ígérete a valódi párhuzamosság: több
+utasításfolyam egyidejű végrehajtása. A teljesítmény azonban nem
+egyszerűen a magok számával skálázódik, mert a cache-hierarchia és a
+memória-hozzáférés jelentős költségeket hordoz. A klasszikus UMA
+(Uniform Memory Access) modellben minden mag azonos késleltetéssel éri
+el a főmemóriát, ám a gyakorlatban a magokhoz közeli cache-szintek
+eltérőek lehetnek, és a koherencia fenntartása további forgalmat
+generál.</p>
+<h3 data-number="10.4.2" id="cache-koherencia-és-hamis-megosztás"><span
+class="header-section-number">10.4.2</span> 1.1. Cache-koherencia és
+hamis megosztás</h3>
+<p>A cache-koherencia protokollok (például a MESI) gondoskodnak arról,
+hogy az összes mag konzisztens képet lásson a memóriáról. Amikor egy mag
+módosít egy cache-vonalat, a többi magban lévő másolat érvénytelenül, és
+a soron következő olvasás koherencia-tranzakciót indít. Ez a mechanizmus
+akkor is aktiválódik, ha két mag logikailag különböző, de fizikailag
+ugyanabba a cache-vonalba eső adatot módosít. Ezt a jelenséget
+<strong>hamis megosztásnak</strong> (false sharing) nevezzük.</p>
+<p>Vegyünk egy egyszerű C struktúrát, amelyet két szál egyidejűleg
+használ:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció: hamis megosztásra hajlamos struktúra */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> shared_data <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> counter_a<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> counter_b<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> shared_data shared __attribute__<span class="op">((</span>aligned<span class="op">(</span><span class="dv">64</span><span class="op">)));</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="co">/* Feltételezzük, hogy a cache-vonal mérete 64 bájt. */</span></span></code></pre></div>
+<p>Ha az egyik szál rendszeresen növeli a <code>counter_a</code> mezőt,
+a másik pedig a <code>counter_b</code> mezőt, akkor a két mező ugyanabba
+a 64 bájtos cache-vonalba kerül. A módosítások versenyeznek a
+cache-vonal tulajdonjogáért, ami felesleges koherencia-forgalmat és
+teljesítménycsökkenést okoz – még akkor is, ha a program szemantikailag
+helyes, és nincs adatverseny.</p>
+<p>A megoldás az adatok szétválasztása külön cache-vonalakra, például
+kitöltéssel vagy igazítással:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció: cache-vonalakra igazított mezők */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> shared_data <span class="op">{</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> counter_a<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> _pad_a<span class="op">[</span><span class="dv">7</span><span class="op">];</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> counter_b<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> _pad_b<span class="op">[</span><span class="dv">7</span><span class="op">];</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> shared<span class="op">;</span></span></code></pre></div>
+<p>Itt a <code>_pad</code> mezők biztosítják, hogy a
+<code>counter_a</code> és a <code>counter_b</code> más-más cache-vonalra
+essen. A padding mérete architektúra- és implementációfüggő, ezért a
+hordozható kódban inkább az <code>aligned(64)</code> attribútumot vagy a
+C11 <code>_Alignas</code> specifikációját ajánlott használni. A
+labormérésben majd látjuk, hogy a hamis megosztás megszüntetése milyen
+mértékben javítja az átvitelt.</p>
+<h3 data-number="10.4.3" id="cache-affinitás-és-migrációs-költség"><span
+class="header-section-number">10.4.3</span> 1.2. Cache-affinitás és
+migrációs költség</h3>
+<p>Egy folyamat vagy szál többszöri ütemezése során a gyakran használt
+adatai a legutóbb futtató mag cache-ében halmozódnak fel. Ha az ütemező
+átköltözteti a szálat egy másik magra, a cache-tartalom elveszik, és a
+következő futás hideg cache-sel indul, ami kezdetben sok cache-misshez
+vezet. Ezt a jelenséget <strong>cache-affinitás</strong> vagy
+<strong>processzor-affinitás</strong> néven ismerjük. A modern ütemezők
+(például a Linux CFS) kifejezetten igyekeznek megtartani a folyamatot
+azon a magon, ahol legutóbb futott, hacsak a terheléskiegyenlítés nem
+indokolja a migrációt.</p>
+<p>A migrációs költség nem csupán a cache-újratöltésből adódik. A
+TLB-bejegyzések is elvesznek, és NUMA-rendszerekben a távoli
+memória-hozzáférés még drágábbá válik. Emiatt az affinitás megőrzése a
+teljesítmény szempontjából kulcsfontosságú, de nem abszolút: ha egy mag
+túlterhelt, a migráció a jobb választás.</p>
+<h3 data-number="10.4.4"
+id="memória-sorrendezés-a-többmagos-gyakorlatban"><span
+class="header-section-number">10.4.4</span> 1.3. Memória-sorrendezés a
+többmagos gyakorlatban</h3>
+<p>Ahogy az <code>os034</code> egységben tárgyaltuk, a gyengén
+sorrendezett architektúrák (például ARM, POWER) és az optimalizáló
+fordítók megengedik, hogy a memóriaműveletek sorrendje eltérjen a
+programozó által leírtól. A többmagos rendszerekben ezért a lock-free
+struktúrák használatakor elengedhetetlen a megfelelő
+memória-sorrendezési megszorítások alkalmazása. A C11 atomi típusai és a
+<code>memory_order</code> paraméterek lehetővé teszik a szükséges
+akadályok kifejezését:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció: acquire-release pár használata */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">_Atomic</span> <span class="dt">int</span> ready <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> data <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> producer<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    data <span class="op">=</span> <span class="dv">42</span><span class="op">;</span>                     <span class="co">/* sima írás */</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    atomic_store_explicit<span class="op">(&amp;</span>ready<span class="op">,</span> <span class="dv">1</span><span class="op">,</span> memory_order_release<span class="op">);</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> consumer<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">while</span> <span class="op">(!</span>atomic_load_explicit<span class="op">(&amp;</span>ready<span class="op">,</span> memory_order_acquire<span class="op">))</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">;</span>                         <span class="co">/* spin */</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A release-acquire pár garantálja, hogy data == 42 látható. */</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Egy többmagos rendszerben a fenti minta biztosítja, hogy a
+<code>data</code> írása nem kerül a <code>ready</code> írás után,
+illetve a <code>ready</code> olvasásakor a consumer már látja a producer
+összes korábbi írását. A barrier nélküli kód hibás lehet az x86 erős
+sorrendezése miatt is, ha a jövőben gyengébb architektúrára portoljuk –
+ezért a hordozható kód mindig explicit sorrendezési megszorításokat
+használ.</p>
+<h3 data-number="10.4.5" id="smp-és-numa"><span
+class="header-section-number">10.4.5</span> 2. SMP és NUMA</h3>
+<p>A klasszikus <strong>SMP</strong> (Symmetric Multi-Processing)
+rendszerekben minden processzormag egyenrangú, és a memória-hozzáférés
+közel azonos késleltetésű. Ez a modell egyszerű, de a nagyobb
+rendszereknél a közös memóriabusz és a memóriavezérlő szűk
+keresztmetszetté válik. A <strong>NUMA</strong> (Non-Uniform Memory
+Access) architektúra ezt a problémát oldja meg azzal, hogy a memóriát
+csomópontokra osztja, ahol minden csomóponthoz saját processzor(ok) és
+helyi memória tartozik. Egy mag a saját csomópontjának memóriáját
+gyorsan éri el, míg a másik csomópont memóriája (távoli memória) nagyobb
+késleltetéssel és kisebb sávszélességgel érhető el.</p>
+<h3 data-number="10.4.6" id="a-numa-topológia-és-következményei"><span
+class="header-section-number">10.4.6</span> 2.1. A NUMA topológia és
+következményei</h3>
+<p>A NUMA topológiát a firmware (ACPI SRAT) vagy a device tree írja le.
+Az operációs rendszer ebből építi fel a memória- és processzortopológiai
+térképet. Egy tipikus kétcsomópontos rendszerben a csomópontok a
+következőképpen nézhetnek ki:</p>
+<table>
+<colgroup>
+<col style="width: 12%" />
+<col style="width: 7%" />
+<col style="width: 16%" />
+<col style="width: 30%" />
+<col style="width: 32%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Csomópont</th>
+<th>CPU-k</th>
+<th>Helyi memória</th>
+<th>Helyi késleltetés (ciklus)</th>
+<th>Távoli késleltetés (ciklus)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Node 0</td>
+<td>0,1,2,3</td>
+<td>0x0000 0000 – 0x3FFF FFFF</td>
+<td>~200</td>
+<td>~600</td>
+</tr>
+<tr class="even">
+<td>Node 1</td>
+<td>4,5,6,7</td>
+<td>0x4000 0000 – 0x7FFF FFFF</td>
+<td>~200</td>
+<td>~600</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban szereplő értékek csak szemléltetésre szolgálnak; a
+valós késleltetések erősen függnek a hardvertől, az órajeltől és a
+memóriavezérlőtől. A mérési laborban mindig a saját konfigurációra
+vonatkozó értékeket kell rögzíteni.</p>
+<p>A NUMA hatása akkor válik drámaivá, ha egy folyamat a Node 0-on fut,
+de a memóriája nagy része a Node 1-ben van. Az operációs rendszer ezért
+igyekszik a memóriát ahhoz a csomóponthoz kötni, ahol a folyamat fut.
+Ezt a mechanizmust <strong>memóriapolitikának</strong> nevezzük. A
+gyakori politikák:</p>
+<ul>
+<li><strong>First-touch (első érintés):</strong> az oldal ahhoz a
+csomóponthoz kerül, amelyik először írja. Ez gyakran a futtató mag
+csomópontját jelenti, de vándorló folyamatoknál hibás döntés lehet.</li>
+<li><strong>Bind (kötés):</strong> a memória kizárólag egy adott
+csomópontról érhető el.</li>
+<li><strong>Interleave (váltakozás):</strong> az oldalakat ciklikusan
+osztja el a csomópontok között, ami hasznos lehet sok szálat használó,
+nagy adattömböket kezelő alkalmazásoknál.</li>
+<li><strong>Preferred (előnyben részesített):</strong> egy adott
+csomópontot előnyben részesít, de vész esetén máshonnan is
+allokálhat.</li>
+</ul>
+<p>Linux alatt ezeket a <code>mbind</code>, <code>set_mempolicy</code>
+rendszerhívásokkal vagy a <code>numactl</code> parancssori eszközzel
+lehet szabályozni. A programozói gyakorlatban célszerű a
+teljesítménykritikus alkalmazásokat úgy futtatni, hogy a szálak és a
+memóriájuk egy csomóponton maradjanak. Ezt a célt szolgálja a
+processzor- és memória-affinitás együttes beállítása.</p>
+<h3 data-number="10.4.7"
+id="ütemezési-következmények-numa-rendszerekben"><span
+class="header-section-number">10.4.7</span> 2.2. Ütemezési
+következmények NUMA-rendszerekben</h3>
+<p>A NUMA-tudatos ütemezőnek figyelembe kell vennie a memória
+elhelyezkedését is, nem csak a CPU-terhelést. A Linux CFS-ben a
+<strong>sched_domain</strong> hierarchia leírja a magok közötti
+topológiát: először azonos magon lévő szálak (SMT), majd azonos
+NUMA-csomópontban lévő magok, végül a teljes rendszer. A
+terheléskiegyenlítés először a legalsó szinten próbálkozik, és csak
+akkor lép feljebb, ha az alsóbb szint nem képes kiegyenlíteni a
+terhelést. Ez csökkenti a távoli memória-hozzáférés valószínűségét.</p>
+<p>A gyakorlatban a NUMA-tudatosságot a következő eszközökkel lehet
+mérni és befolyásolni:</p>
+<ul>
+<li><code>numactl --hardware</code>: megmutatja a topológiát és a
+csomópontok közötti távolságot.</li>
+<li><code>numactl --cpunodebind=0 --membind=0 &lt;parancs&gt;</code>: a
+folyamatot és a memóriáját a Node 0-ra köti.</li>
+<li><code>numastat</code>: megjeleníti a NUMA-csomópontonkénti
+memóriastatisztikákat, például a helyi és távoli elérési arányokat.</li>
+</ul>
+<p>A laborban ezeket az eszközöket használjuk a méréshez.</p>
+<h3 data-number="10.4.8"
+id="heterogén-magok-big.little-és-modern-hibrid-architektúrák"><span
+class="header-section-number">10.4.8</span> 3. Heterogén magok:
+big.LITTLE és modern hibrid architektúrák</h3>
+<p>Az energiatakarékosság és a teljesítmény követelményeinek egyidejű
+kielégítésére a processzorgyártók heterogén többmagos rendszereket
+fejlesztettek ki. Az ARM <strong>big.LITTLE</strong> és
+<strong>DynamIQ</strong> koncepciója, valamint az Intel hibrid
+architektúrája (P-core/E-core) két eltérő típusú magot kombinál:</p>
+<ul>
+<li><strong>Nagy magok (big / P-core):</strong> magas órajel, mély
+futószalag, nagyobb cache, nagyobb teljesítmény és
+energiafogyasztás.</li>
+<li><strong>Kis magok (LITTLE / E-core):</strong> alacsonyabb órajel,
+rövidebb futószalag, kisebb cache, lényegesen alacsonyabb
+energiafelvétel, de korlátozott csúcsteljesítmény.</li>
+</ul>
+<p>A cél, hogy a rövid, interaktív feladatok a kis magokon fussanak, míg
+a nagy számításigényű, hosszabb feladatok a nagy magokra kerüljenek. Az
+ütemezőnek tehát nem csupán a terhelést kell kiegyenlítenie, hanem a
+magok <strong>kapacitását</strong> is figyelembe kell vennie.</p>
+<h3 data-number="10.4.9" id="kapacitásalapú-ütemezés"><span
+class="header-section-number">10.4.9</span> 3.1. Kapacitásalapú
+ütemezés</h3>
+<p>A homogén SMP rendszerekben minden mag azonos kapacitású, ezért a
+terheléskiegyenlítés lényege a futási idők egyenlő elosztása. Heterogén
+rendszerben a „terhelés” fogalma relatívvá válik: egy nagy magon 10 ms
+CPU-idő több hasznos munkát jelent, mint egy kis magon 10 ms. Az
+operációs rendszer ezért <strong>kapacitássúlyozott</strong> terhelést
+számol.</p>
+<p>Linuxban a <strong>Capacity Aware Scheduling</strong> és az
+<strong>Energy Aware Scheduling</strong> (EAS) kiterjesztések kezelik
+ezt. A magok kapacitása a maximális frekvenciájukhoz és IPC-jükhöz
+viszonyított relatív érték. Az ütemező a folyamatok terhelését a magok
+kapacitásához méri, és a döntéseknél figyelembe veszi a várható
+energiafogyasztást is. A nagy magokra akkor kerülnek feladatok, ha a kis
+magok már nem képesek a határidőket tartani, vagy ha a feladat jellege
+(pl. számításigényes, hosszú) ezt indokolja.</p>
+<h3 data-number="10.4.10" id="feladat-osztályozás-és-migráció"><span
+class="header-section-number">10.4.10</span> 3.2. Feladat-osztályozás és
+migráció</h3>
+<p>A feladatokat jellemzőik alapján lehet osztályozni:</p>
+<ul>
+<li><strong>CPU-intenzív:</strong> folyamatosan számol, ritkán blokkol.
+Ideális a nagy magra, különben a futási idő meghosszabbodik.</li>
+<li><strong>I/O-intenzív:</strong> gyakran vár I/O-ra, rövid
+CPU-burstjei vannak. A kis magon is jól fut, energiatakarékosan.</li>
+<li><strong>Interaktív:</strong> rövid késleltetési igények, de gyakori
+ébredések. A kis magon való futtatás növelheti az észlelt késleltetést,
+ezért gyakran a nagy magra kerül.</li>
+</ul>
+<p>A migráció a heterogén rendszerekben kétféle lehet:</p>
+<ul>
+<li><strong>Kis magról nagyra:</strong> amikor egy feladat CPU-igénye
+tartósan megnő, a kis magon már nem fér el a kívánt késleltetés, ezért
+át kell költöztetni. Ez a migráció viszonylag drága, de a teljesítmény
+indokolja.</li>
+<li><strong>Nagy magról kisra:</strong> amikor a feladat CPU-igénye
+lecsökken, vagy a nagy magra másik feladat vár, a folyamat átkerülhet a
+kis magra energiát megtakarítani.</li>
+</ul>
+<p>Az ütemezőnek óvatosan kell dönteni a migrációról, mert a túl gyakori
+váltás (ping-pong) a cache-affinitást és a TLB-t is érinti. A
+gyakorlatban a Linux CFS hiszterézist alkalmaz: a migrációhoz a
+terheléskülönbségnek egy bizonyos küszöböt meg kell haladnia.</p>
+<h3 data-number="10.4.11" id="energia--és-hőkezelés"><span
+class="header-section-number">10.4.11</span> 3.3. Energia- és
+hőkezelés</h3>
+<p>A heterogén rendszerek egyik fő célja az energiafogyasztás
+csökkentése. Az ütemező döntései közvetlenül hatnak az energiafelvételre
+és a hőtermelésre. Az energia szempontjából két stratégia létezik:</p>
+<ul>
+<li><strong>Race-to-idle:</strong> a feladatot a leggyorsabb magon
+futtatjuk, majd a rendszer mielőbb mély alvó állapotba lép. Ez akkor
+hatékony, ha a feladat rövid, és az alvó állapot energiamegtakarítása
+nagy.</li>
+<li><strong>Pack-and-sleep:</strong> a feladatokat kevés magra sűrítjük,
+hogy a többi mag mély alvó állapotba kerülhessen. Ez akkor előnyös, ha a
+feladatok közötti kommunikáció kicsi, és a szükséges teljesítmény
+alacsony.</li>
+</ul>
+<p>Az EAS ezeket a stratégiákat energia-modell segítségével értékeli. A
+modell az adott rendszerre jellemző energiafelvételi görbéket
+tartalmazza. Az ütemező célja az energia és a késleltetés egyensúlyának
+megtalálása. A <code>schedutil</code> CPU-frekvencia-szabályozó szorosan
+együttműködik az ütemezővel, és a terheléshez igazítja az órajelet.</p>
+<h3 data-number="10.4.12" id="terheléselosztás-és-energia"><span
+class="header-section-number">10.4.12</span> 4. Terheléselosztás és
+energia</h3>
+<p>A terheléselosztás klasszikus célja a processzorok kihasználtságának
+kiegyenlítése, minimalizálva a várakozási időt. Heterogén és
+energiaérzékeny rendszerekben azonban a cél bonyolultabb: a teljesítmény
+optimalizálását az energiafogyasztás és a hőtermelés korlátai mellett
+kell elvégezni.</p>
+<h3 data-number="10.4.13" id="terheléskiegyenlítő-algoritmusok"><span
+class="header-section-number">10.4.13</span> 4.1. Terheléskiegyenlítő
+algoritmusok</h3>
+<p>A Linux CFS-ben a terheléskiegyenlítést időszakosan (periodikusan),
+üresjáratban (idle) és felébredéskor (wakeup) is elvégzi. A periodikus
+kiegyenlítés egy adott <code>sched_domain</code> szinten történik, és a
+folyamatokat a túlterhelt magokról a kevésbé terheltekre mozgatja. Az
+idle kiegyenlítés akkor lép működésbe, amikor egy mag befejezi a
+munkáját, és megpróbálja ellopni egy másik magtól a folyamatot. A wakeup
+kiegyenlítés akkor dönt, amikor egy alvó folyamat felébred, és több mag
+közül választhat – itt figyelembe veszi a cache-affinitást és az
+energiahatékonyságot.</p>
+<p>A terhelés mérésére a Linux a <strong>PELT</strong> (Per-Entity Load
+Tracking) modellt használja, amely minden folyamat terhelését időben
+csökkenő súllyal követi. Ez lehetővé teszi a rövid távú ingadozások
+simítását, és megbízható becslést ad a folyamat CPU-igényéről. Heterogén
+rendszerben a PELT értéket a mag kapacitásával normalizálják.</p>
+<h3 data-number="10.4.14" id="energiagazdálkodás"><span
+class="header-section-number">10.4.14</span> 4.2.
+Energiagazdálkodás</h3>
+<p>Az energiafelvétel csökkentésének három fő eszköze:</p>
+<ul>
+<li><strong>DVFS</strong> (Dynamic Voltage and Frequency Scaling): a CPU
+órajelének és feszültségének csökkentése alacsony terhelésnél. Az
+energiafelvétel közelítőleg a frekvenciával lineárisan, a feszültséggel
+négyzetesen arányos, ezért a frekvenciacsökkentés jelentős megtakarítást
+hoz.</li>
+<li><strong>CPU idle állapotok (C-states):</strong> a mag mélyebb alvó
+állapotba kerül, amikor nincs munka. Minél mélyebb az állapot, annál
+nagyobb az energiamegtakarítás, de annál hosszabb a felébredési
+késleltetés.</li>
+<li><strong>Klaszterezés:</strong> a big.LITTLE rendszerekben a magok
+csoportokba (clusters) szerveződnek, és a teljes klaszter energiája
+akkor kapcsolható ki, ha minden mag alvó állapotban van.</li>
+</ul>
+<p>Az ütemezőnek mérlegelnie kell: érdemes-e a feladatot a nagy magra
+tenni, hogy hamarabb végezzen (race-to-idle), vagy a kis magon futtatni,
+hogy csökkentsük a pillanatnyi energiafelvételt. Az
+<strong>energia-késleltetési szorzat</strong> (Energy-Delay Product,
+EDP) egy gyakran használt metrika:</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>E</mi><mi>D</mi><mi>P</mi><mo>=</mo><mi>E</mi><mo>⋅</mo><msub><mi>t</mi><mtext mathvariant="normal">exec</mtext></msub><mo>,</mo></mrow><annotation encoding="application/x-tex">
+EDP = E \cdot t_{\text{exec}},
+</annotation></semantics></math></p>
+<p>ahol
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>E</mi><annotation encoding="application/x-tex">E</annotation></semantics></math>
+az energiafogyasztás,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>t</mi><mtext mathvariant="normal">exec</mtext></msub><annotation encoding="application/x-tex">t_{\text{exec}}</annotation></semantics></math>
+pedig a végrehajtási idő. Az EDP minimalizálása kompromisszumot jelent a
+nyers teljesítmény és az energia között.</p>
+<h3 data-number="10.4.15" id="gyakorlati-példa-affinitási-terv"><span
+class="header-section-number">10.4.15</span> 4.3. Gyakorlati példa:
+affinitási terv</h3>
+<p>Tegyük fel, hogy egy QEMU-ban emulált, 4 magos, 2 nagy + 2 kis maggal
+rendelkező rendszeren két folyamatot futtatunk:</p>
+<ul>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>:
+CPU-intenzív, hosszú, határidő nélküli számítás (pl. mátrixszorzás).
+Jellemzői:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mn>1</mn></msub><mo>=</mo><mn>8</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">C_1 = 8\,\text{ms}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mn>1</mn></msub><mo>=</mo><mn>10</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">T_1 = 10\,\text{ms}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>D</mi><mn>1</mn></msub><mo>=</mo><mn>10</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">D_1 = 10\,\text{ms}</annotation></semantics></math>
+(látszólag valós idejű, de a példában csak a relatív terhelés
+illusztrálására).</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>:
+interaktív, rövid, gyakori ébredésű feladat (pl. shell-parancs).
+Jellemzői:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>C</mi><mn>2</mn></msub><mo>=</mo><mn>1</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">C_2 = 1\,\text{ms}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>T</mi><mn>2</mn></msub><mo>=</mo><mn>20</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">T_2 = 20\,\text{ms}</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>D</mi><mn>2</mn></msub><mo>=</mo><mn>2</mn><mspace width="0.167em"></mspace><mtext mathvariant="normal">ms</mtext></mrow><annotation encoding="application/x-tex">D_2 = 2\,\text{ms}</annotation></semantics></math>.</li>
+</ul>
+<p>A cél:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+futtatása a nagy magokon,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>
+futtatása a kis magokon, miközben a cache-affinitást megtartjuk. A
+tervet így fogalmazzuk meg:</p>
+<ol type="1">
+<li>Azonosítjuk a nagy és kis magokat a rendszerben (pl.
+<code>/sys/devices/system/cpu/cpu*/cpu_capacity</code> vagy a device
+tree alapján).</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>-t
+a nagy magokhoz (CPU0, CPU1) kötjük <code>sched_setaffinity</code>
+segítségével.</li>
+<li><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>-t
+a kis magokhoz (CPU2, CPU3) kötjük.</li>
+<li>A memóriát az első érintés politikájával a megfelelő csomóponthoz
+rendeljük (NUMA esetén).</li>
+<li>A mérés során rögzítjük a végrehajtási időt, a cache-miss arányt és
+az energiafogyasztást.</li>
+</ol>
+<p>Az alábbi C kódrészlet szemlélteti a processzor-affinitás beállítását
+Linuxon:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció: CPU-affinitás beállítása Linuxon */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#define </span><span class="ot">_GNU_SOURCE</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;sched.h&gt;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    cpu_set_t set<span class="op">;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    CPU_ZERO<span class="op">(&amp;</span>set<span class="op">);</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* A példában a háttérben futó CPU-intenzív folyamatot</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="co">       a 0. és 1. magra (nagy magokra) kötjük. */</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    CPU_SET<span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="op">&amp;</span>set<span class="op">);</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    CPU_SET<span class="op">(</span><span class="dv">1</span><span class="op">,</span> <span class="op">&amp;</span>set<span class="op">);</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    pid_t pid <span class="op">=</span> getpid<span class="op">();</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>sched_setaffinity<span class="op">(</span>pid<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>set<span class="op">),</span> <span class="op">&amp;</span>set<span class="op">)</span> <span class="op">==</span> <span class="op">-</span><span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;sched_setaffinity&quot;</span><span class="op">);</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* Itt jön a tényleges számítási feladat. */</span></span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* ... */</span></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> EXIT_SUCCESS<span class="op">;</span></span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A rendszerhívás paraméterei: <code>pid</code>,
+<code>cpusetsize</code>, <code>mask</code>. Visszatérési értéke 0 siker
+esetén, <code>-1</code> hibakor, ilyenkor az <code>errno</code> a hibát
+jelzi. A kód nem végrehajtandó a gazdagépen, csak emulált
+környezetben.</p>
+<h3 data-number="10.4.16"
+id="labor-többmagos-ütemezési-és-affinitási-terv"><span
+class="header-section-number">10.4.16</span> 5. Labor: többmagos
+ütemezési és affinitási terv</h3>
+<p>A labor célja, hogy egy emulált környezetben mérje a hamis megosztás
+és a NUMA/affinitás hatását, és ellenőrizze a heterogén ütemezési
+tervet. A labor <strong>kiinduló állapota</strong> egy QEMU virtuális
+gép, amely 4 virtuális CPU-val és 2 NUMA-csomóponttal rendelkezik. A
+konfiguráció a következő parancsokkal hozható létre:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># QEMU indítása 4 CPU-val, 2 NUMA-csomóponttal, 1 GiB memóriával</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-enable-kvm</span> <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-smp</span> 4 <span class="dt">\</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-m</span> 1024 <span class="dt">\</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-numa</span> node,nodeid=0,cpus=0-1,memdev=ram0 <span class="dt">\</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-numa</span> node,nodeid=1,cpus=2-3,memdev=ram1 <span class="dt">\</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-object</span> memory-backend-ram,id=ram0,size=512M <span class="dt">\</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-object</span> memory-backend-ram,id=ram1,size=512M <span class="dt">\</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-drive</span> file=emulated-disk.img,format=raw <span class="dt">\</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">-boot</span> order=c <span class="dt">\</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">-serial</span> mon:stdio</span></code></pre></div>
+<p><strong>Figyelem:</strong> Ez a parancs csak emulált környezetben
+futtatható. A hoszt valódi lemezét, bootloaderét vagy firmware-ét tilos
+módosítani. A labor minden lépése eldobható virtuális gépen
+történik.</p>
+<h3 data-number="10.4.17" id="mérőprogram"><span
+class="header-section-number">10.4.17</span> 5.1. Mérőprogram</h3>
+<p>Két rövid C programot készítünk:</p>
+<ol type="1">
+<li><strong>False sharing teszt:</strong> Két szál párhuzamosan növeli
+egy közös struktúra különböző mezőit. Az egyik változatban a mezők
+ugyanabba a cache-vonalba esnek (hamis megosztás), a másikban paddinggel
+szétválasztjuk őket. Mindkét változatot 10 millió iterációra futtatjuk,
+és <code>clock_gettime</code> segítségével mérjük az időt, valamint
+<code>perf stat</code>-tal a cache-miss eseményeket.</li>
+<li><strong>Affinitás teszt:</strong> Egy CPU-intenzív folyamatot (pl.
+szumma számítás) először CPU0-ra kötünk, majd CPU0–1-re engedjük, végül
+CPU0–3-ra. Mindegyik esetben mérjük a falási időt és a CPU-migrációk
+számát.</li>
+</ol>
+<p>A mérőprogram pszeudokódja:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Illusztráció: false sharing mérése */</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;pthread.h&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;time.h&gt;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#define ITER </span><span class="dv">10000000</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> shared <span class="op">{</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> a<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> pad<span class="op">[</span><span class="dv">7</span><span class="op">];</span> <span class="co">/* 0, ha nincs padding; 7, ha van */</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">long</span> b<span class="op">;</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> s<span class="op">;</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>worker_a<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>arg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> ITER<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> s<span class="op">.</span>a<span class="op">++;</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> <span class="op">*</span>worker_b<span class="op">(</span><span class="dt">void</span> <span class="op">*</span>arg<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> ITER<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> s<span class="op">.</span>b<span class="op">++;</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> NULL<span class="op">;</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">void</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>    <span class="kw">struct</span> timespec t0<span class="op">,</span> t1<span class="op">;</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    clock_gettime<span class="op">(</span>CLOCK_MONOTONIC<span class="op">,</span> <span class="op">&amp;</span>t0<span class="op">);</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>    pthread_t ta<span class="op">,</span> tb<span class="op">;</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>    pthread_create<span class="op">(&amp;</span>ta<span class="op">,</span> NULL<span class="op">,</span> worker_a<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>    pthread_create<span class="op">(&amp;</span>tb<span class="op">,</span> NULL<span class="op">,</span> worker_b<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>    pthread_join<span class="op">(</span>ta<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>    pthread_join<span class="op">(</span>tb<span class="op">,</span> NULL<span class="op">);</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>    clock_gettime<span class="op">(</span>CLOCK_MONOTONIC<span class="op">,</span> <span class="op">&amp;</span>t1<span class="op">);</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>    <span class="dt">double</span> dt <span class="op">=</span> <span class="op">(</span>t1<span class="op">.</span>tv_sec <span class="op">-</span> t0<span class="op">.</span>tv_sec<span class="op">)</span> <span class="op">+</span> <span class="op">(</span>t1<span class="op">.</span>tv_nsec <span class="op">-</span> t0<span class="op">.</span>tv_nsec<span class="op">)/</span><span class="fl">1e9</span><span class="op">;</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Elapsed: </span><span class="sc">%f</span><span class="st"> s</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> dt<span class="op">);</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A padding nélküli és a paddinges változatot ugyanazzal a fordítási
+beállítással (<code>-O2</code>) kell lefordítani, és mindegyiket
+legalább ötször lefuttatni. A mért és a várt eredményeket külön kell
+rögzíteni.</p>
+<h3 data-number="10.4.18" id="mérési-napló"><span
+class="header-section-number">10.4.18</span> 5.2. Mérési napló</h3>
+<p>A mérési napló a következő adatokat tartalmazza:</p>
+<table>
+<colgroup>
+<col style="width: 9%" />
+<col style="width: 9%" />
+<col style="width: 6%" />
+<col style="width: 23%" />
+<col style="width: 20%" />
+<col style="width: 13%" />
+<col style="width: 14%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kísérlet</th>
+<th>Változat</th>
+<th>CPU-k</th>
+<th>Futási idő (s, medián)</th>
+<th>Cache-miss (millió)</th>
+<th>CPU-migráció</th>
+<th>Várt eredmény</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FS-01</td>
+<td>nincs pad</td>
+<td>4</td>
+<td>2.34</td>
+<td>45.1</td>
+<td>120</td>
+<td>lassú, sok miss</td>
+</tr>
+<tr class="even">
+<td>FS-02</td>
+<td>pad</td>
+<td>4</td>
+<td>1.12</td>
+<td>2.3</td>
+<td>45</td>
+<td>gyors, kevés miss</td>
+</tr>
+<tr class="odd">
+<td>AFF-01</td>
+<td>CPU0</td>
+<td>1</td>
+<td>1.80</td>
+<td>3.5</td>
+<td>0</td>
+<td>nincs migráció</td>
+</tr>
+<tr class="even">
+<td>AFF-02</td>
+<td>CPU0–1</td>
+<td>2</td>
+<td>1.10</td>
+<td>4.1</td>
+<td>8</td>
+<td>kevés migráció</td>
+</tr>
+<tr class="odd">
+<td>AFF-03</td>
+<td>CPU0–3</td>
+<td>4</td>
+<td>0.75</td>
+<td>5.2</td>
+<td>57</td>
+<td>sok migráció</td>
+</tr>
+</tbody>
+</table>
+<p>A táblázatban szereplő számok <strong>szemléltető jellegűek</strong>,
+a tényleges értékek a hardver, a QEMU verzió és a gazdagép terhelésének
+függvényében változnak. A labornak mindig a saját mérési naplóját kell
+használnia, és a mért értéket el kell különíteni a várt/levezetett
+értéktől. Például a hamis megosztásnál <strong>várt</strong> eredmény,
+hogy a paddinges változat gyorsabb, mert nincs koherencia-tranzakció; a
+<strong>mért</strong> eredmény ezt számszerűsíti.</p>
+<h3 data-number="10.4.19" id="kiértékelés-és-ellenőrzés"><span
+class="header-section-number">10.4.19</span> 5.3. Kiértékelés és
+ellenőrzés</h3>
+<p>A mérési eredményeket a következő szempontok szerint értékeljük:</p>
+<ul>
+<li>A hamis megosztás megszüntetése csökkenti-e a futási időt és a
+cache-miss eseményeket?</li>
+<li>Az affinitás korlátozása csökkenti-e a CPU-migrációt, és hogyan hat
+a futási időre?</li>
+<li>NUMA-rendszerben a <code>numastat</code> segítségével ellenőrizzük,
+hogy a helyi memória-elérés aránya javult-e a megfelelő
+politikával.</li>
+</ul>
+<p>A labornak tartalmaznia kell a <code>numactl --hardware</code>
+kimenetét, a <code>perf stat</code> parancsot, a naplót és a
+visszaállítási útvonalat (a virtuális gép pillanatképe a kísérlet
+előtt). A mérés csak akkor tekinthető reprodukálhatónak, ha a fenti
+adatok együtt elérhetők.</p>
+<h3 data-number="10.4.20" id="tipikus-hibák-és-ellenőrzési-pontok"><span
+class="header-section-number">10.4.20</span> 6. Tipikus hibák és
+ellenőrzési pontok</h3>
+<p>A többmagos és heterogén rendszerekben számos hiba forrása van. A
+leggyakoribbak:</p>
+<ol type="1">
+<li><p><strong>Hamis megosztás figyelmen kívül hagyása:</strong> A
+teljesítmény csökkenése nem nyilvánvaló, mert a kód logikailag helyes.
+Ellenőrzés: <code>perf c2c</code> (cache-to-cache) elemzés Linuxon,
+amely megmutatja a hamis megosztással érintett cache-vonalakat.</p></li>
+<li><p><strong>Túlzott migráció:</strong> Az ütemező gyakran költözteti
+a folyamatokat, ami cache- és TLB-hideget okoz. Ellenőrzés:
+<code>/proc/&lt;pid&gt;/status</code>
+<code>voluntary_ctxt_switches</code> és
+<code>nonvoluntary_ctxt_switches</code> mezői;
+<code>perf stat -e sched:sched_migrate_task</code>.</p></li>
+<li><p><strong>NUMA-topológia mellőzése:</strong> A távoli
+memória-hozzáférés sávszélessége és késleltetése drasztikusan eltérhet.
+Ellenőrzés: <code>numastat -p &lt;pid&gt;</code>,
+<code>numactl --hardware</code>; a távoli elérés arányának
+minimalizálása.</p></li>
+<li><p><strong>Energiatévesztés:</strong> A race-to-idle stratégia nem
+mindig optimális, különösen hosszú, alacsony intenzitású feladatoknál.
+Ellenőrzés: energia-mérés a hardver szintjén (pl. RAPL, powertop), vagy
+energia-modell szimulációja.</p></li>
+<li><p><strong>Heterogén rendszerben a magok egyenlőként
+kezelése:</strong> A kapacitásbeli különbségek figyelmen kívül hagyása
+nem várt késleltetéseket okoz. Ellenőrzés:
+<code>/sys/devices/system/cpu/cpu*/cpu_capacity</code> értékek, ütemezői
+statisztikák (<code>/proc/schedstat</code>).</p></li>
+</ol>
+<p>Egy hibakeresési eseménynél a <code>panic</code>, a stack trace, a
+napló és a reprodukálható konfiguráció együtt szükséges. A laborban a
+virtuális gép naplója és a konfigurációs fájlok a reprodukciós csomag
+részei.</p>
+<h3 data-number="10.4.21" id="összefoglalás"><span
+class="header-section-number">10.4.21</span> 7. Összefoglalás</h3>
+<p>Ebben az egységben áttekintettük a többmagos és heterogén rendszerek
+ütemezési, memória- és energiakihívásait. A cache-koherencia és a hamis
+megosztás közvetlenül befolyásolják a párhuzamos programok
+teljesítményét; a NUMA-architektúrákban a memória-elhelyezés és az
+affinitás kulcsfontosságú. A big.LITTLE típusú heterogén rendszerek
+kapacitásalapú ütemezést és energia-tudatos döntéseket igényelnek. A
+gyakorlati affinitási terv és a mérési labor segítségével a fogalmak
+ellenőrizhetővé válnak.</p>
+<p>A következő egység (<a href="os038.html">Címterek, fizikai és
+virtuális cím</a>) a memóriakezelés alapjaira lép, ahol az itt megismert
+cache- és NUMA-fogalmak fontos előfeltételt jelentenek: a lapozás és a
+TLB viselkedése szorosan kapcsolódik a cache-hierarchiához és a
+párhuzamos memória-hozzáféréshez.</p>
+<h3 data-number="10.4.22" id="önellenőrző-kérdés"><span
+class="header-section-number">10.4.22</span> Önellenőrző kérdés</h3>
+<p>Egy 8 magos rendszerben két NUMA-csomópont van (Node 0: CPU 0–3, Node
+1: CPU 4–7).
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>1</mn></msub><annotation encoding="application/x-tex">P_1</annotation></semantics></math>
+egy CPU-intenzív, nagy memóriaigényű folyamat,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><msub><mi>P</mi><mn>2</mn></msub><annotation encoding="application/x-tex">P_2</annotation></semantics></math>
+pedig egy interaktív, kis memóriaigényű folyamat. Tervezze meg az
+affinitási és memóriapolitikát úgy, hogy a végrehajtási időt és az
+energiafogyasztást is optimalizálja. Indokolja, hogy miért a választott
+csomópontra köti a folyamatokat, és milyen mérésekkel ellenőrizné a terv
+helyességét.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os036.html">← 10.3 RCU, epoch-alapú visszanyerés és skálázható szinkronizáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os038.html">11.1 Címterek, fizikai és virtuális cím →</a></div>
+</nav>
+</body>
+</html>

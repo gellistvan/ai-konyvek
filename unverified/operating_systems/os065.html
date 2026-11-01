@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.4 Crash recovery, fsck és helyreállítás – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Fájlrendszerek és tárolás</a> › <a href="index.html#osch16">17 Megbízhatóság és crash consistency</a></p>
+<div class="links"><a class="prev" rel="prev" href="os064.html">← 17.3 RAID, replikáció és hibatűrés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os066.html">18.1 Snapshot, klónozás és thin provisioning →</a></div>
+</nav>
+<h2 data-number="17.4" id="os065"><span
+class="header-section-number">17.4</span> Crash recovery, fsck és
+helyreállítás</h2>
+<p>A hirtelen leállás utáni helyreállítás a fájlrendszer-megbízhatóság
+egyik legnehezebb problémája. Az operációs rendszer a lemezre írt
+adatokat puffereli, a metaadatokat több lépésben frissíti, és a folyamat
+közben bekövetkező megszakítás inkonzisztens állapotot hagyhat hátra. A
+cél nem csupán a hibák észlelése, hanem az, hogy a rendszer a lehető
+legrövidebb idő alatt, adatvesztés nélkül vagy minimális adatvesztéssel
+térjen vissza a konzisztens működéshez. Ez a fejezet a crash recovery
+három pillérét tárgyalja: a <strong>fájlrendszer-ellenőrzést
+(fsck)</strong>, a <strong>napló-visszajátszást (journal
+replay)</strong> és az <strong>árva inode-ok (orphan inode)</strong>
+felszámolását, valamint bemutatja, hogyan kapcsolódik mindehhez a
+<strong>mentés és visszaállítás</strong>.</p>
+<h3 data-number="17.4.1"
+id="a-hirtelen-leállás-és-a-konzisztencia-fogalma"><span
+class="header-section-number">17.4.1</span> 1. A hirtelen leállás és a
+konzisztencia fogalma</h3>
+<p>Hirtelen leállásnak nevezzük, ha a rendszer nem a szabályos
+leállítási szekvencián keresztül áll meg, hanem azonnal, például
+áramkimaradás, hardverhiba, kernelpánik vagy a felhasználó által kiadott
+<code>reset</code> hatására. Ilyenkor a kernel nem tudja leüríteni
+(flush) a fájlrendszer-puffereket, és a lemezen lévő struktúrák részben
+frissített állapotban maradhatnak.</p>
+<p>A fájlrendszer-konzisztencia azt jelenti, hogy a lemezen tárolt
+metaadatok (szuperblokk, inode-ok, blokk-bitképek, könyvtárbejegyzések)
+egymással összhangban vannak, és nincs olyan blokk vagy inode, amelyet
+egyszerre több célra használ a rendszer. A hirtelen leállás leggyakoribb
+következményei:</p>
+<ul>
+<li><strong>Elveszett blokkok</strong>: a blokk-bitkép szerint szabad,
+de egy inode még hivatkozik rá, vagy fordítva.</li>
+<li><strong>Rossz hivatkozási számláló</strong>: az inode
+<code>i_links_count</code> mezője nem egyezik a rá mutató
+könyvtárbejegyzések számával.</li>
+<li><strong>Árva inode</strong>: az inode törlés alatt áll, de a
+folyamat félbeszakadt, így az inode sem nem szabad, sem nem
+hivatkozott.</li>
+<li><strong>Sérült szuperblokk</strong>: a fájlrendszer globális
+paraméterei (blokkméret, blokkszám, inode-tábla helye) hibásak.</li>
+</ul>
+<p>A helyreállítás feladata ezeknek az eltéréseknek a felderítése és
+javítása úgy, hogy az adatok minél nagyobb része megmaradjon.</p>
+<h3 data-number="17.4.2" id="fsck-a-fájlrendszer-ellenőrző"><span
+class="header-section-number">17.4.2</span> 2. Fsck: a
+fájlrendszer-ellenőrző</h3>
+<p>Az <strong>fsck</strong> (file system check) egy olyan program, amely
+a lemezen tárolt struktúrákat offline módon – azaz lecsatolt (unmount)
+fájlrendszeren – ellenőrzi és javítja. Bár a modern naplózó
+fájlrendszerek csökkentik a teljes ellenőrzés szükségességét, a fsck
+továbbra is kulcsszerepet játszik a súlyos sérülések detektálásában és a
+napló által nem kezelt hibák javításában.</p>
+<p>A klasszikus <code>e2fsck</code> (ext2/ext3/ext4) öt fázisban
+dolgozik:</p>
+<ol type="1">
+<li><strong>Szuperblokk és blokk-bitkép ellenőrzése</strong>: ellenőrzi
+a szuperblokk mágikus számát, a blokkméretet, a blokkszámot, majd
+beolvassa az inode- és blokk-bitképeket.</li>
+<li><strong>Könyvtár- és inode-kapcsolatok ellenőrzése</strong>: bejárja
+az összes inode-ot, és ellenőrzi, hogy a hivatkozott blokkok
+szerepelnek-e a blokk-bitképben.</li>
+<li><strong>Könyvtárbejegyzések ellenőrzése</strong>: bejárja a
+könyvtárakat, és ellenőrzi, hogy minden bejegyzés érvényes inode-ra
+mutat-e, és hogy a <code>..</code> bejegyzés helyes-e.</li>
+<li><strong>Hivatkozási számlálók ellenőrzése</strong>: összeveti az
+inode-ok <code>i_links_count</code> mezőjét a tényleges
+könyvtárbejegyzések számával.</li>
+<li><strong>Blokk-bitkép összevetése</strong>: ellenőrzi, hogy nincs-e
+olyan blokk, amelyet két inode is használ, vagy amely elveszett.</li>
+</ol>
+<p>A fsck futtatásakor a program kérdezi a felhasználót, vagy
+automatikusan (például a <code>-y</code> kapcsolóval) javítja a hibákat.
+Egy tipikus hívás:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Lecsatolt ext4 fájlrendszer ellenőrzése és automatikus javítás</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">fsck.ext4</span> <span class="at">-f</span> <span class="at">-y</span> /dev/vdb1</span></code></pre></div>
+<p><strong>Rendszerhívás szintjén</strong> a fsck nem egyetlen
+rendszerhívást használ, hanem közvetlenül olvassa és írja a
+blokkeszközt. A lecsatolt állapot biztosítja, hogy a kernel ne módosítsa
+a fájlrendszert az ellenőrzés közben.</p>
+<p>A fsck korlátai: nagy fájlrendszeren a teljes ellenőrzés percekig
+vagy órákig tarthat, ezért a naplózó fájlrendszerek inkább a napló
+visszajátszására támaszkodnak, és a fsck-ot csak akkor futtatják, ha a
+napló sérült vagy a rendszer ezt kéri.</p>
+<h3 data-number="17.4.3"
+id="journal-replay-a-napló-visszajátszása"><span
+class="header-section-number">17.4.3</span> 3. Journal replay: a napló
+visszajátszása</h3>
+<p>A naplózó fájlrendszerek (ext3, ext4, XFS, NTFS) a
+metaadat-változtatásokat először egy körkörös naplóba (journal) írják,
+majd csak ezután frissítik a tényleges adatszerkezeteket. A napló célja,
+hogy a hirtelen leállás után a rendszer a naplóban lévő tranzakciók
+újrajátszásával (redo) vagy visszavonásával (undo) helyreállítsa a
+konzisztenciát.</p>
+<p>A folyamat lépései:</p>
+<ol type="1">
+<li><strong>Napló beolvasása</strong>: a kernel a mount során ellenőrzi
+a napló szuperblokkját, és megkeresi az utolsó érvényes tranzakció
+végét.</li>
+<li><strong>Redo passz</strong>: a naplóban lévő, már commit-ált
+tranzakciók adatait alkalmazza a fájlrendszerre. Ez azt jelenti, hogy a
+naplóban rögzített blokkokat átmásolja a végső helyükre.</li>
+<li><strong>Undo passz (opcionális)</strong>: a nem commit-ált
+tranzakciók változtatásait elveti, hogy a fájlrendszer ne tartalmazzon
+félig végrehajtott műveleteket.</li>
+<li><strong>Napló törlése</strong>: a sikeres visszajátszás után a napló
+területét üresnek jelöli.</li>
+</ol>
+<p>A <code>journal replay</code> tehát nem igényel teljes
+fájlrendszer-ellenőrzést, ezért a modern rendszerek a crash után gyorsan
+elindulnak.</p>
+<p><strong>Példa</strong>: egy ext4 fájlrendszeren a mount során a
+kernel a következő üzenetet írhatja a naplóba:</p>
+<pre><code>EXT4-fs (vdb1): recovery complete
+EXT4-fs (vdb1): mounted filesystem with ordered data mode. Opts: (null)</code></pre>
+<p>A napló módok (ext4 esetén) befolyásolják a helyreállítás és a
+teljesítmény viszonyát:</p>
+<ul>
+<li><strong>journal</strong>: minden adat és metaadat a naplóba kerül, a
+legbiztonságosabb, de lassú.</li>
+<li><strong>ordered</strong> (alapértelmezett): a metaadatok
+naplózódnak, az adatblokkokat a commit előtt kiírják a végleges
+helyükre. Crash esetén az adatok konzisztensek, de egy nem commit-ált
+tranzakció adatai elveszhetnek.</li>
+<li><strong>writeback</strong>: a metaadatok naplózódnak, de az adatok
+kiírási sorrendje nem garantált. Gyorsabb, de crash után az adatok
+inkonzisztensek lehetnek.</li>
+</ul>
+<p>A journal replay a <code>mount</code> rendszerhívás részeként fut le.
+A rendszerhívás paramétere a fájlrendszer típusa, az eszköz és a mount
+pont; visszatérési értéke 0 siker esetén, hiba esetén <code>-1</code> és
+az <code>errno</code> tartalmazza a hibakódot (például
+<code>EINVAL</code> érvénytelen paraméter, <code>EIO</code> I/O hiba). A
+felhasználói térből a <code>mount -t ext4 /dev/vdb1 /mnt</code> parancs
+hívja meg ezt a rendszerhívást.</p>
+<h3 data-number="17.4.4" id="orphan-inode-ok-kezelése"><span
+class="header-section-number">17.4.4</span> 4. Orphan inode-ok
+kezelése</h3>
+<p>Az <strong>orphan inode</strong> (árva inode) olyan inode, amelynek a
+törlése elindult, de a folyamat a törlés befejezése előtt megszakadt. Ez
+tipikusan akkor fordul elő, ha egy folyamat egy nyitott fájlt töröl
+(<code>unlink</code>), de a fájl még nyitva van, vagy ha egy folyamat
+éppen a könyvtárbejegyzés eltávolítását végzi, amikor a rendszer
+leáll.</p>
+<p>Az ext4 naplózó fájlrendszerben az orphan inode-ok listáját a
+szuperblokkban tárolják. A mount során a kernel beolvassa ezt a listát,
+és minden inode-ot felszámol: a hivatkozási számlálót nullára állítja, a
+blokkokat felszabadítja, és az inode-ot törli. Ez a folyamat a
+<strong>orphan recovery</strong>.</p>
+<p><strong>Példa folyamat</strong>:</p>
+<ol type="1">
+<li>Egy folyamat megnyitja a <code>/tmp/teszt.txt</code> fájlt
+(<code>open</code>).</li>
+<li>A folyamat törli a fájlt (<code>unlink</code>), de nem zárja be a
+leírót.</li>
+<li>A rendszer hirtelen leáll.</li>
+<li>Újraindulás után a kernel a mount során észleli az orphan listában a
+fájlt, és felszabadítja az inode-ot és a blokkokat.</li>
+</ol>
+<p>Az orphan lista a naplóban is rögzítve van, így a journal replay
+során is feldolgozásra kerül.</p>
+<p><strong>Rendszerhívás</strong>: az <code>unlink</code> rendszerhívás
+paramétere az elérési út, visszatérési értéke 0 siker esetén, hiba
+esetén <code>-1</code> és <code>errno</code> (például
+<code>ENOENT</code> ha nem létezik, <code>EACCES</code> ha nincs jog). A
+fájl tényleges törlése csak akkor történik meg, ha az összes nyitott
+leíró bezárult; addig az inode orphan állapotban van.</p>
+<h3 data-number="17.4.5" id="cow-fájlrendszerek-és-a-scrub"><span
+class="header-section-number">17.4.5</span> 5. COW fájlrendszerek és a
+scrub</h3>
+<p>A copy-on-write (COW) fájlrendszerek (ZFS, Btrfs) eltérő
+megközelítést alkalmaznak: a metaadatokat és az adatokat fa-struktúrában
+tárolják, és minden módosítás új blokkokba íródik, azaz a régi állapot
+mindaddig megmarad, amíg az új gyökérblokk commit-álása meg nem
+történik. Ez a <strong>tranzakciós frissítés</strong> azt jelenti, hogy
+a hirtelen leállás után a fájlrendszer mindig az utolsó konzisztens
+állapotba tér vissza, mert a commit előtti változtatások nem érhetők el
+a gyökérből.</p>
+<p>Ezek a fájlrendszerek általában nem igényelnek hagyományos fsck-ot,
+mert a struktúra eleve konzisztens. Helyette <strong>scrub</strong>
+eljárást használnak, amely a lemezen tárolt checksum-ok segítségével
+ellenőrzi a blokkok integritását, és a tükrözött vagy RAID-elt
+példányokból helyreállítja a sérült adatokat. A scrub ütemezetten fut,
+és nem igényel lecsatolást.</p>
+<p><strong>Példa Btrfs scrub</strong>:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub start /mnt</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">btrfs</span> scrub status /mnt</span></code></pre></div>
+<p>A scrub eredményeként a rendszer jelzi a javított hibák számát. Ez a
+mechanizmus a crash recovery után is fontos, mert a hirtelen leállás
+fizikai sérülést is okozhat (például egy írás közbeni áramkimaradás
+részben írott blokkot hagyhat).</p>
+<h3 data-number="17.4.6" id="adatmentés-és-visszaállítás"><span
+class="header-section-number">17.4.6</span> 6. Adatmentés és
+visszaállítás</h3>
+<p>A crash recovery a fájlrendszer konzisztenciáját állítja helyre, de
+nem véd az adatvesztés ellen, ha a lemez fizikailag megsérül, vagy ha a
+felhasználó tévedésből töröl. Az <strong>adatmentés (backup)</strong> és
+a <strong>visszaállítás (restore)</strong> a katasztrófa utáni
+helyreállítás alapja.</p>
+<p>A mentési stratégiák:</p>
+<ul>
+<li><strong>Teljes mentés</strong>: minden adatot lemásol. Egyszerű, de
+lassú és sok tárhelyet igényel.</li>
+<li><strong>Inkrementális mentés</strong>: csak az utolsó mentés óta
+megváltozott adatokat menti. Gyors, de a visszaállításhoz az összes
+korábbi mentés szükséges.</li>
+<li><strong>Differenciális mentés</strong>: az utolsó teljes mentés óta
+megváltozott adatokat menti. A visszaállításhoz a teljes mentés és a
+legutóbbi differenciális mentés kell.</li>
+</ul>
+<p>A <strong>snapshot</strong> (pillanatkép) egy fájlrendszer-szintű,
+időponthoz kötött olvasható másolat. A COW fájlrendszerekben a snapshot
+olcsó, mert csak a megváltozott blokkokat kell másolni. A snapshotok
+gyors helyreállítást tesznek lehetővé, de nem helyettesítik a külső
+mentést, mert ugyanazon a lemezen vannak.</p>
+<p>A visszaállítás folyamata:</p>
+<ol type="1">
+<li>A sérült adatok azonosítása.</li>
+<li>A megfelelő mentés kiválasztása (teljes, inkrementális,
+snapshot).</li>
+<li>A mentés visszaállítása a lemezre.</li>
+<li>A fájlrendszer ellenőrzése (fsck) a konzisztencia
+biztosítására.</li>
+<li>A visszaállított rendszer tesztelése.</li>
+</ol>
+<p>A helyreállítási célokat két metrika határozza meg:</p>
+<ul>
+<li><strong>RPO (Recovery Point Objective)</strong>: az az időpont,
+ameddig az adatoknak vissza kell állniuk; azaz a maximálisan elfogadható
+adatvesztés.</li>
+<li><strong>RTO (Recovery Time Objective)</strong>: az az időtartam,
+amely alatt a szolgáltatásnak újra elérhetőnek kell lennie.</li>
+</ul>
+<p>Ezeket a mérőszámokat a katasztrófa-tervezés során kell meghatározni,
+és a mentési stratégiát ennek megfelelően kell kialakítani.</p>
+<h3 data-number="17.4.7"
+id="labor-crash-recovery-forgatókönyv-emulált-környezetben"><span
+class="header-section-number">17.4.7</span> 7. Labor: crash-recovery
+forgatókönyv emulált környezetben</h3>
+<p>Ez a labor egy reprodukálható crash-recovery forgatókönyvet valósít
+meg QEMU virtuális gépen, ext4 fájlrendszerrel. A cél a journal replay,
+az orphan inode felszámolás és a fsck működésének megfigyelése és
+mérése.</p>
+<h3 data-number="17.4.8" id="kiinduló-állapot-és-konfiguráció"><span
+class="header-section-number">17.4.8</span> 7.1. Kiinduló állapot és
+konfiguráció</h3>
+<ul>
+<li><strong>Hoszt</strong>: Linux, QEMU 8.0 vagy újabb, e2fsprogs 1.47.0
+(ellenőrizendő verziók a reprodukciós csomagban).</li>
+<li><strong>Vendég</strong>: QEMU <code>x86_64</code> virtuális gép, 1
+vCPU, 512 MiB RAM.</li>
+<li><strong>Lemezkép</strong>: <code>crash-lab.qcow2</code>, 2 GiB
+virtuális méret.</li>
+<li><strong>Fájlrendszer</strong>: ext4, a <code>/dev/vda1</code>
+partíción, ordered naplózási móddal.</li>
+</ul>
+<p>A vendég operációs rendszer egy minimális Linux (például Debian
+netboot) vagy egy saját kernel, de a labor egyszerűsége kedvéért egy
+meglévő Linux disztribúciót használunk.</p>
+<h3 data-number="17.4.9" id="build-és-futtatási-parancsok"><span
+class="header-section-number">17.4.9</span> 7.2. Build és futtatási
+parancsok</h3>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Lemezkép létrehozása és partition</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-img</span> create <span class="at">-f</span> qcow2 crash-lab.qcow2 2G</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co"># (A vendég telepítése után a lemezkép rögzített állapotba kerül.)</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co"># QEMU indítása</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="ex">qemu-system-x86_64</span> <span class="dt">\</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-m</span> 512 <span class="dt">\</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-drive</span> file=crash-lab.qcow2,format=qcow2,if=virtio <span class="dt">\</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">-display</span> none <span class="at">-serial</span> stdio <span class="dt">\</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">-kernel</span> /boot/vmlinuz-6.1.0-lab <span class="dt">\</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">-initrd</span> /boot/initrd.img-6.1.0-lab <span class="dt">\</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">-append</span> <span class="st">&quot;root=/dev/vda1 console=ttyS0&quot;</span></span></code></pre></div>
+<p>A <code>-kernel</code> és <code>-initrd</code> opciók a vendég kernel
+betöltésére szolgálnak; a pontos elérési utak a reprodukciós csomagban
+találhatók.</p>
+<h3 data-number="17.4.10" id="forgatókönyv-lépései"><span
+class="header-section-number">17.4.10</span> 7.3. Forgatókönyv
+lépései</h3>
+<ol type="1">
+<li><strong>Előkészítés</strong>: Indítsuk el a virtuális gépet, és
+hozzunk létre egy fájlt, majd töröljük azt, hogy orphan inode
+keletkezzen.</li>
+</ol>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Vendégen belül, root felhasználóként</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> /dev/vda1 /mnt</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;crash test&quot;</span> <span class="op">&gt;</span> /mnt/teszt.txt</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Nyitott leíróval törlés</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="bu">exec</span> <span class="dv">3</span><span class="op">&lt;&gt;</span> /mnt/teszt.txt</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> /mnt/teszt.txt</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co"># A leíró továbbra is nyitva van, az inode orphan listába kerül.</span></span></code></pre></div>
+<ol start="2" type="1">
+<li><p><strong>Hirtelen leállás szimulálása</strong>: A hoszton küldjünk
+egy azonnali leállítást a QEMU-nak, például <code>kill -9</code>-cel a
+QEMU folyamatra, vagy a QEMU monitorban <code>quit</code> helyett a
+<code>system_powerdown</code> helyett <code>q</code> parancsot
+használva. A legegyszerűbb:
+<code>kill -9 $(pidof qemu-system-x86_64)</code>. Ez a vendég kernel
+számára hirtelen power loss-nak felel meg.</p></li>
+<li><p><strong>Újraindítás és mérés</strong>: Indítsuk el újra a
+virtuális gépet. A kernel bootolása közben az ext4 meghajtó
+automatikusan elvégzi a journal replay-t és az orphan recovery-t.
+Rögzítsük a kernel logból a
+<code>EXT4-fs (vda1): recovery complete</code> üzenet
+időbélyegét.</p></li>
+<li><p><strong>Fsck futtatása</strong>: A sikeres mount után lecsatoljuk
+a fájlrendszert, és lefuttatjuk a fsck-ot:</p></li>
+</ol>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">umount</span> /mnt</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="bu">time</span> fsck.ext4 <span class="at">-f</span> <span class="at">-y</span> /dev/vda1</span></code></pre></div>
+<p>A <code>time</code> parancs méri a futási időt. A <code>-f</code>
+kényszeríti a teljes ellenőrzést, még akkor is, ha a fájlrendszer tiszta
+jelzést tartalmaz.</p>
+<ol start="5" type="1">
+<li><strong>Mentés és visszaállítás tesztelése</strong>: Készítsünk egy
+egyszerű tar archívumot a kritikus adatokról, majd töröljük az eredeti
+fájlt, és állítsuk vissza a mentésből:</li>
+</ol>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">tar</span> <span class="at">-czf</span> /backup/teszt.tar.gz /mnt</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">rm</span> /mnt/teszt.txt</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="fu">tar</span> <span class="at">-xzf</span> /backup/teszt.tar.gz <span class="at">-C</span> /</span></code></pre></div>
+<h3 data-number="17.4.11" id="mérési-napló-és-elvárt-eredmény"><span
+class="header-section-number">17.4.11</span> 7.4. Mérési napló és elvárt
+eredmény</h3>
+<p>A mérést a vendég kernel logjából és a <code>time</code> kimenetéből
+gyűjtjük. A hardver: QEMU emulált CPU (default <code>qemu64</code>), 1
+vCPU, 512 MiB RAM, virtio blokk. A fordítási beállítások a vendég
+kernelnél a disztribúció által szállított binárisok.</p>
+<p>A táblázat a várt és mért eredményeket különíti el:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Mérési pont</th>
+<th>Várt érték</th>
+<th>Mért érték</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Journal replay idő (boot logból)</td>
+<td>&lt; 100 ms</td>
+<td>(pl. 42 ms)</td>
+</tr>
+<tr class="even">
+<td>Orphan recovery</td>
+<td>az inode felszabadul, nincs hibaüzenet</td>
+<td>(naplóban “recovery complete”)</td>
+</tr>
+<tr class="odd">
+<td>fsck futási idő</td>
+<td>&lt; 5 s (2 GiB lemez)</td>
+<td>(pl. 1.8 s)</td>
+</tr>
+<tr class="even">
+<td>fsck hibaüzenet</td>
+<td>nincs hiba</td>
+<td>“clean” vagy “0 bad blocks”</td>
+</tr>
+<tr class="odd">
+<td>Visszaállított fájl tartalma</td>
+<td>“crash test”</td>
+<td>(pl. “crash test”)</td>
+</tr>
+</tbody>
+</table>
+<p>A mérési módszer: a vendég <code>dmesg</code> kimenetét a soros
+konzolon rögzítjük, a <code>time</code> kimenetét a <code>bash</code>
+beépített <code>time</code> kulcsszavával mérjük. Az órajelfrekvencia a
+QEMU emulált CPU-jára nem értelmezhető közvetlenül, ezért az időmérés a
+vendég kernel monoton óráján alapul.</p>
+<p><strong>Megjegyzés</strong>: A journal replay idő mérése a boot log
+timestamp-jén alapul, amely a kernel monoton óráját használja; a
+pontosság 1 ms. A fsck futási időt a <code>time</code> parancs
+<code>real</code> értéke adja.</p>
+<h3 data-number="17.4.12" id="visszaállítás"><span
+class="header-section-number">17.4.12</span> 7.5. Visszaállítás</h3>
+<p>A labor után a virtuális gép leállítható, a lemezkép eldobható vagy
+visszaállítható a kiinduló snapshotba. A QEMU lemezkép
+<code>qcow2</code> formátuma támogatja a snapshotokat, így a következő
+futtatás előtt
+<code>qemu-img snapshot -c baseline crash-lab.qcow2</code> paranccsal
+rögzíthetjük a tiszta állapotot.</p>
+<h3 data-number="17.4.13" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">17.4.13</span> 8. Tipikus hibák és helyes
+megoldások</h3>
+<p>A crash recovery során számos hiba fordulhat elő. Az alábbi táblázat
+összefoglalja a leggyakoribbakat és a helyes eljárást:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Hiba</th>
+<th>Leírás</th>
+<th>Helyes megoldás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Fsck futtatása csatolt fájlrendszeren</strong></td>
+<td>A fájlrendszer írásvédett módban is sérülhet, mert a kernel
+puffereli a módosításokat.</td>
+<td>Mindig lecsatolás (<code>umount</code>) után futtassuk a
+fsck-ot.</td>
+</tr>
+<tr class="even">
+<td><strong>Journal letiltása teljesítmény miatt</strong></td>
+<td>A napló nélküli ext2 fájlrendszer minden crash után teljes fsck-ot
+igényel, ami hosszú leállást okoz.</td>
+<td>Használjunk naplózó fájlrendszert (ext3/ext4, XFS), és csak extrém
+esetben kapcsoljuk ki.</td>
+</tr>
+<tr class="odd">
+<td><strong>Orphan inode-ok figyelmen kívül hagyása</strong></td>
+<td>Az orphan lista feldolgozásának hiánya elveszett blokkokat és
+inode-okat eredményez.</td>
+<td>A mount során a kernel automatikusan elvégzi az orphan recovery-t;
+ne tiltsuk le.</td>
+</tr>
+<tr class="even">
+<td><strong>Restore utáni fsck elmulasztása</strong></td>
+<td>A visszaállított fájlrendszer metaadatai sérültek lehetnek a mentés
+hibája miatt.</td>
+<td>Minden visszaállítás után futtassunk fsck-ot, mielőtt a
+fájlrendszert élesben használjuk.</td>
+</tr>
+<tr class="odd">
+<td><strong>Helytelen backup verzió</strong></td>
+<td>A visszaállításhoz nem a megfelelő inkrementális láncot
+választjuk.</td>
+<td>Dokumentáljuk a mentési láncot, és teszteljük a visszaállítást
+rendszeresen.</td>
+</tr>
+<tr class="even">
+<td><strong>A napló figyelmen kívül hagyása</strong></td>
+<td>A napló sérülése esetén a mount meghiúsul, de a felhasználó
+megpróbálja kézzel csatolni.</td>
+<td>A mount hiba esetén vizsgáljuk a naplót (<code>dmesg</code>), és
+szükség esetén futtassunk fsck-ot.</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="17.4.14" id="önellenőrző-kérdés"><span
+class="header-section-number">17.4.14</span> 9. Önellenőrző kérdés</h3>
+<p><strong>Kérdés</strong>: Egy ext4 fájlrendszeren egy folyamat
+létrehoz egy fájlt, ír bele 1 MiB adatot, majd törli a fájlt, de a
+rendszer a törlés utáni pillanatban, a leíró bezárása előtt hirtelen
+leáll. Az újraindulás után milyen állapotban lesz a fájl inode-ja és a
+hozzá tartozó adatblokkok? Magyarázza el a journal replay és az orphan
+recovery szerepét ebben a forgatókönyvben.</p>
+<p><strong>Válaszvázlat</strong>: A fájl inode-ja az orphan listába
+került, mert az <code>unlink</code> után a link count 0 lett, de a leíró
+nyitva maradt. A hirtelen leállás után a mount során a kernel beolvassa
+a naplót és az orphan listát, majd felszabadítja az inode-ot és az
+adatblokkokat. A journal replay biztosítja, hogy a naplóban lévő,
+commit-ált tranzakciók (például a törlés könyvtárbejegyzésének
+eltávolítása) végrehajtódnak. Az adatblokkok felszabadulnak, és a fájl
+visszavonhatatlanul törlődik. Ha a mentésből akarjuk visszaállítani, a
+mentés készítésének időpontjától függően lehet meg a fájl.</p>
+<h3 data-number="17.4.15" id="összegzés-és-továbbvezetés"><span
+class="header-section-number">17.4.15</span> 10. Összegzés és
+továbbvezetés</h3>
+<p>A crash recovery a fájlrendszerek megbízhatóságának alapvető eleme. A
+naplózás gyors helyreállítást tesz lehetővé, az orphan inode-ok kezelése
+megakadályozza az erőforrás-szivárgást, a fsck pedig a végső védelmi
+vonalat jelenti a sérült struktúrák ellen. A mentés és visszaállítás a
+katasztrófa utáni helyreállítást szolgálja, és a helyes mentési
+stratégia kiválasztása a RPO és RTO követelményektől függ.</p>
+<p>A következő fejezet (<a href="os066.html">Snapshot, klónozás és thin
+provisioning</a> – Snapshot, klónozás és thin provisioning) ezekre az
+alapokra épít: a snapshotok a COW fájlrendszerekben a crash recovery-nél
+is bemutatott tranzakciós frissítést használják, a thin provisioning
+pedig a tárolási hatékonyságot növeli, de újabb
+konzisztencia-kihívásokat vet fel. A crash recovery ismerete
+elengedhetetlen ahhoz, hogy megértsük, hogyan lehet a pillanatképeket
+biztonságosan létrehozni és visszaállítani.</p>
+<p>Ez a fejezet teljesíti a tanulási célokat: bemutatta a hirtelen
+leállás utáni helyreállítás fogalmát, alkalmazta a fsck-ot, a journal
+replay-t és az orphan kezelést egy ellenőrizhető laborban, és felhívta a
+figyelmet a tipikus hibákra a helyes megoldásokkal.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os064.html">← 17.3 RAID, replikáció és hibatűrés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os066.html">18.1 Snapshot, klónozás és thin provisioning →</a></div>
+</nav>
+</body>
+</html>

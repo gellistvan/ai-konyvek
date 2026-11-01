@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>19.4 Zero-copy, offload és hálózati teljesítmény – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz5">V. RÉSZ – Hálózat, biztonság és virtualizáció</a> › <a href="index.html#osch18">19 Hálózati stack</a></p>
+<div class="links"><a class="prev" rel="prev" href="os072.html">← 19.3 Csomagfeldolgozás, netfilter és eBPF</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os074.html">20.1 DNS, DHCP és konfiguráció →</a></div>
+</nav>
+<h2 data-number="19.4" id="os073"><span
+class="header-section-number">19.4</span> Zero-copy, offload és hálózati
+teljesítmény</h2>
+<h3 data-number="19.4.1"
+id="a-hálózati-adatút-optimalizálása-a-csomag-útja-és-a-másolások-problémája"><span
+class="header-section-number">19.4.1</span> 1. A hálózati adatút
+optimalizálása: a csomag útja és a másolások problémája</h3>
+<p>Az előző alfejezetben (<a href="os072.html">Csomagfeldolgozás,
+netfilter és eBPF</a>) láttuk, hogy egy beérkező csomag a hálózati
+kártyától (NIC) a megszakításon, a DMA-n és a kernel hálózati veremén
+(TCP/IP stack) keresztül jut el a felhasználói alkalmazásig. Ez az
+útvonal az általános célú operációs rendszerekben hagyományosan
+többszöri memóriamásolással és kontextusváltással jár, ami a modern,
+nagy sebességű hálózatokon (10 Gbit/s, 25 Gbit/s, 100 Gbit/s) komoly
+szűk keresztmetszetté válik.</p>
+<p>A naiv adatút a következőképpen néz ki egy csomag fogadásakor:</p>
+<ol type="1">
+<li>A DMA-vezérlő a hálózati kártya gyűrűpufferéből a kernel
+<code>sk_buff</code> struktúrába másolja a csomag adatait.</li>
+<li>A kernel a <code>socket</code> rétegbe másolja az adatot.</li>
+<li>Az alkalmazás meghívja a <code>read()</code> rendszerhívást,
+amelynek során a CPU a kernelpufferből a felhasználói térben lévő
+puffferbe másolja az adatot.</li>
+</ol>
+<p>Ez a hagyományos modell három-négy CPU-végrehajtású másolást is
+jelenthet csomagonként, ami jelentősen terheli a CPU-t, rontja a cache
+kihasználtságát, növeli a késleltetést, és csökkenti az elérhető
+maximális sávszélességet.</p>
+<p><strong>A hálózati adatút optimalizálásának célja
+kettős:</strong></p>
+<ul>
+<li><strong>CPU-teher csökkentése:</strong> A CPU-nak a csomagok
+másolgatása helyett az alkalmazáslogikával kellene foglalkoznia.</li>
+<li><strong>Késleltetés és áteresztőképesség javítása:</strong> Kevesebb
+másolás és kontextusváltás közvetlenül jobb latency-t és nagyobb
+throughputot eredményez.</li>
+</ul>
+<p>Az optimalizálás három fő pilléren nyugszik: a <strong>zero-copy
+technikák</strong>, a <strong>hardveres offload</strong> és a
+<strong>CPU-affinitás / NUMA-tudatos elhelyezés</strong>.</p>
+<hr />
+<h3 data-number="19.4.2"
+id="zero-copy-technikák-a-rendszerhívásokban"><span
+class="header-section-number">19.4.2</span> 2. Zero-copy technikák a
+rendszerhívásokban</h3>
+<p>A “zero-copy” kifejezés némileg félrevezető: nem azt jelenti, hogy
+egyáltalán nincs másolás a memóriában, hanem azt, hogy a <strong>CPU nem
+végez felesleges másolást</strong> a felhasználói és a kernelcímterek
+között. A cél, hogy a memóriabuszon és a CPU L1/L2/L3 cache-én keresztül
+történő adatmozgatások száma minimális legyen.</p>
+<h4 data-number="19.4.2.1"
+id="sendfile-és-a-kernel-belső-másolása"><span
+class="header-section-number">19.4.2.1</span> 2.1
+<code>sendfile()</code> és a kernel belső másolása</h4>
+<p>A legegyszerűbb és legelterjedtebb zero-copy minta a fájlok
+kiszolgálása a hálózaton (pl. webkiszolgáló). A hagyományos megoldás a
+<code>read()</code> majd <code>write()</code>:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Hagyományos, nem hatékony másolás */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> buffer<span class="op">[</span><span class="dv">16384</span><span class="op">];</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> n<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> in_fd <span class="op">=</span> open<span class="op">(</span><span class="st">&quot;fajl.bin&quot;</span><span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> out_fd <span class="op">=</span> socket<span class="op">(</span>AF_INET<span class="op">,</span> SOCK_STREAM<span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Itt a fájl adata: lemez -&gt; kernel page cache -&gt; buffer (user space) -&gt; socket kernel puffer -&gt; NIC</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="cf">while</span> <span class="op">((</span>n <span class="op">=</span> read<span class="op">(</span>in_fd<span class="op">,</span> buffer<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buffer<span class="op">)))</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>out_fd<span class="op">,</span> buffer<span class="op">,</span> n<span class="op">)</span> <span class="op">!=</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span><span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Itt az adat négyszer kerül át a memórián a CPU aktív
+közreműködésével. A <code>sendfile()</code> rendszerhívás ezt a
+műveletet egyetlen hívássá olvasztja össze:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Zero-copy adatküldés a kernelben maradva */</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>off_t offset <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> sent <span class="op">=</span> sendfile<span class="op">(</span>out_fd<span class="op">,</span> in_fd<span class="op">,</span> <span class="op">&amp;</span>offset<span class="op">,</span> file_size<span class="op">);</span></span></code></pre></div>
+<p>A <code>sendfile</code> működése során a kernel közvetlenül a
+<strong>page cache</strong>-ből tölti be a fájl adatait, és azt a socket
+puffferbe helyezi. Habár ez még mindig egy memóriamásolás a kernel
+címtartományán belül (page cache -&gt; socket buffer), a CPU-nak nem
+kell átlépnie a kernel/user határt kétszer, és nem kell a felhasználói
+pufferbe másolnia. A modern Linux kernelekben a <code>sendfile</code>
+képes arra is, hogy a socket bufferbe ne a teljes adatot másolja, hanem
+csak egy leírót (descriptor) illesszen be, ami a háttérben a page cache
+lapjaira mutat (ez a <code>splice</code> és a hálózati alrendszer
+együttműködése).</p>
+<h4 data-number="19.4.2.2" id="splice"><span
+class="header-section-number">19.4.2.2</span> 2.2
+<code>splice()</code></h4>
+<p>A <code>splice()</code> rendszerhívás egy általánosabb kernel-belső
+adatmozgató mechanizmus. Két fájlleíró között mozgat adatot anélkül,
+hogy az elhagyná a kernelteret. Az egyik végpontnak általában egy
+pipe-nak kell lennie.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* adat mozgatása fájlból socketbe splice-szal */</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> pipefd<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>pipe<span class="op">(</span>pipefd<span class="op">);</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">// Fájl -&gt; pipe</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> len <span class="op">=</span> splice<span class="op">(</span>in_fd<span class="op">,</span> NULL<span class="op">,</span> pipefd<span class="op">[</span><span class="dv">1</span><span class="op">],</span> NULL<span class="op">,</span> file_size<span class="op">,</span> SPLICE_F_MOVE<span class="op">);</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Pipe -&gt; socket</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>splice<span class="op">(</span>pipefd<span class="op">[</span><span class="dv">0</span><span class="op">],</span> NULL<span class="op">,</span> out_fd<span class="op">,</span> NULL<span class="op">,</span> len<span class="op">,</span> SPLICE_F_MOVE<span class="op">);</span></span></code></pre></div>
+<p>Itt a rendszer a lapokat (pages) csak átcímkézi (re-map), nem pedig
+másolja, amennyiben a hardver és a kernel támogatja a scatter-gather
+DMA-t.</p>
+<h4 data-number="19.4.2.3" id="msg_zerocopy-linux-specifikus"><span
+class="header-section-number">19.4.2.3</span> 2.3
+<code>MSG_ZEROCOPY</code> (Linux-specifikus)</h4>
+<p>A fenti példák főként a bejövő adatokra és a lemezes forrásokra
+vonatkoznak. Ha az alkalmazás a saját memóriájából generált adatot akar
+küldeni, hagyományosan a <code>send()</code> rendszerhívás bemásolja a
+felhasználói puffert a kernel socket puffferébe. A Linux 4.14 óta
+elérhető <code>MSG_ZEROCOPY</code> flag ezt kerüli meg:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">/* Kísérleti jellegő, verziófüggő API (ellenőrzés szükséges a célkernelre) */</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> one <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>setsockopt<span class="op">(</span>fd<span class="op">,</span> SOL_SOCKET<span class="op">,</span> SO_ZEROCOPY<span class="op">,</span> <span class="op">&amp;</span>one<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>one<span class="op">));</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="dt">char</span> <span class="op">*</span>buf <span class="op">=</span> mmap<span class="op">(</span>NULL<span class="op">,</span> size<span class="op">,</span> PROT_READ <span class="op">|</span> PROT_WRITE<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>                 MAP_PRIVATE <span class="op">|</span> MAP_ANONYMOUS<span class="op">,</span> <span class="op">-</span><span class="dv">1</span><span class="op">,</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co">// ... adat feltöltése a buf-ba ...</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> msghdr msg <span class="op">=</span> <span class="op">{</span><span class="dv">0</span><span class="op">};</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> iovec iov <span class="op">=</span> <span class="op">{</span> <span class="op">.</span>iov_base <span class="op">=</span> buf<span class="op">,</span> <span class="op">.</span>iov_len <span class="op">=</span> size <span class="op">};</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>msg<span class="op">.</span>msg_iov <span class="op">=</span> <span class="op">&amp;</span>iov<span class="op">;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>msg<span class="op">.</span>msg_iovlen <span class="op">=</span> <span class="dv">1</span><span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="dt">ssize_t</span> sent <span class="op">=</span> sendmsg<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>msg<span class="op">,</span> MSG_ZEROCOPY<span class="op">);</span></span></code></pre></div>
+<p>Ebben az esetben a kernel a hálózati kártya DMA-képességét használva
+közvetlenül a felhasználói térben lévő lapokról olvassa be az adatot, ha
+a hardveres scatter-gather ezt lehetővé teszi. Fontos megjegyezni, hogy
+ez a módszer akkor hatékony, ha az adat nagyobb, mint a másolás
+költsége. Kis csomagoknál a lapok rögzítésének (pinning) overheadje
+nagyobb lehet, mint a másolásé.</p>
+<p><strong>Tipikus hiba és helyes megoldás:</strong> A kezdő fejlesztők
+gyakran alkalmaznak zero-copy megoldásokat kicsi, pár száz bájtos
+üzenetekre. Ebben az esetben a rendszer a lapok lefoglalásával és
+rögzítésével (page pinning) több munkát végez, mintha egyszerűen
+átmásolná a 64 bájtot a
+<code>copy_to_user</code>/<code>copy_from_user</code> művelettel. A
+helyes megoldás a <strong>döntési táblázat</strong> használata:
+zero-copy csak akkor, ha a payload mérete meghalad egy küszöbértéket
+(jellemzően 1-4 KiB), vagy ha a CPU a szűk keresztmetszet.</p>
+<hr />
+<h3 data-number="19.4.3"
+id="hardveres-offload-dma-stateless-offload-és-toe"><span
+class="header-section-number">19.4.3</span> 3. Hardveres offload: DMA,
+stateless offload és TOE</h3>
+<p>Az operációs rendszernek nem kell minden feladatot szoftveresen
+elvégeznie. A hálózati kártyák (NIC-ek) egyre több intelligens
+funkcióval rendelkeznek. Az offload célja, hogy a CPU helyett a hardver
+végezze el az ismétlődő, alacsony szintű munkát.</p>
+<h4 data-number="19.4.3.1"
+id="dma-direct-memory-access-és-descriptor-gyűrűk"><span
+class="header-section-number">19.4.3.1</span> 3.1 DMA (Direct Memory
+Access) és Descriptor gyűrűk</h4>
+<p>A DMA a hálózati adatút legalapvetőbb offload mechanizmusa.
+Programozott I/O (PIO) esetén a CPU minden bájtot egyesével olvasna ki a
+kártyáról. A DMA lehetővé teszi, hogy a kártya közvetlenül a
+rendszermemóriába írjon (RX) és onnan olvasson (TX).</p>
+<p>A kernel és a NIC közötti együttműködés <strong>descriptor
+gyűrűkkel</strong> (ring buffer) történik:</p>
+<ul>
+<li><strong>TX Ring:</strong> A kernel lefoglal egy gyűrűt, amelyben a
+memóriacímeket és hosszakat adja meg. A kernel létrehoz egy
+<code>sk_buff</code>-ot, majd a fizikai címét beírja a TX ring következő
+elemébe. A NIC DMA-val elolvassa ezt a mutatót, kiolvassa az adatot a
+RAM-ból, és elküldi a hálózatra.</li>
+<li><strong>RX Ring:</strong> A kernel előre lefoglal üres puffereket,
+és azok címeit beírja az RX ringbe. Amikor csomag érkezik, a NIC DMA-val
+beleír a megadott memóriacímre, majd megszakítást (IRQ) küld.</li>
+</ul>
+<p>A <strong>scatter-gather DMA</strong> az a hardveres képesség, amely
+a zero-copy technikák alapja. Ha a TCP stream adatai nem folytonos
+fizikai memóriában vannak, a CPU-nak külön be kellene másolnia őket egy
+folytonos pufferbe, hogy a hálózati kártya el tudja küldeni. Ha a NIC
+támogatja a scatter-gather-t, a kernel egyszerűen átad egy láncolt
+listát (iovec) a fizikai címekről, és a NIC hardvere szétszórva olvassa
+be azokat, összerakva a keretet a hálózaton.</p>
+<h4 data-number="19.4.3.2"
+id="stateless-offload-checksum-tso-lrogro"><span
+class="header-section-number">19.4.3.2</span> 3.2 Stateless offload:
+Checksum, TSO, LRO/GRO</h4>
+<p>A TCP/IP protokoll több ellenőrző összeget és szegmentálási feladatot
+ír elő, amelyeket hagyományosan a CPU számolt ki.</p>
+<ul>
+<li><strong>Checksum Offload (CSUM):</strong> Az IP és TCP fejléc
+ellenőrző összegének kiszámítása nagy CPU-terhelést jelent nagy
+sávszélességnél. Ha a NIC hardvere támogatja, a kernel beírja a fejlécbe
+a pszeudo-fejléc adatait, és a kártya kiszámítja a végleges checksumot.
+Ez tipikusan mindig bekapcsolt állapotban marad, mert a nyereség
+hatalmas, a kockázat pedig alacsony.</li>
+<li><strong>TCP Segmentation Offload (TSO):</strong> A kernel hálózati
+verme és az alkalmazás gyakran nagy (akár 64 KiB-os) pufferekkel
+dolgozik, de a fizikai hálózat MTU-ja 1500 bájt. Ha a CPU-nak kellene
+feldarabolnia a nagy TCP szegmenseket, az rengeteg apró művelet lenne.
+TSO esetén a kernel átadja a nagy puffert a kártyának, és a
+<strong>hálózati hardver</strong> végzi el a szegmentálást a kicsi
+IP-csomagokra. Ez drámaian csökkenti a per-bájt CPU-költséget.</li>
+<li><strong>Large/Generic Receive Offload (LRO/GRO):</strong> A TSO
+ellentéte. A hálózaton sok kicsi, egymáshoz tartozó szegmens érkezik. Ha
+a kernel mindegyiket külön dolgozná fel, óriási overhead lenne. A GRO a
+szoftveres, de az alsóbb rétegben (NAPI) elvégzett aggregáció: a
+megszakításkezelő összegyűjti az egymáshoz tartozó szegmenseket, és
+egyetlen nagy <code>sk_buff</code>-ként adja fel a TCP veremnek. (A
+régebbi LRO ezt hardveresen tette, de az gyakran megsértette a TCP
+szabályokat, különösen a routing és a tűzfalak alatt, ezért a Linux
+inkább a szoftveres GRO-t preferálja).</li>
+</ul>
+<h4 data-number="19.4.3.3" id="toe-tcp-offload-engine"><span
+class="header-section-number">19.4.3.3</span> 3.3 TOE (TCP Offload
+Engine)</h4>
+<p>A TOE a “teljes” offload megvalósítása. Itt a hálózati kártya nem
+csak a checksum-ot számolja, vagy a szegmentálást végzi, hanem a
+<strong>teljes TCP state machine-t</strong> lefuttatja a hardverben
+(háromfázisú handshake, torlódásvezérlés, nyugtázás,
+retransmission).</p>
+<p><strong>Előny:</strong> Az elméleti CPU-teher a nullához közelíthet,
+hiszen a hoszt CPU-ja szinte nem vesz részt a TCP feldolgozásában.
+<strong>Hátrány és jelenlegi helyzet:</strong> A modern, nagysebességű
+hálózatokban az általános célú operációs rendszerek (különösen a Linux)
+<strong>nem használnak teljes TOE-t</strong>. Ennek okai:</p>
+<ol type="1">
+<li><strong>Biztonság és tűzfal (<code>netfilter</code>, eBPF):</strong>
+Ha a TCP handshake és a kapcsolatállapot a hardverben él, akkor a kernel
+tűzfala (pl. iptables, nftables) és az eBPF programok nem látják a
+kapcsolat állapotát, így nem tudnak beavatkozni (pl. SYN cookie, DDoS
+védelem).</li>
+<li><strong>Rugalmasság és debuggolás:</strong> A kernel TCP verme (pl.
+CUBIC, BBR torlódásvezérlés) folyamatosan fejlődik. A hardverbe égetett
+implementációk elavulnak, nem frissíthetők, és nehezen
+debuggolhatók.</li>
+<li><strong>Virtualizáció és live migration:</strong> Ha a TCP állapot a
+hardverben van, lehetetlen egy virtuális gépet élőben átköltöztetni
+(live migration) egy másik szerverre, mert a kapcsolat állapota nem
+exportálható.</li>
+</ol>
+<p>Ezért a gyakorlatban a <strong>stateless offload (TSO, CSUM,
+RSS)</strong> és az intelligens DMA a nyerő stratégia, a teljes TOE-t
+pedig főleg speciális beágyazott környezetekben vagy régebbi eszközökön
+találjuk.</p>
+<hr />
+<h3 data-number="19.4.4" id="latency-throughput-és-cpu-affinitás"><span
+class="header-section-number">19.4.4</span> 4. Latency, Throughput és
+CPU-affinitás</h3>
+<p>Az optimalizálás célja a mérőszámok javítása, tehát meg kell értenünk
+a hálózati teljesítmény metrikáit és a CPU-architektúra hatását.</p>
+<ul>
+<li><strong>Throughput (Áteresztőképesség):</strong> Az időegység alatt
+átvitt hasznos adat mennyisége (Mbit/s vagy csomag/s). A throughput
+növelése főként a nagy másolások kiküszöbölésén (zero-copy) és az
+offload-on (TSO/LRO) múlik.</li>
+<li><strong>Latency (Késleltetés):</strong> Az az idő, ami alatt egy
+csomag eljut a forrástól a célig (vagy a végponttól a végpontig az
+alkalmazásban). A latency csökkentése gyakran a megszakítások
+késleltetésének csökkentésén és az ütemezés optimalizálásán múlik.</li>
+</ul>
+<h4 data-number="19.4.4.1"
+id="cpu-affinitás-és-rss-receive-side-scaling"><span
+class="header-section-number">19.4.4.1</span> 4.1 CPU-affinitás és RSS
+(Receive Side Scaling)</h4>
+<p>A többmagos rendszerekben a hálózati adatút egyik legnagyobb
+ellensége a <strong>cache thrashing</strong> és a <strong>lock
+contention</strong>. Ha egy csomag megszakítása a 0. CPU-n fut le, a
+felhasználói alkalmazás pedig a 4. CPU-n, akkor az adatot a
+cache-koherencia protokollnak (MESI) át kell mozgatnia a processzorok
+között, ami jelentős késleltetést ad hozzá.</p>
+<p><strong>Receive Side Scaling (RSS):</strong> A hálózati kártyák
+támogatják a hardveres terheléselosztást. Az RSS a TCP/IP fejléc
+(IP-címek és portok) hash-e alapján a bejövő csomagokat több RX ringbe
+osztja szét. Minden RX ringhez külön megszakítási vektor tartozhat,
+amelyet a kernel egy adott CPU-hoz köthet.</p>
+<p><strong>Interrupt Coalescing és Busy Polling:</strong> A nagy
+sebességű hálózatoknál a megszakítások áradata (interrupt storm) miatt a
+CPU soha nem jut el az alkalmazás futtatásáig. Két stratégia
+létezik:</p>
+<ol type="1">
+<li><strong>Interrupt Coalescing (Adaptive RX/TX):</strong> A kártya nem
+küld megszakítást minden csomag után, hanem vár egy kicsit (néhány
+mikroszekundum), vagy vár, amíg N csomag összegyűlik. Ez növeli a batch
+méretet és növeli a throughputot, de növeli a késleltetést is! Ez a
+klasszikus latency vs. throughput trade-off.</li>
+<li><strong>Busy Polling (<code>SO_BUSY_POLL</code>):</strong> Alacsony
+késleltetésű környezetekben az alkalmazás nem alszik el a
+<code>recv</code> hívásra várva, hanem a kernel aktívan pörög egy CPU
+magon, és pollozza a hálózati kártya RX gyűrűjét. Ez drasztikusan
+csökkenti a latency-t (akár 10-20 mikroszekundumra), de 100%-os
+CPU-terhelést jelent.</li>
+</ol>
+<p><strong>CPU-affinitás beállítása a laborban:</strong> A
+<code>taskset</code> vagy a <code>cpuset</code> cgroup segítségével az
+alkalmazást ugyanarra a NUMA node-ra és CPU magra kötjük, mint ahol a
+NIC megszakítása fut.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Példa: IRQ affinity beállítása (emulált labor kontextusban)</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Az IRQ 123-t a 2-es CPU-hoz kötjük</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="op">&gt;</span> /proc/irq/123/smp_affinity_list</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Az alkalmazást a 2-es CPU-hoz és a 2-es NUMA node-hoz kötjük</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="ex">taskset</span> <span class="at">-c</span> 2 numactl <span class="at">--membind</span><span class="op">=</span>2 ./halozati_app</span></code></pre></div>
+<p>A CPU-affinitás csökkenti a lock contention-t, biztosítja, hogy az
+adat az L2/L3 cache-ben marad, és kiszámíthatóbbá teszi a
+késleltetést.</p>
+<hr />
+<h3 data-number="19.4.5"
+id="labor-zero-copy-és-offload-döntési-táblázat"><span
+class="header-section-number">19.4.5</span> 5. Labor: Zero-copy és
+offload döntési táblázat</h3>
+<p><em>Környezet:</em> Emulált labor QEMU-ban, <code>virtio-net</code>
+hálózati kártyával. Rögzített konfiguráció: 4 vCPU, 8 GiB RAM, Linux
+kernel 6.x (a pontos verzió a reprodukciós naplóban rögzítendő, mert az
+API-k verziófüggőek lehetnek).</p>
+<h4 data-number="19.4.5.1" id="cél"><span
+class="header-section-number">19.4.5.1</span> 5.1 Cél</h4>
+<p>Megmérni és összehasonlítani a hagyományos másolás és a
+zero-copy/offload technikák hatását a latency-re, throughputra és
+CPU-terhelésre. A mérések alapján létrehozni egy <strong>döntési
+táblázatot</strong>.</p>
+<h4 data-number="19.4.5.2" id="eszközök-és-mérési-módszer"><span
+class="header-section-number">19.4.5.2</span> 5.2 Eszközök és mérési
+módszer</h4>
+<ul>
+<li><strong>Források:</strong> Kis C program (<code>sender.c</code>,
+<code>receiver.c</code>) a <code>sendfile</code>, <code>splice</code> és
+hagyományos <code>send</code> használatára.</li>
+<li><strong>Hálózati konfiguráció:</strong>
+<code>ethtool -K &lt;iface&gt; tx on rx on tso on gro on</code> (offload
+be), majd kikapcsolt állapot mérése.</li>
+<li><strong>Mérés:</strong> <code>iperf3</code> a TCP throughputra,
+<code>qperf</code> vagy <code>ping -f</code> a latency-re és
+csomagvesztésre. <code>perf stat</code> a CPU-ciklusok és cache-miss
+mérésére.</li>
+</ul>
+<h4 data-number="19.4.5.3"
+id="elvárt-levezetett-vs.-mért-eredmények"><span
+class="header-section-number">19.4.5.3</span> 5.3 Elvárt (levezetett)
+vs. Mért eredmények</h4>
+<p>A mérés előtt rögzítsük az <strong>elvárt viselkedést</strong>: -
+<em>Elvárt:</em> A <code>sendfile</code> használata nagy fájloknál
+20-40%-kal csökkenti a CPU-felhasználást a
+<code>read</code>+<code>write</code>-hez képest. - <em>Elvárt:</em> A
+TSO bekapcsolása 1500 MTU mellett lehetővé teszi a 10 Gbit-es vonal
+telítését, míg kikapcsolva a CPU a 100%-ot eléri, és a sávszélesség
+beszűkül. - <em>Elvárt:</em> A latency a legjobb akkor lesz, ha Busy
+Polling (<code>SO_BUSY_POLL</code>) van, a legrosszabb pedig Interrupt
+Coalescing bekapcsolásával.</p>
+<p><em>(A mérési naplóba a mért értékeket ide kell beilleszteni, és az
+eltéréseket elemezni.)</em></p>
+<h4 data-number="19.4.5.4" id="döntési-táblázat-sablon"><span
+class="header-section-number">19.4.5.4</span> 5.4 Döntési táblázat
+(Sablon)</h4>
+<table>
+<colgroup>
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+<col style="width: 20%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Felhasználási mód / Munkaterhelés</th>
+<th style="text-align: left;">Zero-copy ajánlott?</th>
+<th style="text-align: left;">Offload ajánlott (TSO/GRO)?</th>
+<th style="text-align: left;">CPU-affinitás fontos?</th>
+<th style="text-align: left;">Indoklás</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;"><strong>HTTP fájlkiszolgáló (nagy
+fájlok)</strong></td>
+<td style="text-align: left;"><strong>Igen</strong>
+(<code>sendfile</code>)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;"><strong>Közepes</strong></td>
+<td style="text-align: left;">A CPU a másolásokkal lesz telítve, offload
+nélkül nem éri el a sávszélességet.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>DNS/DHCP szerver (kis
+csomagok)</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A kis (max 512 B) csomagoknál a
+laprögzítés drágább, mint a másolás. A latency a kritikus, az affinity
+csökkenti a cache-miss-t.</td>
+</tr>
+<tr class="odd">
+<td style="text-align: left;"><strong>Adatbázis replikáció (közepes
+csomagok)</strong></td>
+<td style="text-align: left;"><strong>Talán</strong>
+(<code>MSG_ZEROCOPY</code>)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A nagy batch-ek hatékonyak, de a
+tranzakciós integritás miatt a kernelben tartás lehet
+biztonságosabb.</td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>Valós idejű
+játék/streaming</strong></td>
+<td style="text-align: left;"><strong>Nem</strong></td>
+<td style="text-align: left;"><strong>Ki</strong> (TSO növeli a
+latency-t)</td>
+<td style="text-align: left;"><strong>Igen</strong></td>
+<td style="text-align: left;">A kis keretek gyors továbbítása a cél, a
+batchesítés (Interrupt Coalescing, TSO) rontja a válaszidőt.</td>
+</tr>
+</tbody>
+</table>
+<h4 data-number="19.4.5.5"
+id="tipikus-hibák-és-megoldások-a-labor-során"><span
+class="header-section-number">19.4.5.5</span> 5.5 Tipikus hibák és
+megoldások a labor során</h4>
+<ol type="1">
+<li><strong>Hiba:</strong> Az offload-ot kikapcsolják, mert “az hamis
+képet ad”. <strong>Megoldás:</strong> Ez téves. A modern virtuális
+környezetek (VirtIO) szoftveresen emulálják a TSO/GRO-t; letiltása a
+host CPU-t terheli, és nem méri a valós elérhető teljesítményt. Mindig
+dokumentálni kell az <code>ethtool</code> állapotát.</li>
+<li><strong>Hiba:</strong> A CPU-affinitást nem ellenőrzik, és a mérési
+eredmények nagy szórást mutatnak. <strong>Megoldás:</strong> A QEMU vCPU
+szálait is rögzíteni kell (<code>taskset</code> a QEMU szálakra), mert a
+virtuális környezetben a hoszt ütemezője felülírhatja a vendég affinity
+beállításokat.</li>
+<li><strong>Hiba:</strong> A <code>sendfile</code>-t kisméretű,
+interaktív üzenetekre használják. <strong>Megoldás:</strong> Ilyenkor a
+hívás overheadje és a kontextusváltás a domináns, nem a másolás. Ilyen
+esetekben a batch feldolgozás vagy az io_uring a helyes válasz.</li>
+</ol>
+<h3 data-number="19.4.6" id="összegzés"><span
+class="header-section-number">19.4.6</span> 6. Összegzés</h3>
+<p>Ebben az alfejezetben láthattuk, hogy a hálózati teljesítmény nem
+csak a CPU órajelétől függ, hanem attól, hogyan szervezzük meg az adatok
+útját. A zero-copy technikák (<code>sendfile</code>,
+<code>splice</code>, <code>MSG_ZEROCOPY</code>) megszüntetik a
+felesleges CPU-másolásokat. A hardveres offload (Checksum, TSO, GRO)
+kiveszi a per-packet terhelést a CPU-ból. Végül a CPU-affinitás és a
+modern interrupt kezelés (RSS, Busy Polling) biztosítja, hogy a
+megfelelő adat a megfelelő cache-ben legyen a megfelelő időben.</p>
+<p>Fontos megérteni, hogy a hálózati verem optimalizálása mindig
+kompromisszum. Nincs “egy jó beállítás” mindenre: a nagy
+áteresztőképességet igénylő fájltranszfer más konfigurációt igényel,
+mint az alacsony késleltetést igénylő valós idejű alkalmazás. A mérnök
+feladata a munkaterhelés profilozása és a bemutatott döntési táblázat
+alapján a helyes kernel- és hardverparaméterek kiválasztása. A következő
+alfejezetben (<a href="os074.html">DNS, DHCP és konfiguráció</a>) ezt a
+tudást alkalmazzuk a hálózati szolgáltatások (DNS, DHCP) építésekor,
+ahol a kis csomagok miatt a latency és az affinity kiemelt szerepet
+kap.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os072.html">← 19.3 Csomagfeldolgozás, netfilter és eBPF</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os074.html">20.1 DNS, DHCP és konfiguráció →</a></div>
+</nav>
+</body>
+</html>

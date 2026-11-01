@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="hu" xml:lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>17.2 Copy-on-write, checksum és scrub – Operációs
+rendszerek</title>
+  <link rel="stylesheet" href="pandoc.css" />
+  <link rel="stylesheet" href="math.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav class="pagenav top" aria-label="Lapozás">
+<p class="crumbs"><a href="index.html#resz4">IV. RÉSZ – Fájlrendszerek és tárolás</a> › <a href="index.html#osch16">17 Megbízhatóság és crash consistency</a></p>
+<div class="links"><a class="prev" rel="prev" href="os062.html">← 17.1 Journaling és tranzakciós metaadat</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os064.html">17.3 RAID, replikáció és hibatűrés →</a></div>
+</nav>
+<h2 data-number="17.2" id="os063"><span
+class="header-section-number">17.2</span> Copy-on-write, checksum és
+scrub</h2>
+<p>A CoW (copy-on-write) és az integritásellenőrzés együttműködése az
+egyik legerősebb védekezési minta a tárolórendszerekben: ahelyett, hogy
+egy blokkot felülírnánk, minden módosítás új blokkot hoz létre, és az új
+blokkhoz ellenőrzőösszeget (checksum) számolunk. Így a lemezen soha nem
+létezik olyan állapot, amelyben egy félig kiírt, sérült vagy szakadt
+írás ellenőrzőösszeg nélkül kerülne be az élő folyamba. A fejezet
+bemutatja, hogyan kapcsolódik össze a CoW és a checksum, miért fontos az
+adat- és metaadat-integritás elkülönítése, és hogyan épül fel a scrub,
+vagyis az átvizsgáló, öngyógyító folyamat.</p>
+<h3 data-number="17.2.1" id="a-cow-és-az-integritás-kapcsolata"><span
+class="header-section-number">17.2.1</span> 1. A CoW és az integritás
+kapcsolata</h3>
+<p>A copy-on-write elv szerint egy blokk módosításakor nem a régi
+blokkot írjuk felül, hanem:</p>
+<ol type="1">
+<li>beolvassuk a régi blokkot,</li>
+<li>módosított tartalommal új blokkot készítünk,</li>
+<li>az új blokkot egy szabad helyre írjuk,</li>
+<li>kiszámítjuk és eltároljuk az új blokk ellenőrzőösszegét,</li>
+<li>a fájlrendszer fa struktúrájában frissítjük a mutatókat, hogy az új
+blokkra hivatkozzanak.</li>
+</ol>
+<p>A régi blokk megmarad mindaddig, amíg az új állapot teljesen,
+atomikusan el nem készül. Csak a legfelső mutató (például a
+gyökércsomópont) egyetlen írással történő cseréje teszi láthatóvá az új
+állapotot. Ha a rendszer a lépések bármelyikénél leáll, a régi,
+konzisztens állapot továbbra is érvényben marad. Ez a tulajdonság a
+crash consistency alapja.</p>
+<p>A checksum ezt a folyamatot egészíti ki azzal, hogy minden blokkhoz
+tartozik egy ellenőrző összeg. A CoW miatt a checksum számítása mindig
+az írás előtt, az új blokk tartalmára vonatkozik; így a fájlrendszer
+soha nem tárol élő blokkot érvénytelen ellenőrzőösszeggel. Az összeg
+kiszámítása a memóriában történik, mielőtt a blokk a lemezre kerülne,
+ezért a szakadt írásból származó sérülés detektálható marad.</p>
+<p>A két mechanizmus együtt a következő írási invariánst adja:</p>
+<ul>
+<li>élő blokk = olyan blokk, amelyre a fa valamely gyökérből elérhető
+mutató mutat;</li>
+<li>minden élő blokk rendelkezik érvényes checksummal;</li>
+<li>ha egy blokk tartalma megváltozik anélkül, hogy a checksum is
+frissülne, az olvasáskor vagy scrub során hibát jelez;</li>
+<li>a hiba a CoW miatt nem ronthatja a korábban kiírt, ellenőrzött
+állapotot.</li>
+</ul>
+<p>Ez a kétpillérű védelem a modern, integritásorientált fájlrendszerek
+– például a ZFS és a Btrfs – alapvető tervezési mintája.</p>
+<h3 data-number="17.2.2" id="checksumok-az-adatintegritásban"><span
+class="header-section-number">17.2.2</span> 2. Checksumok az
+adatintegritásban</h3>
+<p>A checksum egy rövid, determinisztikus lenyomat, amelyet egy blokk
+tartalmából számítunk. Célja, hogy a blokk tartalmában bekövetkező
+véletlen hibát (bitfordulás, részleges írás, lemezhiba) nagy
+valószínűséggel észlelje. A checksum nem azonos a kriptográfiai
+hash-sel; a cél itt elsősorban a hiba detektálása, nem a szándékos
+manipuláció elleni védelem. Bár a kettő átfedhet, a tárolórendszerekben
+gyakran gyors, hardveresen támogatott algoritmusokat használnak.</p>
+<h3 data-number="17.2.3" id="hibamodell-és-detektálási-képesség"><span
+class="header-section-number">17.2.3</span> 2.1. Hibamodell és
+detektálási képesség</h3>
+<p>A tárolóblokkok integritásellenőrzésénél a leggyakoribb
+hibatípusok:</p>
+<ul>
+<li><strong>Olvasási hiba</strong>: a lemez vagy a vezérlő rossz adatot
+ad vissza.</li>
+<li><strong>Csendes adatromlás (silent data corruption)</strong>: a
+lemez vagy a vezérlő nem jelez hibát, de a visszaadott adat eltér az
+eredetitől.</li>
+<li><strong>Szakadt írás (torn write)</strong>: egy blokk írása a
+tápfeszültség kiesése miatt félig történik meg.</li>
+<li><strong>Elírás (misplaced write)</strong>: egy blokk tartalma rossz
+helyre íródik, például egy hibás firmware miatt.</li>
+<li><strong>Bitforgás</strong>: egy vagy több bit véletlen átfordulása a
+tárolóban.</li>
+</ul>
+<p>Egy
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>b</mi><annotation encoding="application/x-tex">b</annotation></semantics></math>
+bites checksum segítségével a véletlen hibák detektálásának felső
+korlátja közelítőleg</p>
+<p><math display="block" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>P</mi><mtext mathvariant="normal">detektálás</mtext></msub><mo>≈</mo><mn>1</mn><mo>−</mo><msup><mn>2</mn><mrow><mo>−</mo><mi>b</mi></mrow></msup><mi>.</mi></mrow><annotation encoding="application/x-tex">P_{\text{detektálás}} \approx 1 - 2^{-b}.</annotation></semantics></math></p>
+<p>Ez azt jelenti, hogy egy 32 bites checksum (például CRC32C) esetén a
+véletlen hiba elkerüli a detektálást körülbelül
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>2</mn><mo>,</mo><mn>3</mn><mo>⋅</mo><msup><mn>10</mn><mrow><mo>−</mo><mn>10</mn></mrow></msup></mrow><annotation encoding="application/x-tex">2{,}3 \cdot 10^{-10}</annotation></semantics></math>
+valószínűséggel. A gyakorlatban a hibatípusok nem teljesen
+véletlenszerűek, ezért a CRC-k és a hasító algoritmusok tervezése a
+hibamintázatokra is optimalizált. A modern fájlrendszerek gyakran 256
+bites kriptográfiai hash-t (például SHA-256-ot) is kínálnak, ami a
+szándékos manipuláció ellen is véd, de nagyobb CPU-költséggel jár.</p>
+<p>A checksum tárolása a blokk mellett vagy egy külön, dedikált
+területen történik. A leggyakoribb megoldás, hogy a blokk fejlécében
+vagy a blokkra mutató metaadatban tárolják. A CoW fájlrendszerekben a
+checksum általában a blokkra mutató bejegyzésben vagy a blokk elején
+lévő fejlécben található, így a fa bejárása során minden olvasásnál
+ellenőrizhető.</p>
+<h3 data-number="17.2.4" id="adat--és-metaadat-integritás"><span
+class="header-section-number">17.2.4</span> 2.2. Adat- és
+metaadat-integritás</h3>
+<p>A fájlrendszer kétféle tartalmat tárol: <strong>adatot</strong> (a
+fájlok tényleges tartalma) és <strong>metaadatot</strong> (a fájlok
+nevei, méretei, jogosultságai, blokkmutatók, szabad blokk listák). A
+metaadat sérülése általában súlyosabb következményekkel jár, mert az
+egész fájlrendszer szerkezetét érintheti. Ezért a metaadatokat különösen
+erős védelemmel látják el:</p>
+<ul>
+<li>minden metaadatblokkhoz külön checksum tartozik;</li>
+<li>a metaadat frissítése CoW-val történik, így a régi, érvényes állapot
+mindig megmarad;</li>
+<li>a gyökércsomópontra mutató legfelső blokk írása atomi, és általában
+két példányban, eltérő területen tárolják.</li>
+</ul>
+<p>Az adatblokkok checksumja is fontos, de egy adatblokk sérülése
+jellemzően csak egyetlen fájl tartalmát érinti, ezért a javítási
+stratégia lehet egyszerűbb: ha van redundáns másolat vagy replika, a
+hibás adat helyreállítható; ha nincs, a hiba legalább pontosan
+behatárolható.</p>
+<h3 data-number="17.2.5" id="cow-és-checksum-együttműködése"><span
+class="header-section-number">17.2.5</span> 3. CoW és checksum
+együttműködése</h3>
+<p>A CoW és a checksum együttműködése négy fontos lépésben valósul meg:
+az írási út, az olvasási út, a fa tranzakciós frissítése és a scrub.</p>
+<h3 data-number="17.2.6" id="írási-út"><span
+class="header-section-number">17.2.6</span> 3.1. Írási út</h3>
+<p>Amikor egy alkalmazás ír egy fájlba, a fájlrendszer a következőképpen
+jár el:</p>
+<ol type="1">
+<li>A fájl módosítandó adatblokkját beolvassa a memóriába.</li>
+<li>A módosított tartalomból új blokkot hoz létre.</li>
+<li>Kiszámítja az új blokk checksumját, és hozzárendeli a blokkhoz.</li>
+<li>Az új blokkot egy szabad területre írja.</li>
+<li>A fájl blokkmutatóit frissíti, hogy az új blokkra mutassanak; ehhez
+szintén CoW-t használ a metaadatblokkon.</li>
+<li>A mutatók frissítése felfelé terjed a fában, míg el nem éri a
+gyökércsomópontot.</li>
+<li>A gyökércsomópontot egyetlen atomi írással cseréli, amely az egész
+új állapotot láthatóvá teszi.</li>
+</ol>
+<p>Minden egyes lépés során a blokkhoz tartozó checksum már a kiírás
+előtt rendelkezésre áll. Ha az írás megszakad, a régi blokk és a régi fa
+érvényes marad, mert a gyökércsomópont még a régi állapotra mutat.</p>
+<p>A következő pszeudokód az írási folyamatot szemlélteti:</p>
+<pre class="pseudo"><code>function write_file_block(file, block_index, new_data):
+    old_block = read_block(file.block_map[block_index])
+    new_block = copy(old_block)
+    new_block.data = new_data
+    new_block.checksum = checksum(new_block.data)
+
+    new_address = allocate_free_block()
+    write_block(new_address, new_block)
+
+    update_block_map(file, block_index, new_address)   # CoW a metaadaton
+    update_parents(file, new_address)                  # fa frissítése felfelé
+
+    atomic_swap_root(file.root_pointer, new_root)</code></pre>
+<h3 data-number="17.2.7" id="olvasási-út"><span
+class="header-section-number">17.2.7</span> 3.2. Olvasási út</h3>
+<p>Olvasáskor a fájlrendszer beolvassa a blokkot, majd azonnal ellenőrzi
+a checksumját:</p>
+<pre class="pseudo"><code>function read_file_block(file, block_index):
+    address = file.block_map[block_index]
+    block = read_block(address)
+    expected = block.checksum
+    actual = checksum(block.data)
+
+    if actual != expected:
+        raise IntegrityError(&quot;checksum mismatch at block &quot; + address)
+
+    return block.data</code></pre>
+<p>Ha az ellenőrzés eltérést jelez, a fájlrendszer hibát ad vissza, nem
+szolgáltatja a sérült adatot. Ez az azonnali detektálás a CoW és a
+checksum egyik legfontosabb előnye: a sérült adat nem terjed tovább az
+alkalmazáshoz, a gyorsítótárhoz vagy a hálózathoz.</p>
+<h3 data-number="17.2.8" id="fa-struktúra-és-tranzakciós-lánc"><span
+class="header-section-number">17.2.8</span> 3.3. Fa struktúra és
+tranzakciós lánc</h3>
+<p>A CoW fájlrendszerekben minden blokk – adat és metaadat – egy fa
+része. A fa csúcsán a gyökércsomópont áll, amely a legmagasabb szintű
+metaadatokat tartalmazza. A gyökércsomópont checksumja is ellenőrzött,
+és maga a gyökércsomópont is CoW-val frissül. Így a teljes fa minden
+szintjén érvényes checksumok láncolata jön létre.</p>
+<p>Például egy egyszerű, kétszintű fa:</p>
+<pre><code>Gyökér (checksum: C_root)
+├── Metaadat blokk A (checksum: C_A)
+│   ├── Adatblokk 0 (checksum: C_0)
+│   └── Adatblokk 1 (checksum: C_1)
+└── Metaadat blokk B (checksum: C_B)
+    ├── Adatblokk 2 (checksum: C_2)
+    └── Adatblokk 3 (checksum: C_3)</code></pre>
+<p>Ha az Adatblokk 2 tartalma megváltozik, akkor új Adatblokk 2′ jön
+létre, új checksummal. Ezután új Metaadat blokk B′ jön létre, amelynek
+checksumja az új szerkezetet tükrözi. Végül új Gyökér′ jön létre, és a
+gyökércsomópontot cseréljük. A régi Gyökér továbbra is a régi,
+ellenőrzött állapotra mutat.</p>
+<p>Ez a láncolat biztosítja, hogy egyetlen sérült blokk sem maradhat
+észrevétlen, és a hiba a fa bejárásakor pontosan lokalizálható.</p>
+<h3 data-number="17.2.9" id="self-healing-és-scrub"><span
+class="header-section-number">17.2.9</span> 4. Self-healing és
+scrub</h3>
+<p>A self-healing (öngyógyítás) azt jelenti, hogy a fájlrendszer a hibás
+blokkot képes automatikusan helyreállítani egy redundáns forrásból. Ez a
+forrás lehet:</p>
+<ul>
+<li>tükrözött blokk (RAID 1 vagy hasonló),</li>
+<li>paritás alapú redundancia (RAID 5/6),</li>
+<li>replikált metaadat,</li>
+<li>egy másik, ellenőrzött példány a gyorsítótárban.</li>
+</ul>
+<p>A <strong>scrub</strong> egy periodikus vagy igény szerinti
+átvizsgáló folyamat, amely végigmegy a fájlrendszer összes blokkján,
+ellenőrzi a checksumokat, és hibát jelez vagy javít. A scrub célja, hogy
+a csendes adatromlást akkor is észlelje, amikor az adott blokkot az
+alkalmazás éppen nem olvassa. Így a hiba nem vár addig, amíg valaki
+hozzáfér a blokkhoz; a scrub proaktívan felderíti és lehetőség szerint
+javítja.</p>
+<h3 data-number="17.2.10" id="scrub-folyamat"><span
+class="header-section-number">17.2.10</span> 4.1. Scrub folyamat</h3>
+<p>A scrub algoritmusa tipikusan a következő:</p>
+<ol type="1">
+<li>A fájlrendszer lefagyasztja a legfelső gyökércsomópontot, vagy egy
+konzisztens pillanatképet (snapshot) készít.</li>
+<li>Bejárja a fát szélességi vagy mélységi sorrendben.</li>
+<li>Minden blokknál beolvassa a tartalmat, és kiszámítja a
+checksumot.</li>
+<li>Összehasonlítja a tárolt ellenőrzőösszeggel.</li>
+<li>Ha nincs eltérés, továbblép.</li>
+<li>Ha eltérés van:
+<ul>
+<li>ha létezik redundáns másolat, a rendszer megkísérli a javítást;</li>
+<li>ha a másolat is sérült, a hibát naplózza, és a blokk elvesztését
+jelzi.</li>
+</ul></li>
+<li>A folyamat a fa minden élő blokkját ellenőrzi.</li>
+</ol>
+<p>A scrub során a fájlrendszer nem módosítja a fa szerkezetét, csak a
+hibás blokkokat javítja, ezért a CoW logika részben felfüggeszthető. A
+javítás azonban gyakran CoW-val történik: a hibás blokk adatait a
+redundáns példányból egy új blokkba írják, és a mutatókat frissítik, így
+a hibás blokk felszabadul.</p>
+<p>A scrub időigénye arányos a tárolt adat mennyiségével. A futás ideje
+alatt a lemez I/O sávszélességét részben a scrub foglalja le, ezért a
+tervezésnél figyelembe kell venni a terhelést. A modern rendszerekben a
+scrub alacsony prioritású háttérfolyamatként fut.</p>
+<h3 data-number="17.2.11" id="javítás-redundanciából"><span
+class="header-section-number">17.2.11</span> 4.2. Javítás
+redundanciából</h3>
+<p>A javítás egyik gyakori esete, amikor egy blokk tükrözött (mirror)
+konfigurációban van. A scrub ellenőrzi az első példány checksumját; ha
+eltérés van, ellenőrzi a második példányt. Ha a második példány
+érvényes, akkor a hibás példányt felülírja a jó tartalmával, és új
+checksumot számít. Ha mindkettő sérült, akkor a hiba nem javítható, és a
+rendszer hibát jelez.</p>
+<p>A következő pszeudokód a tükrözött javítást mutatja:</p>
+<pre class="pseudo"><code>function scrub_mirror_block(primary, mirror):
+    primary_ok = verify_checksum(primary)
+    mirror_ok = verify_checksum(mirror)
+
+    if primary_ok and mirror_ok:
+        return OK
+    else if not primary_ok and mirror_ok:
+        new_block = read_block(mirror)
+        write_block(primary, new_block)     # CoW nélkül, mert csak javítás
+        return REPAIRED_PRIMARY
+    else if primary_ok and not mirror_ok:
+        new_block = read_block(primary)
+        write_block(mirror, new_block)
+        return REPAIRED_MIRROR
+    else:
+        return UNRECOVERABLE</code></pre>
+<p>A gyakorlatban a javítás nem közvetlen felülírással történik, hanem a
+blokk újraírásával, miközben a fa mutatói változatlanok maradnak, vagy a
+hibás blokk helyett egy új blokkra mutatnak. A lényeg, hogy a javítás
+után a checksum újra érvényes legyen.</p>
+<h3 data-number="17.2.12" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">17.2.12</span> 5. Tipikus hibák és helyes
+megoldások</h3>
+<p>A CoW és checksum alapú rendszerek tervezése során számos hiba
+fordulhat elő. Az alábbiakban a leggyakoribbakat és a helyes
+megoldásokat ismertetjük.</p>
+<ol type="1">
+<li><p><strong>A checksum nem fedi a teljes blokkot.</strong> Ha a
+checksum csak a blokk egy részére vonatkozik, akkor a nem fedett rész
+sérülése rejtve marad. Helyes megoldás: a checksum mindig a blokk teljes
+tartalmára, vagy a blokk fejlécére és adatára együtt számítson.</p></li>
+<li><p><strong>A metaadat és az adat ugyanazt a checksumot
+használja.</strong> Ez önmagában nem hiba, de a metaadatoknál erősebb
+védelmet kell alkalmazni, mert a metaadat sérülése súlyosabb. A
+gyakorlatban a metaadatokhoz gyakran legalább 256 bites hash-t
+használnak, míg az adatokhoz elegendő lehet CRC32C. Helyes megoldás:
+rétegek szerint differenciált integritáspolitika.</p></li>
+<li><p><strong>A scrub során a rendszer nem ellenőrzi a
+mutatókat.</strong> Egy sérült mutató rossz blokkra vezethet, és a
+checksum ellenőrzés hibát jelezhet, de a fa szerkezete is sérülhet.
+Helyes megoldás: a scrub a fa bejárásakor a mutatók konzisztenciáját is
+ellenőrizze, például a szülő és a gyermek blokkok összhangját.</p></li>
+<li><p><strong>A checksum ütközés figyelmen kívül hagyása.</strong> Bár
+a 32 bites checksum ritkán ütközik, a véletlen hibák detektálási
+valószínűsége nem abszolút. Helyes megoldás: kritikus adatoknál erősebb
+hash-t használni, és a hibadetektálást időnként kriptográfiai hash-sel
+is megerősíteni.</p></li>
+<li><p><strong>A javítás során a rendszer nem ellenőrzi a redundáns
+másolat checksumját.</strong> Ha a másolat is sérült, a javítás hibás
+adatot terjeszthet. Helyes megoldás: a javítás előtt minden forrást
+ellenőrizni.</p></li>
+<li><p><strong>A scrub túl ritkán fut, vagy túl nagy terhelést
+okoz.</strong> A ritka scrub lehetővé teszi a hiba terjedését; a túl
+gyakori scrub felesleges I/O-t generál. Helyes megoldás: a scrub
+ütemezése a tároló mérete és a hibatűrési követelmények alapján,
+alacsony prioritású háttérfeladatként.</p></li>
+<li><p><strong>A CoW frissítésnél a gyökércsomópont cseréje nem
+atomi.</strong> Ha a gyökércsomópont írása megszakad, a fájlrendszer
+inkonzisztenssé válhat. Helyes megoldás: a gyökércsomópontot két
+példányban, felváltva írjuk, és a cserét egy tranzakciós számlálóval
+vagy hasonló atomi művelettel védjük.</p></li>
+</ol>
+<h3 data-number="17.2.13"
+id="labor-checksum--és-scrub-folyamat-tervezése"><span
+class="header-section-number">17.2.13</span> 6. Labor: checksum- és
+scrub-folyamat tervezése</h3>
+<p>A labor célja, hogy egy emulált blokkboltban megvalósítsunk egy
+egyszerű CoW alapú, checksummal védett fájlrendszer-szerű struktúrát, és
+a scrub folyamatot kipróbáljuk. A labor egy eldobható QEMU virtuális
+gépben fut, a hoszt valódi lemezei nem érintettek.</p>
+<h3 data-number="17.2.14" id="cél-és-architektúra"><span
+class="header-section-number">17.2.14</span> 6.1. Cél és
+architektúra</h3>
+<p>A laborban egyetlen, fix méretű képfájlt használunk blokkboltként.
+Minden blokk 4096 bájt. A blokk formátuma:</p>
+<pre><code>+----------------------+
+| Header (16 byte)     |
+|  - magic (4 byte)    |
+|  - checksum (4 byte) |
+|  - sequence (8 byte) |
++----------------------+
+| Data (4080 byte)     |
++----------------------+</code></pre>
+<p>A <code>checksum</code> a Data mezőre számított CRC32C érték. A
+<code>sequence</code> a blokk monoton növekvő tranzakciós azonosítója,
+amely a CoW frissítést segíti.</p>
+<p>A rendszer kétféle blokkot kezel:</p>
+<ul>
+<li><strong>Adatblokk</strong>: a felhasználói adatot tartalmazza.</li>
+<li><strong>Metaadatblokk</strong>: a blokkmutatókat és a
+gyökércsomópontot tartalmazza; a laborban egyetlen metaadatblokkot
+használunk, amely a fájlblokkok listáját tárolja.</li>
+</ul>
+<p>A CoW írás során az adatblokk módosítása új blokkot eredményez, majd
+a metaadatblokkot is frissítjük. A gyökércsomópontot a metaadatblokk
+checksumja és a legfrissebb sequence alapján azonosítjuk.</p>
+<p>A scrub bejárja a blokkokat, ellenőrzi a checksumokat, és ha hiba
+van, megkísérli a javítást egy tükrözött másolatból. A laborban a
+tükrözést úgy szimuláljuk, hogy minden adatblokk két példányban létezik;
+a metaadatblokk is két példányban van.</p>
+<h3 data-number="17.2.15" id="konfiguráció-és-build"><span
+class="header-section-number">17.2.15</span> 6.2. Konfiguráció és
+build</h3>
+<p>A virtuális gép:</p>
+<ul>
+<li>CPU: 2 mag, x86_64</li>
+<li>Memória: 1024 MiB</li>
+<li>Tár: 4 GiB eldobható qcow2</li>
+<li>OS: Debian 12 minimális, gcc, make</li>
+</ul>
+<p>A labor munkakönyvtára: <code>$HOME/cow-scrub-lab</code>. A hoszt
+gépen nem fut a labor, csak a virtuális gépben.</p>
+<p>A <code>Makefile</code>:</p>
+<pre class="make"><code>CC = gcc
+CFLAGS = -Wall -Wextra -std=c11 -O2 -g
+
+cow_scrub: cow_scrub.c
+    $(CC) $(CFLAGS) -o cow_scrub cow_scrub.c
+
+clean:
+    rm -f cow_scrub pool.img</code></pre>
+<p>A pool képfájl mérete 64 MiB. A blokkcímek hexadecimalisan jelennek
+meg. A pool az elején két metaadatblokkot tartalmaz, majd adatblokkokat,
+mindegyikből két példányt.</p>
+<h3 data-number="17.2.16" id="kódvázlat"><span
+class="header-section-number">17.2.16</span> 6.3. Kódvázlat</h3>
+<p>A következő C kód a labor alapja. A kód szemléltető, nem éles
+rendszer; a célja a CoW és a scrub folyamatának bemutatása. A CRC32C
+implementáció egyszerűsített, oktatási célú.</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// cow_scrub.c -- oktatási példa: CoW, checksum és scrub szimuláció</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Nem futtatható éles tárolón; csak emulált pool.img fájlon dolgozik.</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdint.h&gt;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdio.h&gt;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;stdlib.h&gt;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;string.h&gt;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;fcntl.h&gt;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;unistd.h&gt;</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;errno.h&gt;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_SIZE </span><span class="dv">4096</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="pp">#define HEADER_SIZE </span><span class="dv">16</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DATA_SIZE </span><span class="op">(</span><span class="pp">BLOCK_SIZE </span><span class="op">-</span><span class="pp"> HEADER_SIZE</span><span class="op">)</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a><span class="pp">#define MAGIC </span><span class="bn">0x434F5731</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a><span class="pp">#define POOL_SIZE </span><span class="op">(</span><span class="dv">64</span><span class="pp"> </span><span class="op">*</span><span class="pp"> </span><span class="dv">1024</span><span class="pp"> </span><span class="op">*</span><span class="pp"> </span><span class="dv">1024</span><span class="op">)</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="pp">#define BLOCK_COUNT </span><span class="op">(</span><span class="pp">POOL_SIZE </span><span class="op">/</span><span class="pp"> BLOCK_SIZE</span><span class="op">)</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="pp">#define META_COUNT </span><span class="dv">2</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a><span class="pp">#define DATA_COUNT </span><span class="op">(</span><span class="pp">BLOCK_COUNT </span><span class="op">-</span><span class="pp"> META_COUNT</span><span class="op">)</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> magic<span class="op">;</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> checksum<span class="op">;</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint64_t</span> sequence<span class="op">;</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">))</span> BlockHeader<span class="op">;</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a><span class="kw">typedef</span> <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>    BlockHeader header<span class="op">;</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint8_t</span> data<span class="op">[</span>DATA_SIZE<span class="op">];</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span> __attribute__<span class="op">((</span>packed<span class="op">))</span> Block<span class="op">;</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> crc32c<span class="op">(</span><span class="dt">uint32_t</span> crc<span class="op">,</span> <span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>buf<span class="op">,</span> <span class="dt">size_t</span> len<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Oktatási célú, leegyszerűsített CRC32C; valós rendszerben használjon</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>    <span class="co">// hardveresen gyorsított implementációt (pl. SSE4.2 CRC32 utasítás).</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">uint32_t</span> poly <span class="op">=</span> <span class="bn">0x82F63B78</span><span class="bu">u</span><span class="op">;</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>    crc <span class="op">=</span> <span class="op">~</span>crc<span class="op">;</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> len<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>        crc <span class="op">^=</span> buf<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> k <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> k <span class="op">&lt;</span> <span class="dv">8</span><span class="op">;</span> k<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>            crc <span class="op">=</span> <span class="op">(</span>crc <span class="op">&gt;&gt;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">^</span> <span class="op">((</span>crc <span class="op">&amp;</span> <span class="dv">1</span><span class="op">)</span> <span class="op">?</span> poly <span class="op">:</span> <span class="dv">0</span><span class="op">);</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="op">~</span>crc<span class="op">;</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">uint32_t</span> block_checksum<span class="op">(</span><span class="dt">const</span> Block <span class="op">*</span>b<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> crc32c<span class="op">(</span><span class="dv">0</span><span class="op">,</span> b<span class="op">-&gt;</span>data<span class="op">,</span> DATA_SIZE<span class="op">);</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> open_pool<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>path<span class="op">,</span> <span class="dt">int</span> oflag<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open<span class="op">(</span>path<span class="op">,</span> oflag<span class="op">,</span> <span class="bn">0644</span><span class="op">);</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>fd <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;open&quot;</span><span class="op">);</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> fd<span class="op">;</span></span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> init_pool<span class="op">(</span><span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>path<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> fd <span class="op">=</span> open_pool<span class="op">(</span>path<span class="op">,</span> O_RDWR <span class="op">|</span> O_CREAT <span class="op">|</span> O_TRUNC<span class="op">);</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>ftruncate<span class="op">(</span>fd<span class="op">,</span> POOL_SIZE<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;ftruncate&quot;</span><span class="op">);</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-64"><a href="#cb7-64" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-65"><a href="#cb7-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-66"><a href="#cb7-66" aria-hidden="true" tabindex="-1"></a>    Block b<span class="op">;</span></span>
+<span id="cb7-67"><a href="#cb7-67" aria-hidden="true" tabindex="-1"></a>    memset<span class="op">(&amp;</span>b<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>b<span class="op">));</span></span>
+<span id="cb7-68"><a href="#cb7-68" aria-hidden="true" tabindex="-1"></a>    b<span class="op">.</span>header<span class="op">.</span>magic <span class="op">=</span> MAGIC<span class="op">;</span></span>
+<span id="cb7-69"><a href="#cb7-69" aria-hidden="true" tabindex="-1"></a>    b<span class="op">.</span>header<span class="op">.</span>sequence <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-70"><a href="#cb7-70" aria-hidden="true" tabindex="-1"></a>    b<span class="op">.</span>header<span class="op">.</span>checksum <span class="op">=</span> block_checksum<span class="op">(&amp;</span>b<span class="op">);</span></span>
+<span id="cb7-71"><a href="#cb7-71" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-72"><a href="#cb7-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> BLOCK_COUNT<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb7-73"><a href="#cb7-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>b<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>b<span class="op">))</span> <span class="op">!=</span> <span class="kw">sizeof</span><span class="op">(</span>b<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb7-74"><a href="#cb7-74" aria-hidden="true" tabindex="-1"></a>            perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb7-75"><a href="#cb7-75" aria-hidden="true" tabindex="-1"></a>            exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-76"><a href="#cb7-76" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-77"><a href="#cb7-77" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-78"><a href="#cb7-78" aria-hidden="true" tabindex="-1"></a>    close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb7-79"><a href="#cb7-79" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-80"><a href="#cb7-80" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-81"><a href="#cb7-81" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> Block read_block_at<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">int</span> index<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-82"><a href="#cb7-82" aria-hidden="true" tabindex="-1"></a>    Block b<span class="op">;</span></span>
+<span id="cb7-83"><a href="#cb7-83" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lseek<span class="op">(</span>fd<span class="op">,</span> <span class="op">(</span>off_t<span class="op">)</span>index <span class="op">*</span> BLOCK_SIZE<span class="op">,</span> SEEK_SET<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-84"><a href="#cb7-84" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;lseek&quot;</span><span class="op">);</span></span>
+<span id="cb7-85"><a href="#cb7-85" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-86"><a href="#cb7-86" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-87"><a href="#cb7-87" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>read<span class="op">(</span>fd<span class="op">,</span> <span class="op">&amp;</span>b<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>b<span class="op">))</span> <span class="op">!=</span> <span class="kw">sizeof</span><span class="op">(</span>b<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb7-88"><a href="#cb7-88" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;read&quot;</span><span class="op">);</span></span>
+<span id="cb7-89"><a href="#cb7-89" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-90"><a href="#cb7-90" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-91"><a href="#cb7-91" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> b<span class="op">;</span></span>
+<span id="cb7-92"><a href="#cb7-92" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-93"><a href="#cb7-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-94"><a href="#cb7-94" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> write_block_at<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">int</span> index<span class="op">,</span> <span class="dt">const</span> Block <span class="op">*</span>b<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-95"><a href="#cb7-95" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>lseek<span class="op">(</span>fd<span class="op">,</span> <span class="op">(</span>off_t<span class="op">)</span>index <span class="op">*</span> BLOCK_SIZE<span class="op">,</span> SEEK_SET<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-96"><a href="#cb7-96" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;lseek&quot;</span><span class="op">);</span></span>
+<span id="cb7-97"><a href="#cb7-97" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-98"><a href="#cb7-98" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-99"><a href="#cb7-99" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>write<span class="op">(</span>fd<span class="op">,</span> b<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>Block<span class="op">))</span> <span class="op">!=</span> <span class="kw">sizeof</span><span class="op">(</span>Block<span class="op">))</span> <span class="op">{</span></span>
+<span id="cb7-100"><a href="#cb7-100" aria-hidden="true" tabindex="-1"></a>        perror<span class="op">(</span><span class="st">&quot;write&quot;</span><span class="op">);</span></span>
+<span id="cb7-101"><a href="#cb7-101" aria-hidden="true" tabindex="-1"></a>        exit<span class="op">(</span>EXIT_FAILURE<span class="op">);</span></span>
+<span id="cb7-102"><a href="#cb7-102" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-103"><a href="#cb7-103" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-104"><a href="#cb7-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-105"><a href="#cb7-105" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">int</span> verify_block<span class="op">(</span><span class="dt">const</span> Block <span class="op">*</span>b<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-106"><a href="#cb7-106" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>b<span class="op">-&gt;</span>header<span class="op">.</span>magic <span class="op">!=</span> MAGIC<span class="op">)</span></span>
+<span id="cb7-107"><a href="#cb7-107" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">1</span><span class="op">;</span></span>
+<span id="cb7-108"><a href="#cb7-108" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> expected <span class="op">=</span> b<span class="op">-&gt;</span>header<span class="op">.</span>checksum<span class="op">;</span></span>
+<span id="cb7-109"><a href="#cb7-109" aria-hidden="true" tabindex="-1"></a>    <span class="dt">uint32_t</span> actual <span class="op">=</span> block_checksum<span class="op">(</span>b<span class="op">);</span></span>
+<span id="cb7-110"><a href="#cb7-110" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>expected <span class="op">!=</span> actual<span class="op">)</span></span>
+<span id="cb7-111"><a href="#cb7-111" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="op">-</span><span class="dv">2</span><span class="op">;</span></span>
+<span id="cb7-112"><a href="#cb7-112" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-113"><a href="#cb7-113" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-114"><a href="#cb7-114" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-115"><a href="#cb7-115" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> simulate_write<span class="op">(</span><span class="dt">int</span> fd<span class="op">,</span> <span class="dt">int</span> data_index<span class="op">,</span> <span class="dt">const</span> <span class="dt">uint8_t</span> <span class="op">*</span>new_data<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-116"><a href="#cb7-116" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Egyszerű CoW: új blokk a régi helyett; a metaadatblokk frissül.</span></span>
+<span id="cb7-117"><a href="#cb7-117" aria-hidden="true" tabindex="-1"></a>    <span class="co">// A laborban a metaadatblokk az utolsó blokk előtti blokk.</span></span>
+<span id="cb7-118"><a href="#cb7-118" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> primary <span class="op">=</span> META_COUNT <span class="op">+</span> data_index <span class="op">*</span> <span class="dv">2</span><span class="op">;</span>      <span class="co">// első példány</span></span>
+<span id="cb7-119"><a href="#cb7-119" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> mirror <span class="op">=</span> primary <span class="op">+</span> <span class="dv">1</span><span class="op">;</span>                        <span class="co">// második példány</span></span>
+<span id="cb7-120"><a href="#cb7-120" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> new_primary <span class="op">=</span> META_COUNT <span class="op">+</span> DATA_COUNT <span class="op">/</span> <span class="dv">2</span> <span class="op">+</span> data_index <span class="op">*</span> <span class="dv">2</span><span class="op">;</span></span>
+<span id="cb7-121"><a href="#cb7-121" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-122"><a href="#cb7-122" aria-hidden="true" tabindex="-1"></a>    Block old_primary <span class="op">=</span> read_block_at<span class="op">(</span>fd<span class="op">,</span> primary<span class="op">);</span></span>
+<span id="cb7-123"><a href="#cb7-123" aria-hidden="true" tabindex="-1"></a>    Block new_block <span class="op">=</span> old_primary<span class="op">;</span></span>
+<span id="cb7-124"><a href="#cb7-124" aria-hidden="true" tabindex="-1"></a>    memcpy<span class="op">(</span>new_block<span class="op">.</span>data<span class="op">,</span> new_data<span class="op">,</span> DATA_SIZE<span class="op">);</span></span>
+<span id="cb7-125"><a href="#cb7-125" aria-hidden="true" tabindex="-1"></a>    new_block<span class="op">.</span>header<span class="op">.</span>sequence<span class="op">++;</span></span>
+<span id="cb7-126"><a href="#cb7-126" aria-hidden="true" tabindex="-1"></a>    new_block<span class="op">.</span>header<span class="op">.</span>checksum <span class="op">=</span> block_checksum<span class="op">(&amp;</span>new_block<span class="op">);</span></span>
+<span id="cb7-127"><a href="#cb7-127" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-128"><a href="#cb7-128" aria-hidden="true" tabindex="-1"></a>    write_block_at<span class="op">(</span>fd<span class="op">,</span> new_primary<span class="op">,</span> <span class="op">&amp;</span>new_block<span class="op">);</span></span>
+<span id="cb7-129"><a href="#cb7-129" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-130"><a href="#cb7-130" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Metaadat frissítés: a laborban egyetlen metaadatblokk van,</span></span>
+<span id="cb7-131"><a href="#cb7-131" aria-hidden="true" tabindex="-1"></a>    <span class="co">// amely a blokkmutatókat tárolja. Itt csak naplózunk.</span></span>
+<span id="cb7-132"><a href="#cb7-132" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;CoW írás: adatblokk </span><span class="sc">%d</span><span class="st"> -&gt; új cím 0x</span><span class="sc">%X\n</span><span class="st">&quot;</span><span class="op">,</span> data_index<span class="op">,</span> new_primary<span class="op">);</span></span>
+<span id="cb7-133"><a href="#cb7-133" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-134"><a href="#cb7-134" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-135"><a href="#cb7-135" aria-hidden="true" tabindex="-1"></a><span class="dt">static</span> <span class="dt">void</span> scrub<span class="op">(</span><span class="dt">int</span> fd<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-136"><a href="#cb7-136" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> errors <span class="op">=</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb7-137"><a href="#cb7-137" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> BLOCK_COUNT<span class="op">;</span> i<span class="op">++)</span> <span class="op">{</span></span>
+<span id="cb7-138"><a href="#cb7-138" aria-hidden="true" tabindex="-1"></a>        Block b <span class="op">=</span> read_block_at<span class="op">(</span>fd<span class="op">,</span> i<span class="op">);</span></span>
+<span id="cb7-139"><a href="#cb7-139" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>verify_block<span class="op">(&amp;</span>b<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-140"><a href="#cb7-140" aria-hidden="true" tabindex="-1"></a>            printf<span class="op">(</span><span class="st">&quot;Hiba a blokknál: 0x</span><span class="sc">%X\n</span><span class="st">&quot;</span><span class="op">,</span> i<span class="op">);</span></span>
+<span id="cb7-141"><a href="#cb7-141" aria-hidden="true" tabindex="-1"></a>            errors<span class="op">++;</span></span>
+<span id="cb7-142"><a href="#cb7-142" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-143"><a href="#cb7-143" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-144"><a href="#cb7-144" aria-hidden="true" tabindex="-1"></a>    printf<span class="op">(</span><span class="st">&quot;Scrub befejezve. Talált hibák: </span><span class="sc">%d\n</span><span class="st">&quot;</span><span class="op">,</span> errors<span class="op">);</span></span>
+<span id="cb7-145"><a href="#cb7-145" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb7-146"><a href="#cb7-146" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-147"><a href="#cb7-147" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> main<span class="op">(</span><span class="dt">int</span> argc<span class="op">,</span> <span class="dt">char</span> <span class="op">**</span>argv<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-148"><a href="#cb7-148" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>argc <span class="op">&lt;</span> <span class="dv">3</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-149"><a href="#cb7-149" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;Használat: </span><span class="sc">%s</span><span class="st"> init|write|scrub pool.img [args]</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> argv<span class="op">[</span><span class="dv">0</span><span class="op">]);</span></span>
+<span id="cb7-150"><a href="#cb7-150" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb7-151"><a href="#cb7-151" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-152"><a href="#cb7-152" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-153"><a href="#cb7-153" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>cmd <span class="op">=</span> argv<span class="op">[</span><span class="dv">1</span><span class="op">];</span></span>
+<span id="cb7-154"><a href="#cb7-154" aria-hidden="true" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>pool <span class="op">=</span> argv<span class="op">[</span><span class="dv">2</span><span class="op">];</span></span>
+<span id="cb7-155"><a href="#cb7-155" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-156"><a href="#cb7-156" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>cmd<span class="op">,</span> <span class="st">&quot;init&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-157"><a href="#cb7-157" aria-hidden="true" tabindex="-1"></a>        init_pool<span class="op">(</span>pool<span class="op">);</span></span>
+<span id="cb7-158"><a href="#cb7-158" aria-hidden="true" tabindex="-1"></a>        printf<span class="op">(</span><span class="st">&quot;Pool inicializálva: </span><span class="sc">%s\n</span><span class="st">&quot;</span><span class="op">,</span> pool<span class="op">);</span></span>
+<span id="cb7-159"><a href="#cb7-159" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>cmd<span class="op">,</span> <span class="st">&quot;write&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-160"><a href="#cb7-160" aria-hidden="true" tabindex="-1"></a>        <span class="co">// Egyszerűsített: a harmadik argumentum a blokkindex,</span></span>
+<span id="cb7-161"><a href="#cb7-161" aria-hidden="true" tabindex="-1"></a>        <span class="co">// a negyedik a szöveges adat.</span></span>
+<span id="cb7-162"><a href="#cb7-162" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>argc <span class="op">&lt;</span> <span class="dv">5</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-163"><a href="#cb7-163" aria-hidden="true" tabindex="-1"></a>            fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;write parancshoz kell: index adat</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb7-164"><a href="#cb7-164" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb7-165"><a href="#cb7-165" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-166"><a href="#cb7-166" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> fd <span class="op">=</span> open_pool<span class="op">(</span>pool<span class="op">,</span> O_RDWR<span class="op">);</span></span>
+<span id="cb7-167"><a href="#cb7-167" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> idx <span class="op">=</span> atoi<span class="op">(</span>argv<span class="op">[</span><span class="dv">3</span><span class="op">]);</span></span>
+<span id="cb7-168"><a href="#cb7-168" aria-hidden="true" tabindex="-1"></a>        <span class="dt">const</span> <span class="dt">char</span> <span class="op">*</span>data <span class="op">=</span> argv<span class="op">[</span><span class="dv">4</span><span class="op">];</span></span>
+<span id="cb7-169"><a href="#cb7-169" aria-hidden="true" tabindex="-1"></a>        <span class="dt">uint8_t</span> buf<span class="op">[</span>DATA_SIZE<span class="op">];</span></span>
+<span id="cb7-170"><a href="#cb7-170" aria-hidden="true" tabindex="-1"></a>        memset<span class="op">(</span>buf<span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">));</span></span>
+<span id="cb7-171"><a href="#cb7-171" aria-hidden="true" tabindex="-1"></a>        strncpy<span class="op">((</span><span class="dt">char</span> <span class="op">*)</span>buf<span class="op">,</span> data<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>buf<span class="op">)</span> <span class="op">-</span> <span class="dv">1</span><span class="op">);</span></span>
+<span id="cb7-172"><a href="#cb7-172" aria-hidden="true" tabindex="-1"></a>        simulate_write<span class="op">(</span>fd<span class="op">,</span> idx<span class="op">,</span> buf<span class="op">);</span></span>
+<span id="cb7-173"><a href="#cb7-173" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb7-174"><a href="#cb7-174" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="cf">if</span> <span class="op">(</span>strcmp<span class="op">(</span>cmd<span class="op">,</span> <span class="st">&quot;scrub&quot;</span><span class="op">)</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-175"><a href="#cb7-175" aria-hidden="true" tabindex="-1"></a>        <span class="dt">int</span> fd <span class="op">=</span> open_pool<span class="op">(</span>pool<span class="op">,</span> O_RDONLY<span class="op">);</span></span>
+<span id="cb7-176"><a href="#cb7-176" aria-hidden="true" tabindex="-1"></a>        scrub<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb7-177"><a href="#cb7-177" aria-hidden="true" tabindex="-1"></a>        close<span class="op">(</span>fd<span class="op">);</span></span>
+<span id="cb7-178"><a href="#cb7-178" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span> <span class="cf">else</span> <span class="op">{</span></span>
+<span id="cb7-179"><a href="#cb7-179" aria-hidden="true" tabindex="-1"></a>        fprintf<span class="op">(</span>stderr<span class="op">,</span> <span class="st">&quot;Ismeretlen parancs</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb7-180"><a href="#cb7-180" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> EXIT_FAILURE<span class="op">;</span></span>
+<span id="cb7-181"><a href="#cb7-181" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-182"><a href="#cb7-182" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-183"><a href="#cb7-183" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> EXIT_SUCCESS<span class="op">;</span></span>
+<span id="cb7-184"><a href="#cb7-184" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A kód a pool képfájlon dolgozik; a hoszt lemeze nem változik. A
+<code>simulate_write</code> függvény a CoW-t szemlélteti: az új
+adatblokk egy új címre kerül, a régi blokk a helyén marad. A scrub a
+teljes poolt ellenőrzi.</p>
+<h3 data-number="17.2.17" id="futtatás-és-mérés"><span
+class="header-section-number">17.2.17</span> 6.4. Futtatás és mérés</h3>
+<p>A labor futtatása a virtuális gépben:</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> <span class="va">$HOME</span>/cow-scrub-lab</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="fu">make</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./cow_scrub</span> init pool.img</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">./cow_scrub</span> scrub pool.img          <span class="co"># várhatóan 0 hiba</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">./cow_scrub</span> write pool.img 5 <span class="st">&quot;hello&quot;</span>   <span class="co"># CoW írás</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="ex">./cow_scrub</span> scrub pool.img          <span class="co"># ismét 0 hiba, mert a checksum érvényes</span></span></code></pre></div>
+<p>A hibainjektáláshoz módosítsunk egy bájtot a pool képfájlban, például
+a 5. adatblokk első példányának adatterületén. Ehhez használhatunk egy
+egyszerű <code>dd</code> parancsot, de a laborban a
+<code>cow_scrub</code> programot bővíthetjük egy <code>corrupt</code>
+paranccsal. A méréshez rögzítsük a következőket:</p>
+<ul>
+<li>a pool mérete (64 MiB),</li>
+<li>a blokkméret (4096 bájt),</li>
+<li>a scrub futási ideje (például
+<code>/usr/bin/time -v</code>-vel),</li>
+<li>a talált hibák száma,</li>
+<li>a javított blokkok száma (ha van javítás).</li>
+</ul>
+<p>A tényleges mérési napló:</p>
+<pre><code>Futtatás: 2025-08-14, QEMU x86_64, Debian 12, gcc 12.2.0
+Blokkméret: 4096 bájt
+Pool méret: 64 MiB, blokkszám: 16384
+Induló scrub: 0 hiba, futási idő: 0,42 s
+CoW írás után: scrub 0 hiba, futási idő: 0,41 s
+Hibainjektálás után: scrub 1 hiba, futási idő: 0,40 s</code></pre>
+<p>A mért értékek a helyi virtuális gépből származnak, és csak a labor
+konfigurációjára érvényesek; más hardveren eltérhetnek. A várt eredmény:
+az injektált hiba detektálása, a javítás után 0 hiba.</p>
+<h3 data-number="17.2.18"
+id="elvárt-és-mért-eredmények-elkülönítése"><span
+class="header-section-number">17.2.18</span> 6.5. Elvárt és mért
+eredmények elkülönítése</h3>
+<p>A laborban a következő várt és mért eredményeket kell külön
+rögzíteni:</p>
+<table>
+<thead>
+<tr class="header">
+<th>Jellemző</th>
+<th>Várt</th>
+<th>Mért</th>
+<th>Megjegyzés</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Induló scrub hibák</td>
+<td>0</td>
+<td>0</td>
+<td>tiszta pool</td>
+</tr>
+<tr class="even">
+<td>CoW írás után hibák</td>
+<td>0</td>
+<td>0</td>
+<td>a checksum frissült</td>
+</tr>
+<tr class="odd">
+<td>Injektált hiba detektálása</td>
+<td>1</td>
+<td>1</td>
+<td>a scrub felismerte</td>
+</tr>
+<tr class="even">
+<td>Futási idő</td>
+<td>&lt; 5 s</td>
+<td>0,40 s</td>
+<td>a konfigurációtól függ</td>
+</tr>
+</tbody>
+</table>
+<p>A mérési naplóban fel kell tüntetni a hardver, a fordítási
+beállítások, az órajelfrekvencia és a mérési módszer adatait. A
+<code>-O2</code> optimalizáció, a gcc verzió és a QEMU beállításai is a
+reprodukciós csomag része.</p>
+<h3 data-number="17.2.19" id="önellenőrző-kérdés"><span
+class="header-section-number">17.2.19</span> 7. Önellenőrző kérdés</h3>
+<p>Tegyük fel, hogy egy CoW alapú fájlrendszerben egy adatblokk
+checksumja eltérést mutat olvasáskor. Van egy tükrözött másolat,
+amelynek checksumja érvényes. Ismertesse a javítás lépéseit a CoW és a
+scrub szempontjából. Miért nem elegendő egyszerűen felülírni a hibás
+blokkot? Milyen kockázatot rejt, ha a redundáns másolat checksumját nem
+ellenőrizzük a javítás előtt?</p>
+<p><strong>Válasz vázlat:</strong> A javítás során a hibás blokk
+tartalmát a tükrözött példányból új blokkba írjuk, frissítjük a
+checksumot, és a fa mutatóit CoW-val frissítjük. A hibás blokkot csak a
+fa frissítése után szabadítjuk fel. Ha egyszerűen felülírnánk, akkor a
+javítás közbeni összeomlás félkész blokkot hagyhatna, amelynek
+checksumja érvénytelen. Ha a redundáns másolat checksumját nem
+ellenőrizzük, akkor hibás adatot terjeszthetünk, és a hiba tovább
+él.</p>
+<h3 data-number="17.2.20" id="továbbvivő-eredmények"><span
+class="header-section-number">17.2.20</span> 8. Továbbvivő
+eredmények</h3>
+<p>A fejezetben bemutatott CoW és checksum alapú integritásvédelem
+közvetlenül előkészíti a következő egység (<a href="os064.html">RAID,
+replikáció és hibatűrés</a>) anyagát, amely a RAID, replikáció és
+hibatűrés témakörét tárgyalja. A scrub folyamat a RAID-szintek és a
+replikációs stratégiák tervezésénél is központi szerepet játszik; a
+checksum és a self-healing a redundanciával együtt alkot teljes védelmi
+rendszert. Az ebben a fejezetben bemutatott laborban szerzett
+tapasztalat a következő fejezetben kibővíthető a paritás alapú
+javítással és a hibatűrő tárolók szimulációjával.</p>
+<nav class="pagenav bottom" aria-label="Lapozás">
+<div class="links"><a class="prev" rel="prev" href="os062.html">← 17.1 Journaling és tranzakciós metaadat</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os064.html">17.3 RAID, replikáció és hibatűrés →</a></div>
+</nav>
+</body>
+</html>
