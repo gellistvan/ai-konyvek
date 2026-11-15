@@ -79,21 +79,28 @@ tranzakcióban a naplóba írja, majd a commit rekordot tartósan flush-eli,
 és csak ezután alkalmazza a valós blokkokat.</p>
 <p>A következő pszeudokód egy ilyen tranzakció felépítését mutatja:</p>
 <pre class="pseudo"><code>procedure create_file(dir_inode, dir_block, name, new_inode, bitmap_block):
-    tx = begin_tx()
+    tx = begin_tx()                    # tx_id és kezdő LSN kiosztása
 
-    journal_append(tx, TX_UPDATE, INODE_BLOCK, new_inode)
-    journal_append(tx, TX_UPDATE, DIR_BLOCK, dir_block)
-    journal_append(tx, TX_UPDATE, BITMAP_BLOCK, bitmap_block)
+    lsn1 = next_lsn()
+    lsn2 = next_lsn()
+    lsn3 = next_lsn()
+    journal_append(tx, TX_UPDATE, INODE_BLOCK, new_inode, lsn1)
+    journal_append(tx, TX_UPDATE, DIR_BLOCK, dir_block, lsn2)
+    journal_append(tx, TX_UPDATE, BITMAP_BLOCK, bitmap_block, lsn3)
 
-    commit_tx(tx)          # commit rekord írása és tartós flush
-    apply_to_filesystem(tx) # valós blokkok frissítése</code></pre>
+    commit_tx(tx)          # TX_COMMIT rekord + a napló tartós flush-e
+    apply_to_filesystem(tx) # home blokkok írása LSN-ellenőrzéssel</code></pre>
 <p>A <code>begin_tx</code> egy új tranzakciót nyit, és
 <code>TX_BEGIN</code> rekordot ír a naplóba. A
-<code>journal_append</code> hozzáfűzi a módosított blokkokat a naplóhoz.
-A <code>commit_tx</code> kiírja a <code>TX_COMMIT</code> rekordot, és
-biztosítja, hogy a tranzakció minden rekordja tartósan tárolva legyen.
-Ezután az <code>apply_to_filesystem</code> a naplóban lévő blokkokat a
-végleges lemezterületre másolja.</p>
+<code>journal_append</code> hozzáfűzi a módosított blokkokat a naplóhoz;
+minden rekord tartalmazza a tranzakcióazonosítót, a rekord sorszámát, a
+blokkazonosítót, az új tartalmat, a blokk új verzióját jelentő LSN-t és
+egy ellenőrző összeget. A <code>commit_tx</code> kiírja a
+<code>TX_COMMIT</code> rekordot, és biztosítja, hogy a tranzakció minden
+rekordja tartósan tárolva legyen. Ezután az
+<code>apply_to_filesystem</code> a naplóban lévő blokkokat a végleges
+lemezterületre másolja, de csak akkor írja felül a home blokkot, ha a
+rekord LSN-je nagyobb a home blokkban tárolt LSN-nél.</p>
 <p>Fontos, hogy a <code>commit_tx</code> nem csupán a commit rekord
 kiírását jelenti, hanem az összes naplórekord tartós flush-ét is. A WAL
 szabály szerint a commit rekord csak akkor tekinthető érvényesnek, ha az
@@ -112,62 +119,121 @@ a commit rekord egyértelműen jelzi, hogy a tranzakció minden rekordja
 érvényes, és a valós blokkok frissítése biztonságosan elvégezhető. Ha a
 rendszer a commit után, de a valós blokkok frissítése előtt omlik össze,
 a helyreállítás során a tranzakciót újra alkalmazzuk.</p>
+<p><strong>A tartósítási sorrend egy tranzakcióra:</strong></p>
+<ol type="1">
+<li><code>TX_BEGIN</code>: a tranzakcióazonosító és a kezdő LSN (log
+sequence number) kiosztása; a rekord a naplóba kerül.</li>
+<li><code>TX_UPDATE</code>: minden módosított blokk új tartalma a
+naplóba kerül a blokkazonosítóval, a rekord sorszámával, az új
+blokkverziót jelentő LSN-nel és ellenőrző összeggel. A napló tartós
+flush-ének legkésőbb a commit rekord előtt meg kell történnie; a commit
+csak akkor érvényes, ha az összes megelőző update tartós.</li>
+<li><code>TX_COMMIT</code>: a commit rekord kiírása és tartós flush-e.
+Ettől kezdve a tranzakció visszajátszható; a commit rekord tartalmazza a
+tranzakció rekordjainak ellenőrző összegét is.</li>
+<li><strong>Home blokkok tartós kiírása:</strong> a naplóban lévő új
+tartalom másolása a végleges blokkhelyekre. Minden home blokk fejlécében
+(vagy a fájlrendszer metaadatában) tárolt <code>last_lsn</code> értékhez
+hasonlítjuk a rekord LSN-jét; a blokkot csak akkor írjuk felül, ha a
+rekord LSN-je nagyobb. Ez akadályozza meg, hogy egy elavult checkpoint-
+vagy helyreállítási írás felülírjon egy újabb verziót. A home írások
+befejezése után a data-eszköz <code>fsync</code>-je következik.</li>
+<li><strong>Checkpoint és a naplófark előreléptetése:</strong> csak
+azután jelölhető ki a napló farka, hogy a tranzakció összes home blokkja
+tartósan kiíródott, és a checkpoint rekord (a tail LSN-jével) is tartós.
+A tail soha nem léphet a legrégebbi aktív vagy nem commit-olt tranzakció
+első rekordja elé. A tail tartós rögzítése után a felszabadult
+naplóterület újrahasznosítható.</li>
+</ol>
 <p>A checkpoint célja a naplóterület felszabadítása. A napló véges,
 ezért idővel a bejegyzéseket ki kell vezetni a végleges lemezterületre,
-és a naplófejet előrébb kell mozgatni. A checkpoint során a rendszer
-azokat a tranzakciókat, amelyek már befejezettek és a valós blokkokra
-alkalmazottak, tisztaként megjelöli, és a naplóterületet újra
-felhasználhatóvá teszi. A checkpoint nem törölheti egy tranzakció
-naplóbejegyzéseit addig, amíg a valós blokkok frissítése nem fejeződött
-be, különben crash esetén a tranzakció elveszne.</p>
-<p>A következő pszeudokód a helyreállítási folyamatot mutatja:</p>
+és a naplófejet előrébb kell mozgatni. A checkpoint nem törölheti egy
+tranzakció naplóbejegyzéseit addig, amíg a valós blokkok frissítése nem
+fejeződött be és nem vált tartóssá, különben crash esetén a tranzakció
+elveszne. A checkpoint nem a régi blokk tartalmát írja vissza, hanem a
+naplóban lévő új tartalmat alkalmazza LSN-ellenőrzéssel; a már
+alkalmazott, újabb verziójú blokkot kihagyja.</p>
+<p>A következő pszeudokód a helyreállítási folyamatot mutatja. Az
+egyszerűsített hibamodell szerint az első érvénytelen vagy csonka
+rekordnál megállunk: az utána következő rekordokat nem próbáljuk
+megmenteni, a már érvényes commit-tal lezárt tranzakciókat viszont
+alkalmazzuk.</p>
 <pre class="pseudo"><code>procedure recover_journal():
-    current_tx = NULL
-    committed = []
-
-    for record in read_journal_forward():
+    tail = last_durable_checkpoint_tail()
+    txs = empty map                 # tx_id -&gt; tranzakció
+    for record in read_journal_from(tail):
+        if not valid_header(record) or not checksum_ok(record):
+            break                   # csonka vagy sérült farok: nincs további érvényes rekord
         if record.type == TX_BEGIN:
-            current_tx = new_tx(record.tx_id)
+            if record.tx_id in txs:
+                break
+            txs[record.tx_id] = new_tx(record.tx_id, record.lsn)
         elif record.type == TX_UPDATE:
-            current_tx.records.append(record)
+            tx = txs.get(record.tx_id)
+            if tx is NULL or tx.commit_lsn is not NULL:
+                break
+            if record.seq != tx.expected_seq:
+                break               # hiányzó vagy ismétlődő rekord
+            tx.records.append(record)
+            tx.expected_seq = record.seq + 1
         elif record.type == TX_COMMIT:
-            committed.append(current_tx)
-            current_tx = NULL
+            tx = txs.get(record.tx_id)
+            if tx is NULL or record.commit_checksum != checksum(tx.records):
+                break
+            tx.commit_lsn = record.lsn
+        else:
+            break                   # ismeretlen rekordtípus: a továbbiak nem hitelesek
 
-    for tx in committed:
-        apply_to_filesystem(tx)
+    for tx in txs ordered by commit_lsn:
+        if tx.commit_lsn is not NULL:
+            for rec in tx.records ordered by rec.lsn:
+                write_home_block_if_newer(rec)
 
-    discard all non-committed transactions</code></pre>
+    discard all non-committed or incomplete transactions</code></pre>
 <p>A helyreállítás előrefelé olvassa a naplót, tranzakciókat épít fel,
-és csak azokat a tranzakciókat alkalmazza, amelyekhez
-<code>TX_COMMIT</code> rekord tartozik. A befejezetlen tranzakciókat
+és csak azokat a tranzakciókat alkalmazza, amelyekhez érvényes
+<code>TX_COMMIT</code> rekord tartozik. A <code>TX_UPDATE</code>
+rekordok sorrendjének folytonosnak kell lennie, és a commit ellenőrző
+összegének egyeznie kell a tranzakció rekordjaival; ellenkező esetben a
+tranzakció nem kerül alkalmazásra. A befejezetlen tranzakciókat
 eldobjuk, mert azok rekordjai nem feltétlenül teljesek. Ez a mechanizmus
 biztosítja, hogy a fájlrendszer metaadatai soha ne kerüljenek félig
-frissített állapotba.</p>
+frissített állapotba. A csonka farok után érkező, esetleg committed
+tranzakciók elveszhetnek ebben az egyszerűsített modellben; a valós
+rendszerek ezért a napló végén duplikált vagy generációs
+checkpoint-rekordokat is használnak.</p>
 <p>A checkpoint algoritmusa:</p>
 <pre class="pseudo"><code>procedure checkpoint():
-    for tx in clean_transactions_ordered_by_id():
-        for rec in tx.records:
-            write_original_block(rec.block)
+    for tx in committed_transactions_ordered_by_commit_lsn():
+        for rec in tx.records ordered by rec.lsn:
+            write_home_block_if_newer(rec)   # elavult LSN esetén nem ír
+        fsync_data_device()                  # a home blokkok tartósak
         mark_tx_clean(tx)
-    advance_journal_head()</code></pre>
-<p>A <code>clean_transactions_ordered_by_id</code> azokat a
-tranzakciókat adja vissza, amelyek már commit-oltak, és a valós
-blokkjaik módosítása megtörtént. A checkpoint ezeket a blokkokat még
-egyszer, szükség esetén ellenőrzésképpen, a végleges helyükre írja, majd
-a tranzakciót tisztaként jelöli. A naplófej előremozgatása után a
-felszabadult naplóterület újra felhasználható.</p>
+    tail = oldest_lsn_needed_by_active_tx()
+    write_checkpoint_record(tail)            # a tail és az ahhoz tartozó LSN
+    fsync_journal_device()                   # a checkpoint rekord tartós
+    advance_journal_head(tail)               # csak most hasznosítható újra a terület</code></pre>
+<p>A <code>committed_transactions_ordered_by_commit_lsn</code> a
+commit-LSN szerinti sorrendben adja vissza a még nem takarított,
+committed tranzakciókat. A <code>write_home_block_if_newer</code> csak
+akkor írja a home blokkot, ha a rekord LSN-je nagyobb a blokkban tárolt
+<code>last_lsn</code>-nél; így egy elavult rekord nem írhatja felül a
+nála újabb verziót. A <code>mark_tx_clean</code> csak a home blokkok
+tartós kiírása után futhat, a <code>advance_journal_head</code> pedig
+csak a checkpoint rekord tartós flush-e után. Ha a checkpoint rekord
+csonka, a helyreállítás az előző érvényes checkpoint tail-jéből
+indul.</p>
 <p>A komplexitás szempontjából a naplóírás tranzakciónként
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>k</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(k)</annotation></semantics></math>
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mo stretchy="false" form="prefix">(</mo><mi>k</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">O(k)</annotation></semantics></math>
 I/O-műveletet igényel, ahol
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>k</mi><annotation encoding="application/x-tex">k</annotation></semantics></math>
 a módosított blokkok száma. A helyreállítás a napló hosszában lineáris,
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>N</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(N)</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mo stretchy="false" form="prefix">(</mo><mi>N</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">O(N)</annotation></semantics></math>,
 ahol
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>N</mi><annotation encoding="application/x-tex">N</annotation></semantics></math>
 a naplórekordok száma. A checkpoint költsége a kiürítendő blokkok
 számával arányos,
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mrow><mo stretchy="true" form="prefix">(</mo><mi>M</mi><mo stretchy="true" form="postfix">)</mo></mrow></mrow><annotation encoding="application/x-tex">O(M)</annotation></semantics></math>,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>O</mi><mo stretchy="false" form="prefix">(</mo><mi>M</mi><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">O(M)</annotation></semantics></math>,
 de ez a költség a normál működés során eloszlik, és a napló méretétől
 függően ritkán jelentkezik. A naplózás írásamplifikációja a naplózási
 módtól függ, amint azt a következő szakasz mutatja.</p>
@@ -199,16 +265,53 @@ tartalma szemét.</p>
 class="header-section-number">17.1.6</span> Ordered mód</h3>
 <p>Az ordered mód a writeback és a data journaling közötti
 kompromisszum. A napló továbbra is csak a metaadatokat tartalmazza, de a
-rendszer szigorú sorrendet tart: mielőtt egy metaadat-tranzakciót
-commit-olna, az összes hozzá tartozó adatblokkot tartósan kiírja a
-végleges helyére. Így a metaadatok soha nem mutathatnak olyan
-adatblokkra, amely nincs tartósan tárolva.</p>
-<p>Crash után a fájlrendszer metaadatai konzisztensek, és a fájlok
-tartalma vagy a régi, vagy az új, de soha nem kevert vagy szemét. Ha egy
-fájl létrehozása félbeszakad, a fájl nem jelenik meg, mert a
-könyvtárbejegyzés frissítése nem commit-olt; ha viszont megjelenik,
-akkor az adatai is tartósak. Ez a mód a legtöbb általános célú
-rendszerben jó egyensúlyt ad.</p>
+rendszer szigorú sorrendet tart: egy metaadat-tranzakció commit
+rekordjának tartósítása előtt a tranzakcióhoz tartozó összes adatblokkot
+a végleges helyére kell írni, és a data-eszközt <code>fsync</code>-elni
+kell. A napló update rekordjai és a commit rekord között is érvényes a
+WAL sorrend. Ez a szabály azonban önmagában nem jelent alkalmazásszintű
+atomicitást; a garancia attól függ, hogy a tranzakció új blokkot
+allokál-e, vagy egy már hivatkozott blokkot ír felül.</p>
+<p><strong>Újonnan allokált blokk.</strong> Fájl létrehozásakor vagy új
+blokkal történő hosszabbításkor az adat egy még nem hivatkozott blokkba
+kerül. Az ordered mód előbb ezt az adatblokkot írja ki és
+<code>fsync</code>-eli, majd csak ezután teszi tartóssá a
+metaadat-tranzakciót (az inode méretét, blokkmutatóját és a foglaltsági
+bitkép frissítését). Ha a rendszer a commit előtt omlik össze, a
+tranzakciót eldobjuk: a fájl régi állapota érvényes (vagy a fájl nem
+jelenik meg), az új blokk pedig nem hivatkozott, ezért a tartalma
+közömbös. Ha a commit tartós, az adat már korábban tartós volt, így a
+metaadat nem mutathat inicializálatlan blokkra; az eredmény vagy a régi,
+vagy az új állapot, nem keverék.</p>
+<p><strong>Meglévő blokk felülírása.</strong> Ha a fájl egy már
+hivatkozott blokkját írjuk felül, az adat ugyanarra a helyre kerül, és a
+régi tartalom a felülírással elvész. Az ordered mód itt is
+garantálhatja, hogy a metaadat-commit előtt az adatblokk tartósan
+kiíródott, de ez nem teszi atomivá magát a felülírást: egy áramszünet az
+írás közben csonka blokkot hagyhat, és a commit előtti összeomlásnál a
+régi metaadat új vagy részben új adatra mutathat. Több blokkból álló
+felülírásnál a blokkok régi és új tartalma keveredhet. Az
+<code>fsync</code> csak a kiírás befejeződését és tartósságát várja meg,
+nem tudja visszaállítani a félig felülírt blokkot, és nem ad tranzakciós
+garanciát az alkalmazás számára.</p>
+<p>Alkalmazásszintű, mindent-vagy-semmit cseréhez ezért új blokkra (vagy
+ideiglenes fájlba) kell írni, <code>fsync</code>-elni kell az adatot,
+majd atomi <code>rename</code>-nel kell a régi nevet felülírni, végül a
+könyvtár <code>fsync</code>-jével kell tartóssá tenni a névbejegyzést. A
+<code>rename</code> csak ugyanazon a fájlrendszeren atomi, és a könyvtár
+<code>fsync</code>-je nélkül a névcsere crash után nem feltétlenül marad
+meg. A data journaling a naplón belül teszi atomivá az adat- és
+metaadat-frissítést, de a tartóssághoz ott is a commit rekord és a napló
+<code>fsync</code>-je szükséges.</p>
+<p>Crash után a fájlrendszer metaadatai tehát konzisztensek, de a fájl
+tartalma csak az új blokk esetében garantáltan a régi vagy az új állapot
+valamelyike. Meglévő blokk felülírásánál az ordered mód a metaadatok
+konzisztenciáját adja, az adat atomicitását nem. Ha egy fájl létrehozása
+félbeszakad, a fájl nem jelenik meg, mert a könyvtárbejegyzés frissítése
+nem commit-olt; ha viszont megjelenik, akkor az adatai is tartósak. Ez a
+mód a legtöbb általános célú rendszerben jó egyensúlyt ad, de az
+alkalmazásnak kell eldöntenie, mikor van szüksége a felülíráson túli
+atomicitásra.</p>
 <h3 data-number="17.1.7" id="data-journaling-mód"><span
 class="header-section-number">17.1.7</span> Data journaling mód</h3>
 <p>A data journaling módban a napló a metaadatok mellett a felhasználói
@@ -232,7 +335,7 @@ mert egy adatblokk kétszer íródik lemezre.</p>
 <col style="width: 20%" />
 </colgroup>
 <thead>
-<tr class="header">
+<tr>
 <th>Mód</th>
 <th>Naplózott tartalom</th>
 <th>Adat-metaadat sorrend</th>
@@ -241,29 +344,38 @@ mert egy adatblokk kétszer íródik lemezre.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
+<tr>
 <td>writeback</td>
 <td>csak metaadat</td>
 <td>nincs szigorú sorrend</td>
-<td>metaadatok konzisztensek, adatok lehetnek érvénytelenek</td>
+<td>metaadatok konzisztensek, adatok lehetnek régek vagy
+inicializálatlanok</td>
 <td>alacsony</td>
 </tr>
-<tr class="even">
+<tr>
 <td>ordered</td>
 <td>csak metaadat</td>
-<td>adatok előbb, mint metaadat</td>
-<td>metaadatok és a hivatkozott adatok konzisztensek</td>
-<td>közepes</td>
+<td>adatblokk <code>fsync</code>-je a metaadat-commit tartósítása
+előtt</td>
+<td>metaadatok konzisztensek; új blokk inicializált, de meglévő blokk
+felülírása csonka/kevert lehet, alkalmazásszintű atomicitás nincs</td>
+<td>alacsony (mint a writeback, több <code>fsync</code>-kel)</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>data journaling</td>
 <td>metaadat és adat</td>
-<td>adat és metaadat is naplózva</td>
-<td>metaadatok és adatok is konzisztensek</td>
-<td>magas</td>
+<td>adat és metaadat is a naplóban, majd commit és home írás</td>
+<td>metaadatok és adatok is konzisztensek, ha a commit rekord érvényes
+és a napló tartós</td>
+<td>magas (az adat kétszer íródik)</td>
 </tr>
 </tbody>
 </table>
+<p>A táblázat „ordered” sora két eltérő esetet foglal össze. Új blokk
+allokálásakor a crash utáni állapot a régi vagy az új, és a hivatkozott
+adat tartós. Meglévő blokk felülírásakor a metaadat konzisztens
+maradhat, de a blokk tartalma csonka vagy több blokkon át kevert is
+lehet; az ordered mód nem nyújt alkalmazásszintű atomicitást.</p>
 <p>A mód kiválasztása mindig a rendszer céljaitól függ:
 adatbázis-szervereknél gyakran az ordered vagy a data journaling a
 választás, míg nagy áteresztőképességű, kevésbé kritikus környezetben a
@@ -290,8 +402,12 @@ visszajátszásnak ellenőriznie kell.</p>
 naplóbejegyzéseket.</strong> Ha a checkpoint akkor is felszabadítja a
 tranzakció naplórekordjait, amikor a valós blokkok frissítése még nem
 fejeződött be, crash esetén a tranzakció elveszik. A megoldás: a
-checkpoint csak azután jelölheti tisztának a tranzakciót, miután a valós
-blokkok mindegyikét sikeresen kiírta.</p>
+checkpoint csak a home blokkok <code>fsync</code>-je után jelölheti
+tisztának a tranzakciót, a naplófejet (tail) pedig csak a checkpoint
+rekord tartós flush-e után léptetheti előre; a tail nem előzheti meg a
+legrégebbi aktív tranzakciót. A home blokk LSN-ellenőrzése
+megakadályozza, hogy egy elavult checkpoint-írás felülírjon egy újabb
+blokkot.</p>
 <p><strong>4. A tranzakcióhatárok rossz megválasztása.</strong> Túl nagy
 tranzakciók esetén a napló gyorsan megtelik, és a checkpoint sokat
 késik; túl kicsi tranzakciók esetén a commit rekordok száma nő, ami
@@ -304,15 +420,22 @@ mert a napló nem lett érvénytelenítve, a blokkok tartalma megsérülhet. A
 megoldás: a naplórekordoknak idempotens műveleteket kell leírniuk, vagy
 a tranzakció visszajátszása után a naplót meg kell jelölni, hogy ne
 legyen újra alkalmazva.</p>
-<p><strong>6. Az ordered módban az adatblokkok kiírása elmarad.</strong>
-Ha a metaadat-tranzakció commit-ja előtt nem flush-elik az
-adatblokkokat, a metaadatok hivatkozhatnak nem tartós adatokra. A
-megoldás: az adatblokkokat explicit módon, a metaadat commit előtt
-flush-elni.</p>
+<p><strong>6. Az ordered módban az adatblokkok kiírása elmarad, vagy a
+felülírást összekeverik az új blokkal.</strong> Ha a metaadat-tranzakció
+commit-ja előtt nem flush-elik az adatblokkokat, a metaadatok
+hivatkozhatnak nem tartós adatokra. A megoldás: az adatblokkokat
+explicit módon, a metaadat commit előtt <code>fsync</code>-elni kell.
+Fontos azonban, hogy ez csak az újonnan allokált blokkoknál ad „régi
+vagy új” garanciát; egy már hivatkozott blokk felülírásakor a régi
+tartalom elvész, és az írás közbeni áramszünet csonka blokkot hagyhat.
+Alkalmazásszintű atomicitáshoz új blokkra írás, <code>fsync</code>,
+atomi <code>rename</code>, majd a könyvtár <code>fsync</code>-je, vagy
+data journaling szükséges.</p>
 <p>Ezek a hibák mind a WAL sorrend, a commit és a checkpoint közötti
 kapcsolat félreértéséből fakadnak. A helyes megoldás mindig a sorrend
 szigorú betartása: először a naplórekordok tartós kiírása, majd a
-commit, végül a valós blokkok frissítése és a checkpoint.</p>
+commit, ezután a valós blokkok frissítése és tartósítása, végül a
+checkpoint rekord és a naplófark tartós előreléptetése.</p>
 <h3 data-number="17.1.9"
 id="labor-journaling--és-write-ahead-log-terv-készítése"><span
 class="header-section-number">17.1.9</span> Labor: journaling- és
@@ -391,7 +514,7 @@ Az alábbi táblázat a szükséges oszlopokat mutatja:</p>
 <col style="width: 19%" />
 </colgroup>
 <thead>
-<tr class="header">
+<tr>
 <th>Mód</th>
 <th>Tranzakció ID</th>
 <th>Áramszünet pont</th>
@@ -403,31 +526,32 @@ Az alábbi táblázat a szükséges oszlopokat mutatja:</p>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
+<tr>
 <td>writeback</td>
 <td>12</td>
-<td>commit után, valós írás előtt</td>
-<td>metaadat konzisztens, adat érvénytelen lehet</td>
+<td>commit után, valós metaadat írás előtt</td>
+<td>metaadat konzisztens, adat régi vagy inicializálatlan lehet</td>
 <td>…</td>
 <td>…</td>
 <td>…</td>
 <td>…</td>
 </tr>
-<tr class="even">
+<tr>
 <td>ordered</td>
 <td>12</td>
-<td>commit előtt</td>
-<td>tranzakció eldobva, régi állapot</td>
+<td>commit előtt, adatírás után</td>
+<td>új blokk: tranzakció eldobva, régi állapot; meglévő blokk
+felülírása: metaadat régi, adat csonka vagy új lehet</td>
 <td>…</td>
 <td>…</td>
 <td>…</td>
 <td>…</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>data</td>
 <td>12</td>
-<td>commit után, valós írás után</td>
-<td>minden konzisztens</td>
+<td>commit után, home írás közben</td>
+<td>minden konzisztens a naplóból</td>
 <td>…</td>
 <td>…</td>
 <td>…</td>
@@ -435,6 +559,10 @@ Az alábbi táblázat a szükséges oszlopokat mutatja:</p>
 </tr>
 </tbody>
 </table>
+<p>Az ordered sor két esetet foglal össze; a mérési naplóban külön
+érdemes rögzíteni az új blokk allokálását és a meglévő blokk
+felülírását, mert a crash utáni adatállapot csak az elsőnél garantáltan
+„régi vagy új”.</p>
 <p>A <strong>várt konzisztencia</strong> oszlopba a tervezett
 viselkedést kell írni, a <strong>mért konzisztencia</strong> oszlopba
 pedig a szimuláció tényleges eredményét. A kettő eltérése hibát
@@ -443,14 +571,20 @@ jelez.</p>
 class="header-section-number">17.1.13</span> Elvárt eredmény</h3>
 <ul>
 <li>Writeback módban a metaadatok mindig konzisztensek, de adatblokkok
-lehetnek érvénytelenek. A helyreállítás során a metaadatok
-visszajátszása sikeres.</li>
-<li>Ordered módban a metaadatok konzisztensek, és a hivatkozott adatok
-tartósak; a tranzakció csak akkor játszódik vissza, ha a commit rekord
-tartós.</li>
-<li>Data journaling módban a metaadatok és az adatok is konzisztensek; a
+lehetnek régek vagy inicializálatlanok. A helyreállítás során a
+metaadatok visszajátszása sikeres.</li>
+<li>Ordered módban a metaadatok konzisztensek. Új blokk allokálásakor a
+hivatkozott adat tartós, és a tranzakció csak tartós commit rekord
+esetén játszódik vissza; a crash utáni állapot a régi vagy az új.
+Meglévő blokk felülírásakor a metaadat konzisztens maradhat, de a blokk
+tartalma csonka vagy több blokkon át kevert lehet, mert az ordered mód
+nem ad alkalmazásszintű atomicitást. Ehhez új blokkra írás,
+<code>fsync</code>, atomi <code>rename</code> és a könyvtár
+<code>fsync</code>-je, vagy data journaling szükséges.</li>
+<li>Data journaling módban a metaadatok és az adatok is konzisztensek,
+feltéve, hogy a commit rekord érvényes és a napló tartós; a
 visszajátszás után a fájl tartalma és a metaadatok egyaránt
-helyesek.</li>
+helyreállnak.</li>
 </ul>
 <p>A mérési naplónak tartalmaznia kell a kiinduló állapot lemez-hash-ét,
 a műveletsort, a szimulációs paramétereket, valamint a használt
@@ -461,7 +595,11 @@ class="header-section-number">17.1.14</span> Önellenőrző kérdés</h3>
 <p>Rendelje hozzá a három naplózási módhoz a crash utáni állapotot:
 writeback, ordered, data journaling. Magyarázza el, miért garantálja a
 WAL azt, hogy a metaadatok soha nem kerülnek félig frissített állapotba,
-és mi a commit rekord szerepe a helyreállításban.</p>
+és mi a commit rekord szerepe a helyreállításban. Térjen ki arra is,
+miért viselkedik másként egy újonnan allokált blokk és egy meglévő blokk
+felülírása az ordered módban, és hogyan biztosít az <code>fsync</code> +
+új blokk + atomi <code>rename</code> + könyvtár-<code>fsync</code>
+alkalmazásszintű atomicitást.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="os061.html">← 16.4 Hálózati fájlrendszerek: NFS, SMB és objektumtár</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os063.html">17.2 Copy-on-write, checksum és scrub →</a></div>
 </nav>
