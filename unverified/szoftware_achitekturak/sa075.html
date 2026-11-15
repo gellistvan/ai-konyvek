@@ -309,13 +309,19 @@ szolgáltatás hívja a fizetési szolgáltatást.</p>
 <p>A hívási lánc a következő lépésekből állhat:</p>
 <ol type="1">
 <li>A rendelési szolgáltatás egy bulkhead-en keresztül éri el a fizetési
-szolgáltatást, amelynek külön kapcsolatkészlete van.</li>
-<li>A fizetési hívás egy timeout-tal rendelkezik, például 3
-másodperc.</li>
+szolgáltatást, amelynek külön kapcsolatkészlete van. A bulkhead-helyet a
+kísérlet alatt tartja, de a backoff-várakozás idejére
+felszabadítja.</li>
+<li>A fizetési hívás egy timeout-tal rendelkezik, például 3 másodperc; a
+teljes kérésre külön, végponti határidő (deadline) vonatkozik, amely a
+sorban állást, az összes kísérletet és a backoffot is tartalmazza.</li>
 <li>A hívás mögött egy circuit breaker figyeli a fizetési szolgáltatás
 állapotát.</li>
 <li>Ha a hívás időtúllépés vagy átmeneti szerverhiba miatt sikertelen, a
-retry logika az idempotencia kulccsal újrapróbálja.</li>
+retry logika az idempotencia kulccsal, a hátralévő végponti határidőn
+belül és korlátozott számú kísérlettel újrapróbálja. Nyitott circuit
+breaker mellett nincs végtelen retry: a hívás azonnal meghiúsul, és csak
+a half-open próba után indul újra.</li>
 </ol>
 <p>Fontos, hogy a sorrend és a felelősségi körök világosak legyenek. A
 timeout a hívás időtartamát korlátozza, a bulkhead az erőforrásokat
@@ -341,15 +347,28 @@ hívási láncot mutat be:</p>
         P--&gt;&gt;CB: 200 OK
         CB--&gt;&gt;B: Válasz
         B--&gt;&gt;C: Válasz
-    else A hívás időtúllépés vagy 503
-        P--&gt;&gt;CB: Hiba
+    else 503 – a szerver egyértelműen elutasította
+        P--&gt;&gt;CB: 503 Service Unavailable
         CB--&gt;&gt;B: Hiba
         B--&gt;&gt;C: Hiba
-        C-&gt;&gt;C: Retry logika (exponenciális backoff + jitter)
+        C-&gt;&gt;C: Retry a hátralévő végponti határidőn belül (backoff + jitter)
+        Note over C,B: A bulkhead-hely a backoff idejére felszabadul
         C-&gt;&gt;B: Újrapróbált hívás (ugyanaz az idempotencia kulcs)
         B--&gt;&gt;CB: Hívás engedélyezve
         CB-&gt;&gt;P: HTTP POST /payments
         P--&gt;&gt;CB: 200 OK
+        CB--&gt;&gt;B: Válasz
+        B--&gt;&gt;C: Válasz
+    else Timeout – a kimenet ismeretlen
+        P--xCB: Nincs válasz a határidőig
+        CB--&gt;&gt;B: Timeout
+        B--&gt;&gt;C: Timeout
+        Note over C,P: A szerver a műveletet már végrehajthatta; a válasz elveszett
+        C-&gt;&gt;C: Egyeztetés az idempotencia kulccsal, majd szükség esetén retry
+        C-&gt;&gt;B: Újrapróbált vagy egyeztető hívás (ugyanaz a kulcs)
+        B--&gt;&gt;CB: Hívás engedélyezve
+        CB-&gt;&gt;P: HTTP POST /payments vagy GET /payments/{kulcs}
+        P--&gt;&gt;CB: 200 OK vagy a korábbi eredmény
         CB--&gt;&gt;B: Válasz
         B--&gt;&gt;C: Válasz
     end</code></pre>
@@ -359,8 +378,45 @@ szolgáltatás között helyezkedik el. A retry logika a hívó oldalon fut,
 biztosítja, hogy a retry ne kerülje meg a védelmi mechanizmusokat, és
 hogy a circuit breaker nyitott állapotában a retry azonnali hibát
 kapjon, így nem növeli a terhelést.</p>
-<h3 data-number="20.2.8" id="tipikus-hibák-és-anti-minták"><span
-class="header-section-number">20.2.8</span> Tipikus hibák és
+<h3 data-number="20.2.8"
+id="válaszvesztés-idempotencia-és-egyeztetés"><span
+class="header-section-number">20.2.8</span> Válaszvesztés, idempotencia
+és egyeztetés</h3>
+<p>A timeout és az 503 nem ugyanaz a hiba. Az 503 azt jelenti, hogy a
+szerver egyértelműen elutasította a kérést, tehát a művelet nem
+hajtódott végre; a timeout viszont <strong>ismeretlen kimenet</strong>,
+mert a szerver a válasz megküldése előtt már végrehajthatta a terhelést.
+Ilyenkor a vak retry duplikált fizetést okozhat. Ezért a fizetési
+hívásnál a következő szerződéselemeket kell rögzíteni:</p>
+<ul>
+<li><strong>Idempotencia kulcs</strong> minden kísérletnél ugyanaz; a
+szolgáltató szerződése rögzíti, mennyi ideig őrzi meg a kulcsot, és mi
+történik párhuzamos ismétlésnél (ugyanaz a válasz, 409 Conflict vagy
+egyeztetési hivatkozás).</li>
+<li><strong>Kérésazonosság</strong>: a kulcs mellett a kérés tartalma
+(összeg, pénznem, rendelésazonosító) is egyezzen; eltérő tartalommal
+ugyanaz a kulcs szerződésszegés.</li>
+<li><strong>Egyeztető művelet</strong>: timeout után a kliens a kulccsal
+lekérdezheti a tranzakció állapotát
+(<code>GET /payments/{kulcs}</code>), és csak akkor indít új terhelést,
+ha a szolgáltató igazoltan nem hajtotta végre.</li>
+<li><strong>Végponti határidő</strong>: a teljes kérésre egy abszolút
+deadline vonatkozik, amelyből minden kísérlet és backoff ugyanabból a
+keretből gazdálkodik; a kísérletek száma korlátozott.</li>
+<li><strong>Bulkhead-fegyelem</strong>: a várakozó retry nem tarthatja
+lefoglalva a bulkhead helyét, különben a backoff alatt is blokkolja a
+többi kérést. A helyet a kísérlet előtt foglaljuk le, a várakozás előtt
+szabadítjuk fel.</li>
+<li><strong>Circuit breaker</strong>: nyitott állapotban a hívás
+azonnali hibát kap, nem indul végtelen retry; csak a half-open próba
+után lehet újra terhelni.</li>
+</ul>
+<p>Ezek a szabályok a labor ellenőrzési szempontjai között is
+szerepelnek: a próbában a fizetés már megtörtént, a válasz elveszett, az
+ismétlés nem terhel másodszor, és a végállapot az egyeztető hívással
+visszakereshető.</p>
+<h3 data-number="20.2.9" id="tipikus-hibák-és-anti-minták"><span
+class="header-section-number">20.2.9</span> Tipikus hibák és
 anti-minták</h3>
 <p>A fenti minták helytelen alkalmazása gyakran több kárt okoz, mint
 hasznot. Az alábbiakban a leggyakoribb hibákat gyűjtöttük össze.</p>
@@ -405,17 +461,17 @@ megkerüli a circuit breakert, vagy a timeout értéke nagyobb, mint a
 circuit breaker open állapotának időtartama, a rendszer viselkedése
 kiszámíthatatlanná válik. A védelmi rétegeket úgy kell kialakítani, hogy
 egymásra épüljenek, és a hibák ne tudják kijátszani őket.</p>
-<h3 data-number="20.2.9"
+<h3 data-number="20.2.10"
 id="labor-reziliencia-minta-kiválasztása-egy-hívási-láncra"><span
-class="header-section-number">20.2.9</span> Labor: reziliencia-minta
+class="header-section-number">20.2.10</span> Labor: reziliencia-minta
 kiválasztása egy hívási láncra</h3>
 <p>A labor célja, hogy a fejezetben bemutatott mintákat egy konkrét, de
 egyszerűsített hívási láncra alkalmazd. Az átadandó eredmény egy
 reprodukálható dokumentum vagy jegyzetfüzet, amely rögzíti a kontextust,
 a döntési naplót és az ellenőrzési szempontokat, és világosan elkülöníti
 a mért és a várt eredményt.</p>
-<h3 data-number="20.2.10" id="kiinduló-állapot"><span
-class="header-section-number">20.2.10</span> Kiinduló állapot</h3>
+<h3 data-number="20.2.11" id="kiinduló-állapot"><span
+class="header-section-number">20.2.11</span> Kiinduló állapot</h3>
 <p>Egy e-kereskedelmi rendszerben a <strong>Rendelési
 szolgáltatás</strong> (Order Service) két külső függőséget hív meg
 szinkron módon:</p>
@@ -435,8 +491,8 @@ hívás ugyanazt a szálkészletet használja. A rendszer terheléses tesztjei
 azt mutatják, hogy a fizetési szolgáltatás lassulásakor a Rendelési
 szolgáltatás szálkészlete 10 másodperc alatt kimerül, és a
 készletellenőrzés is elérhetetlenné válik.</p>
-<h3 data-number="20.2.11" id="feladat"><span
-class="header-section-number">20.2.11</span> Feladat</h3>
+<h3 data-number="20.2.12" id="feladat"><span
+class="header-section-number">20.2.12</span> Feladat</h3>
 <p>Tervezd meg a két hívás reziliencia-konfigurációját a fenti minták
 felhasználásával. Az alábbi kérdésekre válaszolj, és a döntéseidet
 indokold:</p>
@@ -453,8 +509,8 @@ erőforrásokat és limiteket választanál?</li>
 láncot diagrams-as-code formában (például Mermaid
 szekvenciadiagram).</li>
 </ol>
-<h3 data-number="20.2.12" id="elvárt-eredmény"><span
-class="header-section-number">20.2.12</span> Elvárt eredmény</h3>
+<h3 data-number="20.2.13" id="elvárt-eredmény"><span
+class="header-section-number">20.2.13</span> Elvárt eredmény</h3>
 <p>A labor végére egy olyan dokumentumot kell készítened, amely
 tartalmazza:</p>
 <ul>
@@ -471,8 +527,8 @@ esetén.</li>
 mérési adatok (például terheléses tesztből), azokat külön szakaszban
 tüntesd fel, és jelöld, melyik állítás mért, melyik várt.</li>
 </ul>
-<h3 data-number="20.2.13" id="ellenőrzési-szempontok"><span
-class="header-section-number">20.2.13</span> Ellenőrzési szempontok</h3>
+<h3 data-number="20.2.14" id="ellenőrzési-szempontok"><span
+class="header-section-number">20.2.14</span> Ellenőrzési szempontok</h3>
 <ul>
 <li>A timeout értékek indoklása összhangban van a
 válaszidő-eloszlással.</li>
@@ -488,16 +544,16 @@ timeout minden hívásra vonatkozik.</li>
 <li>A diagram jelzi a rendszerhatárokat, a komponensek felelősségét és a
 kapcsolatok protokollját.</li>
 </ul>
-<h3 data-number="20.2.14" id="visszaállítási-út"><span
-class="header-section-number">20.2.14</span> Visszaállítási út</h3>
+<h3 data-number="20.2.15" id="visszaállítási-út"><span
+class="header-section-number">20.2.15</span> Visszaállítási út</h3>
 <p>Mivel ez a labor tervezési gyakorlat, éles rendszeren nem kell
 végrehajtani semmilyen konfigurációt. Ha a mérésekhez saját lokális
 környezetet hozol létre, a változtatásokat izolált konténerben vagy
 virtuális gépen végezd, és a labor végén állítsd vissza az eredeti
 állapotot a konfigurációs fájlok visszaállításával. A destruktív
 műveletek (például adatbázis-törlés) nem részei ennek a feladatnak.</p>
-<h3 data-number="20.2.15" id="mért-és-várt-eredmény-elkülönítése"><span
-class="header-section-number">20.2.15</span> Mért és várt eredmény
+<h3 data-number="20.2.16" id="mért-és-várt-eredmény-elkülönítése"><span
+class="header-section-number">20.2.16</span> Mért és várt eredmény
 elkülönítése</h3>
 <p>A labor dokumentumban külön szakaszban jelöld, hogy mely állítások
 alapulnak valós mérésen, és melyek csupán várt becslések. Például:</p>
@@ -515,9 +571,9 @@ igazoljuk.)</li>
 <p>Az ilyen elkülönítés elengedhetetlen ahhoz, hogy a dokumentáció ne
 keltsen hamis bizonyosságot, és a későbbi olvasó pontosan tudja, mi
 bizonyított és mi feltételezett.</p>
-<h3 data-number="20.2.16"
+<h3 data-number="20.2.17"
 id="ellenőrzőlista-a-reziliencia-minták-tervezéséhez"><span
-class="header-section-number">20.2.16</span> Ellenőrzőlista a
+class="header-section-number">20.2.17</span> Ellenőrzőlista a
 reziliencia-minták tervezéséhez</h3>
 <p>A fejezet lezárásaként az alábbi ellenőrzőlista segít a tervezési
 lépések végiggondolásában:</p>
@@ -548,15 +604,15 @@ rendszerhatárok.</label></li>
 mértékegységgel és mérési ablakkal szerepelnek a
 dokumentációban.</label></li>
 </ul>
-<h3 data-number="20.2.17" id="önellenőrző-kérdés"><span
-class="header-section-number">20.2.17</span> Önellenőrző kérdés</h3>
+<h3 data-number="20.2.18" id="önellenőrző-kérdés"><span
+class="header-section-number">20.2.18</span> Önellenőrző kérdés</h3>
 <p>Magyarázd el, miért nem elegendő önmagában a retry egy túlterhelt
 fizetési szolgáltatás hívásánál, és milyen további mintákat vetnél be,
 hogy a rendszer ellenálló maradjon. Válaszodban térj ki az
 idempotenciára, a circuit breaker szerepére és a bulkhead
 fontosságára.</p>
-<h3 data-number="20.2.18" id="összefoglalás"><span
-class="header-section-number">20.2.18</span> Összefoglalás</h3>
+<h3 data-number="20.2.19" id="összefoglalás"><span
+class="header-section-number">20.2.19</span> Összefoglalás</h3>
 <p>Ebben a fejezetben a hibaizoláció és a túlterhelés megelőzésének négy
 alapvető mintáját tekintettük át. A <strong>timeout</strong> korlátot
 szab a várakozási időnek, a <strong>retry</strong> az átmeneti hibákra
