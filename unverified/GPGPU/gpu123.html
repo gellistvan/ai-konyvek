@@ -30,9 +30,9 @@ garantált. A warp-ok ütemezése, a blokkok végrehajtási sorrendje, az
 atomi műveletek kiszolgálási sorrendje mind befolyásolják az összegzési
 fát. Ezért ugyanaz a kernel ugyanazon a bemeneten különböző
 futtatásokkor kissé eltérő eredményt adhat. Ezt a jelenséget nevezzük
-nem determinisztikus redukciónak. A fejezet célja, hogy megértesse ennek
-okát, bemutassa az atomi műveletek és a sorrend szerepét, és gyakorlati
-mintát adjon determinisztikus összegzés megvalósítására.</p>
+nem determinisztikus redukciónak. Az alfejezet célja, hogy megértesse
+ennek okát, bemutassa az atomi műveletek és a sorrend szerepét, és
+gyakorlati mintát adjon determinisztikus összegzés megvalósítására.</p>
 <h3 data-number="32.2.1"
 id="a-nem-determinisztikus-redukció-forrása"><span
 class="header-section-number">32.2.1</span> A nem determinisztikus
@@ -106,7 +106,7 @@ eredmény. A bit-pontosság ennél erősebb: különböző hardvereken is
 ugyanaz a bitminta. A GPU-k esetében a bit-pontosság gyakran nem érhető
 el, mert a különböző architektúrák eltérő számú magot, eltérő
 utasításkészletet (például FMA) és eltérő kerekítési viselkedést
-mutatnak. A fejezet a determinizmusra összpontosít, nem a
+mutatnak. Az alfejezet a determinizmusra összpontosít, nem a
 bit-pontosságra.</p>
 <p>A determinisztikus redukció nem feltétlenül pontosabb, csak
 reprodukálható. A pontosság javításához FP64 vagy kompenzált összegzés
@@ -140,14 +140,16 @@ garantálja a determinizmust.</li>
 két kernel segítségével. Az első kernel minden blokkban egy részösszeget
 számol, a második kernel a részösszegeket összegzi. Mindkét kernel
 rögzített sorrendet használ.</p>
-<pre class="cuda"><code>// nyelv: CUDA C++ (C++17), fordító: nvcc
-// Determinisztikus redukció: 1. fázis - blokkon belüli részösszegek
+<pre class="cuda"><code>// nyelv: CUDA C++ (C++17), fordító: nvcc 12.x, -arch=sm_80 (A100, cc 8.0); precizitás: FP32
+// Nem futtatott példa. Determinisztikus redukció: két fázis, rögzített sorrend.
 #include &lt;cuda_runtime.h&gt;
 #include &lt;cstdio&gt;
 #include &lt;cstdlib&gt;
+#include &lt;cstring&gt;
+#include &lt;vector&gt;
 
 #define CHECK_CUDA(call) do {                                              \
-    cudaError_t err = call;                                                 \
+    cudaError_t err = (call);                                               \
     if (err != cudaSuccess) {                                               \
         std::fprintf(stderr, &quot;CUDA hiba: %s, fájl: %s, sor: %d\n&quot;,          \
                      cudaGetErrorString(err), __FILE__, __LINE__);          \
@@ -162,14 +164,15 @@ __global__ void blockReduce(const float* __restrict__ input,
                             float* __restrict__ partialSums,
                             int n) {
     extern __shared__ float sdata[];  // shared memory a fa-redukcióhoz
-    unsigned int tid = threadIdx.x;
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
 
     // 1. lépés: minden szál összegzi a hozzá tartozó elemeket.
     // A grid-stride loop rögzített sorrendben járja be az elemeket,
     // mert az indexek növekvő sorrendben következnek.
     float sum = 0.0f;
-    for (unsigned int i = idx; i &lt; n; i += blockDim.x * gridDim.x) {
+    for (int i = idx; i &lt; n; i += stride) {
         sum += input[i];
     }
 
@@ -177,7 +180,7 @@ __global__ void blockReduce(const float* __restrict__ input,
     sdata[tid] = sum;
     __syncthreads();
 
-    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
         if (tid &lt; s) {
             sdata[tid] += sdata[tid + s];
         }
@@ -195,14 +198,14 @@ __global__ void finalReduce(const float* __restrict__ partialSums,
                             float* __restrict__ result,
                             int numBlocks) {
     extern __shared__ float sdata[];
-    unsigned int tid = threadIdx.x;
+    int tid = threadIdx.x;
 
     // A részösszegeket be kell tölteni; a hiányzó szálak 0-t kapnak.
     float sum = (tid &lt; numBlocks) ? partialSums[tid] : 0.0f;
     sdata[tid] = sum;
     __syncthreads();
 
-    for (unsigned int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
+    for (int s = blockDim.x / 2; s &gt; 0; s &gt;&gt;= 1) {
         if (tid &lt; s) {
             sdata[tid] += sdata[tid + s];
         }
@@ -220,8 +223,10 @@ float deterministicSum(const float* d_input, int n) {
     // A grid méretét úgy választjuk, hogy a blokkok száma ne függjön
     // a bemenet méretétől, hanem fix legyen. Ez biztosítja, hogy a
     // részösszegek száma mindig ugyanannyi.
-    const int blockSize = 256;
-    const int gridSize = 64;  // fix, nem függ n-től
+    constexpr int blockSize = 256;
+    constexpr int gridSize = 64;  // fix, nem függ n-től
+    // A 2. fázis egyetlen blokkja blockSize szálon olvassa a részösszegeket:
+    static_assert(gridSize &lt;= blockSize, &quot;a finalReduce csak blockSize részösszeget olvas&quot;);
 
     size_t sharedBytes = blockSize * sizeof(float);
 
@@ -245,14 +250,40 @@ float deterministicSum(const float* d_input, int n) {
     CHECK_CUDA(cudaFree(d_partialSums));
     CHECK_CUDA(cudaFree(d_result));
     return result;
+}
+
+// Teszt: ugyanaz a bemenet 10-szer; a bitminták összevetése (futásról futásra determinizmus).
+int main() {
+    const int n = 1 &lt;&lt; 20;                    // 2^20 elem = 4 MiB (FP32)
+    std::vector&lt;float&gt; h(n);
+    srand(12345);
+    for (int i = 0; i &lt; n; ++i) h[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
+
+    float* d_input;
+    CHECK_CUDA(cudaMalloc(&amp;d_input, n * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_input, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+
+    float first = deterministicSum(d_input, n);
+    bool identical = true;
+    for (int run = 1; run &lt; 10; ++run) {
+        float r = deterministicSum(d_input, n);
+        if (std::memcmp(&amp;r, &amp;first, sizeof(float)) != 0) identical = false;
+    }
+    std::printf(&quot;eredmeny = %.9g, 10 futas bitre azonos: %s\n&quot;, first, identical ? &quot;igen&quot; : &quot;nem&quot;);
+    CHECK_CUDA(cudaFree(d_input));
+    return 0;
 }</code></pre>
 <p>Ebben a példában a determinizmus forrása a rögzített
 <code>gridSize = 64</code> és <code>blockSize = 256</code>. A blokkon
 belüli fa-redukció sorrendje rögzített, és a második fázisban a
 részösszegek sorrendje a blokk indexe szerint rögzített. Az első fázis
 grid-stride loopja is rögzített sorrendben járja be az elemeket. Így
-ugyanazon bemenetre és ugyanazon hardveren az eredmény minden
-futtatáskor bitre azonos lesz.</p>
+ugyanazon bemenetre, ugyanazon hardveren és szoftververzión az eredmény
+futásról futásra bitre azonos lesz. Ez nem jelenti, hogy az eredmény
+megegyezik a szekvenciális CPU-összeggel: a fa más sorrendben összegez.
+A fix <code>gridSize</code> legfeljebb <code>blockSize</code> lehet (a
+<code>static_assert</code> ezt őrzi); nagyobb grid esetén a második
+fázist több lépcsőssé kell tenni.</p>
 <p>Fontos megjegyezni, hogy ez a megoldás nem a leggyorsabb, mert a grid
 mérete fix, és a második fázis egyetlen blokkot használ, ami szűk
 keresztmetszet lehet. A teljesítmény és a determinizmus között gyakran
@@ -265,14 +296,16 @@ sorrend</h3>
 <p>Az atomi műveletek használata a redukcióban kényelmes, de
 lebegőpontos adatok esetén nem determinisztikus. A következő kód egy
 tipikus, nem determinisztikus redukciót mutat:</p>
-<pre class="cuda"><code>// nyelv: CUDA C++ (C++17), fordító: nvcc
-// Nem determinisztikus redukció atomicAdd használatával
+<pre class="cuda"><code>// nyelv: CUDA C++ (C++17), fordító: nvcc 12.x; precizitás: FP32; nem futtatott
+// Nem determinisztikus redukció atomicAdd használatával (a host oldali hívás a fenti main mintájára,
+// `result` előzetes nullázásával írható meg)
 __global__ void atomicReduction(const float* __restrict__ input,
                                 float* __restrict__ result,
                                 int n) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
     float sum = 0.0f;
-    for (unsigned int i = idx; i &lt; n; i += blockDim.x * gridDim.x) {
+    for (int i = idx; i &lt; n; i += stride) {
         sum += input[i];
     }
     // Az atomicAdd sorrendje nem garantált, ezért az eredmény
@@ -293,13 +326,11 @@ az eredményt adja, függetlenül a sorrendtől. Ezt a tulajdonságot
 kihasználhatjuk például integer alapú számlálóknál vagy
 bitmaszkoknál.</p>
 <p>A lebegőpontos atomi műveletek determinizmusának hiánya miatt a
-gyakorlatban a determinisztikus redukciót gyakran úgy valósítják meg,
-hogy elkerülik az atomi műveleteket, vagy csak olyan helyen használják,
-ahol a sorrend nem számít (például egy blokk részösszegének hozzáadása
-egy másik blokkéhoz, ha a részösszegek már determinisztikusak? De az
-atomicAdd még ekkor is nem determinisztikus a lebegőpontos
-asszociativitás miatt). Ezért a fent bemutatott kétfázisú megoldás az
-ajánlott.</p>
+gyakorlatban a determinisztikus redukciót úgy valósítják meg, hogy
+elkerülik a lebegőpontos atomi műveleteket. Az <code>atomicAdd</code>
+még determinisztikus részösszegek esetén is nem determinisztikus, mert a
+hozzáadás sorrendje változhat. Ezért a fent bemutatott kétfázisú
+megoldás az ajánlott.</p>
 <p>A maximum és minimum redukciók esetén a művelet asszociatív és
 kommutatív, ezért az ilyen redukciók determinisztikusak, függetlenül a
 sorrendtől. Ugyanez igaz a bitwise OR/AND műveletekre. Ez fontos
@@ -309,16 +340,22 @@ amelyek művelete nem asszociatív.</p>
 class="header-section-number">32.2.5</span> A CUB és Thrust
 determinizmusa</h3>
 <p>A CUDA ökoszisztéma könyvtárai, mint a CUB és a Thrust, hatékony
-redukciós primitíveket kínálnak. Azonban ezek dokumentációja nem
-garantálja a redukciós sorrendet, ezért a
-<code>cub::DeviceReduce::Sum</code> és a <code>thrust::reduce</code>
-eredménye nem tekinthető determinisztikusnak. Ha a felhasználónak
-determinisztikus összegzésre van szüksége, akkor vagy saját kernelt kell
-írnia, vagy a könyvtár által kínált lehetőségeket kell megvizsgálnia
-(például a CUB bizonyos verziói támogatják a determinisztikus redukciót,
-de ezt a verzióhoz kell kötni, és ellenőrizni kell). A fejezetben
-bemutatott saját kernel azért előnyös, mert a sorrendet teljes mértékben
-a programozó irányítja.</p>
+redukciós primitíveket kínálnak. A CUB <code>DeviceReduce</code>
+dokumentált viselkedése szerint ugyanazon GPU-architektúrán, ugyanazon
+verzióval és ugyanazon bemenettel (azonos launch-konfigurációval)
+futásról futásra determinisztikus: a redukciós fa rögzített, nincs
+lebegőpontos atomi összegzés. A <code>thrust::reduce</code> CUB-ra épül.
+A bitazonosság azonban nem garantált különböző GPU-architektúrák vagy
+könyvtárverziók között, mert a belső tile-méret és a fa megváltozhat. Ha
+architektúrák vagy verziók közötti reprodukálhatóság kell, vagy saját
+kernelt kell írni, vagy a használt CCCL/CUB verzió dokumentációjának
+determinizmus-szakaszát kell ellenőrizni és az eredményt verzióhoz kötni
+(a CCCL újabb verziói explicit determinizmus-követelményt is kínálnak;
+ezt a használt CUDA 12.x verzióra ellenőrizni kell, a példa nem
+futtatott). Gyors ellenőrzés: ugyanazon bemenetre többszöri
+<code>cub::DeviceReduce::Sum</code> hívás bitminta-összevetése. A fent
+bemutatott saját kernel előnye, hogy a sorrend a kódból egyértelműen
+látszik és verziófüggetlen.</p>
 <h3 data-number="32.2.6" id="opencl-példa"><span
 class="header-section-number">32.2.6</span> OpenCL példa</h3>
 <p>Az OpenCL programozási modell hasonló, de a munkacsoportok
@@ -329,42 +366,67 @@ részösszegek rögzített sorrendű összegzése egy második kernelben.</p>
 <p>A következő OpenCL kernel egy work-groupon belüli részösszeget
 számol:</p>
 <div class="sourceCode" id="cb3"><pre
-class="sourceCode opencl"><code class="sourceCode opencl"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// nyelv: OpenCL C, fordító: bármely OpenCL 1.2+ implementáció</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Determinisztikus blokkon belüli redukció OpenCL-ben</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> <span class="dt">void</span> blockReduce<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> input<span class="op">,</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>                          <span class="kw">__global</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>                          <span class="dt">const</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">__local</span> <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span>  <span class="co">// local memory, fix méret</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> groupSize <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">unsigned</span> <span class="dt">int</span> numGroups <span class="op">=</span> get_num_groups<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0f</span><span class="op">;</span></span>
-<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> i <span class="op">=</span> gid<span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i <span class="op">+=</span> groupSize <span class="op">*</span> numGroups<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> input<span class="op">[</span>i<span class="op">];</span></span>
-<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
-<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+class="sourceCode opencl"><code class="sourceCode opencl"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// nyelv: OpenCL C (1.2+), precizitás: FP32; nem futtatott példa, csak dokumentáció/statikus ellenőrzés</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Determinisztikus blokkon belüli redukció OpenCL-ben.</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// A reqd_work_group_size attribútum miatt a kernel csak 256-os work-group mérettel indítható</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// (más méretnél az enqueue CL_INVALID_WORK_GROUP_SIZE hibát ad), így a 256 elemű local tömb biztonságos.</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> blockReduce<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> input<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>                 <span class="kw">__global</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">__local</span> <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span>  <span class="co">// local memory, fix méret</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> groupSize <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> numGroups <span class="op">=</span> get_num_groups<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0f</span><span class="op">;</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> gid<span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i <span class="op">+=</span> groupSize <span class="op">*</span> numGroups<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> input<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
 <span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">unsigned</span> <span class="dt">int</span> s <span class="op">=</span> groupSize <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
-<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
-<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        partialSums<span class="op">[</span>get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
-<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Itt a work-group méretet rögzíteni kell, például 256. A
-<code>numGroups</code> a work-groupok száma, amely szintén rögzített
-kell legyen. A második kernel a részösszegeket összegzi egyetlen
-work-groupban. Az OpenCL-ben a <code>barrier</code> biztosítja a local
-memory konzisztenciáját. A determinizmus itt is a rögzített méreteken és
-a rögzített sorrendű fa-redukción múlik.</p>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> groupSize <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        partialSums<span class="op">[</span>get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. fázis: egyetlen work-group összegzi a részösszegeket rögzített sorrendben.</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> finalReduce<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>                 <span class="kw">__global</span> <span class="dt">float</span><span class="op">*</span> result<span class="op">,</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> numGroups<span class="op">)</span> <span class="op">{</span>   <span class="co">// numGroups &lt;= 256</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">__local</span> <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>tid <span class="op">&lt;</span> numGroups<span class="op">)</span> <span class="op">?</span> partialSums<span class="op">[</span>tid<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0f</span><span class="op">;</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">128</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        result<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>A host oldalon mindkét kernelt
+<code>clEnqueueNDRangeKernel</code>-lel kell indítani: az első fázisban
+a local méret 256, a global méret <code>numGroups * 256</code> (a
+<code>numGroups</code> fix, például 64), a második fázisban egyetlen 256
+széles work-group, <code>numGroups ≤ 256</code>. A
+<code>numGroups</code> rögzítése és a rögzített sorrendű fa-redukció
+adja a determinizmust; a <code>barrier</code> biztosítja a local memory
+konzisztenciáját.</p>
 <h3 data-number="32.2.7" id="jax-példa"><span
 class="header-section-number">32.2.7</span> JAX példa</h3>
 <p>A JAX funkcionális programozási modelljében a redukciók, mint a
@@ -373,30 +435,35 @@ JAX dokumentációja szerint a redukciók sorrendje a backendtől és a
 hardvertől függhet, ezért a bit-pontosság nem garantált. Ha
 determinisztikus összegzést szeretnénk, explicit módon kell szabályozni
 a sorrendet.</p>
-<p>Például a <code>jnp.cumsum</code> egy tengely mentén szekvenciálisan
-összegzi az elemeket, így a sorrend rögzített, de ez nem párhuzamos. Egy
-másik lehetőség a <code>jax.lax.associative_scan</code>, amely szintén
-rögzített sorrendet biztosít, de párhuzamosan fut. Azonban a
-<code>jnp.sum</code> esetén a sorrend nem garantált, mert a JAX a
-redukciót gyakran tree-reductionnel végzi, amelynek sorrendje a
-hardvertől függ.</p>
-<pre class="jax"><code># nyelv: JAX (Python), futtató: CPU/GPU/TPU
-# Determinisztikus összegzés JAX-ban: rendezett cumsum utolsó eleme
-import jax
-import jax.numpy as jnp
-
-def deterministic_sum(x):
-    # A cumsum tengely mentén szekvenciális sorrendet biztosít,
-    # de nem párhuzamos. Nagy tömböknél lassú lehet.
-    return jnp.cumsum(x, axis=0)[-1]
-
-# Alternatíva: a jnp.sort-tal rendezett összegzés nem segít,
-# mert az összegzés sorrendje továbbra is párhuzamos.</code></pre>
+<p>A <code>jnp.sum</code> XLA GPU backenden tipikusan futásról futásra
+azonos eredményt ad (nem atomi összegzést használ), de ez nem
+dokumentált garancia, és a fa szerkezete a backendtől, a hardvertől és a
+verziótól függ, ezért a bitazonosság különböző környezetek között nem
+várható. A <code>jnp.cumsum</code> nem szekvenciális összegzés: az XLA
+párhuzamos prefix-scanként (reduce-window/associative scan) valósítja
+meg, így az összegzési fája más, mint a <code>jnp.sum</code>-é, de nem
+pontosabb és nem „determinisztikusabb”. Rögzített, szekvenciális
+sorrendet a <code>jax.lax.scan</code> vagy a
+<code>jax.lax.fori_loop</code> ad (lassú, mert soros). A bit-szintű
+reprodukálhatóságot a használt JAX/XLA verzió dokumentációja szerint az
+<code>XLA_FLAGS=--xla_gpu_deterministic_ops=true</code> jelző támogatja
+(verziófüggő, ellenőrizendő; a példa nem futtatott).</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># nyelv: JAX (Python), futtató: CPU/GPU/TPU; nem futtatott példa</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># Rögzített (szekvenciális) sorrendű összegzés JAX-ban lax.scan-nel</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> jax.numpy <span class="im">as</span> jnp</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax <span class="im">import</span> lax</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> sequential_sum(x):</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A scan elemenként, növekvő index szerint összegez: a sorrend rögzített, de nem párhuzamos.</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    total, _ <span class="op">=</span> lax.scan(<span class="kw">lambda</span> carry, v: (carry <span class="op">+</span> v, <span class="va">None</span>), jnp.float32(<span class="dv">0</span>), x)</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> total</span></code></pre></div>
 <p>A JAX esetében a determinizmus gyakran kompromisszumot igényel a
 teljesítmény rovására. A felhasználónak tisztában kell lennie ezzel, és
 ha a determinizmus kritikus, akkor vagy szekvenciális redukciót kell
-használni, vagy a műveletet saját kernelben implementálni (például CUDA
-custom call segítségével).</p>
+használni, a determinisztikus XLA-opciókat kell bekapcsolni, vagy a
+műveletet saját kernelben kell implementálni (például CUDA custom call
+segítségével).</p>
 <h3 data-number="32.2.8"
 id="labor-determinisztikus-összegzés-mérése"><span
 class="header-section-number">32.2.8</span> Labor: determinisztikus
@@ -406,35 +473,59 @@ OpenCL-ben vagy JAX-ban, és annak igazolása, hogy az eredmény
 reprodukálható. A mérési környezetet rögzíteni kell: GPU modell, driver,
 CUDA verzió, operációs rendszer, órajel, power limit. A mérés előtt
 warm-up, majd legalább 5-10 ismétlés, átlag és szórás számítása.</p>
-<p>A következő egy példa mérési napló, amelyet a laborban el kell
-készíteni:</p>
-<p><strong>Környezet:</strong> - GPU: NVIDIA RTX 3080 (compute
-capability 8.6) - Driver: 550.54.14 - CUDA: 12.4 - OS: Ubuntu 22.04 LTS
-- Órajel: rögzített, power limit: 320 W - Precision: FP32</p>
-<p><strong>Bemenet:</strong> - Vektor mérete: 1 048 576 elem (1 MiB
-float) - Értékek: [0, 1) tartományba eső egyenletes eloszlású véletlen
-számok, de a méréshez ugyanaz a tömb kerül betöltésre minden
+<p>A következő a laborban elkészítendő mérési napló sablonja. A
+környezeti adatok helyőrzők, a mért értékeket a saját futtatásból kell
+kitölteni; ebben a szövegben nincs mért eredmény.</p>
+<p><strong>Környezet (helyőrző):</strong> - GPU: NVIDIA RTX 3080
+(compute capability 8.6) vagy a saját GPU - Driver: &lt;rögzítendő&gt; -
+CUDA: 12.x (&lt;rögzítendő&gt;) - OS: Ubuntu 22.04 LTS - Órajel és power
+limit: &lt;rögzítendő, <code>nvidia-smi</code>&gt; - Precision: FP32</p>
+<p><strong>Bemenet:</strong> - Vektor mérete: 2^20 = 1 048 576 elem (4
+MiB FP32) - Értékek: [0, 1) tartományba eső egyenletes eloszlású
+véletlen számok rögzített maggal; ugyanaz a tömb kerül betöltésre minden
 futtatáskor.</p>
-<p><strong>Várt eredmény:</strong> - A várt eredményt a CPU-n
-szekvenciálisan, ugyanabban a sorrendben (növekvő indexek) számítjuk,
-FP32-ben. Ez a referencia. - A GPU determinisztikus redukciójának bitre
-azonosnak kell lennie a referenciával, mert a sorrend rögzített.
-(Megjegyzés: a CPU és a GPU kerekítési viselkedése eltérhet, ha az FP32
-összeadás nem ugyanazt az utasítást használja, például FMA. Ezért a
-referencia számításnál ugyanazt a műveletet kell használni, például
-<code>std::plus&lt;float&gt;</code>.)</p>
-<p><strong>Mért eredmény:</strong> - 10 futtatás után az eredmény minden
-esetben ugyanaz az FP32 érték, bitre azonos. - A futásidő átlagosan 0,42
-ms, szórás 0,02 ms. - A determinisztikus redukció eredménye:
-<code>123456.789</code> (példa) - A nem determinisztikus atomicAdd
-redukció eredménye ugyanarra a bemenetre 10 futtatás alatt:
-<code>123456.781</code>, <code>123456.795</code>,
-<code>123456.786</code>, … (eltérő ulp-k).</p>
+<p><strong>Várt eredmény:</strong> - Az összeg nagyságrendje: 2^20 · 0,5
+≈ 524 288 (egyenletes [0,1) eloszlás várható értéke 0,5); a pontos érték
+a bemenettől függ. - A GPU determinisztikus redukciója futásról futásra
+bitre azonos eredményt ad ugyanazon hardveren és szoftververzión, mert a
+sorrend rögzített. - A GPU eredménye nem azonos a szekvenciális
+CPU-összeggel, mert a fa más sorrendben összegez. Referenciaként ezért
+vagy egy, a GPU fát (szálankénti grid-stride részösszegek, majd
+páronkénti fa) CPU-n lemásoló függvény szolgál (ekkor bitre azonos
+eredmény várható), vagy a szekvenciális CPU-összeg, relatív tűréssel
+összevetve (FP64 referencia mellett). - A nem determinisztikus
+<code>atomicAdd</code> redukció eredménye futásonként az utolsó néhány
+ulp-n belül eltérhet.</p>
+<p><strong>Mért eredmény (kitöltendő):</strong> - 10 futtatás eredményei
+és bitminta-összevetésük: &lt;mért – kitöltendő&gt; - Futásidő átlag és
+szórás (warm-up után, ≥ 10 ismétlés): &lt;mért – kitöltendő&gt; - Az
+<code>atomicAdd</code> redukció 10 eredménye: &lt;mért –
+kitöltendő&gt;</p>
 <p>A laborban a várt és mért eredményt külön dokumentálni kell, és
 igazolni kell, hogy a determinisztikus redukció valóban reprodukálható,
 míg az atomi alapú nem.</p>
-<h3 data-number="32.2.9" id="tipikus-hibák-és-helyes-megoldások"><span
-class="header-section-number">32.2.9</span> Tipikus hibák és helyes
+<h3 data-number="32.2.9"
+id="további-determinizmus-források-a-gyakorlatban"><span
+class="header-section-number">32.2.9</span> További
+determinizmus-források a gyakorlatban</h3>
+<p>A fent tárgyalt minták mellett a gyakorlatban a következők a
+legfontosabbak: (1) a warp-szintű shuffle-redukció
+(<code>__shfl_down_sync</code>) és a cooperative groups
+<code>reduce</code> rögzített fát követ, így ugyanazon tile-méretnél
+determinisztikus; (2) a cuBLAS több streamen futtatva a
+workspace-konfigurációtól függően lehet nem determinisztikus, ezt a
+<code>CUBLAS_WORKSPACE_CONFIG</code> környezeti változó (pl.
+<code>:4096:8</code>) rögzíti; (3) a PyTorch determinisztikus módja a
+<code>torch.use_deterministic_algorithms(True)</code>, amely a nem
+determinisztikus műveleteknél hibát jelez vagy determinisztikus
+változatot választ; (4) az atomi fix-pontos akkumuláció: a lebegőpontos
+értékeket egész számra skálázva <code>atomicAdd</code>-del (egész, tehát
+asszociatív) összegzi, majd visszaskálázza; ennek ára a skálázás és a
+túlcsordulás/pontosságvesztés kezelése. Ezeket a verziófüggő
+beállításokat a használt könyvtárverzió dokumentációja szerint kell
+ellenőrizni.</p>
+<h3 data-number="32.2.10" id="tipikus-hibák-és-helyes-megoldások"><span
+class="header-section-number">32.2.10</span> Tipikus hibák és helyes
 megoldások</h3>
 <ol type="1">
 <li><p><strong>Hiba:</strong> A fejlesztő atomicAdd-ot használ
@@ -466,22 +557,28 @@ sorrendje nem rögzített (például párhuzamos <code>std::reduce</code>).
 sorrendben végezze, vagy a második fázist GPU-n, rögzített sorrenddel
 valósítsa meg.</p></li>
 </ol>
-<h3 data-number="32.2.10" id="önellenőrző-kérdés"><span
-class="header-section-number">32.2.10</span> Önellenőrző kérdés</h3>
+<h3 data-number="32.2.11" id="önellenőrző-kérdés"><span
+class="header-section-number">32.2.11</span> Önellenőrző kérdés</h3>
 <p>Miért nem determinisztikus az <code>atomicAdd</code>-alapú
 lebegőpontos redukció, és milyen két technikával lehet determinisztikus
 összegzést megvalósítani? (Válaszát indokolja a lebegőpontos
 asszociativitás és a hardveres ütemezés szempontjából.)</p>
-<h3 data-number="32.2.11" id="összefoglalás"><span
-class="header-section-number">32.2.11</span> Összefoglalás</h3>
+<p><strong>Válasz.</strong> Az <code>atomicAdd</code> sorrendje a
+hardveres ütemezéstől függ, a lebegőpontos összeadás nem asszociatív,
+ezért a kerekítések futásonként más eredményt adhatnak. Két technika:
+(1) rögzített launch-konfiguráció és rögzített fa-redukció két fázisban,
+atomi műveletek nélkül; (2) egész típusú (fix-pontos) atomi akkumuláció,
+ahol az összeadás asszociatív.</p>
+<h3 data-number="32.2.12" id="összefoglalás"><span
+class="header-section-number">32.2.12</span> Összefoglalás</h3>
 <p>A nem determinisztikus redukció a GPU-számítások egyik leggyakoribb
 reprodukálhatósági problémája. A lebegőpontos összeadás nem asszociatív,
 és a párhuzamos végrehajtás sorrendje nem garantált. Az atomi műveletek
 sorrendje a hardver memóriarendszerétől függ, ezért lebegőpontos
 adatokra nem determinisztikus. A determinisztikus redukció
 megvalósításához rögzíteni kell a launch konfigurációt, a blokkon belüli
-fa-redukció sorrendjét és a blokkok közötti összegzés sorrendjét. A
-fejezet bemutatott egy kétfázisú CUDA-mintát, amely determinisztikus
+fa-redukció sorrendjét és a blokkok közötti összegzés sorrendjét. Az
+alfejezet bemutatott egy kétfázisú CUDA-mintát, amely determinisztikus
 összegzést biztosít, és ismertette az OpenCL és JAX megfelelőit is. A
 laborban a hallgatóknak méréssel kell igazolniuk a determinizmust és a
 reprodukálhatóságot.</p>
