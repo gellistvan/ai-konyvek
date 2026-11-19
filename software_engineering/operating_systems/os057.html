@@ -45,9 +45,9 @@ például a tulajdonosváltás (<code>chown</code>), a törlés
 (<code>chmod</code>).</p>
 <p>A kernel a hozzáférési döntést nem egyetlen ponton hozza meg. A VFS
 réteg az inode-műveletek között definiál egy <code>permission</code>
-vagy <code>check_acl</code> hívást, amely a fájlrendszer-specifikus
-inode-objektumon hajtja végre az ellenőrzést. A döntéshez három
-forrásból gyűjthet információt:</p>
+hívást (az ACL-t a fájlrendszer a <code>get_acl</code> műveleten át
+adja), amely a fájlrendszer-specifikus inode-objektumon hajtja végre az
+ellenőrzést. A döntéshez három forrásból gyűjthet információt:</p>
 <ol type="1">
 <li><strong>Klasszikus UID/GID modell</strong>: a folyamat tulajdonosi
 azonosítója, csoporttagsága és az inode <code>mode</code> mezője.</li>
@@ -146,7 +146,7 @@ megegyezik az inode <code>st_gid</code> értékével, akkor a csoportbitek
 </ol>
 <p>Fontos, hogy ez a sorrend nem kumulatív: ha a tulajdonosi osztályba
 tartozik a folyamat, akkor a csoport- és other biteket a kernel
-figyelmen kívül hagyja. Ezért például egy <code>0o047</code> jogú
+figyelmen kívül hagyja. Ezért például egy <code>0o447</code> jogú
 fájlnál (tulajdonos: <code>r--</code>, csoport: <code>r--</code>, other:
 <code>rwx</code>) a tulajdonos <strong>nem</strong> tud írni, bár a
 “mindenki más” igen. Ez gyakori félreértés, ezért a gyakorlatban a
@@ -166,20 +166,24 @@ alapján, ami elkerüli a path-alapú TOCTOU problémát.</li>
 tulajdonost és/vagy csoportot változtat. A közönséges felhasználó csak
 akkor változtathatja a tulajdonost, ha <code>CAP_CHOWN</code> képessége
 van; a csoportot csak olyan csoportra, amelynek tagja.</li>
-<li><code>int umask(mode_t mask)</code> – a folyamatban beállít egy
-bitmaszkot, amelyet a <code>open</code> és <code>creat</code> hívásoknál
-a mode bitből levon. A tipikus <code>022</code> maszk azt jelenti, hogy
-az újonnan létrehozott fájl nem kap <code>w</code> bitet a csoportnak és
-az other-nek.</li>
+<li><code>mode_t umask(mode_t mask)</code> – a folyamatban beállít egy
+bitmaszkot (a hívás mindig sikeres, és a korábbi maszkot adja vissza),
+amelyet a <code>open</code> és <code>creat</code> hívásoknál a mode
+bitből levon. A tipikus <code>022</code> maszk azt jelenti, hogy az
+újonnan létrehozott fájl nem kap <code>w</code> bitet a csoportnak és az
+other-nek.</li>
 </ul>
 <p>A setuid/setgid/sticky bitek kombinációja a mode mezőben tárolódik,
 és a <code>chmod</code> hívásnál a <code>0o4000</code>,
 <code>0o2000</code>, <code>0o1000</code> értékekkel adhatók meg. A
 kernel a <code>chmod</code> során bizonyos biztonsági szabályokat
-érvényesít: a setuid bitet nem lehet beállítani olyan fájlra, amelynek
-nincs <code>x</code> bitje, és a nem privilegizált folyamat nem
-állíthatja be a setuid bitet olyan fájlra, amelynek tulajdonosa nem ő
-maga.</p>
+érvényesít: a nem tulajdonos (<code>CAP_FOWNER</code> nélkül) egyáltalán
+nem módosíthatja a módbiteket (<code>EPERM</code>); a setgid bit
+<code>CAP_FSETID</code> nélkül csak akkor marad meg, ha a fájl csoportja
+a hívó valamelyik csoportja. A setuid/setgid bitet a kernel a fájl
+írásakor és tulajdonosváltáskor automatikusan törli. (<code>x</code> bit
+nélküli fájlon a setuid beállítható, de hatástalan; az <code>ls</code>
+nagy <code>S</code>-sel jelzi.)</p>
 <p>A klasszikus modell egyszerű, de merev: csak három osztályba sorol,
 és nem tudja kifejezni például azt, hogy “Bob olvashatja, Carol írhatja,
 Dave pedig egyáltalán nem éri el”. Erre szolgálnak az ACL-ek.</p>
@@ -219,9 +223,11 @@ szerepel, az adott bejegyzés és az <code>ACL_MASK</code> metszete
 érvényes.</li>
 <li>Ha az effektív GID vagy valamelyik kiegészítő csoport megegyezik a
 tulajdonos csoporttal vagy valamelyik <code>ACL_GROUP</code>
-bejegyzéssel, akkor az összes egyező csoportbejegyzés (és az
-<code>ACL_GROUP_OBJ</code>) uniójának és az <code>ACL_MASK</code>-nak a
-metszete érvényes.</li>
+bejegyzéssel, akkor a hozzáférés megadott, ha az egyező bejegyzések (az
+<code>ACL_GROUP_OBJ</code> és az <code>ACL_GROUP</code> bejegyzések)
+<strong>közül legalább egy</strong> az <code>ACL_MASK</code>-kal metszve
+önmagában tartalmazza az összes kért jogot; ha egyik sem, a hozzáférés
+megtagadva, és az <code>ACL_OTHER</code>-t ilyenkor sem vizsgálja.</li>
 <li>Különben az <code>ACL_OTHER</code> érvényes, maszk nélkül.</li>
 </ol>
 <p>A sorrend nem kumulatív: az első egyező osztály dönt, a többi
@@ -295,7 +301,7 @@ dönt:</p>
 <pre class="text"><code>döntés(folyamat, inode, kért_maszk):
     # 1) DAC: vagy ACL, vagy klasszikus mode – nem mindkettő egymás után
     if ACL_van(inode):
-        engedett = ACL_döntés(folyamat, inode)      # az ACL 1-4. szabálya
+        engedett = ACL_engedélyez(folyamat, inode, kért_maszk)   # az ACL 1-4. szabálya (logikai döntés)
     else:
         if folyamat.euid == inode.uid:
             engedett = inode.mode.owner
@@ -315,10 +321,12 @@ dönt:</p>
     elif CAP_DAC_OVERRIDE in folyamat.effective:
         return engedélyez
 
-    if (kért_maszk &amp; (MAY_READ | MAY_EXEC)) and \
-       CAP_DAC_READ_SEARCH in folyamat.effective:
-        # könyvtárra keresés, fájlra olvasás; szabályos fájl végrehajtására nem jogosít
-        return engedélyez
+    if CAP_DAC_READ_SEARCH in folyamat.effective:
+        # könyvtárra csak olvasás/keresés, fájlra csak olvasás; írásra és szabályos fájl végrehajtására nem jogosít
+        if S_ISDIR(inode.mode) and (kért_maszk &amp; ~(MAY_READ | MAY_EXEC)) == 0:
+            return engedélyez
+        if kért_maszk == MAY_READ:
+            return engedélyez   # fájl: csak olvasás
 
     return megtagad</code></pre>
 <p>A <code>CAP_DAC_OVERRIDE</code> tehát a DAC-döntést írja felül, de
@@ -329,6 +337,21 @@ engedélyezi. A képességek nem írják felül az LSM-et (SELinux, AppArmor):
 a DAC/képesség döntés után az LSM külön ellenőrzést végez, és a végső
 engedély a kettő metszete. A képességek az immutable flaget és a csak
 olvasható mountot sem írják felül.</p>
+<p>Az alábbi folyamatábra a döntés sorrendjét a labor három esetén
+mutatja be: az első egyező osztály dönt, a maszk az
+<code>ACL_USER</code> és a csoportbejegyzéseket korlátozza, a képességek
+csak a DAC-elutasítás után, az LSM pedig a DAC/képesség döntése után
+következik.</p>
+<figure id="fig-os057-hozzaferes-dontes">
+<div class="fig-interactive"><iframe src="figures/html/os057-hozzaferes-dontes.html" title="Folyamatábra az ACL-, tulajdonos-, named user-, csoport- és other-ágról, a képesség-felülírásról és az LSM-ről; három példa-nyomvonallal." loading="lazy" style="width:100%;border:0;height:760px"></iframe><noscript><img src="figures/img/os057-hozzaferes-dontes.png" style="width:88.0%"
+alt="Folyamatábra az ACL-, tulajdonos-, named user-, csoport- és other-ágról, a képesség-felülírásról és az LSM-ről; három példa-nyomvonallal." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/os057-hozzaferes-dontes.png" style="width:88.0%"
+alt="Folyamatábra az ACL-, tulajdonos-, named user-, csoport- és other-ágról, a képesség-felülírásról és az LSM-ről; három példa-nyomvonallal." /></details></div>
+<figcaption>A Linux fájlhozzáférési döntés sorrendje (egyszerűsítve):
+ACL vagy mode-osztály, maszk-metszés, képesség-felülírás és LSM.
+Csoport-ACL-nél elég egy egyező bejegyzés, amelynek a maszkkal vett
+metszete fedi a kérést; a <code>CAP_DAC_READ_SEARCH</code> fájlon csak
+olvasást enged.</figcaption>
+</figure>
 <p>A képességek a fájlhozzáférés mellett a kvótákra is kihatnak: a
 <code>CAP_SYS_RESOURCE</code> képességgel rendelkező folyamat túllépheti
 a kvótakorlátokat, illetve kezelheti azokat. Ezt a kvótaszakaszban
@@ -422,9 +445,10 @@ hogy más felhasználókat veszélyeztessen.</li>
 <li>A türelmi idő hossza a szervezeti politikától függ; a túllépés után
 a felhasználónak törölnie vagy archiválnia kell az adatokat.</li>
 </ul>
-<p>A kvóta és a jogosultságok kapcsolata szoros: a kvótát csak az a
-folyamat tudja módosítani, amelyik <code>CAP_SYS_RESOURCE</code>
-képességgel rendelkezik, és a kvótabejegyzések maguk is a felhasználói
+<p>A kvóta és a jogosultságok kapcsolata szoros: a kvótát csak
+<code>CAP_SYS_ADMIN</code> képességű folyamat módosíthatja (a
+<code>quotactl</code> ezt kéri; <code>CAP_SYS_RESOURCE</code> a korlátok
+túllépését engedi), és a kvótabejegyzések maguk is a felhasználói
 azonosítókhoz kötődnek. A <code>CAP_SYS_RESOURCE</code> képességgel
 rendelkező folyamat átlépheti a hard limitet is, ami a rendszergazda
 számára hasznos, de egy kiszivárgott képesség súlyos kockázatot
@@ -470,7 +494,7 @@ adatot és a méretváltozást erőlteti ki, a többi metaadatot nem. A
 <li><strong>Konzisztencia a fizikai tárolón</strong>: A POSIX nem
 követeli meg a crash utáni teljes konzisztenciát, de a fájlrendszer
 implementációk általában naplózással vagy copy-on-write módszerrel
-biztosítják, hogy a metaadatok ne sérüljenek. A kommunkáról a későbbi
+biztosítják, hogy a metaadatok ne sérüljenek. A naplózásról a későbbi
 alfejezet (<a href="os062.html">Journaling és tranzakciós metaadat</a>)
 részletesen szól.</li>
 </ul>
@@ -496,8 +520,11 @@ kezeli:</p>
 <li>Ha <code>oldpath</code> fájl, akkor a <code>newpath</code> egy
 létező fájlra is mutathat; ekkor a régi <code>newpath</code> tartalma
 megsemmisül, és az új név az <code>oldpath</code> inode-jára mutat. Ez a
-folyamat atomi, nincs olyan pillanat, amikor a fájl mindkét néven
-létezik, és nincs olyan, amikor a <code>newpath</code> hiányzik.</li>
+folyamat atomi abban az értelemben, hogy nincs olyan pillanat, amikor a
+<code>newpath</code> hiányzik: egy másik folyamat vagy a régi, vagy az
+új tartalmat látja rajta. Egy rövid ideig viszont előfordulhat, hogy az
+<code>oldpath</code> és a <code>newpath</code> is ugyanarra a fájlra
+mutat.</li>
 <li>Ha <code>oldpath</code> könyvtár, akkor a <code>newpath</code> csak
 üres könyvtárra mutathat, és a <code>newpath</code> nem lehet az
 <code>oldpath</code> alkönyvtára.</li>
@@ -564,16 +591,18 @@ könyvtárához. A hívás a <code>-1</code> értékkel jelzi a hibát, és az
 közötti átnevezés), <code>ENOENT</code> (a forrás nem létezik),
 <code>EACCES</code> (nincs írási jog a könyvtárakhoz),
 <code>EPERM</code> (a fájlrendszer nem támogatja a könyvtár-átnevezést),
-<code>EISDIR</code> (a <code>newpath</code> könyvtár, de az
-<code>oldpath</code> nem könyvtár, vagy fordítva),
+<code>EISDIR</code> (a <code>newpath</code> létező könyvtár, de az
+<code>oldpath</code> nem), <code>ENOTDIR</code> (az <code>oldpath</code>
+könyvtár, a <code>newpath</code> létező nem-könyvtár),
 <code>ENOTEMPTY</code> (a cél könyvtár nem üres), <code>EBUSY</code> (a
 forrás vagy cél használatban van), <code>ENOSPC</code> (nincs szabad
 blokk/inode).</p>
 <p>A <code>rename()</code> a kvóta szempontjából is érdekes: a forrás
 inode kvótája nem változik, mert az inode átkerül egy másik név alá. A
-cél <code>newpath</code> inode-ja azonban felszabadul, ami a cél fájl
-tulajdonosának kvótáját csökkenti. Ezért a <code>rename()</code> során a
-fájlrendszernek a kvótaszámlálást is frissítenie kell.</p>
+cél korábbi inode-ja azonban elveszít egy nevet; ha ez volt az utolsó
+név, és nincs nyitva, felszabadul, és a tulajdonos kvótája csökken.
+Ezért a <code>rename()</code> során a fájlrendszernek a kvótaszámlálást
+is frissítenie kell.</p>
 <h3 data-number="15.4.8"
 id="gyakorlati-labor-jogosultsági-mátrix-és-kvótaterv"><span
 class="header-section-number">15.4.8</span> 8. Gyakorlati labor:
@@ -586,9 +615,9 @@ eredményeket a vártaktól elkülönítve rögzítjük.</p>
 <h3 data-number="15.4.9" id="környezet"><span
 class="header-section-number">15.4.9</span> Környezet</h3>
 <ul>
-<li>Egy eldobható QEMU virtuális gép vagy Linux konténer, 2 GiB RAM, 1
-vCPU, 16 GiB virtuális lemez, ext4 fájlrendszer, <code>usrquota</code>
-és <code>grpquota</code> mount opciókkal.</li>
+<li>Egy eldobható QEMU virtuális gép, 2 GiB RAM, 1 vCPU, 16 GiB
+virtuális lemez, ext4 fájlrendszer, <code>usrquota</code> és
+<code>grpquota</code> mount opciókkal.</li>
 <li>A build- és futtatási parancsok a reprodukciós csomag részeként
 szerepelnek, például:</li>
 </ul>
@@ -625,9 +654,9 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="
 <p>A csoportokat a felhasználók előtt kell létrehozni, és a primer
 csoportot explicit meg kell adni; a <code>useradd -m</code>
 alapértelmezés szerint a felhasználóval azonos nevű privát csoportot
-hozhat létre, amitől a <code>chown alice:dev</code> és a csoportos
-jogosultságok nem a várt módon működnének. Az <code>id</code> kimenete
-rögzíti a tényleges primer és kiegészítő csoportokat.</p>
+hozhat létre, amitől a csoportos jogosultságok nem a várt módon
+működnének. Az <code>id</code> kimenete rögzíti a tényleges primer és
+kiegészítő csoportokat.</p>
 <ol start="2" type="1">
 <li><strong>Tesztfájlok létrehozása</strong>: hozzunk létre egy
 projektkönyvtárat <code>/srv/projekt</code> néven, tulajdonosa
@@ -635,13 +664,15 @@ projektkönyvtárat <code>/srv/projekt</code> néven, tulajdonosa
 <code>2770</code> (setgid bit a közös csoport örökléséhez, tulajdonos és
 csoport teljes jog, other semmi). Ezen belül hozzunk létre egy fájlt
 <code>secret.txt</code> néven, tulajdonosa <code>alice</code>, csoportja
-<code>alice</code>, mode <code>0600</code>. Ezután állítsunk be egy
-ACL-t, amely <code>bob</code>-nak olvasási jogot ad a fájlhoz:</li>
+<code>ops</code> (a setgid könyvtár <code>dev</code> csoportját
+szándékosan <code>ops</code>-ra írjuk felül), mode <code>0600</code>.
+Ezután állítsunk be egy ACL-t, amely <code>bob</code>-nak olvasási jogot
+ad a fájlhoz:</li>
 </ol>
 <div class="sourceCode" id="cb6"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">install</span> <span class="at">-d</span> <span class="at">-o</span> alice <span class="at">-g</span> dev <span class="at">-m</span> 2770 /srv/projekt</span>
 <span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">runuser</span> <span class="at">-u</span> alice <span class="at">--</span> sh <span class="at">-c</span> <span class="st">&#39;umask 077; printf &quot;%s\n&quot; titok &gt; /srv/projekt/secret.txt&#39;</span></span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> alice:alice /srv/projekt/secret.txt</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">chown</span> alice:ops /srv/projekt/secret.txt</span>
 <span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">chmod</span> 600 /srv/projekt/secret.txt</span>
 <span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="ex">setfacl</span> <span class="at">-m</span> u:bob:r-- /srv/projekt/secret.txt</span>
 <span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">getfacl</span> /srv/projekt/secret.txt</span>
@@ -653,7 +684,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="
 <p>A <code>secret.txt</code> létrehozása nem maradhat el: a
 <code>chown</code>/<code>chmod</code> egy nem létező fájlon hibát ad. A
 setgid könyvtárban a fájl csoportja alapból <code>dev</code> lenne,
-ezért a <code>chown alice:alice</code> szándékosan felülírja. A
+ezért a <code>chown alice:ops</code> szándékosan felülírja. A
 <code>/srv/lab-public</code> külön könyvtár arra kell, hogy carol
 beléphessen és listázhasson, de a <code>0600</code>-os
 <code>note.txt</code> olvasása fájlszinten bukjon el; így az
@@ -719,11 +750,29 @@ inode-okban 1000 soft limitet és 1200 hard limitet. A türelmi idő legyen
 60 másodperc. A parancs:</li>
 </ol>
 <div class="sourceCode" id="cb7"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># a kvotat a labor sajat, eldobhato fajlrendszeren kell bekapcsolni</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> <span class="at">-no</span> SOURCE,TARGET,FSTYPE,OPTIONS /srv/labmnt</span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">quotaon</span> <span class="at">-v</span> /srv/labmnt          <span class="co"># ha meg nem fut</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">setquota</span> <span class="at">-u</span> alice 102400 122880 1000 1200 /srv/labmnt</span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">quota</span> <span class="at">-u</span> alice</span></code></pre></div>
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0. A labor sajat, eldobhato, kvotas fajlrendszere (a vendegben, rootkent)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">truncate</span> <span class="at">-s</span> 512M /var/tmp/labq.img</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">mkfs.ext4</span> <span class="at">-F</span> <span class="at">-O</span> quota /var/tmp/labq.img</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /srv/labmnt</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="fu">mount</span> <span class="at">-o</span> loop,usrquota,grpquota /var/tmp/labq.img /srv/labmnt</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /srv/labmnt/alice <span class="kw">&amp;&amp;</span> <span class="fu">chown</span> alice:dev /srv/labmnt/alice</span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="ex">quotaon</span> <span class="at">-v</span> /srv/labmnt</span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a><span class="co"># a kvotat a labor sajat fajlrendszeren kell bekapcsolni</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a><span class="ex">findmnt</span> <span class="at">-no</span> SOURCE,TARGET,FSTYPE,OPTIONS /srv/labmnt</span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="ex">setquota</span> <span class="at">-u</span> alice 102400 122880 1000 1200 /srv/labmnt</span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="ex">setquota</span> <span class="at">-t</span> 60 60 /srv/labmnt   <span class="co"># turelmi ido: 60 s (blokk, inode)</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="ex">quota</span> <span class="at">-u</span> alice</span></code></pre></div>
+<p>A fenti 0. lépést (a kvótás fájlrendszer létrehozása) a 2. lépés
+előtt kell végrehajtani, és az <code>/srv/projekt</code> a teszt-írási
+könyvtárral együtt a kvótás fájlrendszeren (<code>/srv/labmnt</code>)
+legyen: a 2. lépés <code>/srv/projekt</code> útvonalai ennek megfelelően
+<code>/srv/labmnt/projekt</code>-re módosítandók; a parancsok a vendég
+eldobható lemezképén futnak, a <code>quotacheck -cug</code> az ext4
+<code>quota</code> feature nélkül szükséges. A soft limit átlépése után
+60 s-on belül kell elérni a hard limitet, különben a türelmi idő lejárta
+miatt már a soft limitnél <code>EDQUOT</code> jön (a parancsokat nem
+futtattam, a pontos kimenet a vendég eszközeitől függ).</p>
 <p>A <code>/dev/vda1</code> nem használható vakon: a tényleges eszköz-
 és mountpont a laborlemeztől függ, és a kvótát csak kvóta-támogatással
 mountolt fájlrendszeren lehet beállítani. A mount opciók között legyen
@@ -735,7 +784,8 @@ blokkok 1 KiB egységek, ezért a 100 MiB = 102400 blokk, a 120 MiB =
 <ol start="5" type="1">
 <li><strong>Tesztelés</strong>: bejelentkezünk <code>alice</code>
 felhasználóval, és egy egyszerű C programmal vagy <code>dd</code>-vel
-fájlokat hozunk létre a <code>/home/alice</code> könyvtárban. A mért
+fájlokat hozunk létre az <code>/srv/labmnt/alice</code> könyvtárban (a
+kvótás fájlrendszeren, <code>alice</code> tulajdonában). A mért
 eredmények:</li>
 </ol>
 <ul>
@@ -785,12 +835,12 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="
 <span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="ex">runuser</span> <span class="at">-u</span> alice <span class="at">--</span> mv /srv/projekt/a.txt /srv/projekt/b.txt</span>
 <span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="fu">stat</span> <span class="at">-c</span> <span class="st">&#39;%i %n&#39;</span> /srv/projekt/b.txt</span>
 <span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="ex">quota</span> <span class="at">-u</span> alice</span></code></pre></div>
-<p>A forrás inode-száma megmarad, csak a neve változik; a cél inode-ja
-felszabadul, ezért a <code>stat</code> inode-száma és a
-<code>quota</code> kimenete együtt igazolja a szemantikát. Az
-<code>EXDEV</code> esetet külön kell tesztelni, például
-<code>/dev/shm</code> tmpfs-re másolva: ilyenkor a <code>mv</code>
-másolásra esik vissza, és a művelet nem atomi.</p>
+<p>A forrás inode-száma megmarad, csak a neve változik; a cél korábbi
+inode-ja (ha az utolsó név volt, és nincs nyitva) felszabadul, ezért a
+<code>stat</code> inode-száma és a <code>quota</code> kimenete együtt
+igazolja a szemantikát. Az <code>EXDEV</code> esetet külön kell
+tesztelni, például <code>/dev/shm</code> tmpfs-re másolva: ilyenkor a
+<code>mv</code> másolásra esik vissza, és a művelet nem atomi.</p>
 <p>A labor végén a mért adatokat táblázatban összefoglaljuk, és a várt
 értékekkel összehasonlítjuk. A konfigurációt és a mérési naplót a
 reprodukciós csomag tartalmazza.</p>
@@ -960,6 +1010,32 @@ milyen hibakódot ad vissza ilyenkor?</li>
 <li>Milyen kockázatai vannak a setuid bitnek, és hogyan csökkenthető a
 privilégiumok kiszivárgása?</li>
 </ol>
+<p><strong>Válaszok röviden:</strong></p>
+<ol type="1">
+<li><code>alice</code> (tulajdonos, <code>rw-</code>): olvashat és
+írhat; <code>bob</code> (a <code>dev</code> tagja, <code>r--</code>):
+csak olvashat; <code>carol</code> (other, <code>---</code>): semmit nem
+tehet (<code>EACCES</code>). Végrehajtani senki nem tudja, mert nincs
+<code>x</code> bit.</li>
+<li>A soft limit átléphető a türelmi idő végéig (figyelmeztetéssel); a
+hard limit abszolút korlát, átlépéskor <code>EDQUOT</code>. A türelmi
+idő azt adja meg, mennyi ideig maradhat a használat a soft limit fölött;
+lejárta után a soft limit is tiltja az újabb foglalást.</li>
+<li>Ha a fájlon van ACL-maszk, a <code>chmod g-w</code> a
+csoport-osztály bitjeit, azaz a maszkot módosítja, nem az egyes
+bejegyzéseket: minden nevesített felhasználó- és csoportbejegyzés
+effektív joga a maszkkal metszve elveszíti a <code>w</code>-t, a
+bejegyzések maguk nem változnak.</li>
+<li>A <code>rename()</code> egy fájlrendszeren belül egy
+könyvtárbejegyzést cserél, ez atomi; két fájlrendszer között az inode
+nem vihető át, ezért <code>EXDEV</code> hibát ad, és a <code>mv</code>
+másolásra és törlésre esik vissza, ami nem atomi.</li>
+<li>A setuid program a tulajdonos jogán fut, ezért egy sebezhetősége
+teljes jogosultság-átvételhez vezethet. Csökkentés: minimális
+jogosultság, a jog azonnali lemondása a nem megbízható adat előtt,
+finomabb képességek használata, <code>nosuid</code> mount, gondos
+bemenet-ellenőrzés.</li>
+</ol>
 <p>A fenti kérdések megválaszolása segít ellenőrizni, hogy a
 hozzáférés-vezérlés és az erőforrás-korlátok alapelvei világosak-e. A
 következő alfejezet (<a href="os058.html">FAT, ext4 és XFS</a>) a
@@ -968,5 +1044,5 @@ itt bevezetett jogosultsági és kvótafogalmakra.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="os056.html">← 15.3 Fájlallokáció: FAT, inode és extent</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="os058.html">16.1 FAT, ext4 és XFS →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>
