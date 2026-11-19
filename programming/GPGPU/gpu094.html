@@ -444,15 +444,19 @@ vagy annak megfelelő)</li>
 <li>OS: Ubuntu 22.04 LTS</li>
 <li>Fordító: nvcc 12.4, C++17</li>
 </ul>
-<p>A kódban a hibakezeléshez saját makrót használunk, amely ellenőrzi a
-<code>cudaGetLastError</code>-t és a szinkronizációt.</p>
+<p>A hibakezeléshez a kanonikus <code>CUDA_CHECK</code> makrót
+használjuk, amely a kapott hívás visszatérési értékét ellenőrzi; a
+kernelindítás után külön <code>CUDA_CHECK(cudaGetLastError())</code>
+áll.</p>
 <h3 data-number="25.1.8" id="forráskód"><span
 class="header-section-number">25.1.8</span> Forráskód</h3>
 <pre class="cuda"><code>// stream_event_lab.cu
 // CUDA C++17
 // Streamek és események labor
 #include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
 #include &lt;iostream&gt;
+#include &lt;string&gt;
 #include &lt;vector&gt;
 #include &lt;cmath&gt;
 #include &lt;cstdlib&gt;
@@ -460,7 +464,7 @@ class="header-section-number">25.1.8</span> Forráskód</h3>
 // Hibakezelő makró
 #define CUDA_CHECK(call)                                                        \
     do {                                                                         \
-        cudaError_t err = call;                                                  \
+        cudaError_t err = (call);                                                \
         if (err != cudaSuccess) {                                                \
             std::cerr &lt;&lt; &quot;CUDA error at &quot; &lt;&lt; __FILE__ &lt;&lt; &quot;:&quot; &lt;&lt; __LINE__         \
                       &lt;&lt; &quot;: &quot; &lt;&lt; cudaGetErrorString(err) &lt;&lt; std::endl;           \
@@ -499,10 +503,8 @@ int main() {
         CUDA_CHECK(cudaStreamCreateWithFlags(&amp;streams[i], cudaStreamNonBlocking));
     }
 
-    cudaEvent_t start_events[num_streams];
     cudaEvent_t stop_events[num_streams];
     for (int i = 0; i &lt; num_streams; ++i) {
-        CUDA_CHECK(cudaEventCreate(&amp;start_events[i]));
         CUDA_CHECK(cudaEventCreate(&amp;stop_events[i]));
     }
 
@@ -510,37 +512,62 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice));
 
-    // Több streamen indítjuk a kerneleket, mindegyik a saját szeletén
-    for (int i = 0; i &lt; num_streams; ++i) {
-        int offset = i * chunk_size;
-        CUDA_CHECK(cudaEventRecord(start_events[i], streams[i]));
-        // A kernelindítás az adott streamben
-        int threads = 256;
-        int blocks = (chunk_size + threads - 1) / threads;
-        vectorAdd&lt;&lt;&lt;blocks, threads, 0, streams[i]&gt;&gt;&gt;(
-            d_A + offset, d_B + offset, d_C + offset, chunk_size);
-        CUDA_CHECK(cudaGetLastError()); // kernelindítási hibák ellenőrzése
-        CUDA_CHECK(cudaEventRecord(stop_events[i], streams[i]));
-    }
-
-    // Egy esemény a szinkronizációhoz: az utolsó stream megvárja az összes többi
-    // stream stop eseményét, majd ezen a streamen rögzítjük az all_done eseményt.
+    // Mérés: 5 warm-up + 20 mért ismétlés. A közös t_begin esemény a streams[0]-on
+    // van, a többi stream megvárja, így minden idő közös nullponthoz mérhető.
+    const int warmup = 5, reps = 20;
     const int last = num_streams - 1;
-    cudaEvent_t all_done;
+    cudaEvent_t t_begin, all_done;
+    CUDA_CHECK(cudaEventCreate(&amp;t_begin));
     CUDA_CHECK(cudaEventCreate(&amp;all_done));
-    for (int i = 0; i &lt; last; ++i) {
-        CUDA_CHECK(cudaStreamWaitEvent(streams[last], stop_events[i], 0));
+    std::vector&lt;std::vector&lt;float&gt;&gt; t(num_streams);
+    std::vector&lt;float&gt; t_total;
+    for (int rep = 0; rep &lt; warmup + reps; ++rep) {
+        CUDA_CHECK(cudaEventRecord(t_begin, streams[0]));
+        for (int i = 1; i &lt; num_streams; ++i) {
+            CUDA_CHECK(cudaStreamWaitEvent(streams[i], t_begin, 0));
+        }
+        // Több streamen indítjuk a kerneleket, mindegyik a saját szeletén
+        for (int i = 0; i &lt; num_streams; ++i) {
+            int offset = i * chunk_size;
+            int threads = 256;
+            int blocks = (chunk_size + threads - 1) / threads;
+            vectorAdd&lt;&lt;&lt;blocks, threads, 0, streams[i]&gt;&gt;&gt;(
+                d_A + offset, d_B + offset, d_C + offset, chunk_size);
+            CUDA_CHECK(cudaGetLastError()); // kernelindítási hibák ellenőrzése
+            CUDA_CHECK(cudaEventRecord(stop_events[i], streams[i]));
+        }
+        // Az utolsó stream megvárja az összes többi stream stop eseményét,
+        // majd ezen a streamen rögzítjük az all_done eseményt.
+        for (int i = 0; i &lt; last; ++i) {
+            CUDA_CHECK(cudaStreamWaitEvent(streams[last], stop_events[i], 0));
+        }
+        CUDA_CHECK(cudaEventRecord(all_done, streams[last]));
+        // Az all_done csak akkor teljesül, ha mind a négy stream munkája kész.
+        CUDA_CHECK(cudaEventSynchronize(all_done));
+        if (rep &lt; warmup) continue;                  // a warm-up futásokat eldobjuk
+        for (int i = 0; i &lt; num_streams; ++i) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&amp;ms, t_begin, stop_events[i]));
+            t[i].push_back(ms);
+        }
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&amp;total_ms, t_begin, all_done));
+        t_total.push_back(total_ms);
     }
-    CUDA_CHECK(cudaEventRecord(all_done, streams[last]));
-    // Az all_done csak akkor teljesül, ha mind a négy stream munkája kész.
-    CUDA_CHECK(cudaEventSynchronize(all_done));
 
-    // Események közötti idők kiszámítása
+    // Medián és IQR (ms) a közös nullponttól mért befejezési időkre
+    auto report = [](const char* name, std::vector&lt;float&gt; v) {
+        std::sort(v.begin(), v.end());
+        int n = static_cast&lt;int&gt;(v.size());
+        float med = 0.5f * (v[n / 2 - 1] + v[n / 2]);
+        float iqr = v[3 * n / 4] - v[n / 4];
+        std::cout &lt;&lt; name &lt;&lt; &quot; medián: &quot; &lt;&lt; med &lt;&lt; &quot; ms (IQR &quot; &lt;&lt; iqr &lt;&lt; &quot; ms)&quot;
+                  &lt;&lt; std::endl;
+    };
     for (int i = 0; i &lt; num_streams; ++i) {
-        float elapsed_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&amp;elapsed_ms, start_events[i], stop_events[i]));
-        std::cout &lt;&lt; &quot;Stream &quot; &lt;&lt; i &lt;&lt; &quot; idő: &quot; &lt;&lt; elapsed_ms &lt;&lt; &quot; ms&quot; &lt;&lt; std::endl;
+        report((&quot;Stream &quot; + std::to_string(i) + &quot; befejezés&quot;).c_str(), t[i]);
     }
+    report(&quot;Teljes futásidő (t_begin -&gt; all_done)&quot;, t_total);
 
     // Eredmény visszamásolása és ellenőrzése
     CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, bytes, cudaMemcpyDeviceToHost));
@@ -557,10 +584,10 @@ int main() {
 
     // Takarítás
     for (int i = 0; i &lt; num_streams; ++i) {
-        CUDA_CHECK(cudaEventDestroy(start_events[i]));
         CUDA_CHECK(cudaEventDestroy(stop_events[i]));
         CUDA_CHECK(cudaStreamDestroy(streams[i]));
     }
+    CUDA_CHECK(cudaEventDestroy(t_begin));
     CUDA_CHECK(cudaEventDestroy(all_done));
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
@@ -569,9 +596,12 @@ int main() {
     return 0;
 }</code></pre>
 <p>A kódban megfigyelhető, hogy a kerneleket négy különböző streamben
-indítjuk, mindegyik a saját adatszeletén dolgozik. Az eseményeket minden
-stream elején és végén rögzítjük, így megmérhetjük az egyes streamek
-futási idejét. A streamek közötti szinkronizációhoz egy
+indítjuk, mindegyik a saját adatszeletén dolgozik. A közös
+<code>t_begin</code> eseményt a <code>streams[0]</code>-on rögzítjük, a
+többi stream megvárja, a <code>stop_events[i]</code> pedig minden stream
+végén rögzül; az <code>i</code>-edik stream mért ideje így a közös
+kezdettől az adott stream munkájának végéig tart, nem a saját kernel
+futásideje. A streamek közötti szinkronizációhoz egy
 <code>all_done</code> eseményt használunk: az utolsó stream megvárja a
 másik három stream <code>stop_events[i]</code> eseményét
 (<code>cudaStreamWaitEvent</code>), majd az utolsó streamen rögzítjük az
@@ -582,36 +612,58 @@ teljesül, ha mind a négy stream befejeződött; a host a
 <code>cudaEventSynchronize</code> segítségével várja meg. Ezután a
 <code>cudaEventElapsedTime</code> hívások már teljesült eseményekre
 vonatkoznak, és a (default streamen végzett) visszamásolás is csak a
-kész kernelek után indul. A korábbi, hibás változatban minden stream a
-<em>3.</em> stream eseményére várt, az <code>all_done</code> pedig csak
-a 3. streamen volt rögzítve, így a 0–2. stream befejezését senki nem
-várta meg; ez versenyhelyzethez és <code>cudaErrorNotReady</code>
-hibához vezethetett. Egyszerűbb, de durvább alternatíva a
+kész kernelek után indul. Tipikus hiba, ha minden stream ugyanannak az
+egy streamnek az eseményére vár, és az <code>all_done</code>-t csak ott
+rögzítjük: ekkor a többi stream befejezését senki nem várja meg, a
+<code>cudaEventElapsedTime</code> <code>cudaErrorNotReady</code>-vel
+térhet vissza. Egyszerűbb, de durvább alternatíva a
 <code>cudaDeviceSynchronize()</code>, illetve minden stream
 <code>cudaStreamSynchronize</code>-ja.</p>
+<figure id="fig-gpu094-stream-events">
+<div class="fig-interactive"><iframe src="figures/html/gpu094-stream-events.html" title="Két idővonal. Felül Host, Stream 0–3 és GPU sáv: a host kiadja a parancsokat, majd a cudaEventSynchronize-ban vár. A stream-sávokon a start háromszögek mind a nulla közelében, a stop körök 0,2, 0,4, 0,6 és 0,8 ms körül; kapcsos jelölés mutatja a 0,20, 0,39, 0,58 és 0,77 ms-os streamidőket. A GPU-sávban a K0–K3 kernelek egymás után. Három szaggatott nyíl fut a 0–2. stream stop eseményéből a 3. stream all_done csillagába. Alul ugyanez flag nélküli streamekkel: a K1 után kiadott szinkron cudaMemcpy a default streamen megvárja a K0-t és a K1-et, a K2 és a K3 pedig csak utána indulhat; a host a másolás alatt blokkol." loading="lazy" style="width:100%;border:0;height:760px"></iframe><noscript><img src="figures/img/gpu094-stream-events.png" style="width:100.0%"
+alt="Két idővonal. Felül Host, Stream 0–3 és GPU sáv: a host kiadja a parancsokat, majd a cudaEventSynchronize-ban vár. A stream-sávokon a start háromszögek mind a nulla közelében, a stop körök 0,2, 0,4, 0,6 és 0,8 ms körül; kapcsos jelölés mutatja a 0,20, 0,39, 0,58 és 0,77 ms-os streamidőket. A GPU-sávban a K0–K3 kernelek egymás után. Három szaggatott nyíl fut a 0–2. stream stop eseményéből a 3. stream all_done csillagába. Alul ugyanez flag nélküli streamekkel: a K1 után kiadott szinkron cudaMemcpy a default streamen megvárja a K0-t és a K1-et, a K2 és a K3 pedig csak utána indulhat; a host a másolás alatt blokkol." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu094-stream-events.png" style="width:100.0%"
+alt="Két idővonal. Felül Host, Stream 0–3 és GPU sáv: a host kiadja a parancsokat, majd a cudaEventSynchronize-ban vár. A stream-sávokon a start háromszögek mind a nulla közelében, a stop körök 0,2, 0,4, 0,6 és 0,8 ms körül; kapcsos jelölés mutatja a 0,20, 0,39, 0,58 és 0,77 ms-os streamidőket. A GPU-sávban a K0–K3 kernelek egymás után. Három szaggatott nyíl fut a 0–2. stream stop eseményéből a 3. stream all_done csillagába. Alul ugyanez flag nélküli streamekkel: a K1 után kiadott szinkron cudaMemcpy a default streamen megvárja a K0-t és a K1-et, a K2 és a K3 pedig csak utána indulhat; a host a másolás alatt blokkol." /></details></div>
+<figcaption>Streamenkénti események, streamközi várakozás és az
+<code>all_done</code> esemény a labor programjában (elméleti modell,
+illusztratív arányok, nem mérés): a négy start esemény szinte egyszerre,
+a négy stop esemény lépcsőzetesen teljesül, mert a nagy kernelek a GPU-n
+egymás után futnak; az eseménypár így a közös kezdettől a stream
+munkájának végéig mér. Alul: flag nélküli streamek és egy közbeszúrt,
+legacy default streames <code>cudaMemcpy</code> „falat” húz a streamek
+közé.</figcaption>
+</figure>
 <p>A program kimenetének alakja (az értékek helyőrzők, a labor nem
 került futtatásra; a mért naplót a hallgató tölti ki):</p>
-<pre><code>Stream 0 idő: &lt;mért – kitöltendő&gt; ms
-Stream 1 idő: &lt;mért – kitöltendő&gt; ms
-Stream 2 idő: &lt;mért – kitöltendő&gt; ms
-Stream 3 idő: &lt;mért – kitöltendő&gt; ms
-Az eredmény helyes.</code></pre>
-<p>Várt viselkedés (nem mérés): a négy stream közel azonos időt vesz
-igénybe, mivel a feladat egyenletesen oszlik meg; a teljes futási idő
-nem feltétlenül a leglassabb stream idejének négyszerese, mert a
-streamek átfedésben futhatnak. A kernelindítás első hívása
-modulbetöltési költséget is tartalmazhat, ezért a méréshez warm-up (egy
-eldobott futás) szükséges.</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">Stream</span> 0 befejezés medián: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">Stream</span> 1 befejezés medián: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">Stream</span> 2 befejezés medián: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="ex">Stream</span> 3 befejezés medián: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="ex">Teljes</span> futásidő medián: <span class="op">&lt;</span>mért – kitöltendő<span class="op">&gt;</span> ms <span class="er">(</span><span class="ex">IQR</span> <span class="op">&lt;</span>kitöltendő<span class="op">&gt;</span> ms<span class="kw">)</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="ex">Az</span> eredmény helyes.</span></code></pre></div>
+<p>Várt viselkedés (nem mérés): nagy (itt 4 Mi elemes) kerneleknél
+egyetlen kernel is kitölti a GPU-t, így a négy kernel a gyakorlatban
+egymás után fut. Mivel a négy start esemény szinte egyszerre teljesül,
+az i. stream mért ideje az előtte sorra kerülő kernelek idejét is
+tartalmazza: a mért értékek jellemzően lépcsőzetesen nőnek (≈ 1×, 2×,
+3×, 4× egy kernelidő), és a 3. stream ideje közelíti a teljes futásidőt.
+A streamenkénti eseménypár tehát a stream munkájának befejezési idejét
+méri a közös kezdettől, nem a saját kernel futásidejét. Valódi átfedés
+csak akkor látszik, ha a kernelek egyenként nem telítik a GPU-t (kevés
+blokk), vagy ha másolás és számítás fedi át egymást (25.2). Az első
+kernelindítás modulbetöltési költséget is tartalmazhat, ezért van a
+mérés előtt warm-up.</p>
 <p>A labor fordítási parancsa:</p>
 <div class="sourceCode" id="cb12"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-o</span> stream_event_lab stream_event_lab.cu</span></code></pre></div>
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-std</span><span class="op">=</span>c++17 <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> stream_event_lab stream_event_lab.cu</span></code></pre></div>
 <p>A futtatás:</p>
 <div class="sourceCode" id="cb13"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./stream_event_lab</span></span></code></pre></div>
-<p>A méréshez a fenti kódot egy eldobott (warm-up) futás után legalább
-öt-tíz alkalommal le kell futtatni, és az átlagot, valamint a szórást
-rögzíteni kell. Az itt szereplő napló csak formátumminta, mért értéket
-nem tartalmaz.</p>
+<p>A program 5 warm-up után 20 ismétlést mér a programon belül, és
+mediánt és IQR-t közöl (a könyv mérési protokollja); a cél-architektúrát
+(<code>-arch</code>) a saját GPU compute capability-je szerint kell
+megadni. Az itt szereplő napló csak formátumminta, mért értéket nem
+tartalmaz.</p>
 <h3 data-number="25.1.9" id="önellenőrző-kérdések"><span
 class="header-section-number">25.1.9</span> Önellenőrző kérdések</h3>
 <ol type="1">
@@ -653,5 +705,5 @@ aszinkronitást.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu093.html">← 24.4 Memória és pontosság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu095.html">25.2 Adatmozgatás és számítás átfedése →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

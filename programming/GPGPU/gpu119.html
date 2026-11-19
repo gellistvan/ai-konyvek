@@ -73,7 +73,7 @@ műveleteket. Ez teszi lehetővé, hogy a CPU előre dolgozzon, miközben a
 GPU még a korábbi feladatokat végzi. Az Nsight Systems idővonalán ezt
 úgy látjuk, hogy a CPU API-hívásai rövidek, és a GPU oldalán a kernelek
 később kezdődnek, esetleg átfedésben más streamek műveleteivel.</p>
-<p>A CUDA API-hívások két nagy csoportra oszthatók:</p>
+<p>A CUDA API-hívások három csoportra oszthatók:</p>
 <ul>
 <li><strong>Vezérlő hívások</strong>: <code>cudaLaunchKernel</code>,
 <code>cudaMemcpyAsync</code>, <code>cudaMemsetAsync</code>. Ezek
@@ -146,8 +146,10 @@ eseményekkel finomabban vezérelhető a szinkronizáció. A
 események lehetővé teszik más streamek közötti függőségek létrehozását
 anélkül, hogy a teljes eszközt blokkolnánk.</li>
 </ul>
-<p>Az Nsight Systems idővonalán a szinkronizációs hívások sárga sávként
-jelennek meg a CPU szálon, és gyakran látható, hogy a GPU eközben
+<p>Az Nsight Systems idővonalán a szinkronizációs hívások a CPU-szál
+CUDA API sorában hosszú
+<code>cudaStreamSynchronize</code>/<code>cudaDeviceSynchronize</code>
+sávként jelennek meg, és gyakran látható, hogy a GPU eközben
 üresjáratban van. Ha a GPU sávjában hosszú üres szakaszok vannak, akkor
 érdemes megkeresni az őket megelőző CPU-oldali szinkronizációs
 hívást.</p>
@@ -201,10 +203,34 @@ streames feldolgozás</strong>:</p>
 <li>Az egyes streamek műveletei átfedhetik egymást: amíg az egyik stream
 kernelje fut, a másik stream H2D másolása a PCIe buszon dolgozik.</li>
 </ol>
+<p>Az alábbi sematikus, nsys-szerű idővonal a következő példaprogram
+négy szeletére mutatja, mit kell látni a Kernels és a Memory sorokban
+egy és négy stream, egy és két másolómotor, illetve pageable host
+memória esetén.</p>
+<figure id="fig-gpu119-atfedes-idovonal">
+<div class="fig-interactive"><iframe src="figures/html/gpu119-atfedes-idovonal.html" title="Egy streamnél 12 soros művelet; négy streammel és két másolómotorral a H2D és a D2H egyidejűleg fut, a teljes idő kb. 0,86 ms-ra csökken." loading="lazy" style="width:100%;border:0;height:480px"></iframe><noscript><img src="figures/img/gpu119-atfedes-idovonal.png" style="width:100.0%"
+alt="Egy streamnél 12 soros művelet; négy streammel és két másolómotorral a H2D és a D2H egyidejűleg fut, a teljes idő kb. 0,86 ms-ra csökken." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu119-atfedes-idovonal.png" style="width:100.0%"
+alt="Egy streamnél 12 soros művelet; négy streammel és két másolómotorral a H2D és a D2H egyidejűleg fut, a teljes idő kb. 0,86 ms-ra csökken." /></details></div>
+<figcaption>Másolás–számítás átfedés az idővonalon: egy streamnél 12
+soros művelet (1,4 ms), négy streammel és két másolómotorral a H2D és a
+D2H egyidejűleg fut (kb. 0,86 ms); sematikus, levezetett
+mintaidők</figcaption>
+</figure>
 <p>Ha a streameket helyesen állítjuk be, az idővonalon azt látjuk, hogy
 a Kernels és a Memory sorok sávjai időben átfedve jelennek meg. A teljes
 futási idő így jelentősen csökkenhet a szekvenciális végrehajtáshoz
 képest.</p>
+<p>Az átfedés nyereségének felső korlátja: T_seq = Σ(H2D + K + D2H),
+T_átfedés ≥ max(ΣH2D, ΣD2H, ΣK). Ha a kernel a másolásnál sokkal
+rövidebb, mint a lenti példában (néhány µs, szemben a szeletenkénti ~0,2
+ms-os másolással; a számok becslések, ellenőrzendők), a nyereség szinte
+csak a H2D és a D2H párhuzamosságából jön (két másolómotor kell hozzá),
+legfeljebb ~2×; kernel–másolás átfedés ilyenkor alig látszik. A
+kernelidő a példában az <code>iters</code> paraméterrel növelhető
+(<code>for (int k = 0; k &lt; iters; ++k) v = v * scale + 1e-7f;</code>),
+hogy a kernelidő a szeletmásolás idejével összemérhető legyen (az
+<code>nsys</code> <code>cuda_gpu_kern_sum</code> és
+<code>cuda_gpu_mem_time_sum</code> alapján hangolva).</p>
 <h3 data-number="31.2.5"
 id="példaprogram-több-stream-és-aszinkron-másolás"><span
 class="header-section-number">31.2.5</span> Példaprogram: több stream és
@@ -215,13 +241,17 @@ egyszerű vektor-skálázást végez, de a hangsúly a stream-kezelésen
 van.</p>
 <pre class="cuda"><code>// File: stream_overlap.cu
 // Fordítás: nvcc -std=c++17 -O3 stream_overlap.cu -o stream_overlap
-// Futtatás: ./stream_overlap
+// Futtatás: ./stream_overlap 1   (baseline)   és   ./stream_overlap 4
 // Környezet (helyőrző, nem futtatott): CUDA 12.3, NVIDIA A100 40 GB PCIe (cc 8.0),
-//            driver 545.23.08, Ubuntu 22.04; power limit/ECC/MIG: nvidia-smi alapján rögzítendő.
+//            driver 545.23.08, Ubuntu 22.04;
+//            power limit/ECC/MIG: nvidia-smi alapján rögzítendő.
 
 #include &lt;cuda_runtime.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
 #include &lt;iostream&gt;
 #include &lt;cstdlib&gt;
+#include &lt;vector&gt;
 
 // Hibakezelő makró
 #define CUDA_CHECK(call)                                                      \
@@ -243,11 +273,15 @@ __global__ void scale_kernel(const float* __restrict__ input,
     }
 }
 
-int main() {
-    constexpr int num_streams = 4;
+int main(int argc, char** argv) {
+    // Használat: ./stream_overlap [1|4]; az 1 a szekvenciális baseline, a 4 az átfedő változat
+    const int ns = (argc &gt; 1) ? std::atoi(argv[1]) : 4;
+    if (ns != 1 &amp;&amp; ns != 4) { std::cerr &lt;&lt; &quot;num_streams: 1 vagy 4\n&quot;; return 1; }
+    constexpr int num_chunks = 4;              // a szeletek száma nem függ a streamek számától
     constexpr int chunk_size = 1 &lt;&lt; 20;        // 1 Mi elemenként
-    constexpr int total_size = num_streams * chunk_size;
+    constexpr int total_size = num_chunks * chunk_size;
     constexpr size_t bytes_per_chunk = chunk_size * sizeof(float);
+    constexpr int warmup = 5, reps = 20;
 
     // Host memória: page-locked (pinned), enélkül nincs valódi másolás–számítás átfedés
     float *h_input, *h_output;
@@ -262,8 +296,8 @@ int main() {
     CUDA_CHECK(cudaMalloc(&amp;d_output, total_size * sizeof(float)));
 
     // Stream-ek létrehozása non-blocking flaggel
-    cudaStream_t streams[num_streams];
-    for (int i = 0; i &lt; num_streams; ++i) {
+    cudaStream_t streams[num_chunks];
+    for (int i = 0; i &lt; ns; ++i) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&amp;streams[i], cudaStreamNonBlocking));
     }
 
@@ -272,49 +306,50 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&amp;start));
     CUDA_CHECK(cudaEventCreate(&amp;stop));
 
-    // Warm-up: hideg indítás (kontextus, modulbetöltés) kizárása a mérésből
-    scale_kernel&lt;&lt;&lt;1, 256, 0, streams[0]&gt;&gt;&gt;(d_input, d_output, scale, 256);
-    CUDA_CHECK(cudaGetLastError());
+    // Egy teljes pipeline-futás: a szeletek a streamek között körben (i % ns) oszlanak el
+    auto run_pipeline = [&amp;]() {
+        for (int i = 0; i &lt; num_chunks; ++i) {
+            cudaStream_t st = streams[i % ns];
+            CUDA_CHECK(cudaMemcpyAsync(d_input + i * chunk_size,
+                                       h_input + i * chunk_size,
+                                       bytes_per_chunk,
+                                       cudaMemcpyHostToDevice, st));
+            int threads = 256;
+            int blocks = (chunk_size + threads - 1) / threads;
+            scale_kernel&lt;&lt;&lt;blocks, threads, 0, st&gt;&gt;&gt;(
+                d_input + i * chunk_size, d_output + i * chunk_size,
+                scale, chunk_size);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpyAsync(h_output + i * chunk_size,
+                                       d_output + i * chunk_size,
+                                       bytes_per_chunk,
+                                       cudaMemcpyDeviceToHost, st));
+        }
+        for (int i = 0; i &lt; ns; ++i) {
+            CUDA_CHECK(cudaStreamSynchronize(streams[i]));
+        }
+    };
+
+    // Warm-up: 5 teljes pipeline-futás (másolóút, pinned pufferek, modulbetöltés)
+    for (int r = 0; r &lt; warmup; ++r) run_pipeline();
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // A start esemény a munka kiadása előtt, a teljes eszköz kiürítése után kerül rögzítésre
-    CUDA_CHECK(cudaEventRecord(start, 0));
-
-    // Minden stream feldolgozza a saját szeletét
-    for (int i = 0; i &lt; num_streams; ++i) {
-        // H2D másolás aszinkron
-        CUDA_CHECK(cudaMemcpyAsync(d_input + i * chunk_size,
-                                   h_input + i * chunk_size,
-                                   bytes_per_chunk,
-                                   cudaMemcpyHostToDevice,
-                                   streams[i]));
-
-        // Kernel indítás
-        int threads = 256;
-        int blocks = (chunk_size + threads - 1) / threads;
-        scale_kernel&lt;&lt;&lt;blocks, threads, 0, streams[i]&gt;&gt;&gt;(
-            d_input + i * chunk_size,
-            d_output + i * chunk_size,
-            scale,
-            chunk_size);
-
-        // D2H másolás aszinkron
-        CUDA_CHECK(cudaMemcpyAsync(h_output + i * chunk_size,
-                                   d_output + i * chunk_size,
-                                   bytes_per_chunk,
-                                   cudaMemcpyDeviceToHost,
-                                   streams[i]));
+    // 20 mért futás; a start/stop a legacy default streamen, a teljes eszköz kiürítése után
+    std::vector&lt;float&gt; ms(reps);
+    for (int r = 0; r &lt; reps; ++r) {
+        CUDA_CHECK(cudaEventRecord(start, 0));
+        run_pipeline();
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms[r], start, stop));
     }
-
-    // Várakozás minden stream befejezésére
-    for (int i = 0; i &lt; num_streams; ++i) {
-        CUDA_CHECK(cudaStreamSynchronize(streams[i]));
-    }
-
-    CUDA_CHECK(cudaEventRecord(stop, 0));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float elapsed_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&amp;elapsed_ms, start, stop));
+    double mean = 0.0, var = 0.0;
+    for (float t : ms) mean += t;
+    mean /= reps;
+    for (float t : ms) var += (t - mean) * (t - mean);
+    double sd = std::sqrt(var / (reps - 1));
+    std::sort(ms.begin(), ms.end());
+    double median = 0.5 * (ms[reps / 2 - 1] + ms[reps / 2]);
 
     // Ellenőrzés
     for (int i = 0; i &lt; total_size; ++i) {
@@ -324,11 +359,11 @@ int main() {
         }
     }
 
-    std::cout &lt;&lt; &quot;Total time with &quot; &lt;&lt; num_streams &lt;&lt; &quot; streams: &quot;
-              &lt;&lt; elapsed_ms &lt;&lt; &quot; ms&quot; &lt;&lt; std::endl;
+    std::cout &lt;&lt; &quot;Streams: &quot; &lt;&lt; ns &lt;&lt; &quot;, medián: &quot; &lt;&lt; median &lt;&lt; &quot; ms, szórás: &quot;
+              &lt;&lt; sd &lt;&lt; &quot; ms&quot; &lt;&lt; std::endl;
 
     // Takarítás
-    for (int i = 0; i &lt; num_streams; ++i) {
+    for (int i = 0; i &lt; ns; ++i) {
         CUDA_CHECK(cudaStreamDestroy(streams[i]));
     }
     CUDA_CHECK(cudaFree(d_input));
@@ -346,12 +381,15 @@ default stream miatti implicit szinkronizációt. A host pufferek pinned
 memóriák (<code>cudaMallocHost</code>), a <code>cudaMemcpyAsync</code>
 hívások mindegyike a megfelelő streamhez van rendelve, így a másolások
 (megfelelő másolómotorokkal) párhuzamosan futhatnak a kernelekkel. A
-<code>start</code> esemény a default streamben van rögzítve a
-<code>cudaDeviceSynchronize</code> után, a <code>stop</code> pedig
-azután, hogy a host minden streamet megvárt, így a mért idő a teljes
-pipeline-t fedi. A kernel indítások is ugyanabban a streamben vannak,
-így a streamen belül a sorrend garantált: H2D, majd kernel, majd
-D2H.</p>
+program 5 warm-up és 20 mért pipeline-futást végez, és mediánt, szórást
+ír ki; az <code>1</code> paraméterű futás a szekvenciális baseline
+(minden szelet ugyanabban a streamben), a <code>4</code> az átfedő
+változat, az <code>nsys profile</code> mindkettőre lefuttatandó. A
+<code>start</code> esemény a default streamben van rögzítve az előző
+futás teljes befejezése után, a <code>stop</code> pedig azután, hogy a
+host minden streamet megvárt, így a mért idő a teljes pipeline-t fedi. A
+kernel indítások is ugyanabban a streamben vannak, így a streamen belül
+a sorrend garantált: H2D, majd kernel, majd D2H.</p>
 <h3 data-number="31.2.6"
 id="labor-stream--és-copy-átfedés-elemzése-nsight-systems-szel"><span
 class="header-section-number">31.2.6</span> Labor: stream- és
@@ -410,9 +448,10 @@ másolásai, kerneljei és D2H másolásai átfedésben jelennek meg a Kernels
 és Memory sorokban. Ideális esetben a teljes idő rövidebb, mint a
 szekvenciális végrehajtás összege.</li>
 <li><strong>CPU blokkoló hívások</strong>: a
-<code>cudaStreamSynchronize</code> hívások a CPU szálon sárga sávként
-jelennek meg. Azt várjuk, hogy ezek a hívások a feldolgozás végén, rövid
-ideig tartanak, mert a streamek már majdnem befejeződtek.</li>
+<code>cudaStreamSynchronize</code> hívások a CPU szál CUDA API sorában
+sávként jelennek meg. Azt várjuk, hogy ezek a hívások a feldolgozás
+végén, rövid ideig tartanak, mert a streamek már majdnem
+befejeződtek.</li>
 <li><strong>CPU oldali üresjárat</strong>: ha a CPU szál sávjában hosszú
 üres szakaszok vannak, az azt jelzi, hogy a CPU nem tud elég gyorsan
 munkát adni a GPU-nak. Ezt kevesebb, nagyobb munkaegységgel,
@@ -427,10 +466,10 @@ class="header-section-number">31.2.10</span> Várt eredmények</h3>
 <p>A várt eredmények a következők (a konkrét számok a hardvertől
 függenek, de a tendencia egyértelmű):</p>
 <ul>
-<li>A négy stream együttes futási ideje <strong>kevesebb</strong>, mint
-ugyanazon munka egyetlen streamben, szekvenciálisan mért ideje (a
-gyorsulás mértékét a labor méri; küszöböt nem rögzítünk), mivel a
-másolások és a kernelek átfedik egymást.</li>
+<li>A négy stream együttes futási ideje <strong>nem lehet több</strong>,
+mint ugyanazon munka egyetlen streamben mért ideje; a gyorsulás mértéke
+a kernel/másolás időaránytól és a másolómotorok számától függ (a labor
+méri; küszöböt nem rögzítünk).</li>
 <li>Az Nsight Systems idővonalán a H2D és a D2H másolások sávjai
 <strong>részben vagy teljesen átfednek</strong> a kernelek
 sávjaival.</li>
@@ -514,9 +553,10 @@ használata aszinkron helyett</h4>
 a <code>cudaMemcpyAsync</code> helyett. A szinkron másolás blokkolja a
 CPU-t, és implicit módon szinkronizál a default streamen keresztül, ami
 megszünteti az átfedést.</p>
-<p><strong>Jel az idővonalon</strong>: Hosszú sárga sáv a CPU szálon, a
-GPU pedig várakozik. A kernelek és másolások szekvenciálisan követik
-egymást.</p>
+<p><strong>Jel az idővonalon</strong>: Hosszú
+<code>cudaStreamSynchronize</code>/<code>cudaDeviceSynchronize</code>
+sáv a CPU szál CUDA API sorában, a GPU pedig várakozik. A kernelek és
+másolások szekvenciálisan követik egymást.</p>
 <p><strong>Helyes megoldás</strong>: Mindig
 <code>cudaMemcpyAsync</code>-t használjunk pinned host memóriával, és
 explicit streameket adjunk meg. A másolás irányától függően a
@@ -585,7 +625,7 @@ Systems alapvető használatát.</p>
 hajt végre H2D másolást, kernelt és D2H másolást. Az Nsight Systems
 idővonalán azt látjuk, hogy a kernelek sávjai egymás után, átfedés
 nélkül jelennek meg, és a másolási sávok is szekvenciálisak. Mi lehet a
-két legvalószínűbb oka, és hogyan javítaná?</p>
+legvalószínűbb oka (legalább kettő), és hogyan javítaná?</p>
 <p><strong>Válasz</strong>: Explicit streamek mellett, a default stream
 használata nélkül a streamek blocking jellege nem szekvencializál. A
 leggyakoribb okok: (1) a host puffer pageable memória, ezért a másolás
@@ -596,8 +636,9 @@ default streamet is használó művelet (vagy szinkron
 <code>cudaMemcpy</code>) szinkronizálja a blocking streameket. A
 javítás: <code>cudaMallocHost</code> pinned puffer,
 <code>cudaMemcpyAsync</code>, <code>cudaStreamNonBlocking</code>
-streamek, a default stream kerülése, és az <code>nsys stats</code>
-jelentésekkel a másolómotor-kihasználtság ellenőrzése.</p>
+streamek, a default stream kerülése, és az idővonalon (Memory sorok,
+<code>cuda_gpu_mem_time_sum</code>) ellenőrizzük, hogy a H2D és a D2H
+egyidejűleg fut-e.</p>
 <h3 data-number="31.2.14" id="összefoglalás"><span
 class="header-section-number">31.2.14</span> Összefoglalás</h3>
 <p>Az Nsight Systems a rendszerszintű profilozás alapvető eszköze.
@@ -614,5 +655,5 @@ elemzése és a reprodukálhatóság kerül előtérbe.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu118.html">← 31.1 Nsight Compute és a kernelmetrikák</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu120.html">31.3 Benchmarkmódszertan →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

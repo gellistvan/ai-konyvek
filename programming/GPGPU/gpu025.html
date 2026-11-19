@@ -114,13 +114,16 @@ szükséges,</li>
 vagy stencil során,</li>
 <li>a hozzáférést bank-konfliktusmentesre tudjuk szervezni.</li>
 </ul>
-<p>A shared memory mérete korlátozott: tipikusan 48–164 KiB SM-enként, a
-konfigurációtól és architektúrától függően. Ha a teljes probléma
-elférne, akkor is figyelni kell arra, hogy a shared memory használata
-csökkenti az occupancy-t, mert egy SM-en a blockok száma korlátozott. A
-döntés során ezért mindig ellenőrizni kell, hogy a shared memória által
-elért global-memory-megtakarítás nagyobb-e, mint az
-occupancy-csökkenésből adódó latency-hiding romlás.</p>
+<p>A shared memory mérete korlátozott: SM-enként a konfigurálható shared
+memória CC 7.5-ön 64 KiB, CC 8.0-n 164 KiB, CC 8.6/8.9-en 100 KiB, CC
+9.0-n 228 KiB (az L1-gyel közös tárból; a CUDA Programming Guide értékei
+alapján, emlékezetből, ellenőrzendő); blokkonként alapesetben 48 KiB,
+opt-innel ennél több (lásd 6.4). Ha a teljes probléma elférne, akkor is
+figyelni kell arra, hogy a shared memory használata csökkenti az
+occupancy-t, mert egy SM-en a blockok száma korlátozott. A döntés során
+ezért mindig ellenőrizni kell, hogy a shared memória által elért
+global-memory-megtakarítás nagyobb-e, mint az occupancy-csökkenésből
+adódó latency-hiding romlás.</p>
 <h3 data-number="7.4.5" id="constant-memory"><span
 class="header-section-number">7.4.5</span> Constant memory</h3>
 <p>A constant memory grid-szintű, olvasható a device számára, de írni
@@ -161,7 +164,8 @@ vagy shared-memory-kialakítását újra kell gondolni.</p>
 <h3 data-number="7.4.7" id="texture-memory"><span
 class="header-section-number">7.4.7</span> Texture memory</h3>
 <p>A texture memory egy speciális, read-only elérési út, amelyet
-textúraobjektumokkal vagy textúra referenciákkal érhetünk el. Akkor
+textúraobjektumokkal (<code>cudaTextureObject_t</code>) érünk el; a régi
+textúra-referencia API a CUDA 12.0 óta nem érhető el (lásd 7.3). Akkor
 használjuk, ha:</p>
 <ul>
 <li>2D/3D térbeli lokalitás van a hozzáférésekben, és a cache-sorok
@@ -262,7 +266,9 @@ mindig az adott GPU compute capability szerint kell pontosítani.</p>
 <tr>
 <td>Texture memory</td>
 <td>Grid</td>
-<td>Kernel során (read-only)</td>
+<td>Alkalmazás során (a textúraobjektum a
+<code>cudaDestroyTextureObject</code>-ig, a mögöttes memória a
+<code>cudaFree</code>-ig él); a kernel csak olvassa</td>
 <td>2D/3D lokalitás, interpoláció</td>
 <td>Device olvassa</td>
 <td>Cache-től függő</td>
@@ -443,8 +449,9 @@ __global__ void local_penalty(const float* __restrict__ x,
                               int n,
                               int kMax)
 {
-    // A tmp[] dinamikusan indexelt, ezért a fordító nagy valószínűséggel
-    // local memoryt használ. A kMax paraméter miatt a ciklus nem unrollható.
+    // A tmp[] a második ciklusban futásidejű, szálindextől függő indexszel
+    // olvasott, ezért nem tartható regiszterben: a fordító stack-tömbként
+    // a local memóriába teszi. A kMax kettőhatvány kell legyen (KMAX = 64).
     float tmp[128];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (kMax &gt; 128) kMax = 128;   // védelem a túlindexelés ellen
@@ -454,10 +461,18 @@ __global__ void local_penalty(const float* __restrict__ x,
         }
         float sum = 0.0f;
         for (int k = 0; k &lt; kMax; ++k) {
-            sum += tmp[k];
+            sum += tmp[(k + i) &amp; (kMax - 1)];   // futásidejű index: local memória
         }
         y[i] = sum;
     }
+}
+
+// Ellenpélda: a warp szálai különböző címeket olvasnak, a hozzáférés sorosodik
+__global__ void constant_table_divergent(const float* __restrict__ x,
+                                         float* __restrict__ y, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i &lt; n) y[i] = x[i] * c_coef[threadIdx.x &amp; 255];
 }
 
 // Warp-uniform konstans-táblázat: a blokk minden szála ugyanazt az elemet olvassa (broadcast)
@@ -465,18 +480,23 @@ __global__ void constant_table(const float* __restrict__ x, float* __restrict__ 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i &lt; n) y[i] = x[i] * c_coef[blockIdx.x &amp; 255];      // azonos cím a warpon belül
-    // ellenpélda: c_coef[threadIdx.x &amp; 255] -&gt; a warp szálai különböző címeket olvasnak, a hozzáférés sorosodik
 }</code></pre>
 <p>A <code>local_penalty</code> kernelben a <code>tmp</code> tömb mérete
 128 float. A fordító akkor tudná regiszterben tartani, ha minden
-hozzáférést konstans indexszel oldana fel. Mivel a <code>k</code>
-változó futás közben, a <code>kMax</code> paramétertől függően változik,
-a tömböt valószínűleg local memoryba helyezi. Ezt a mérési profilban a
-local tranzakciók növekedése mutatja majd. Ez stack-tömb (dinamikusan
-indexelt privát tömb), nem regiszter-spill; a spill a regiszterek
-kiszorítása, amit a <code>ptxas -v</code>
-<code>spill stores/loads</code> sora jelez.</p>
-<p>A host oldalon a mérési ciklus (mind az öt változatot ugyanúgy
+hozzáférést fordítási időben ismert indexszel oldana fel (például
+kibontott ciklussal). A második ciklus indexe,
+<code>(k + i) &amp; (kMax - 1)</code>, a szálindextől függ, ezért
+futásidejű, így a tömb a local memóriába kerül; a <code>KMAX = 64</code>
+kettőhatvány, tehát az összeg permutációja változatlanul 2016. Egy
+egyszerű, <code>tmp[k]</code> indexű olvasásnál a fordító a ciklust
+kibonthatná, és a tömb regiszterbe kerülne, a local forgalom nem
+látszana. Ellenőrzés: <code>nvcc -Xptxas -v</code> kimenetében nem nulla
+„bytes stack frame” várható (nem futtattuk, ellenőrzendő); a profilban a
+local tranzakciók számát kell nézni. Ez stack-tömb (dinamikusan indexelt
+privát tömb), nem regiszter-spill; a spill a regiszterek kiszorítása,
+amit a <code>ptxas -v</code> <code>spill stores/loads</code> sora
+jelez.</p>
+<p>A host oldalon a mérési ciklus (mind a hat változatot ugyanúgy
 mérjük, és az eredményt ellenőrizzük; a kódot nem fordítottuk és nem
 futtattuk):</p>
 <pre class="cuda"><code>int main()
@@ -501,6 +521,10 @@ futtattuk):</p>
     float scale = 0.5f, offset = 1.0f;
     CUDA_CHECK(cudaMemcpyToSymbol(c_scale, &amp;scale, sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_offset, &amp;offset, sizeof(float)));
+
+    std::vector&lt;float&gt; h_coef(256);
+    for (int k = 0; k &lt; 256; ++k) h_coef[k] = 1.0f + k * 1e-3f;
+    CUDA_CHECK(cudaMemcpyToSymbol(c_coef, h_coef.data(), sizeof(float) * 256));
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&amp;start));
@@ -538,6 +562,24 @@ futtattuk):</p>
     measure(&quot;shared_reduce&quot;, [&amp;] { shared_reduce&lt;BLOCK&gt;&lt;&lt;&lt;GRID, BLOCK&gt;&gt;&gt;(d_x, d_sum, N); });
     CUDA_CHECK(cudaMemcpy(h_sum.data(), d_sum, GRID * sizeof(float), cudaMemcpyDeviceToHost));
     std::printf(&quot;[shared_reduce] block_sum[0] = %.1f (varhato: %.1f)\n&quot;, h_sum[0], 1.5f * BLOCK);
+    // constant_table: y[i] == h_coef[(i / BLOCK) &amp; 255] (x = 1); a divergens párnál
+    // y[i] == h_coef[i % BLOCK] (BLOCK = 256)
+    auto check_table = [&amp;](const char* name, bool divergent) {
+        CUDA_CHECK(cudaMemcpy(h_out.data(), d_y, nBytes, cudaMemcpyDeviceToHost));
+        for (int i = 0; i &lt; N; ++i) {
+            float e = divergent ? h_coef[i % BLOCK] : h_coef[(i / BLOCK) &amp; 255];
+            if (std::fabs(h_out[i] - e) &gt; 1e-4f) {
+                std::printf(&quot;[%s] ELTERES: %d\n&quot;, name, i);
+                return;
+            }
+        }
+        std::printf(&quot;[%s] eredmeny ok\n&quot;, name);
+    };
+    measure(&quot;constant_table&quot;, [&amp;] { constant_table&lt;&lt;&lt;GRID, BLOCK&gt;&gt;&gt;(d_x, d_y, N); });
+    check_table(&quot;constant_table&quot;, false);
+    measure(&quot;constant_table_divergent&quot;,
+            [&amp;] { constant_table_divergent&lt;&lt;&lt;GRID, BLOCK&gt;&gt;&gt;(d_x, d_y, N); });
+    check_table(&quot;constant_table_divergent&quot;, true);
     measure(&quot;local_penalty&quot;, [&amp;] { local_penalty&lt;&lt;&lt;GRID, BLOCK&gt;&gt;&gt;(d_x, d_y, N, KMAX); });
     check_y(&quot;local_penalty&quot;, KMAX * (KMAX - 1) / 2.0f);       // sum k = 2016
 
@@ -629,8 +671,24 @@ memóriakorlátos)</td>
 <td>Blokkonként egy kimeneti összeg</td>
 </tr>
 <tr>
+<td>constant_table</td>
+<td>Constant, warp-uniform táblaindex (broadcast)</td>
+<td>Azonos a param_scale-lel (memóriakorlátos)</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td><code>c_coef[blockIdx.x &amp; 255]</code></td>
+</tr>
+<tr>
+<td>constant_table_divergent</td>
+<td>Constant, szálankénti táblaindex</td>
+<td>Lassabb: sorosított konstans olvasás</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td><code>c_coef[threadIdx.x &amp; 255]</code></td>
+</tr>
+<tr>
 <td>local_penalty</td>
-<td>Local memória (dinamikusan indexelt privát tömb, stack-tömb)</td>
+<td>Local memória (futásidejű indexű privát tömb, stack-tömb)</td>
 <td>Lassabb, több local/L1/L2-forgalom</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért – kitöltendő&gt;</td>
@@ -708,6 +766,20 @@ laborátadandó a következő formátumban készülhet:</p>
 <td>Local elkerülése</td>
 </tr>
 <tr>
+<td>Dinamikus (futásidejű) indexelés szálankénti tömbre, vagy a tömb nem
+fér regiszterbe?</td>
+<td>Igen</td>
+<td>Local</td>
+<td>Kerülendő; a fordító stack-tömbként a local memóriába teszi</td>
+</tr>
+<tr>
+<td>Térbeli lokalitású, csak olvasott 2D adat, interpolációval vagy
+címzési móddal?</td>
+<td>Igen</td>
+<td>Texture</td>
+<td>Hardveres szűrés és határkezelés, 2D cache</td>
+</tr>
+<tr>
 <td>Kell a host felől írni a kernelek között (a kernel csak
 olvassa)?</td>
 <td>Igen, kis adat</td>
@@ -722,6 +794,17 @@ olvassa)?</td>
 </tr>
 </tbody>
 </table>
+<p>A táblázat kérdései egymásra épülnek; az alábbi döntési fa a javasolt
+sorrendjüket mutatja.</p>
+<figure id="fig-gpu025-decision-tree">
+<img src="figures/img/gpu025-decision-tree.png" style="width:100.0%"
+alt="Döntési fa: írás esetén shared vagy global; read-only esetén warp-uniform olvasásnál constant, interpolációnál texture, újrafelhasználásnál shared, egyébként read-only global; privát tömbnél statikus indexszel regiszter, dinamikussal local." />
+<figcaption>Memóriatér-döntési fa: írás esetén shared vagy global;
+read-only esetén warp-uniform olvasásnál constant, interpolációnál
+texture, újrafelhasználásnál shared, egyébként read-only global;
+szálankénti privát tömbnél statikus indexszel regiszter, dinamikussal
+local</figcaption>
+</figure>
 <p>A laborban az olvasónak ezt a táblázatot a saját kernelére is el kell
 tudnia készíteni, és a mérési naplóval igazolnia a választást.</p>
 <h3 data-number="7.4.16" id="opencl-párhuzam"><span
@@ -788,8 +871,8 @@ class="header-section-number">7.4.17</span> OpenCL példa</h3>
 <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
 <span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
 <span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">size_t</span> lid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> v <span class="op">=</span> <span class="op">(</span>gid <span class="op">&lt;</span> n<span class="op">)</span> <span class="op">?</span> x<span class="op">[</span>gid<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
-<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    v <span class="op">=</span> mad<span class="op">(</span>v<span class="op">,</span> scale<span class="op">,</span> offset<span class="op">);</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="co">// a kitöltő work-itemek 0-t adnak a redukcióhoz (nem az offsetet)</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> v <span class="op">=</span> <span class="op">(</span>gid <span class="op">&lt;</span> <span class="op">(</span><span class="dt">size_t</span><span class="op">)</span>n<span class="op">)</span> <span class="op">?</span> mad<span class="op">(</span>x<span class="op">[</span>gid<span class="op">],</span> scale<span class="op">,</span> offset<span class="op">)</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
 <span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>lid<span class="op">]</span> <span class="op">=</span> v<span class="op">;</span></span>
 <span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">size_t</span> stride <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">)</span> <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> stride <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> stride <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
@@ -918,13 +1001,17 @@ class="header-section-number">7.4.21</span> Önellenőrző kérdés</h3>
 minden szál olvassa, de a szálak indexe a táblázatban különböző: az 1.
 szál a 0. elemet, a 2. szál az 1. elemet, és így tovább. A súlyok nem
 változnak a kernel futása alatt. Melyik memóriateret választanád?</p>
-<p><strong>Válasz:</strong> A constant memória rossz választás lenne,
-mert a hozzáférés nem warp-uniform: a szálak különböző címeket olvasnak,
-ami sorosodáshoz vezet. Ha a táblázat kicsi, érdemes a shared memoryba
-tölteni a block elején, mert a blokk szintű újrafelhasználás
-kihasználható. Ha a táblázat nagyobb és a hozzáférés read-only, a global
-memory vagy a texture memory lehet jó választás. A döntési táblázatban a
-constant sorát tehát csak broadcast hozzáférésnél használjuk.</p>
+<p><strong>Válasz:</strong> A constant memória rossz választás: a warp
+32 szála 32 különböző címet olvas, a konstans cache ezt 32 lépésben
+sorosítja. Mivel minden szál pontosan egy, a saját indexének megfelelő
+elemet olvas, a hozzáférés coalesced, és nincs blokkon belüli
+újrafelhasználás, ezért a global memória a jó választás, read-only
+útvonalon (<code>const float* __restrict__</code> vagy
+<code>__ldg</code>). A shared memóriába töltés itt csak többletmunka
+(lásd az 1. hibát); akkor éri meg, ha a blokk szálai a tábla elemeit
+többször vagy egymás elemeit is olvassák (pl. minden szál a teljes
+táblán végigmegy). A döntési táblázatban a constant sorát csak broadcast
+hozzáférésnél használjuk.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu024.html">← 7.3 Local, constant és texture memória</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu026.html">8.1 Blokk-szintű szinkronizáció →</a></div>
 </nav>

@@ -150,10 +150,19 @@ gyorsabban jön az adat, és nem terheli a memóriabuszt.</p>
 <p>A memóriahatékonyság mérésénél ezért figyelni kell arra, hogy a
 munkakészlet mérete nagyobb legyen, mint az L2, különben a cache elrejti
 a globális memória valódi teljesítményét. Például ha 40 MB L2-vel
-rendelkező GPU-n 32 MB-os tömböt másolunk, az egész belefér az L2-be, és
-a mért sávszélesség az L2 sávszélességét fogja mutatni, nem a HBM-ét. A
-gyakorlatban ezért a sávszélesség-méréseknél legalább néhány száz MB
-vagy GB méretű puffereket használunk.</p>
+rendelkező GPU-n egy 16 MB-os tömböt másolunk egy másik 16 MB-os tömbbe
+(munkahalmaz: 32 MB), az egész belefér az L2-be, és a mért sávszélesség
+az L2-ét fogja mutatni, nem a DRAM-ét. A munkahalmazba a forrás és a cél
+is beleszámít. A gyakorlatban ezért a sávszélesség-méréseknél legalább
+néhány száz MB vagy GB méretű puffereket használunk.</p>
+<figure id="fig-gpu047-bw-vs-size">
+<div class="fig-interactive"><iframe src="figures/html/gpu047-bw-vs-size.html" title="Az effektív sávszélesség az L2 méretéig magas platón marad, utána a DRAM-sávszélességre esik; a 11.3 labor 32 MiB-os munkahalmaza az L2-platón, a 13.2 labor 2 GiB-os munkahalmaza a DRAM-platón van." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu047-bw-vs-size.png" style="width:90.0%"
+alt="Az effektív sávszélesség az L2 méretéig magas platón marad, utána a DRAM-sávszélességre esik; a 11.3 labor 32 MiB-os munkahalmaza az L2-platón, a 13.2 labor 2 GiB-os munkahalmaza a DRAM-platón van." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu047-bw-vs-size.png" style="width:90.0%"
+alt="Az effektív sávszélesség az L2 méretéig magas platón marad, utána a DRAM-sávszélességre esik; a 11.3 labor 32 MiB-os munkahalmaza az L2-platón, a 13.2 labor 2 GiB-os munkahalmaza a DRAM-platón van." /></details></div>
+<figcaption>Másolás effektív sávszélessége a munkahalmaz függvényében
+(sematikus modell az A100 számaival, nem mérés): az L2 méretéig
+L2-plató, felette a DRAM-platóra esik</figcaption>
+</figure>
 <p>A HBM és az L2 közötti együttműködés jól modellezhető a streaming
 hozzáférési mintával: egy nagy tömb lineáris bejárása során az adatok
 egyszer haladnak át a memórián, az L2 nem tudja őket újrahasznosítani,
@@ -292,8 +301,9 @@ int main() {
     CUDA_CHECK(cudaDeviceGetAttribute(&amp;mem_clock_khz, cudaDevAttrMemoryClockRate, dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&amp;bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev));
     // DDR-jellegű memóriára (pl. HBM2): 2 átvitel/órajel. Más memóriatípusnál
-    // (GDDR6/6X) az adatlapból kell ellenőrizni; CUDA 13-tól a clockRate
-    // jellegű attribútumok elavultak/eltávolítottak lehetnek.
+    // (GDDR6/6X) az adatlapból kell ellenőrizni. A cudaDevAttrMemoryClockRate
+    // CUDA 13-ban is elérhető (ellenőrzendő a fejlécben); a cudaDeviceProp
+    // clockRate/memoryClockRate mezői viszont megszűntek.
     const double theoretical_GBps =
         2.0 * (double)mem_clock_khz * 1e3 * (double)bus_bits / 8.0 / 1e9;
 
@@ -332,8 +342,8 @@ int main() {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Mérés: 10 iteráció, az egyedi idők tárolásával
-    constexpr int iterations = 10;
+    // Mérés: 20 iteráció, az egyedi idők tárolásával
+    constexpr int iterations = 20;
     float t_ms[iterations];
     for (int i = 0; i &lt; iterations; ++i) {
         CUDA_CHECK(cudaEventRecord(start));
@@ -344,18 +354,15 @@ int main() {
         CUDA_CHECK(cudaEventElapsedTime(&amp;t_ms[i], start, stop));
     }
 
-    double mean = 0.0;
-    for (float t : t_ms) mean += t;
-    mean /= iterations;
-    double var = 0.0;
-    for (float t : t_ms) var += (t - mean) * (t - mean);
-    const double sd = std::sqrt(var / iterations);
-    const double tmin = *std::min_element(t_ms, t_ms + iterations);
-    const double tmax = *std::max_element(t_ms, t_ms + iterations);
+    std::sort(t_ms, t_ms + iterations);
+    const double median = t_ms[iterations / 2];
+    const double iqr = t_ms[(3 * iterations) / 4] - t_ms[iterations / 4];
+    const double tmin = t_ms[0];
+    const double tmax = t_ms[iterations - 1];
 
     // Átvitt adatmennyiség: olvasás + írás = 2 * bytes
     const double transferred_bytes = 2.0 * (double)bytes;
-    const double bandwidth_GBps = transferred_bytes / (mean / 1000.0) / 1e9;
+    const double bandwidth_GBps = transferred_bytes / (median / 1000.0) / 1e9;
 
     // Validáció: a másolat minden elemét ellenőrizzük
     check_kernel&lt;&lt;&lt;blocks, threads_per_block&gt;&gt;&gt;(d_dst, num_float4, d_bad);
@@ -363,8 +370,8 @@ int main() {
     unsigned long long bad = 0;
     CUDA_CHECK(cudaMemcpy(&amp;bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost));
 
-    std::printf(&quot;Átlagos idő: %.3f ms (szórás %.3f, min %.3f, max %.3f)\n&quot;,
-                mean, sd, tmin, tmax);
+    std::printf(&quot;Medián idő: %.3f ms (IQR %.3f, min %.3f, max %.3f)\n&quot;,
+                median, iqr, tmin, tmax);
     std::printf(&quot;Átvitt adat: %.2f GB\n&quot;, transferred_bytes / 1e9);
     std::printf(&quot;Mért sávszélesség: %.2f GB/s\n&quot;, bandwidth_GBps);
     std::printf(&quot;Elméleti sávszélesség: %.2f GB/s\n&quot;, theoretical_GBps);
@@ -403,8 +410,11 @@ class="header-section-number">13.2.8</span> Build és futtatás</h3>
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_80 <span class="at">-o</span> bw_test bw_test.cu</span></code></pre></div>
 <p>Az <code>-arch=sm_80</code> az NVIDIA Ampere generációhoz tartozó
 compute capability 8.0-t jelenti, ami az A100 esetén helyes. Más GPU-k
-esetén a megfelelő értéket kell használni (pl. <code>sm_86</code> RTX
-3000, <code>sm_89</code> RTX 4000). A futtatás:</p>
+esetén a megfelelő értéket kell használni (pl. <code>sm_86</code> a
+GeForce RTX 30-as sorozathoz, <code>sm_89</code> a GeForce RTX 40-es
+sorozathoz és az RTX Ada munkaállomás-kártyákhoz; a pontos CC-t a
+<code>nvidia-smi --query-gpu=compute_cap --format=csv</code> adja). A
+futtatás:</p>
 <div class="sourceCode" id="cb3"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">./bw_test</span></span></code></pre></div>
 <h3 data-number="13.2.9" id="mérési-napló"><span
@@ -468,14 +478,14 @@ beírni.</p>
 </tr>
 <tr>
 <td>Mérési iterációk</td>
-<td>10</td>
+<td>20</td>
 </tr>
 <tr>
-<td>Átlagos idő</td>
+<td>Medián idő</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 </tr>
 <tr>
-<td>Szórás</td>
+<td>IQR</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 </tr>
 <tr>
@@ -540,8 +550,8 @@ esetleges JIT fordítást. Ha ezt is beleszámítjuk az időbe, alacsonyabb
 sávszélességet kapunk. Megoldás: 3–5 melegítő iteráció a mérés
 előtt.</p></li>
 <li><p><strong>Csak egyetlen mérés</strong>: a futásidő szórása a GPU
-órajel-ingadozása miatt jelentős lehet. Több iteráció átlagát kell
-venni, és a szórást is közölni.</p></li>
+órajel-ingadozása miatt jelentős lehet. Legalább 20 iteráció mediánját
+kell venni, és az IQR-t (vagy a szórást) is közölni.</p></li>
 <li><p><strong>Rossz adatmennyiség-számítás</strong>: ha a kernel olvas
 és ír is, az átvitt adat a puffer méretének kétszerese. Ha ezt
 elfelejtjük, a sávszélességet felére becsüljük. Helyes:
@@ -625,5 +635,5 @@ tárgyalja.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu046.html">← 13.1 A Roofline-modell</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu048.html">13.3 Számítási korlát és compute intensity →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

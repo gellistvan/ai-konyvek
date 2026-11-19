@@ -80,9 +80,9 @@ hoszt figyeli a memóriát, hibás megfigyeléshez vezethet.</p>
 id="a-laza-memóriamodell-relaxed-memory-model"><span
 class="header-section-number">8.4.2.2</span> A laza memóriamodell
 (Relaxed Memory Model)</h4>
-<p>A CUDA memóriamodellje több szempontból hasonlít a C++11
-<code>std::memory_order_relaxed</code> vagy a SPARC/ARM
-processzorokéhoz. Ez azt jelenti, hogy az egyik szál által végrehajtott
+<p>A CUDA memóriamodellje gyenge (relaxed) modell, az ARM és a POWER
+processzorokéhoz hasonló (a SPARC alapértelmezett modellje ezzel szemben
+az erős TSO). Ez azt jelenti, hogy az egyik szál által végrehajtott
 írások sorrendje <strong>nem garantáltan</strong> ugyanabban a
 sorrendben látszik egy másik szál számára, hacsak nem alkalmazunk
 explicit szinkronizációs műveleteket.</p>
@@ -207,6 +207,19 @@ ne rendeződjön a jelzés olvasása elé; az adatot emellett
 <code>volatile</code>/atomi hozzáféréssel kell olvasni, különben a
 fordító az olvasást átrendezheti vagy regiszterben tarthatja.</li>
 </ol>
+<p>Az alábbi ábra a minta legegyszerűbb, üzenetátadási (message passing)
+változatán mutatja, milyen eredményt olvashat a fogyasztó fence nélkül,
+csak producer-oldali fence-szel, illetve mindkét oldali fence-szel.</p>
+<figure id="fig-gpu029-message-passing">
+<div class="fig-interactive"><iframe src="figures/html/gpu029-message-passing.html" title="A producer 42-t ír a payloadba, majd beállítja a zászlót; fence nélkül a fogyasztó a zászlót már látva is olvashat 0-t; csak producer-oldali fence mellett a fogyasztó olvasása a zászló elé rendeződhet; mindkét oldali fence-szel csak 42-t olvashat." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu029-message-passing.png" style="width:100.0%"
+alt="A producer 42-t ír a payloadba, majd beállítja a zászlót; fence nélkül a fogyasztó a zászlót már látva is olvashat 0-t; csak producer-oldali fence mellett a fogyasztó olvasása a zászló elé rendeződhet; mindkét oldali fence-szel csak 42-t olvashat." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu029-message-passing.png" style="width:100.0%"
+alt="A producer 42-t ír a payloadba, majd beállítja a zászlót; fence nélkül a fogyasztó a zászlót már látva is olvashat 0-t; csak producer-oldali fence mellett a fogyasztó olvasása a zászló elé rendeződhet; mindkét oldali fence-szel csak 42-t olvashat." /></details></div>
+<figcaption>Üzenetátadás: fence nélkül és csak producer-oldali
+fence-szel
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mo>=</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">r = 0</annotation></semantics></math>
+is megengedett, mindkét oldali fence-szel csak
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi><mo>=</mo><mn>42</mn></mrow><annotation encoding="application/x-tex">r = 42</annotation></semantics></math></figcaption>
+</figure>
 <p>Sok fejlesztő elköveti azt a hibát, hogy csak a producer oldalon
 használ fence-t, a fogyasztónál nem. Bár az eszköz-szintű láthatóság
 miatt ez gyakran működik, a memóriamodell szigorúan véve megköveteli a
@@ -256,6 +269,7 @@ __global__ void init_kernel(float* data, int N) {
   __syncthreads();
   if (is_last_block &amp;&amp; threadIdx.x == 0) {
     atomicExch(&amp;ready_flag, 1);   // csak az összes blokk érkezése után
+    arrival_counter = 0;          // a következő indításhoz (vagy a host nullázza indítás előtt)
   }
 }</code></pre>
 <h3 data-number="8.4.5"
@@ -348,13 +362,16 @@ class="header-section-number">8.4.6.2</span> Labor kód (CUDA C++)</h4>
 <pre class="cuda"><code>// lab_fence_visibility.cu  (nem futtatott, fordítatlan példa)
 #include &lt;cstdio&gt;
 #include &lt;cstdlib&gt;
+#include &lt;cmath&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
 #include &lt;cuda_runtime.h&gt;
 
-#define CHECK_CUDA(call) do {                                         \
+#define CUDA_CHECK(call) do {                                         \
     cudaError_t err_ = (call);                                        \
     if (err_ != cudaSuccess) {                                        \
-        printf(&quot;CUDA Hiba: %s:%d -&gt; %s\n&quot;, __FILE__, __LINE__,        \
-               cudaGetErrorString(err_));                             \
+        std::fprintf(stderr, &quot;CUDA Hiba: %s:%d -&gt; %s\n&quot;, __FILE__,    \
+                     __LINE__, cudaGetErrorString(err_));             \
         std::exit(EXIT_FAILURE);                                      \
     }                                                                 \
 } while (0)
@@ -387,56 +404,62 @@ __global__ void last_block_kernel(const float* d_in, float* d_partial,
     }
 }
 
+struct Stat { float median, sd; };
+
 template &lt;bool UseFence&gt;
-float run(const float* d_in, float* d_partial, float* d_result,
-          int blocks, int per_block, int iters) {
+Stat run(const float* d_in, float* d_partial, float* d_result,
+         int blocks, int per_block, int iters) {
     cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&amp;start));
-    CHECK_CUDA(cudaEventCreate(&amp;stop));
-    for (int i = 0; i &lt; 3; ++i) {                  // warm-up
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+    for (int i = 0; i &lt; 5; ++i) {                  // warm-up (5)
         last_block_kernel&lt;UseFence&gt;&lt;&lt;&lt;blocks, 32&gt;&gt;&gt;(d_in, d_partial, d_result, per_block);
     }
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-    float total_ms = 0.0f;
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector&lt;float&gt; t(iters);
     for (int i = 0; i &lt; iters; ++i) {
-        CHECK_CUDA(cudaEventRecord(start));
+        CUDA_CHECK(cudaEventRecord(start));
         last_block_kernel&lt;UseFence&gt;&lt;&lt;&lt;blocks, 32&gt;&gt;&gt;(d_in, d_partial, d_result, per_block);
-        CHECK_CUDA(cudaEventRecord(stop));
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        CHECK_CUDA(cudaGetLastError());
-        float ms = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&amp;ms, start, stop));
-        total_ms += ms;
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[i], start, stop));
     }
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-    return total_ms / iters;
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    float mean = 0.0f, var = 0.0f;
+    for (float x : t) mean += x / iters;
+    for (float x : t) var += (x - mean) * (x - mean);
+    std::sort(t.begin(), t.end());
+    float med = 0.5f * (t[iters / 2 - 1] + t[iters / 2]);   // iters páros
+    return { med, std::sqrt(var / (iters - 1)) };           // minta-szórás (n-1)
 }
 
 int main() {
-    const int blocks = 64, per_block = 1024, iters = 10;
+    const int blocks = 64, per_block = 1024, iters = 20;
     const int n = blocks * per_block;              // 65536, float-ban pontosan ábrázolható összeg
     float *d_in, *d_partial, *d_result;
-    CHECK_CUDA(cudaMalloc(&amp;d_in, n * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&amp;d_partial, blocks * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&amp;d_result, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_in, n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_partial, blocks * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_result, sizeof(float)));
     float* h_in = (float*)std::malloc(n * sizeof(float));
     for (int i = 0; i &lt; n; ++i) h_in[i] = 1.0f;    // várt végösszeg: n
-    CHECK_CUDA(cudaMemcpy(d_in, h_in, n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_in, h_in, n * sizeof(float), cudaMemcpyHostToDevice));
 
-    float ms_fence = run&lt;true&gt;(d_in, d_partial, d_result, blocks, per_block, iters);
+    Stat st_fence = run&lt;true&gt;(d_in, d_partial, d_result, blocks, per_block, iters);
     float h_res = 0.0f;
-    CHECK_CUDA(cudaMemcpy(&amp;h_res, d_result, sizeof(float), cudaMemcpyDeviceToHost));
-    printf(&quot;fence: %s (eredmeny %.1f, vart %d), atlag %f ms\n&quot;,
-           h_res == (float)n ? &quot;OK&quot; : &quot;HIBA&quot;, h_res, n, ms_fence);
+    CUDA_CHECK(cudaMemcpy(&amp;h_res, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+    printf(&quot;fence: %s (eredmeny %.1f, vart %d), median %f ms, szoras %f ms\n&quot;,
+           h_res == (float)n ? &quot;OK&quot; : &quot;HIBA&quot;, h_res, n, st_fence.median, st_fence.sd);
 
-    float ms_nofence = run&lt;false&gt;(d_in, d_partial, d_result, blocks, per_block, iters);
-    CHECK_CUDA(cudaMemcpy(&amp;h_res, d_result, sizeof(float), cudaMemcpyDeviceToHost));
-    printf(&quot;fence nelkul: %s (eredmeny %.1f, vart %d), atlag %f ms\n&quot;,
-           h_res == (float)n ? &quot;OK&quot; : &quot;ELTERES&quot;, h_res, n, ms_nofence);
+    Stat st_nofence = run&lt;false&gt;(d_in, d_partial, d_result, blocks, per_block, iters);
+    CUDA_CHECK(cudaMemcpy(&amp;h_res, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+    printf(&quot;fence nelkul: %s (eredmeny %.1f, vart %d), median %f ms, szoras %f ms\n&quot;,
+           h_res == (float)n ? &quot;OK&quot; : &quot;ELTERES&quot;, h_res, n,
+           st_nofence.median, st_nofence.sd);
 
-    CHECK_CUDA(cudaFree(d_in)); CHECK_CUDA(cudaFree(d_partial)); CHECK_CUDA(cudaFree(d_result));
+    CUDA_CHECK(cudaFree(d_in)); CUDA_CHECK(cudaFree(d_partial)); CUDA_CHECK(cudaFree(d_result));
     std::free(h_in);
     return 0;
 }</code></pre>
@@ -455,16 +478,18 @@ eredmények</h4>
 <ul>
 <li><strong>Várt eredmény (modellből, nem mért):</strong> a fence-es
 változat a host ellenőrzése szerint <code>OK</code> (az összeg 65536). A
-fence nélküli változat formálisan adatversenyes: lehet, hogy ugyanazt az
-eredményt adja, lehet, hogy elavult részeredményt olvas; a hiba nem
+fence nélküli változat formálisan adatversenyes: a legtöbb GPU-n
+valószínűleg szintén <code>OK</code>-t ír ki, de ez nem bizonyítja a
+helyességét; lehet, hogy elavult részeredményt olvas, és a hiba nem
 garantáltan reprodukálható. A futásidő a kis kernel indítási költségét
 is tartalmazza (az események a kernelindítást ölelik fel), ezért a fence
 tényleges költsége nem olvasható le külön ebből a mérésből.</li>
 <li><strong>Mért eredmény:</strong>
-<code>&lt;mért – kitöltendő&gt;</code> (GPU, driver, CUDA, 10 mért
-ismétlés átlaga és szórása mindkét változatra; további ellenőrzés:
-<code>compute-sanitizer --tool racecheck</code>, amely a shared memória
-hazardjait vizsgálja, és <code>--tool synccheck</code>).</li>
+<code>&lt;mért – kitöltendő&gt;</code> (GPU, driver, CUDA, 5 warm-up
+után 20 mért ismétlés mediánja és szórása mindkét változatra; további
+ellenőrzés: <code>compute-sanitizer --tool racecheck</code>, amely a
+shared memória hazardjait vizsgálja, és
+<code>--tool synccheck</code>).</li>
 </ul>
 <h3 data-number="8.4.7" id="tipikus-hibák-és-helyes-megoldások"><span
 class="header-section-number">8.4.7</span> Tipikus hibák és helyes
@@ -554,8 +579,24 @@ blokkon belül, és mit nem garantál blokkok között?</li>
 <li>Melyik fence-et és milyen olvasási módot használnál, ha a CPU
 figyeli a GPU jelzését mapped pinned memórián?</li>
 </ol>
+<p><strong>Mintamegoldások (vázlat).</strong> (1) A
+<code>__threadfence()</code> csak a hívó szál saját írásait rendezi; a
+többi szál <code>data[]</code> írásáról nem mond semmit. A last-block
+mintában minden szál fence-el a saját írása után, a
+<code>__syncthreads()</code> után egyetlen szál atomi számlálóval jelzi
+a blokk érkezését, és csak az utolsó blokk (a számláló
+<code>gridDim.x − 1</code> értékénél) állítja a zászlót, illetve olvassa
+a részeredményeket. (2) Blokkon belül a barrier előtti összes global és
+shared írás a barrier után a blokk minden szála számára látható; más
+blokkok felé nem ad láthatósági vagy rendezési garanciát, ahhoz
+<code>__threadfence()</code> vagy release/acquire atomi kell. (3)
+GPU-oldalon <code>__threadfence_system()</code> az adat írása és a
+zászló (atomi) írása között, vagy
+<code>cuda::atomic_ref&lt;int, cuda::thread_scope_system&gt;</code>
+release-tárolás; CPU-oldalon atomi (acquire) vagy legalább
+<code>volatile</code> olvasás a várakozó ciklusban.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu028.html">← 8.3 Warp intrinsics: shuffle, vote és match</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu030.html">9.1 Cooperative groups alapok →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

@@ -159,9 +159,11 @@ klaszterek számát ad, nem blokk/SM-et), a használt CUDA Programming
 Guide kiadásában ellenőrizendő; <strong>a szerzők ezt nem fordították és
 nem futtatták.</strong> A fenti vázlat a szerkezetet mutatja, nem
 igazolt indítási receptet.</p>
-<p>Ebben a vázlatban látható a három szint kombinációja:
-<code>cluster.sync()</code> (a blokkon belüli szinkronizációt is magában
-foglalja), a klaszterek közötti <code>grid.sync()</code>.</p>
+<p>Ebben a vázlatban látható a három szint kombinációja: a blokkszint
+(<code>thread_block</code>, a részösszeg a blokk saját shared
+memóriájában), a klaszterszint (<code>cluster.sync()</code>, amely a
+blokkon belüli szinkronizációt is magában foglalja, és a DSM-olvasás) és
+a gridszint (a klaszterek közötti <code>grid.sync()</code>).</p>
 <h3 data-number="9.4.3" id="munkaelosztás-a-kombinált-kernelben"><span
 class="header-section-number">9.4.3</span> Munkaelosztás a kombinált
 kernelben</h3>
@@ -233,6 +235,15 @@ befejezte az írást, és a következő iteráció elején minden blokk
 biztonságosan beolvashatja a globális halót.</li>
 <li>A ciklus a következő iterációval folytatódik.</li>
 </ol>
+<figure id="fig-gpu033-stencil-halo">
+<div class="fig-interactive"><iframe src="figures/html/gpu033-stencil-halo.html" title="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." loading="lazy" style="width:100%;border:0;height:640px"></iframe><noscript><img src="figures/img/gpu033-stencil-halo.png" style="width:100.0%"
+alt="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu033-stencil-halo.png" style="width:100.0%"
+alt="8 csempe két 4 blokkos klaszterben; a klaszteren belüli halo DSM-ből, a klaszterek közötti globális memóriából érkezik grid.sync után." /></details></div>
+<figcaption>Hierarchikus csempézés és halo-csere a kombinált stencilben:
+a klaszteren belüli halo DSM-ből, a klaszterek közötti globális
+memóriából érkezik; iterációnként két <code>cluster.sync()</code> és egy
+<code>grid.sync()</code> (szemléltetés)</figcaption>
+</figure>
 <p>Ez a felépítés a klaszteren belüli határokon megspórolja a globális
 memória forgalmát, csak a klaszterek közötti határokon használjuk a
 lassú utat. A grid-szinkronizáció iterációnként egyszer következik
@@ -300,8 +311,12 @@ kooperatív indítással</h4>
 kernelt kooperatív indítással futtattuk, és a grid minden blokkja
 egyszerre rezidens. Egyszerű
 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> indítással a
-<code>grid.sync()</code> nem támogatott (a viselkedés holtponttól hibáig
-terjedhet).</p>
+<code>grid.sync()</code> nem támogatott: a mai (CUDA 11+) toolkitekben a
+kernel megszakad, és a következő szinkronizáló hívás
+<code>cudaErrorLaunchFailure</code> hibát ad (sticky hiba; a lektor
+NVRTC/RTX-es ellenőrzése szerint, a pontos viselkedés
+Toolkit-verziófüggő lehet). A kernelben a <code>grid.is_valid()</code>
+lekérdezhető, ha a kód mindkét indítási módot el akarja viselni.</p>
 <p><strong>Hibás minta:</strong></p>
 <pre class="cuda"><code>// HIBÁS: grid.sync() normál &lt;&lt;&lt; &gt;&gt;&gt; indítással
 __global__ void bad_grid_sync() {
@@ -547,7 +562,7 @@ static void cpu_reference(std::vector&lt;float&gt;&amp; u, int N, int T) {
 int main(int argc, char** argv) {
     const int N = (argc &gt; 1) ? std::atoi(argv[1]) : 512;
     const int T = (argc &gt; 2) ? std::atoi(argv[2]) : 100;
-    const int block = 256, reps = 5;
+    const int block = 256, warmup = 5, reps = 20;
     const size_t bytes = (size_t)N * N * sizeof(float);
 
     int dev = 0, coop = 0, sms = 0, per_sm = 0;
@@ -574,7 +589,7 @@ int main(int argc, char** argv) {
     const long long total = (long long)N * N;
     const int base_blocks = (int)std::min&lt;long long&gt;((total + block - 1) / block, 1 &lt;&lt; 20);
 
-    for (int r = -1; r &lt; reps; ++r) {                     // r = -1: warm-up
+    for (int r = -warmup; r &lt; reps; ++r) {                // r &lt; 0: warm-up (5)
         CUDA_CHECK(cudaMemcpy(d_a, init.data(), bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_b, init.data(), bytes, cudaMemcpyHostToDevice));
         int n = N, t = T;
@@ -591,7 +606,7 @@ int main(int argc, char** argv) {
     std::vector&lt;float&gt; gpu((size_t)N * N);
     CUDA_CHECK(cudaMemcpy(gpu.data(), (T % 2 == 0) ? d_a : d_b, bytes, cudaMemcpyDeviceToHost));
 
-    for (int r = -1; r &lt; reps; ++r) {
+    for (int r = -warmup; r &lt; reps; ++r) {
         CUDA_CHECK(cudaMemcpy(d_a, init.data(), bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_b, init.data(), bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaEventRecord(t0));
@@ -612,16 +627,18 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k &lt; ref.size(); ++k)
         max_err = std::max(max_err, std::fabs(ref[k] - gpu[k]));
 
-    auto stats = [&amp;](const float* x, float&amp; mean, float&amp; sd) {
-        mean = 0.0f; for (int r = 0; r &lt; reps; ++r) mean += x[r] / reps;
-        float v = 0.0f; for (int r = 0; r &lt; reps; ++r) v += (x[r] - mean) * (x[r] - mean);
-        sd = std::sqrt(v / (reps - 1));
+    auto stats = [&amp;](const float* x, float&amp; med, float&amp; iqr) {
+        std::vector&lt;float&gt; sorted(x, x + reps);
+        std::sort(sorted.begin(), sorted.end());
+        med = 0.5f * (sorted[reps / 2 - 1] + sorted[reps / 2]);   // reps páros
+        iqr = sorted[3 * reps / 4] - sorted[reps / 4];
     };
     float mc, sc, mb, sb;
     stats(ms_coop, mc, sc);
     stats(ms_base, mb, sb);
     std::printf(&quot;N=%d T=%d coop_blocks=%d max_abs_err=%g\n&quot;, N, T, coop_blocks, max_err);
-    std::printf(&quot;kooperativ: %.3f ms (sd %.3f)\nbaseline  : %.3f ms (sd %.3f)\n&quot;, mc, sc, mb, sb);
+    std::printf(&quot;kooperativ: median %.3f ms (IQR %.3f)\nbaseline  : median %.3f ms (IQR %.3f)\n&quot;,
+                mc, sc, mb, sb);
 
     CUDA_CHECK(cudaEventDestroy(t0));
     CUDA_CHECK(cudaEventDestroy(t1));
@@ -650,13 +667,14 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="
 <p>Futtatás:</p>
 <div class="sourceCode" id="cb9"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">timeout</span> 120 ./stencil_lab 512 100</span></code></pre></div>
-<p>Régebbi CUDA-verzióban a <code>grid.sync()</code> fordításához
-<code>-rdc=true</code> is kellhet; a pontos feltételt a használt toolkit
-dokumentációjában ellenőrizd (nem futtattuk).</p>
+<p>A CUDA 11.0 előtti toolkitekben a <code>grid.sync()</code>
+fordításához <code>-rdc=true</code> kellett; a CUDA 11+ toolkitekben a
+fenti parancs elegendő (a verzióhatárt a kiadási jegyzetből rögzítendő,
+ellenőrzendő; a példát nem futtattuk).</p>
 <h4 data-number="9.4.8.4" id="mérési-napló-és-kiértékelés"><span
 class="header-section-number">9.4.8.4</span> Mérési napló és
 kiértékelés</h4>
-<p>A mérés a kódban: 1 warm-up, majd 5 ismétlés, átlag és szórás; a mért
+<p>A mérés a kódban: 5 warm-up, majd 20 ismétlés, medián és IQR; a mért
 oszlopot az olvasó tölti ki.</p>
 <table style="width:100%;">
 <colgroup>
@@ -673,8 +691,8 @@ oszlopot az olvasó tölti ki.</p>
 <th>Blokkszám</th>
 <th>Blokkméret</th>
 <th>Várt (modellből)</th>
-<th>Mért átlag (ms)</th>
-<th>Mért szórás (ms)</th>
+<th>Mért medián (ms)</th>
+<th>IQR (ms)</th>
 </tr>
 </thead>
 <tbody>
@@ -696,11 +714,12 @@ oszlopot az olvasó tölti ki.</p>
 </tr>
 </tbody>
 </table>
-<p>A GPU és a CPU ugyanazt a műveletsort végzi (ugyanabban a sorrendben
-összegzett szomszédok), de a fordító FMA-kontrakciója eltérést okozhat;
-ezért a max. abszolút hibát jelentsd, és ne tekintsd garantáltan
-nullának. A mérési naplóban tüntesd fel a GPU órajelét, a power limitet,
-az ECC állapotát és a háttérterhelést.</p>
+<p>A GPU és a CPU ugyanazt a műveletsort végzi (balról jobbra összegzett
+szomszédok, majd egy szorzás); FMA-ra összevonható művelet nincs, ezért
+a várt eltérés 0. Ha nem nulla, ellenőrizd a ping-pong pufferválasztást
+és a fordítási kapcsolókat (<code>--use_fast_math</code>, host
+<code>-ffast-math</code>). A mérési naplóban tüntesd fel a GPU órajelét,
+a power limitet, az ECC állapotát és a háttérterhelést.</p>
 <h4 data-number="9.4.8.5" id="feladat-klaszteres-dsm-halo-bővítés"><span
 class="header-section-number">9.4.8.5</span> Feladat: klaszteres
 DSM-halo bővítés</h4>
@@ -743,5 +762,5 @@ kombinált minták helyességének ellenőrzéséhez is elengedhetetlen.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu032.html">← 9.3 Grid-szintű szinkronizáció</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu034.html">10.1 CUDA-hibakódok és ellenőrzés →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

@@ -62,13 +62,17 @@ műveleteket. A hardver nem garantálja, hogy a különböző szálak atomi
 műveletei milyen sorrendben hajtódnak végre; csak azt garantálja, hogy
 mindegyik atomi művelet oszthatatlanul hajtódik végre. Lebegőpontos
 összeadás esetén az <code>atomicAdd</code> eredménye függ a sorrendtől,
-mert minden egyes művelet kerekít. Például ha három értéket adunk össze
-<code>a</code>, <code>b</code>, <code>c</code>, az
-<code>atomicAdd</code> végrehajthatja <code>(a + b) + c</code> vagy
-<code>a + (b + c)</code> sorrendben, és a két eredmény eltérhet. A
-sorrendet a memóriarendszer, a warp-ok ütemezése és a gyorsítótárak
-állapota befolyásolja, így futásonként változhat. Ezért az
-atomicAdd-alapú redukció nem determinisztikus.</p>
+mert minden egyes művelet kerekít. Például ha három értéket,
+<code>a</code>-t, <code>b</code>-t és <code>c</code>-t adunk atomikusan
+egy nullázott akkumulátorhoz, a végrehajtás lehet
+<code>((0 + a) + b) + c</code> vagy <code>((0 + c) + a) + b</code> stb.
+– a tagok érkezési sorrendje változik, és mivel a lebegőpontos összeadás
+nem asszociatív, a végeredmény eltérhet. FP32-ben például a 10⁸, 1,
+−10⁸, 1 tagok sorrendjétől függően az összeg 0, 1 vagy 2 (Pythonban,
+numpy float32-vel mind a 24 sorrendre ellenőrizve). A sorrendet a
+memóriarendszer, a warp-ok ütemezése és a gyorsítótárak állapota
+befolyásolja, így futásonként változhat. Ezért az atomicAdd-alapú
+redukció nem determinisztikus.</p>
 <p>Ezzel szemben az egész típusú atomi műveletek (például
 <code>atomicAdd</code> <code>int</code> típusra) asszociatívak és
 kommutatívak, így a sorrend nem befolyásolja az eredményt, tehát az
@@ -132,9 +136,10 @@ fa-redukciót explicit ciklussal, rögzített párosítással kell végezni,
 részösszegeket egy második fázisban, rögzített sorrendben kell
 összegezni, nem pedig atomi műveletekkel.</li>
 <li><strong>Kompenzált összegzés opcionálisan</strong>: a
-Kahan-összegzés vagy double-double aritmetika javíthatja a pontosságot,
-de csak akkor, ha szekvenciálisan alkalmazzák; párhuzamosan nem
-garantálja a determinizmust.</li>
+Kahan-összegzés vagy a double-double aritmetika javítja a pontosságot;
+determinisztikus marad, ha a műveletek sorrendje rögzített (például
+szálanként Kahan, majd rögzített fa). Önmagában nem pótolja a sorrend
+rögzítését.</li>
 </ol>
 <p>A következő CUDA-példa egy determinisztikus összegzést valósít meg
 két kernel segítségével. Az első kernel minden blokkban egy részösszeget
@@ -148,12 +153,12 @@ rögzített sorrendet használ.</p>
 #include &lt;cstring&gt;
 #include &lt;vector&gt;
 
-#define CHECK_CUDA(call) do {                                              \
-    cudaError_t err = (call);                                               \
-    if (err != cudaSuccess) {                                               \
+#define CUDA_CHECK(call) do {                                              \
+    cudaError_t err_ = (call);                                              \
+    if (err_ != cudaSuccess) {                                              \
         std::fprintf(stderr, &quot;CUDA hiba: %s, fájl: %s, sor: %d\n&quot;,          \
-                     cudaGetErrorString(err), __FILE__, __LINE__);          \
-        std::exit(1);                                                        \
+                     cudaGetErrorString(err_), __FILE__, __LINE__);         \
+        std::exit(EXIT_FAILURE);                                            \
     }                                                                       \
 } while (0)
 
@@ -226,29 +231,30 @@ float deterministicSum(const float* d_input, int n) {
     constexpr int blockSize = 256;
     constexpr int gridSize = 64;  // fix, nem függ n-től
     // A 2. fázis egyetlen blokkja blockSize szálon olvassa a részösszegeket:
-    static_assert(gridSize &lt;= blockSize, &quot;a finalReduce csak blockSize részösszeget olvas&quot;);
+    static_assert(gridSize &lt;= blockSize,
+                  &quot;a finalReduce csak blockSize részösszeget olvas&quot;);
 
     size_t sharedBytes = blockSize * sizeof(float);
 
     // 1. fázis: blokkon belüli részösszegek
     float* d_partialSums;
-    CHECK_CUDA(cudaMalloc(&amp;d_partialSums, gridSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_partialSums, gridSize * sizeof(float)));
     blockReduce&lt;&lt;&lt;gridSize, blockSize, sharedBytes&gt;&gt;&gt;(d_input, d_partialSums, n);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // 2. fázis: részösszegek összegzése
     float* d_result;
-    CHECK_CUDA(cudaMalloc(&amp;d_result, sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&amp;d_result, sizeof(float)));
     finalReduce&lt;&lt;&lt;1, blockSize, sharedBytes&gt;&gt;&gt;(d_partialSums, d_result, gridSize);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     float result;
-    CHECK_CUDA(cudaMemcpy(&amp;result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&amp;result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
 
-    CHECK_CUDA(cudaFree(d_partialSums));
-    CHECK_CUDA(cudaFree(d_result));
+    CUDA_CHECK(cudaFree(d_partialSums));
+    CUDA_CHECK(cudaFree(d_result));
     return result;
 }
 
@@ -260,8 +266,8 @@ int main() {
     for (int i = 0; i &lt; n; ++i) h[i] = static_cast&lt;float&gt;(rand()) / RAND_MAX;
 
     float* d_input;
-    CHECK_CUDA(cudaMalloc(&amp;d_input, n * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_input, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&amp;d_input, n * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_input, h.data(), n * sizeof(float), cudaMemcpyHostToDevice));
 
     float first = deterministicSum(d_input, n);
     bool identical = true;
@@ -269,8 +275,9 @@ int main() {
         float r = deterministicSum(d_input, n);
         if (std::memcmp(&amp;r, &amp;first, sizeof(float)) != 0) identical = false;
     }
-    std::printf(&quot;eredmeny = %.9g, 10 futas bitre azonos: %s\n&quot;, first, identical ? &quot;igen&quot; : &quot;nem&quot;);
-    CHECK_CUDA(cudaFree(d_input));
+    std::printf(&quot;eredmeny = %.9g, 10 futas bitre azonos: %s\n&quot;,
+                first, identical ? &quot;igen&quot; : &quot;nem&quot;);
+    CUDA_CHECK(cudaFree(d_input));
     return 0;
 }</code></pre>
 <p>Ebben a példában a determinizmus forrása a rögzített
@@ -297,8 +304,8 @@ sorrend</h3>
 lebegőpontos adatok esetén nem determinisztikus. A következő kód egy
 tipikus, nem determinisztikus redukciót mutat:</p>
 <pre class="cuda"><code>// nyelv: CUDA C++ (C++17), fordító: nvcc 12.x; precizitás: FP32; nem futtatott
-// Nem determinisztikus redukció atomicAdd használatával (a host oldali hívás a fenti main mintájára,
-// `result` előzetes nullázásával írható meg)
+// Nem determinisztikus redukció atomicAdd használatával (a host oldali hívás a fenti
+// main mintájára, `result` előzetes nullázásával írható meg)
 __global__ void atomicReduction(const float* __restrict__ input,
                                 float* __restrict__ result,
                                 int n) {
@@ -316,9 +323,19 @@ __global__ void atomicReduction(const float* __restrict__ input,
 <code>atomicAdd</code> segítségével hozzáadja a globális
 <code>result</code>-hez. Az <code>atomicAdd</code> műveletek sorrendje a
 hardver által meghatározott, ami nem determinisztikus. Két futtatás
-között az eredmény akár az utolsó ulp (unit in the last place) szintjén
-eltérhet. Ez a különbség általában kicsi, de a determinizmust igénylő
-alkalmazásokban elfogadhatatlan.</p>
+között az eredmény eltérhet; azonos nagyságrendű, azonos előjelű
+tagoknál ez jellemzően néhány ulp (unit in the last place), de erősen
+eltérő nagyságrendű vagy kioltó tagoknál a különbség nagy is lehet (lásd
+az ábrát), és az eltérés a részösszegek számával nő. A determinizmust
+igénylő alkalmazásokban ez elfogadhatatlan.</p>
+<figure id="fig-gpu123-fa-vs-atomic">
+<div class="fig-interactive"><iframe src="figures/html/gpu123-fa-vs-atomic.html" title="Bal oldalon rögzített fa: x0 + x2 = 0 és x1 + x3 = 2, majd 0 + 2 = 2, ez a kódból adódik, ezért mindig 2. Jobb oldalon három futás egy akkumulátorral eltérő érkezési sorrendben: x0, x1, x2, x3 sorrendben az 1 elnyelődik a 10 a nyolcadikon mellett, az eredmény 1; x0, x2, x1, x3 sorrendben 2; x1, x3, x0, x2 sorrendben a futó 2 vész el, az eredmény 0. FP32-ben 10 a nyolcadikon körül a lépésköz 8." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/gpu123-fa-vs-atomic.png" style="width:100.0%"
+alt="Bal oldalon rögzített fa: x0 + x2 = 0 és x1 + x3 = 2, majd 0 + 2 = 2, ez a kódból adódik, ezért mindig 2. Jobb oldalon három futás egy akkumulátorral eltérő érkezési sorrendben: x0, x1, x2, x3 sorrendben az 1 elnyelődik a 10 a nyolcadikon mellett, az eredmény 1; x0, x2, x1, x3 sorrendben 2; x1, x3, x0, x2 sorrendben a futó 2 vész el, az eredmény 0. FP32-ben 10 a nyolcadikon körül a lépésköz 8." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu123-fa-vs-atomic.png" style="width:100.0%"
+alt="Bal oldalon rögzített fa: x0 + x2 = 0 és x1 + x3 = 2, majd 0 + 2 = 2, ez a kódból adódik, ezért mindig 2. Jobb oldalon három futás egy akkumulátorral eltérő érkezési sorrendben: x0, x1, x2, x3 sorrendben az 1 elnyelődik a 10 a nyolcadikon mellett, az eredmény 1; x0, x2, x1, x3 sorrendben 2; x1, x3, x0, x2 sorrendben a futó 2 vész el, az eredmény 0. FP32-ben 10 a nyolcadikon körül a lépésköz 8." /></details></div>
+<figcaption>Rögzített fa (mindig 2) vs. atomikus érkezési sorrend (0, 1
+vagy 2) négy FP32 részösszegen:
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>x</mi><mo>=</mo><mo stretchy="false" form="prefix">(</mo><msup><mn>10</mn><mn>8</mn></msup><mo>,</mo><mn>1</mn><mo>,</mo><mi>−</mi><msup><mn>10</mn><mn>8</mn></msup><mo>,</mo><mn>1</mn><mo stretchy="false" form="postfix">)</mo></mrow><annotation encoding="application/x-tex">x = (10^8, 1, -10^8, 1)</annotation></semantics></math></figcaption>
+</figure>
 <p>Ha a redukciót egész számokra végezzük, az <code>atomicAdd</code>
 determinisztikus, mert az egész összeadás asszociatív és kommutatív.
 Például <code>atomicAdd</code> <code>int</code> típusra mindig ugyanazt
@@ -365,60 +382,61 @@ rögzített work-group méret, rögzített sorrendű helyi redukció, és a
 részösszegek rögzített sorrendű összegzése egy második kernelben.</p>
 <p>A következő OpenCL kernel egy work-groupon belüli részösszeget
 számol:</p>
-<div class="sourceCode" id="cb3"><pre
-class="sourceCode opencl"><code class="sourceCode opencl"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// nyelv: OpenCL C (1.2+), precizitás: FP32; nem futtatott példa, csak dokumentáció/statikus ellenőrzés</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// Determinisztikus blokkon belüli redukció OpenCL-ben.</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// A reqd_work_group_size attribútum miatt a kernel csak 256-os work-group mérettel indítható</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// (más méretnél az enqueue CL_INVALID_WORK_GROUP_SIZE hibát ad), így a 256 elemű local tömb biztonságos.</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> blockReduce<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> input<span class="op">,</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>                 <span class="kw">__global</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">__local</span> <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span>  <span class="co">// local memory, fix méret</span></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> groupSize <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> numGroups <span class="op">=</span> get_num_groups<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0f</span><span class="op">;</span></span>
-<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> gid<span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i <span class="op">+=</span> groupSize <span class="op">*</span> numGroups<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> input<span class="op">[</span>i<span class="op">];</span></span>
-<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
-<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
-<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> groupSize <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
-<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
-<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>        partialSums<span class="op">[</span>get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
-<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. fázis: egyetlen work-group összegzi a részösszegeket rögzített sorrendben.</span></span>
-<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="kw">__kernel</span> __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
-<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> finalReduce<span class="op">(</span><span class="kw">__global</span> <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
-<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>                 <span class="kw">__global</span> <span class="dt">float</span><span class="op">*</span> result<span class="op">,</span></span>
-<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> numGroups<span class="op">)</span> <span class="op">{</span>   <span class="co">// numGroups &lt;= 256</span></span>
-<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">__local</span> <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span></span>
-<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
-<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>tid <span class="op">&lt;</span> numGroups<span class="op">)</span> <span class="op">?</span> partialSums<span class="op">[</span>tid<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0f</span><span class="op">;</span></span>
-<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
-<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">128</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
-<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
-<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
-<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>        result<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
-<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre class="sourceCode c"><code class="sourceCode c"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// nyelv: OpenCL C (1.2+), precizitás: FP32; nem futtatott példa,</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// csak dokumentáció/statikus ellenőrzés</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Determinisztikus blokkon belüli redukció OpenCL-ben.</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// A reqd_work_group_size attribútum miatt a kernel csak 256-os work-group</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">// mérettel indítható (más méretnél az enqueue CL_INVALID_WORK_GROUP_SIZE hibát</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">// ad), így a 256 elemű local tömb biztonságos.</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>__kernel __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> blockReduce<span class="op">(</span>__global <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> input<span class="op">,</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>                 __global <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> n<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    __local <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span>  <span class="co">// local memory, fix méret</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> gid <span class="op">=</span> get_global_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> groupSize <span class="op">=</span> get_local_size<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> numGroups <span class="op">=</span> get_num_groups<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span> sum <span class="op">=</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> gid<span class="op">;</span> i <span class="op">&lt;</span> n<span class="op">;</span> i <span class="op">+=</span> groupSize <span class="op">*</span> numGroups<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        sum <span class="op">+=</span> input<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> sum<span class="op">;</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> groupSize <span class="op">/</span> <span class="dv">2</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        partialSums<span class="op">[</span>get_group_id<span class="op">(</span><span class="dv">0</span><span class="op">)]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="co">// 2. fázis: egyetlen work-group összegzi a részösszegeket rögzített sorrendben.</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>__kernel __attribute__<span class="op">((</span>reqd_work_group_size<span class="op">(</span><span class="dv">256</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">)))</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="dt">void</span> finalReduce<span class="op">(</span>__global <span class="dt">const</span> <span class="dt">float</span><span class="op">*</span> partialSums<span class="op">,</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>                 __global <span class="dt">float</span><span class="op">*</span> result<span class="op">,</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>                 <span class="dt">const</span> <span class="dt">int</span> numGroups<span class="op">)</span> <span class="op">{</span>   <span class="co">// numGroups &lt;= 256</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    __local <span class="dt">float</span> sdata<span class="op">[</span><span class="dv">256</span><span class="op">];</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> tid <span class="op">=</span> get_local_id<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">=</span> <span class="op">(</span>tid <span class="op">&lt;</span> numGroups<span class="op">)</span> <span class="op">?</span> partialSums<span class="op">[</span>tid<span class="op">]</span> <span class="op">:</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> s <span class="op">=</span> <span class="dv">128</span><span class="op">;</span> s <span class="op">&gt;</span> <span class="dv">0</span><span class="op">;</span> s <span class="op">&gt;&gt;=</span> <span class="dv">1</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">(</span>tid <span class="op">&lt;</span> s<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>            sdata<span class="op">[</span>tid<span class="op">]</span> <span class="op">+=</span> sdata<span class="op">[</span>tid <span class="op">+</span> s<span class="op">];</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>        barrier<span class="op">(</span>CLK_LOCAL_MEM_FENCE<span class="op">);</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>tid <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>        result<span class="op">[</span><span class="dv">0</span><span class="op">]</span> <span class="op">=</span> sdata<span class="op">[</span><span class="dv">0</span><span class="op">];</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <p>A host oldalon mindkét kernelt
 <code>clEnqueueNDRangeKernel</code>-lel kell indítani: az első fázisban
 a local méret 256, a global méret <code>numGroups * 256</code> (a
@@ -455,9 +473,10 @@ class="sourceCode python"><code class="sourceCode python"><span id="cb4-1"><a hr
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> jax <span class="im">import</span> lax</span>
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">def</span> sequential_sum(x):</span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A scan elemenként, növekvő index szerint összegez: a sorrend rögzített, de nem párhuzamos.</span></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    total, _ <span class="op">=</span> lax.scan(<span class="kw">lambda</span> carry, v: (carry <span class="op">+</span> v, <span class="va">None</span>), jnp.float32(<span class="dv">0</span>), x)</span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> total</span></code></pre></div>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="co"># A scan elemenként, növekvő index szerint összegez:</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="co"># a sorrend rögzített, de nem párhuzamos.</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    total, _ <span class="op">=</span> lax.scan(<span class="kw">lambda</span> carry, v: (carry <span class="op">+</span> v, <span class="va">None</span>), jnp.float32(<span class="dv">0</span>), x)</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> total</span></code></pre></div>
 <p>A JAX esetében a determinizmus gyakran kompromisszumot igényel a
 teljesítmény rovására. A felhasználónak tisztában kell lennie ezzel, és
 ha a determinizmus kritikus, akkor vagy szekvenciális redukciót kell
@@ -471,8 +490,8 @@ class="header-section-number">32.2.8</span> Labor: determinisztikus
 <p>A labor célja egy determinisztikus összegzés megvalósítása CUDA-ban,
 OpenCL-ben vagy JAX-ban, és annak igazolása, hogy az eredmény
 reprodukálható. A mérési környezetet rögzíteni kell: GPU modell, driver,
-CUDA verzió, operációs rendszer, órajel, power limit. A mérés előtt
-warm-up, majd legalább 5-10 ismétlés, átlag és szórás számítása.</p>
+CUDA verzió, operációs rendszer, órajel, power limit. A mérés előtt 5
+warm-up, majd legalább 20 mért ismétlés, medián és szórás számítása.</p>
 <p>A következő a laborban elkészítendő mérési napló sablonja. A
 környezeti adatok helyőrzők, a mért értékeket a saját futtatásból kell
 kitölteni; ebben a szövegben nincs mért eredmény.</p>
@@ -494,13 +513,61 @@ vagy egy, a GPU fát (szálankénti grid-stride részösszegek, majd
 páronkénti fa) CPU-n lemásoló függvény szolgál (ekkor bitre azonos
 eredmény várható), vagy a szekvenciális CPU-összeg, relatív tűréssel
 összevetve (FP64 referencia mellett). - A nem determinisztikus
-<code>atomicAdd</code> redukció eredménye futásonként az utolsó néhány
-ulp-n belül eltérhet.</p>
+<code>atomicAdd</code> redukció eredménye futásonként eltérhet; az
+eltérés nagysága (ulp-ben) a mérés tárgya, kioltó vagy erősen eltérő
+nagyságrendű tagoknál nem korlátos az utolsó néhány ulp-re.</p>
 <p><strong>Mért eredmény (kitöltendő):</strong> - 10 futtatás eredményei
-és bitminta-összevetésük: &lt;mért – kitöltendő&gt; - Futásidő átlag és
-szórás (warm-up után, ≥ 10 ismétlés): &lt;mért – kitöltendő&gt; - Az
-<code>atomicAdd</code> redukció 10 eredménye: &lt;mért –
-kitöltendő&gt;</p>
+és bitminta-összevetésük: &lt;mért – kitöltendő&gt; - Futásidő medián és
+szórás (5 warm-up után, ≥ 20 ismétlés, mindkét változatra): &lt;mért –
+kitöltendő&gt; - Az <code>atomicAdd</code> redukció 10 eredménye:
+&lt;mért – kitöltendő&gt;</p>
+<p>A laborhoz a fenti <code>main</code> kiegészítendő a következő két
+host-függvénnyel és az általuk adott méréssel (nem futtatott
+vázlat):</p>
+<pre class="cuda"><code>// Kiegészítés a laborhoz (nem futtatott): atomicAdd-változat és időmérés
+// (az atomicReduction kernel a fenti blokkból; #include &lt;algorithm&gt; kell a std::sort-hoz)
+float atomicSum(const float* d_input, int n) {
+    float* d_result;
+    CUDA_CHECK(cudaMalloc(&amp;d_result, sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_result, 0, sizeof(float)));
+    atomicReduction&lt;&lt;&lt;64, 256&gt;&gt;&gt;(d_input, d_result, n);
+    CUDA_CHECK(cudaGetLastError());
+    float r;
+    CUDA_CHECK(cudaMemcpy(&amp;r, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_result));
+    return r;
+}
+
+// 5 warm-up + 20 mért ismétlés, cudaEvent-tel; medián visszaadva (ms)
+template &lt;typename F&gt;
+double medianMs(F f) {
+    cudaEvent_t a, b;
+    CUDA_CHECK(cudaEventCreate(&amp;a));
+    CUDA_CHECK(cudaEventCreate(&amp;b));
+    std::vector&lt;float&gt; ms(20);
+    for (int r = 0; r &lt; 5 + 20; ++r) {
+        CUDA_CHECK(cudaEventRecord(a));
+        f();
+        CUDA_CHECK(cudaEventRecord(b));
+        CUDA_CHECK(cudaEventSynchronize(b));
+        if (r &gt;= 5) CUDA_CHECK(cudaEventElapsedTime(&amp;ms[r - 5], a, b));
+    }
+    std::sort(ms.begin(), ms.end());
+    CUDA_CHECK(cudaEventDestroy(a));
+    CUDA_CHECK(cudaEventDestroy(b));
+    return 0.5 * (ms[9] + ms[10]);
+}</code></pre>
+<p>A <code>main</code>-ben az <code>atomicSum</code> 10 eredményét
+<code>%.9g</code> formátummal és hexadecimális bitmintával
+(<code>std::memcpy</code> <code>unsigned</code>-ba) kell kiírni, a két
+változat futásidejét pedig
+<code>medianMs([&amp;]{ deterministicSum(d_input, n); })</code>, illetve
+<code>medianMs([&amp;]{ atomicSum(d_input, n); })</code> adja (a szórást
+a mért értékekből, a 31.3 minta szerint kell számítani; a függvény itt
+csak a mediánt adja vissza). A <code>deterministicSum</code> és az
+<code>atomicSum</code> mérése
+<code>cudaMalloc</code>/<code>cudaFree</code>-t is tartalmaz; tisztább
+méréshez az allokációkat ki kell emelni az időmért részből.</p>
 <p>A laborban a várt és mért eredményt külön dokumentálni kell, és
 igazolni kell, hogy a determinisztikus redukció valóban reprodukálható,
 míg az atomi alapú nem.</p>
@@ -540,12 +607,10 @@ szerkezetét. <strong>Megoldás:</strong> Rögzítse a grid és block
 méretet, vagy ha a grid mérete változik, akkor a második fázisban a
 részösszegeket olyan sorrendben összegezze, amely független a grid
 méretétől, például mindig ugyanolyan számú blokkra normalizál.</p></li>
-<li><p><strong>Hiba:</strong> A Kahan-összegzést párhuzamosan
-alkalmazzák, abban a hiszemben, hogy az determinisztikus.
-<strong>Megoldás:</strong> A Kahan-összegzés csak szekvenciálisan
-kompenzálja a kerekítési hibát, párhuzamosan nem garantálja a
-determinizmust. Determinisztikus párhuzamos összegzéshez rögzített
-sorrendű fa-redukciót használjon.</p></li>
+<li><p><strong>Hiba:</strong> A Kahan-összegzéstől várják a
+determinizmust, miközben a részösszegeket atomikusan, változó sorrendben
+egyesítik. <strong>Megoldás:</strong> A kompenzált részösszegeket is
+rögzített sorrendben kell egyesíteni (például rögzített fával).</p></li>
 <li><p><strong>Hiba:</strong> A blokkon belüli fa-redukcióban nincs
 <code>__syncthreads()</code> minden szint után, ami adatversenyt okoz,
 és az eredmény nem determinisztikus. <strong>Megoldás:</strong> Minden
@@ -585,5 +650,5 @@ reprodukálhatóságot.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu122.html">← 32.1 Lebegőpontos pontosság</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu124.html">32.3 Hordozhatóság: HIP és SYCL →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

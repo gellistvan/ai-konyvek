@@ -61,6 +61,17 @@ konfigurálható shared memory-ként),</li>
 </ul>
 <p>Forrás: NVIDIA A100 Tensor Core GPU Architecture whitepaper (GA100
 SM).</p>
+<figure id="fig-gpu007-sm-a100">
+<div class="fig-interactive"><iframe src="figures/html/gpu007-sm-a100.html" title="Blokkdiagram: négy azonos partíció, mindegyikben ütemező, regiszterfájl, 16 FP32, 16 INT32, 8 FP64, 1 Tensor Core, 8 LD/ST, 4 SFU; alul közös 192 KiB L1/shared." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="figures/img/gpu007-sm-a100.png" style="width:80.0%"
+alt="Blokkdiagram: négy azonos partíció, mindegyikben ütemező, regiszterfájl, 16 FP32, 16 INT32, 8 FP64, 1 Tensor Core, 8 LD/ST, 4 SFU; alul közös 192 KiB L1/shared." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu007-sm-a100.png" style="width:80.0%"
+alt="Blokkdiagram: négy azonos partíció, mindegyikben ütemező, regiszterfájl, 16 FP32, 16 INT32, 8 FP64, 1 Tensor Core, 8 LD/ST, 4 SFU; alul közös 192 KiB L1/shared." /></details></div>
+<figcaption>Az A100 streaming multiprocesszor négy partíciója (SMSP) és
+közös memóriája: partíciónként 1 warp scheduler, 16 384 × 32 bites
+regiszterfájl, 16 INT32, 16 FP32, 8 FP64, 1 Tensor Core, 8 LD/ST és 4
+SFU; összesen 64 FP32, 32 FP64, 16 SFU, 32 LD/ST és 65 536 regiszter.
+Sematikus, nem méretarányos (forrás: NVIDIA A100
+whitepaper).</figcaption>
+</figure>
 <p>Ezek az adatok a hardver típusától függően eltérhetnek, de az
 erőforrások jellege és a korlátok logikája minden modern GPU-ban
 hasonló. Az SM erőforrásai a kernel indításakor kerülnek kiosztásra. A
@@ -165,14 +176,18 @@ szabadon választhatnak a számukra elérhető warp-ok közül.</p>
 unit</strong>-hoz kerül, amely továbbítja a megfelelő végrehajtó
 egységhez. Az utasítás-kibocsátás sebességét <strong>issue
 rate</strong>-nek nevezzük: ez megmondja, hogy egy scheduler hány
-utasítást tud kibocsátani egy órajelben. A legtöbb modern GPU-ban egy
-scheduler órajelenként legfeljebb egy utasítást bocsáthat ki, de egyes
-architektúrák megengednek bizonyos feltételek mellett két utasítást is
-(dual issue), például ha az egyik FP32, a másik INT32 művelet. Az
-A100-ban 4 warp scheduler van SM-enként; mindegyik 16 FP32 CUDA core-hoz
-kapcsolódik, így a 4 scheduler összesen 64 FP32 core-t vezérel. Minden
-scheduler így egy-egy 16 szálas csoportot tud kiszolgálni órajelenként,
-ami warp-szinten 32 szál feldolgozását jelenti két órajel alatt.</p>
+utasítást tud kibocsátani egy órajelben. A Volta óta az ütemező
+órajelenként legfeljebb egy warputasítást bocsát ki. Mivel egy
+FP32-utasítás a 16 sávos partíción két órajelig foglalja az
+FP32-egységeket, a köztes órajelben kiadható egy független INT32- (vagy
+más egységre menő) utasítás – így fut párhuzamosan az egész és a
+lebegőpontos aritmetika. (A régebbi Kepler-architektúra valódi dual
+issue-t is ismert; a pontos megfogalmazás a Volta/Turing whitepaperrel
+vetendő össze.) Az A100-ban 4 warp scheduler van SM-enként; mindegyik 16
+FP32 CUDA core-hoz kapcsolódik, így a 4 scheduler összesen 64 FP32
+core-t vezérel. Minden scheduler így egy-egy 16 szálas csoportot tud
+kiszolgálni órajelenként, ami warp-szinten 32 szál feldolgozását jelenti
+két órajel alatt.</p>
 <p>A <strong>scoreboard</strong> mechanizmus nyilvántartja, hogy egy
 warp regiszterei készen állnak-e. Ha egy utasítás operandusa még nem
 elérhető (például egy korábbi memóriaművelet vagy nagy késleltetésű
@@ -201,14 +216,16 @@ adódó férőhelyét pontosan nyomon követhetjük.</p>
 #include &lt;stdio.h&gt;
 #include &lt;stdlib.h&gt;
 #include &lt;math.h&gt;
+#include &lt;algorithm&gt;
+#include &lt;vector&gt;
 
-#define CUDA_CHECK(call) do {                             \
-    cudaError_t err = call;                               \
-    if (err != cudaSuccess) {                             \
-        printf(&quot;CUDA error at %s:%d: %s\n&quot;, __FILE__, __LINE__, \
-               cudaGetErrorString(err));                  \
-        exit(EXIT_FAILURE);                               \
-    }                                                     \
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
 } while (0)
 
 __global__ void sm_resource_kernel(const float* a, const float* b,
@@ -268,13 +285,15 @@ int main(void) {
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&amp;start));
     CUDA_CHECK(cudaEventCreate(&amp;stop));
-    // Warm-up (a modulbetöltés és a JIT ne kerüljön a mérésbe)
-    sm_resource_kernel&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(d_a, d_b, d_c, N);
-    CUDA_CHECK(cudaGetLastError());
+    // Warm-up: 5 futás (a modulbetöltés és a JIT ne kerüljön a mérésbe)
+    for (int w = 0; w &lt; 5; ++w) {
+        sm_resource_kernel&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(d_a, d_b, d_c, N);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    const int reps = 10;
-    float times[reps];
+    const int reps = 20;
+    std::vector&lt;float&gt; times(reps);
     for (int r = 0; r &lt; reps; ++r) {
         CUDA_CHECK(cudaEventRecord(start));
         sm_resource_kernel&lt;&lt;&lt;gridSize, blockSize&gt;&gt;&gt;(d_a, d_b, d_c, N);
@@ -283,13 +302,9 @@ int main(void) {
         CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaEventElapsedTime(&amp;times[r], start, stop));
     }
-    float mean = 0.0f;
-    for (int r = 0; r &lt; reps; ++r) mean += times[r];
-    mean /= reps;
-    float var = 0.0f;
-    for (int r = 0; r &lt; reps; ++r) var += (times[r] - mean) * (times[r] - mean);
-    printf(&quot;Kernel time: mean %.4f ms, sample stddev %.4f ms (%d reps)\n&quot;,
-           mean, sqrtf(var / (reps - 1)), reps);
+    std::sort(times.begin(), times.end());
+    printf(&quot;Kernel time: median %.4f ms, IQR %.4f ms (%d reps)\n&quot;,
+           times[reps / 2], times[(3 * reps) / 4] - times[reps / 4], reps);
 
     // Eredmény visszamásolása és ellenőrzése: 1*2+1 = 3
     CUDA_CHECK(cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost));
@@ -326,12 +341,16 @@ ki, többek között a kernel által használt regiszterek számát és a shared
 memory méretét. Az alábbi sorok illusztratív, nem futtatott
 példakimenetet mutatnak (a tényleges értékeket a saját fordítás
 adja):</p>
-<pre><code>ptxas info    : Compiling entry function &#39;_Z19sm_resource_kernelPKfS0_Pfi&#39; for &#39;sm_80&#39;
-ptxas info    : Function properties for _Z19sm_resource_kernelPKfS0_Pfi
+<pre class="text"><code>ptxas info    : Compiling entry function &#39;_Z18sm_resource_kernelPKfS0_Pfi&#39; for &#39;sm_80&#39;
+ptxas info    : Function properties for _Z18sm_resource_kernelPKfS0_Pfi
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 8 registers, 0 bytes smem, 376 bytes cmem[0]</code></pre>
-<p>Ha a kimenet ilyen lenne, a kernel szálanként 8 regisztert használna,
-és a <code>reg[4]</code> tömb ellenére a fordító csak ennyire
+<p>Ez a kimenet kézzel összeállított illusztráció, nem ptxas-futás
+eredménye; a regiszterszám a fordítótól és verziótól függ (egy
+NVRTC-vel, CUDA 13.1-gyel végzett külső ellenőrzés sm_80-ra 12
+regisztert és 380 bájt cmem[0]-t adott; a CUDA 12.4 <code>nvcc</code>
+eltérhet). Ha a kimenet ilyen lenne, a kernel szálanként 8 regisztert
+használna, és a <code>reg[4]</code> tömb ellenére a fordító csak ennyire
 optimalizálta volna a kódot, ami jó példa arra, hogy a forráskódban
 látható változók száma nem egyezik meg a hardveres
 regiszterhasználattal.</p>
@@ -383,7 +402,7 @@ kimenetéből kell venni.</p>
 </tr>
 <tr>
 <td>Regiszter/thread</td>
-<td>8 (feltételezett, a ptxas adja)</td>
+<td>a ptxas adja (pl. 8–12; itt 8 feltételezett)</td>
 <td><code>&lt;mért – kitöltendő&gt;</code></td>
 </tr>
 <tr>
@@ -393,7 +412,8 @@ kimenetéből kell venni.</p>
 </tr>
 <tr>
 <td>Regiszterekből adódó max blokk/SM</td>
-<td>65536 / (8*256) = 32</td>
+<td>8 reg.: 65536 / (8·256) = 32; 12 reg.: a warponkénti 384 regiszter
+512-re kerekítve (foglalási egység) → 65536 / (8·512) = 16</td>
 <td>–</td>
 </tr>
 <tr>
@@ -412,7 +432,7 @@ kimenetéből kell venni.</p>
 <td><code>&lt;mért – kitöltendő&gt;</code></td>
 </tr>
 <tr>
-<td>Kernel futási idő (átlag ± szórás, 10 ismétlés)</td>
+<td>Kernel futási idő (medián, IQR; 20 ismétlés)</td>
 <td>–</td>
 <td><code>&lt;mért – kitöltendő&gt;</code></td>
 </tr>
@@ -440,8 +460,11 @@ félreértések</h3>
 <li><p><strong>Azt gondolni, hogy a magas occupancy automatikusan
 maximális teljesítményt ad.</strong> Az occupancy fontos, de nem minden:
 ha egy kernel memóriakorlátos, a magasabb occupancy nem feltétlenül
-növeli a sávszélességet, sőt, a nagyobb regiszternyomás vagy shared
-memory használat ronthatja a cache hatékonyságát. Az optimális
+növeli a sávszélességet, sőt, a több egyidejű warp kevesebb L1/shared
+kapacitást kap warponként (cache-ütközés), és ha az occupancy-t a
+regiszterszám korlátozásával kényszerítjük ki
+(<code>__launch_bounds__</code>, <code>-maxrregcount</code>), a
+regiszterek local memoryba ömölhetnek (spill), ami lassít. Az optimális
 occupancy-t mindig mérésekkel kell igazolni.</p></li>
 <li><p><strong>A regiszterhasználatot a forráskód változóiból
 közvetlenül megbecsülni.</strong> A CUDA fordító agresszívan
@@ -485,6 +508,16 @@ el, melyik erőforrás a szűk keresztmetszet.</p>
 - A szűk keresztmetszet a warp-slotok száma, tehát maximum 16 blokk fér
 el az SM-en. Ha a regiszterhasználat 8 lenne, a regiszter-oldal 64
 blokkot engedne, de a warp-slotok továbbra is 16-ra korlátoznák.</p>
+<figure id="fig-gpu007-occupancy">
+<div class="fig-interactive"><iframe src="figures/html/gpu007-occupancy.html" title="Két sávdiagram négy korláttal; az elsőn a warp-slot korlát (16) a legkisebb, a másodikon a warp-slot korlát (8); a regiszter- és blokkszám-korlát 32, a shared-korlát 164." loading="lazy" style="width:100%;border:0;height:520px"></iframe><noscript><img src="figures/img/gpu007-occupancy.png" style="width:100.0%"
+alt="Két sávdiagram négy korláttal; az elsőn a warp-slot korlát (16) a legkisebb, a másodikon a warp-slot korlát (8); a regiszter- és blokkszám-korlát 32, a shared-korlát 164." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu007-occupancy.png" style="width:100.0%"
+alt="Két sávdiagram négy korláttal; az elsőn a warp-slot korlát (16) a legkisebb, a másodikon a warp-slot korlát (8); a regiszter- és blokkszám-korlát 32, a shared-korlát 164." /></details></div>
+<figcaption>Az SM-enkénti aktív blokkszám mint a korlátok minimuma
+(A100, CC 8.0): az önellenőrző kérdésben (16 regiszter/szál, 128
+szál/blokk) és a laborban (8 regiszter/szál, 256 szál/blokk) is a
+warp-slot korlát köt (16, illetve 8 blokk/SM, mindkét esetben 100%
+occupancy).</figcaption>
+</figure>
 <p>Ez a kérdés kiválóan illusztrálja, hogy az SM-nek többféle
 erőforrás-korlátja van, és a legszűkebb határozza meg az occupancy-t. A
 következő fejezetek – különösen az occupancy-ről szóló fejezet –
@@ -493,5 +526,5 @@ optimalizálásával.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu006.html">← 3.1 SIMT és warp-végrehajtás</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu008.html">3.3 Memóriahierarchia: regiszter, shared, L1/L2, global →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

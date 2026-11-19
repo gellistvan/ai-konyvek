@@ -161,7 +161,7 @@ emelkedik meg.</p>
 <p>A shared memory bank conflict nem az occupancy tünete: a warpon
 belüli hozzáférési minta tulajdonsága, és a rezidens warpok számától
 függetlenül fennáll (legfeljebb a konfliktusok összköltsége skálázódik
-több warppal). Mérése külön történik (lásd a 13.4 alfejezetet).</p>
+több warppal). Mérése külön történik (lásd a 11.2 alfejezetet).</p>
 <h4 data-number="12.4.3.3" id="az-optimális-occupancy-megtalálása"><span
 class="header-section-number">12.4.3.3</span> Az optimális occupancy
 megtalálása</h4>
@@ -286,11 +286,12 @@ döntsünk.</li>
 <h4 data-number="12.4.4.5" id="mérés-és-validáció"><span
 class="header-section-number">12.4.4.5</span> Mérés és validáció</h4>
 <p>A hangolás során minden változatra mérést kell végezni. A mérés előtt
-melegítő futtatás, majd legalább 5–10 ismétlés szükséges. Az átlag
-mellett a szórást is közölni kell. A méréshez CUDA eventek használata
-javasolt, mert azok a GPU idővonalon mérik az időt. A validáció során a
-kernel kimenetét CPU-referenciával kell összehasonlítani, és a
-hibakorlátot explicit módon kell rögzíteni.</p>
+melegítő futtatás, majd legalább 5 warm-up és legalább 20 mért ismétlés
+szükséges. A mediánt és az IQR-t (vagy a szórást) is közölni kell; az
+átlag önmagában nem elég. A méréshez CUDA eventek használata javasolt,
+mert azok a GPU idővonalon mérik az időt. A validáció során a kernel
+kimenetét CPU-referenciával kell összehasonlítani, és a hibakorlátot
+explicit módon kell rögzíteni.</p>
 <h3 data-number="12.4.5" id="tipikus-hibák-és-tévhitek"><span
 class="header-section-number">12.4.5</span> Tipikus hibák és
 tévhitek</h3>
@@ -406,8 +407,10 @@ register_pressure_kernel(const float* __restrict__ x, float* __restrict__ y,
     y[i] = chain&lt;R&gt;(x[i], alpha);
 }
 
+struct Timing { float median_ms; float iqr_ms; };
+
 template&lt;int R, int BLOCK&gt;
-float run_case(int n, float alpha, int iterations) {
+Timing run_case(int n, float alpha, int iterations) {
     float *d_x = nullptr, *d_y = nullptr;
     CUDA_CHECK(cudaMalloc(&amp;d_x, (size_t)n * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&amp;d_y, (size_t)n * sizeof(float)));
@@ -422,7 +425,7 @@ float run_case(int n, float alpha, int iterations) {
     dim3 bDim(BLOCK);
 
     // warm-up
-    for (int it = 0; it &lt; 3; ++it) {
+    for (int it = 0; it &lt; 5; ++it) {
         register_pressure_kernel&lt;R, BLOCK&gt;&lt;&lt;&lt;gDim, bDim&gt;&gt;&gt;(d_x, d_y, n, alpha);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -432,17 +435,18 @@ float run_case(int n, float alpha, int iterations) {
     CUDA_CHECK(cudaEventCreate(&amp;start));
     CUDA_CHECK(cudaEventCreate(&amp;stop));
 
-    CUDA_CHECK(cudaEventRecord(start));
+    // futásonként egy eseménypár: így medián és IQR számítható
+    std::vector&lt;float&gt; t(iterations);
     for (int it = 0; it &lt; iterations; ++it) {
+        CUDA_CHECK(cudaEventRecord(start));
         register_pressure_kernel&lt;R, BLOCK&gt;&lt;&lt;&lt;gDim, bDim&gt;&gt;&gt;(d_x, d_y, n, alpha);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[it], start, stop));
     }
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float elapsed_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&amp;elapsed_ms, start, stop));
-    float avg_ms = elapsed_ms / (float)iterations;
+    std::sort(t.begin(), t.end());
+    Timing timing{t[iterations / 2], t[(3 * iterations) / 4] - t[iterations / 4]};
 
     // Validáció: az első nv elemet a host ugyanazzal a chain&lt;R&gt; függvénnyel számolja.
     const int nv = std::min(n, 1 &lt;&lt; 20);
@@ -467,21 +471,21 @@ float run_case(int n, float alpha, int iterations) {
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
 
-    return avg_ms;
+    return timing;
 }
 
 int main() {
     constexpr int N = 1 &lt;&lt; 24; // 16 Mi elem, 64 MiB bemenet + 64 MiB kimenet
     constexpr float ALPHA = 0.9f;
-    constexpr int ITER = 10;
+    constexpr int ITER = 20;
 
     std::printf(&quot;Register/block tuning\n&quot;);
     std::printf(&quot;N = %d, alpha = %.1f, iterations = %d\n&quot;, N, ALPHA, ITER);
 
-    std::printf(&quot;BLOCK  R   elapsed_ms   bandwidth_GBps\n&quot;);
+    std::printf(&quot;BLOCK  R   median_ms   iqr_ms   bandwidth_GBps\n&quot;);
     for (int block : {64, 128, 256, 512, 1024}) {
         for (int r : {8, 16, 32, 64, 128}) {
-            float t = 0.0f;
+            Timing t{0.0f, 0.0f};
             switch (block) {
                 case 64:
                     if (r == 8) t = run_case&lt;8, 64&gt;(N, ALPHA, ITER);
@@ -520,8 +524,8 @@ int main() {
                     break;
             }
             float bytes = (float)(2 * N * sizeof(float));
-            float bw = bytes / (t * 1e-3f) / 1e9f;
-            std::printf(&quot;%5d %3d   %8.3f   %10.2f\n&quot;, block, r, t, bw);
+            float bw = bytes / (t.median_ms * 1e-3f) / 1e9f;
+            std::printf(&quot;%5d %3d   %8.3f   %7.3f   %10.2f\n&quot;, block, r, t.median_ms, t.iqr_ms, bw);
         }
     }
     return 0;
@@ -529,12 +533,13 @@ int main() {
 <p>A fenti program a <code>run_case</code> függvényben minden
 konfigurációra lefoglalja a be- és kimeneti tömböket, melegítő futtatást
 végez, majd CUDA eventtel méri a kernel futásidejét, végül validálja az
-eredményt (lásd 6.3). A méréshez 10 ismétlést használ; a kód a
-<code>cudaGetLastError</code> és <code>cudaEventSynchronize</code>
+eredményt (lásd a Validáció szakaszt). A méréshez 5 warm-up és 20 mért
+ismétlést használ, futásonként egy eseménypárral (medián és IQR); a kód
+a <code>cudaGetLastError</code> és <code>cudaEventSynchronize</code>
 hívásokkal ellenőrzi a hibákat. A program nem fordult és nem futott le a
-könyv írásakor; fordítás és futtatás előtt a 6.1 környezetet kell
-rögzíteni, a futtatást időkorláttal (<code>timeout</code>) érdemes
-indítani.</p>
+könyv írásakor; fordítás és futtatás előtt a mérési környezetet (lásd a
+labor Környezet pontját) kell rögzíteni, a futtatást időkorláttal
+(<code>timeout</code>) érdemes indítani.</p>
 <p>A regiszterhasználatot a <code>ptxas -v</code> jelentésből
 olvashatjuk ki. Az alábbi parancs a fenti kernel egy sablonpéldányára
 mutatja a regiszterhasználatot:</p>
@@ -563,35 +568,40 @@ class="header-section-number">12.4.6.4</span> Mérési napló</h4>
 <code>BLOCK=256</code> mellett kitöltendő oszlopok: a <code>ptxas</code>
 által jelentett regiszterszám és spill, az occupancy a
 <code>cudaOccupancyMaxActiveBlocksPerMultiprocessor</code> API-ból, a
-futásidő 10 ismétlés átlaga és szórása, valamint a sávszélesség.</p>
+futásidő 20 mért ismétlés mediánja és IQR-ja, valamint a
+sávszélesség.</p>
 <p><strong>Környezet</strong> (kitöltendő): GPU
 <code>&lt;pl. RTX 4070, cc 8.9&gt;</code>, driver
 <code>&lt;nvidia-smi&gt;</code>, CUDA
 <code>&lt;nvcc --version&gt;</code>, <code>N = 1 &lt;&lt; 24</code>,
-<code>alpha = 0,9</code>, <code>BLOCK = 256</code>.</p>
-<table style="width:100%;">
+<code>alpha = 0,9</code>; a spill hatásához a <code>BLOCK = 1024</code>
+sorait is rögzítsük.</p>
+<table>
 <colgroup>
-<col style="width: 3%" />
-<col style="width: 20%" />
-<col style="width: 16%" />
-<col style="width: 19%" />
-<col style="width: 12%" />
-<col style="width: 10%" />
-<col style="width: 16%" />
+<col style="width: 6%" />
+<col style="width: 9%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
+<col style="width: 13%" />
 </colgroup>
 <thead>
 <tr>
+<th>BLOCK</th>
 <th>R</th>
 <th>regiszter/thread (ptxas)</th>
 <th>spill (byte/thread)</th>
 <th>elméleti occupancy (%)</th>
-<th>futásidő (ms)</th>
-<th>szórás (ms)</th>
+<th>futásidő, medián (ms)</th>
+<th>IQR (ms)</th>
 <th>sávszélesség (GB/s)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
+<td>256</td>
 <td>8</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért&gt;</td>
@@ -601,6 +611,7 @@ futásidő 10 ismétlés átlaga és szórása, valamint a sávszélesség.</p>
 <td>&lt;számolt&gt;</td>
 </tr>
 <tr>
+<td>256</td>
 <td>16</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért&gt;</td>
@@ -610,6 +621,7 @@ futásidő 10 ismétlés átlaga és szórása, valamint a sávszélesség.</p>
 <td>&lt;számolt&gt;</td>
 </tr>
 <tr>
+<td>256</td>
 <td>32</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért&gt;</td>
@@ -619,6 +631,7 @@ futásidő 10 ismétlés átlaga és szórása, valamint a sávszélesség.</p>
 <td>&lt;számolt&gt;</td>
 </tr>
 <tr>
+<td>256</td>
 <td>64</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért&gt;</td>
@@ -628,6 +641,27 @@ futásidő 10 ismétlés átlaga és szórása, valamint a sávszélesség.</p>
 <td>&lt;számolt&gt;</td>
 </tr>
 <tr>
+<td>256</td>
+<td>128</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td>1024</td>
+<td>64</td>
+<td>&lt;mért – kitöltendő&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;mért&gt;</td>
+<td>&lt;számolt&gt;</td>
+</tr>
+<tr>
+<td>1024</td>
 <td>128</td>
 <td>&lt;mért – kitöltendő&gt;</td>
 <td>&lt;mért&gt;</td>
@@ -671,21 +705,20 @@ várjuk, hogy az
 és
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>16</mn></mrow><annotation encoding="application/x-tex">R=16</annotation></semantics></math>
 változat magas occupancy mellett fut, de a szálankénti munka viszonylag
-kicsi, így a memória-hozzáférések aránya nagyobb. Az
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>32</mn></mrow><annotation encoding="application/x-tex">R=32</annotation></semantics></math>
-változatnál az occupancy 66,7%-ra csökken, de a nagyobb számítási
-sűrűség miatt a globális memória-hozzáférések jobban átfedhetők. Az
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>64</mn></mrow><annotation encoding="application/x-tex">R=64</annotation></semantics></math>
-változatnál az occupancy 33,3%, ami még mindig elég lehet a
-memória-késleltetés elrejtéséhez, de a kevesebb aktív warp már
-érzékenyebb a késleltetésre. Az
-<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>R</mi><mo>=</mo><mn>128</mn></mrow><annotation encoding="application/x-tex">R=128</annotation></semantics></math>
-változatnál a regiszterek száma meghaladja a kényelmes tartományt, ezért
-spill jelenik meg, ami extra lokális memória forgalmat okoz, és a
-futásidő jelentősen nő.</p>
-<p><strong>Mért eredmények.</strong> A mért értékeket a 6.4 táblázat
-sablonjába kell beírni; ide csak a ténylegesen mért adatokból levont
-következtetés kerülhet. A várt trendet (nagyobb
+kicsi, így a memória-hozzáférések aránya nagyobb. A lektor statikus
+NVRTC-fordítása (CUDA 13.0, sm_89, nem saját mérésünk, ellenőrzendő)
+szerint a regiszterszám R-rel közel lineárisan nő (R = 8 / 16 / 32 / 64
+/ 128 → 20 / 28 / 39 / 72 / 138). A CC 8.9-es SM-en (65 536 regiszter,
+48 warp) ez 256-os blokknál R ≤ 32-ig 100%, R = 64-nél 50%, R = 128-nál
+16,7% elméleti occupancy-t ad, spill nélkül, mert a
+<code>__launch_bounds__(256)</code> 255 regisztert enged. Spill akkor
+jelenik meg, ha a <code>__launch_bounds__</code> szűkebb keretet ad: a
+<code>BLOCK = 1024</code> példányoknál a keret 65 536 / 1024 = 64
+regiszter, ezért R = 64 és R = 128 várhatóan spillel. A pontos számokat
+a saját <code>ptxas -v</code> kimenet adja.</p>
+<p><strong>Mért eredmények.</strong> A mért értékeket a Mérési napló
+táblázatának sablonjába kell beírni; ide csak a ténylegesen mért
+adatokból levont következtetés kerülhet. A várt trendet (nagyobb
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>R</mi><annotation encoding="application/x-tex">R</annotation></semantics></math>
 esetén kisebb occupancy, a legnagyobb
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>R</mi><annotation encoding="application/x-tex">R</annotation></semantics></math>-nél

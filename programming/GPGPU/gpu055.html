@@ -222,8 +222,8 @@ adatokat más blokkok olvashatják, de a saját blokk nem fogja újra
 olvasni. A <code>__stcs</code> streaming store evict-first prioritást
 ad, míg a <code>__stwt</code> write-through módban azonnal a globális
 memóriába ír, és a cache-ben nem tartja meg a módosított sort. Ez utóbbi
-ritkán előnyös, de bizonyos I/O-jellegű műveleteknél vagy atomi
-láthatósági követelményeknél hasznos lehet.</p>
+ritkán előnyös (pl. host által olvasott, rendszermemóriába írt adatnál);
+láthatósági garanciát nem ad.</p>
 <p>A cache operátorok tehát a <em>hozzáférési szándék</em> explicit
 kifejezését teszik lehetővé. A programozó azt mondja meg a hardvernek,
 hogy az adott memóriahozzáférést milyen újrahasználati mintára számítja.
@@ -271,6 +271,7 @@ méréshez a kernel futásidejét és a memória sávszélességét hasonlítjuk
 #include &lt;cuda_runtime.h&gt;
 #include &lt;stdio.h&gt;
 #include &lt;stdlib.h&gt;
+#include &lt;algorithm&gt;
 #include &lt;cmath&gt;
 #include &lt;vector&gt;
 
@@ -293,7 +294,8 @@ __global__ void stream_add_ca(const float* __restrict__ in,
                                int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx &lt; n) {
-        float val = in[idx];       // alapértelmezett betöltés (a fordító const __restrict__ esetén ld.global.nc-t is választhat; SASS-ban ellenőrizendő)
+        float val = __ldca(&amp;in[idx]);   // explicit ld.global.ca; const __restrict__ esetén
+                                        // a fordító ld.global.nc-t választana
         out[idx] = val * scale;    // alapértelmezett st.global.wb
     }
 }
@@ -323,10 +325,10 @@ __global__ void stream_add_cg(const float* __restrict__ in,
 }
 
 // Segédfüggvény a méréshez: a launch a hívó lambdában van, itt csak hívjuk.
-// CUDA-eseményekkel mér; 10 warm-up és 10 mért ismétlés, átlag + szórás.
+// CUDA-eseményekkel mér; 10 warm-up és 20 mért ismétlés, medián + szórás.
 template &lt;typename F&gt;
-void measure_ms(F&amp;&amp; launch, float&amp; mean_ms, float&amp; sd_ms) {
-    const int warmup = 10, iters = 10;
+void measure_ms(F&amp;&amp; launch, float&amp; median_ms, float&amp; sd_ms) {
+    const int warmup = 10, iters = 20;
     for (int i = 0; i &lt; warmup; ++i) launch();
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -350,7 +352,8 @@ void measure_ms(F&amp;&amp; launch, float&amp; mean_ms, float&amp; sd_ms) {
     m /= iters;
     float v = 0.0f;
     for (float x : t) v += (x - m) * (x - m);
-    mean_ms = m;
+    std::sort(t, t + iters);
+    median_ms = 0.5f * (t[iters / 2 - 1] + t[iters / 2]);
     sd_ms = std::sqrt(v / (iters - 1));
 }
 
@@ -399,18 +402,21 @@ int main() {
     const int blocks = (N + threads - 1) / threads;
 
     float m_ca, s_ca, m_cs, s_cs, m_cg, s_cg;
-    measure_ms([&amp;]() { stream_add_ca&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_ca, scale, N); }, m_ca, s_ca);
-    measure_ms([&amp;]() { stream_add_cs&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_cs, scale, N); }, m_cs, s_cs);
-    measure_ms([&amp;]() { stream_add_cg&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_cg, scale, N); }, m_cg, s_cg);
+    measure_ms([&amp;]() { stream_add_ca&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_ca, scale, N); }, m_ca,
+        s_ca);
+    measure_ms([&amp;]() { stream_add_cs&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_cs, scale, N); }, m_cs,
+        s_cs);
+    measure_ms([&amp;]() { stream_add_cg&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(d_in, d_out_cg, scale, N); }, m_cg,
+        s_cg);
 
     // Ellenőrzés: mindhárom kimenet teljes összevetése a referenciával
     bool ok = verify(d_out_ca, ref, &quot;ca&quot;) &amp; verify(d_out_cs, ref, &quot;cs&quot;) &amp;
               verify(d_out_cg, ref, &quot;cg&quot;);
     if (!ok) return EXIT_FAILURE;
 
-    printf(&quot;Futásidő CA (alap):      %.3f +- %.3f ms\n&quot;, m_ca, s_ca);
-    printf(&quot;Futásidő CS (streaming): %.3f +- %.3f ms\n&quot;, m_cs, s_cs);
-    printf(&quot;Futásidő CG (L2 only):   %.3f +- %.3f ms\n&quot;, m_cg, s_cg);
+    printf(&quot;Futásidő CA (alap):      medián %.3f ms, szórás %.3f\n&quot;, m_ca, s_ca);
+    printf(&quot;Futásidő CS (streaming): medián %.3f ms, szórás %.3f\n&quot;, m_cs, s_cs);
+    printf(&quot;Futásidő CG (L2 only):   medián %.3f ms, szórás %.3f\n&quot;, m_cg, s_cg);
 
     // Sávszélesség: (beolvasás + kiírás) bájt / idő; B / (ms * 1e6) = GB/s
     const double total_bytes = 2.0 * bytes;
@@ -438,15 +444,17 @@ kitölteni; ebben a kéziratban nem szerepel futtatott mérés):</p>
 Compute capability: &lt;mérendő&gt;
 CUDA verzió / driver: &lt;mérendő&gt;
 OS: &lt;mérendő&gt;
-Warm-up: 10 iteráció, mért ismétlések: 10, Precision: FP32
+Warm-up: 10 iteráció, mért ismétlések: 20, Precision: FP32
 
-Futásidők (átlag +- szórás) és sávszélesség (GB/s = 134 217 728 B / (ms * 1e6)):
+Futásidők (medián, szórás) és sávszélesség (GB/s = 134 217 728 B / (ms * 1e6)):
 - CA (alap):      &lt;mért – kitöltendő&gt; ms, &lt;mért – kitöltendő&gt; GB/s
 - CS (streaming): &lt;mért – kitöltendő&gt; ms, &lt;mért – kitöltendő&gt; GB/s
 - CG (L2 only):   &lt;mért – kitöltendő&gt; ms, &lt;mért – kitöltendő&gt; GB/s
 
 Várt eredmény (kvalitatív, nem mért):
-Egyszeri hozzáférésű adatnál a CS és CG különbsége a CA-hoz képest várhatóan kicsi (a kernel DRAM-sávszélesség-korlátos); a hatás a konkrét GPU-tól és a mérettől függ, és a mérés akár nulla különbséget is mutathat.</code></pre>
+Egyszeri hozzáférésű adatnál a CS és CG különbsége a CA-hoz képest várhatóan kicsi
+(a kernel DRAM-sávszélesség-korlátos); a hatás a konkrét GPU-tól és a mérettől függ,
+és a mérés akár nulla különbséget is mutathat.</code></pre>
 <p>A fenti példa jól szemlélteti a cache operátorok használatát. A
 tényleges mérési eredményeket mindig az adott hardveren kell elvégezni,
 mert a gyorsítótárazási politika hardver- és driverfüggő. A példában
@@ -527,13 +535,15 @@ operátorok viselkedése compute capability-től függ. Például a
 architektúrákon (pl. Kepler/Maxwell) a globális betöltések
 L1-gyorsítótárazása alapértelmezetten nem biztos, hogy engedélyezett
 (Volta, CC 7.0+ óta az alapértelmezett), így a <code>__ldca</code> ≡
-<code>*ptr</code> azonosság csak CC 7.0+ esetén áll; az L1 és shared
-memory közös fizikai tárolója már a Fermi óta létezik. Az
-<code>__ldcg</code> blokkok közötti kommunikációnál a láthatóságot is
-érinti, mivel az L1 nem koherens. <strong>Helyes megoldás</strong>: A
-dokumentációban megadott architektúra-specifikus viselkedést ellenőrizni
-kell (verziófüggő, ezért a fejlesztői dokumentációt kell
-figyelni).</p></li>
+<code>*ptr</code> azonosság csak CC 7.0+ esetén áll; az L1 és a shared
+memory Fermi/Kepler architektúrán és Volta (CC 7.0) óta közös fizikai
+tárolón osztozik; Maxwell és Pascal esetén a shared memory külön tároló
+volt. Az <code>__ldcg</code> nem szinkronizációs eszköz: a blokkok
+közötti láthatóságot a 15.4 alfejezetben tárgyalt atomikus műveletek és
+fence-ek biztosítják, nem a cache operátor megválasztása. <strong>Helyes
+megoldás</strong>: A dokumentációban megadott architektúra-specifikus
+viselkedést ellenőrizni kell (verziófüggő, ezért a fejlesztői
+dokumentációt kell figyelni).</p></li>
 <li><p><strong>Helytelen indexelés miatti hibás hint</strong>: A cache
 operátorok használata nem változtatja meg a memóriacímzést, de ha a
 programozó rossz pointert ad át, a hiba ugyanúgy jelentkezik. A
@@ -612,7 +622,7 @@ streaming jellegű hozzáférésről van szó: <code>__ldcs</code> a
 betöltésre és <code>__stcs</code> a kiírásra (az <code>__ldlu</code>
 globális címen ugyanúgy viselkedik, mint az <code>__ldcs</code>). A
 választást baseline-nal (<code>ca</code>) összevetve kell mérni: azonos
-input, 10 warm-up, legalább 10 ismétlés átlaggal és szórással,
+input, 10 warm-up, legalább 20 ismétlés mediánnal és szórással,
 <code>ncu</code>-val a <code>dram__bytes_*.sum</code>,
 <code>lts__t_sector_hit_rate.pct</code> és
 <code>l1tex__t_sector_hit_rate.pct</code> metrikák; a hatás kicsi vagy

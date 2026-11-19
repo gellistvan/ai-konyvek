@@ -78,6 +78,18 @@ sorosan hajtja végre a két ágat: először az <code>if</code> utasításait
 a páros szálakon, majd az <code>else</code> utasításait a páratlan
 szálakon. A két ág végrehajtása után a warp újra konvergál, és a szálak
 közös úton folytatják.</p>
+<p>Az alábbi ábra a labor két kernelén (5.2.5) mutatja, melyik lane
+mikor aktív: a divergens kernelben minden warp két lépésben, felváltva a
+páros és a páratlan lane-ekkel futtatja az ágakat, a warp-uniform
+kernelben minden warp egyetlen ágat futtat teljes maszkkal.</p>
+<figure id="fig-gpu015-active-mask">
+<div class="fig-interactive"><iframe src="figures/html/gpu015-active-mask.html" title="Divergens esetben a warp két lépésben, felváltva a páros és a páratlan lane-ekkel futtatja az ágakat (maszk 0x55555555, majd 0xAAAAAAAA); uniform esetben minden warp egy ágat futtat teljes maszkkal" loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/gpu015-active-mask.png" style="width:95.0%"
+alt="Divergens esetben a warp két lépésben, felváltva a páros és a páratlan lane-ekkel futtatja az ágakat (maszk 0x55555555, majd 0xAAAAAAAA); uniform esetben minden warp egy ágat futtat teljes maszkkal" /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu015-active-mask.png" style="width:95.0%"
+alt="Divergens esetben a warp két lépésben, felváltva a páros és a páratlan lane-ekkel futtatja az ágakat (maszk 0x55555555, majd 0xAAAAAAAA); uniform esetben minden warp egy ágat futtat teljes maszkkal" /></details></div>
+<figcaption>Aktív maszk divergens és warp-uniform elágazásnál
+(sematikus; Volta+ eszközön a két ág sorrendje nem
+rögzített)</figcaption>
+</figure>
 <p>A rekonvergencia az a pont, ahol a divergens szálak ismét egyesülnek.
 A rekonvergencia a pre-Volta modellben a vezérlőfolyam-gráf alapján
 automatikusan, az utasításszinten rögzített pontokon történt. A Volta
@@ -138,10 +150,11 @@ el predikációval vagy warp-uniform feltétellel. A futásidők különbsége
 mutatja a divergencia többletköltségét.</p>
 <p>A méréshez a kernel teljes futásidejét mérjük CUDA eseményekkel
 (<code>cudaEvent_t</code>), warm-up után, a kernel többszöri
-futtatásának átlagával és szórásával. (A <code>clock64()</code>
-ciklusszámláló szálanként, kernelen belül használható finomabb mérésre,
-de ez itt nem szükséges.) A mérési módszertan részleteit a 4.4 alfejezet
-(Az első mérés: CPU vs. GPU) és a 31.3 alfejezet (Benchmarkmódszertan)
+futtatásának mediánjával és IQR-jével (protokoll: lásd a 4.4.4 szakaszt:
+5 warm-up, 20 mért ismétlés). (A <code>clock64()</code> ciklusszámláló
+szálanként, kernelen belül használható finomabb mérésre, de ez itt nem
+szükséges.) A mérési módszertan részleteit a 4.4 alfejezet (Az első
+mérés: CPU vs. GPU) és a 31.3 alfejezet (Benchmarkmódszertan)
 tartalmazza; itt a divergencia kimutatására szorítkozunk.</p>
 <p>A divergencia mérésére egy hasznos mutató az utasítások száma. A
 divergencia közvetlenül az Nsight Compute-tal vizsgálható (CC 7.5 és
@@ -178,8 +191,9 @@ lane-ekre áll.</li>
 (<code>(threadIdx.x / 32) % 2 == 0</code>), így egy warp szálai mind
 ugyanazt az ágat választják, és nincs divergencia; a blokkon belül a két
 ág ugyanolyan arányban fordul elő.</li>
-<li>Mérjük mindkét kernelt külön warm-up futtatással (mindkettőre),
-legalább 10 ismétléssel; közöljük az átlagot és a szórást.</li>
+<li>Mérjük mindkét kernelt külön warm-up futtatással (mindkettőre), a
+protokoll szerint 5 warm-up futással és 20 mért ismétléssel; közöljük a
+mediánt és az IQR-t.</li>
 <li>Ellenőrizzük a SASS-t (<code>cuobjdump -sass</code>): a divergens
 kernelben <code>BRA</code>/<code>BSSY</code>-jellegű vezérlésátadásnak
 kell lennie, és az ágak nem olvadhatnak predikált/<code>SEL</code>
@@ -190,12 +204,14 @@ utasításokká. Ha igen, növeljük az ágtörzs méretét.</li>
 fordítás és a futtatás a hallgató feladata):</p>
 <pre class="cuda"><code>// divergent_vs_uniform.cu
 // Fordítás: nvcc -std=c++17 -O3 -arch=sm_80 -o divergent_vs_uniform divergent_vs_uniform.cu
+#include &lt;algorithm&gt;
 #include &lt;cmath&gt;
 #include &lt;cstdio&gt;
 #include &lt;cstdlib&gt;
+#include &lt;vector&gt;
 #include &lt;cuda_runtime.h&gt;
 
-#define CHECK_CUDA(call) do {                                              \
+#define CUDA_CHECK(call) do {                                              \
     cudaError_t err = (call);                                              \
     if (err != cudaSuccess) {                                              \
         fprintf(stderr, &quot;CUDA error at %s:%d: %s\n&quot;, __FILE__, __LINE__,  \
@@ -235,69 +251,68 @@ __global__ void uniform_kernel(float* data, int n) {
 
 using KernelFn = void (*)(float*, int);
 
-// Egy kernel mérése: warm-up + iters ismétlés; átlag és szórás ms-ban.
+// Egy kernel mérése: 5 warm-up + iters ismétlés; medián és IQR ms-ban.
 static void time_kernel(KernelFn k, float* d, int n, int grid, int block,
-                        int iters, double* mean, double* stdev) {
+                        int iters, double* med, double* iqr) {
     cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&amp;start));
-    CHECK_CUDA(cudaEventCreate(&amp;stop));
-    k&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d, n);                      // warm-up (modulbetöltés, órajel)
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-    double sum = 0.0, sum2 = 0.0;
-    for (int r = 0; r &lt; iters; ++r) {
-        CHECK_CUDA(cudaEventRecord(start));
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
+    for (int w = 0; w &lt; 5; ++w) {                  // warm-up (modulbetöltés, órajel)
         k&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d, n);
-        CHECK_CUDA(cudaGetLastError());
-        CHECK_CUDA(cudaEventRecord(stop));
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        float ms = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&amp;ms, start, stop));
-        sum += ms; sum2 += (double)ms * ms;
+        CUDA_CHECK(cudaGetLastError());
     }
-    *mean = sum / iters;
-    double var = sum2 / iters - (*mean) * (*mean);
-    *stdev = var &gt; 0.0 ? sqrt(var) : 0.0;
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector&lt;float&gt; t(iters);
+    for (int r = 0; r &lt; iters; ++r) {
+        CUDA_CHECK(cudaEventRecord(start));
+        k&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d, n);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;t[r], start, stop));
+    }
+    std::sort(t.begin(), t.end());
+    *med = t[iters / 2];
+    *iqr = t[(3 * iters) / 4] - t[iters / 4];
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 }
 
 int main() {
     const int N = 1 &lt;&lt; 22;                // 4 Mi elem
     const size_t bytes = N * sizeof(float);
-    const int block = 128, grid = (N + block - 1) / block, iters = 10;
+    const int block = 128, grid = (N + block - 1) / block, iters = 20;
     float* h = (float*)malloc(bytes);
     for (int i = 0; i &lt; N; ++i) h[i] = 0.001f * (i % 1000);   // azonos bemenet
     float* d;
-    CHECK_CUDA(cudaMalloc(&amp;d, bytes));
+    CUDA_CHECK(cudaMalloc(&amp;d, bytes));
 
     double m_div, s_div, m_uni, s_uni;
-    CHECK_CUDA(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice));
     time_kernel(divergent_kernel, d, N, grid, block, iters, &amp;m_div, &amp;s_div);
-    CHECK_CUDA(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice)); // azonos bemenet újra
+    CUDA_CHECK(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice)); // azonos bemenet újra
     time_kernel(uniform_kernel, d, N, grid, block, iters, &amp;m_uni, &amp;s_uni);
 
     // Épségellenőrzés: az útvonalak értéktartománya korlátos ([-1, 2]).
-    CHECK_CUDA(cudaMemcpy(h, d, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h, d, bytes, cudaMemcpyDeviceToHost));
     bool ok = true;
     for (int i = 0; i &lt; N; ++i) if (!(h[i] &gt; -1.0f &amp;&amp; h[i] &lt; 2.0f)) { ok = false; break; }
 
-    printf(&quot;Divergent: %.6f ms (std %.6f)\n&quot;, m_div, s_div);
-    printf(&quot;Uniform:   %.6f ms (std %.6f)\n&quot;, m_uni, s_uni);
+    printf(&quot;Divergent: median %.6f ms (IQR %.6f)\n&quot;, m_div, s_div);
+    printf(&quot;Uniform:   median %.6f ms (IQR %.6f)\n&quot;, m_uni, s_uni);
     printf(&quot;Ratio (divergent / uniform): %.2f\n&quot;, m_div / m_uni);
     printf(&quot;Sanity check: %s\n&quot;, ok ? &quot;OK&quot; : &quot;FAILED&quot;);
     free(h);
-    CHECK_CUDA(cudaFree(d));
+    CUDA_CHECK(cudaFree(d));
     return ok ? 0 : 1;
 }</code></pre>
 <p>A kernel launch alakja
 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> (grid = 32768 blokk,
 block = 128 szál 1D elrendezésben, shared bytes és stream nélkül, azaz
-az alapértelmezett). A <code>sqrt</code> itt a host oldali
-<code>std::sqrt</code> (a <code>&lt;cmath&gt;</code>-ból). A kernelek
-egyszerű <code>data[i]</code> írás-olvasása miatt a memóriaforgalom (kb.
-32 MiB kernelenként) elhanyagolható a 128 láncolt
-<code>sinf</code>/<code>cosf</code> hívás mellett.</p>
+az alapértelmezett). A kernelek egyszerű <code>data[i]</code>
+írás-olvasása miatt a memóriaforgalom (kb. 32 MiB kernelenként)
+elhanyagolható a 128 láncolt <code>sinf</code>/<code>cosf</code> hívás
+mellett.</p>
 <p><strong>Mérési napló (kitöltendő, nem futtatott mérés).</strong> A
 környezetet és az eredményeket a saját futtatáskor kell rögzíteni; az
 alábbi értékek helyőrzők, a fejezet nem közöl mért adatot.</p>
@@ -322,8 +337,8 @@ művelet)</li>
 <thead>
 <tr>
 <th>Kernel</th>
-<th>Átlagos idő (ms)</th>
-<th>Szórás (ms)</th>
+<th>Medián idő (ms)</th>
+<th>IQR (ms)</th>
 <th>Megjegyzés</th>
 </tr>
 </thead>
@@ -386,9 +401,9 @@ konstanst használja.</p></li>
 feltétel a <code>threadIdx.x</code>-től függ, a warp-on belül
 divergencia keletkezik. Ez sokszor elkerülhető a feltétel
 átszervezésével, hogy a warp minden szálára ugyanaz az ág vonatkozzon,
-vagy predikációval. Például a <code>blockIdx.x</code>-re alapozott
-feltétel gyakran warp-uniform, mert a blokk indexe minden szálra
-azonos.</p></li>
+vagy predikációval. Például a csak <code>blockIdx</code>-től függő
+feltétel mindig warp-uniform, mert a warp szálai ugyanabba a blokkba
+tartoznak.</p></li>
 <li><p><strong>A <code>__activemask()</code> helytelen
 használata:</strong> Az aktív maszkot nem szabad eltárolni és később
 újra felhasználni olyan utasításban, ahol a szálak újra konvergáltak. Az
@@ -399,26 +414,32 @@ biztonságosabb; Volta+ eszközön a warp-primitívek előtt szükség esetén
 <li><p><strong>A rekonvergencia utasításszintű garanciájának
 feltételezése:</strong> Volta+ eszközön a rekonvergencia időpontja nem
 garantált utasításszinten (ITS), ezért implicit warp-szinkronra nem
-építhetünk (<code>__syncwarp(mask)</code>). Ha a divergens ágak
-különböző erőforrásokat igényelnek, a hardvernek meg kell várnia mindkét
-ág befejezését. Ezért a leglassabb ág határozza meg a warp
-késleltetését.</p></li>
-<li><p><strong>A predikáció túlzott használata:</strong> Ha az ágakban
-sok utasítás van, a predikáció mindkét ág utasításait végrehajtja, ami
-nagyobb költség lehet, mint a divergens végrehajtás. A mérés dönti el,
-melyik jobb.</p></li>
+építhetünk (<code>__syncwarp(mask)</code>). A divergens warp a két ág
+utasításait egymás után, a megfelelő aktív maszkkal adja ki, ezért az
+utasításkiadás költsége a két ág <strong>összege</strong>, nem a
+hosszabbiké; az ITS legfeljebb a két ág késleltetéseit (pl.
+memóriavárakozás) lapolhatja át részben.</p></li>
+<li><p><strong>A predikáció túlzott használata:</strong> predikált
+kódban <em>minden</em> warp mindkét ág utasításait kiadja, akkor is, ha
+a feltétel a warpon belül egyforma; ha az ágak hosszúak és a feltétel
+többnyire warp-uniform, a valódi elágazás olcsóbb, mert a nem választott
+ágat a warp átugorja. Divergens feltételnél a két megoldás utasításszáma
+hasonló. A mérés és a SASS dönti el, melyik jobb.</p></li>
 </ul>
 <h3 data-number="5.2.7" id="önellenőrző-kérdés"><span
 class="header-section-number">5.2.7</span> Önellenőrző kérdés</h3>
-<p>Adott egy warp, amelyben a <code>threadIdx.x &lt; 16</code> feltétel
-igaz. Hány ágat hajt végre a warp, ha a feltétel
-<code>if</code>-<code>else</code> szerkezetben van? Mi történik, ha a
-feltétel <code>blockIdx.x == 0</code>? Válasz indoklása: az első esetben
-a feltétel a szál indexétől függ, így a warp divergens: az
-<code>if</code> ág a 0–15. szálakra, az <code>else</code> ág a 16–31.
-szálakra fut, tehát két ág. A második esetben a feltétel minden szálra
-ugyanaz, mert a <code>blockIdx.x</code> a blokk minden szálára azonos,
-így nincs divergencia, a warp egyetlen ágat hajt végre.</p>
+<p>Adott egy blokk 0. warpja (0–31. szál) és egy
+<code>if (threadIdx.x &lt; 16) … else …</code> elágazás. Hány ágat hajt
+végre a warp? Mi történik, ha a feltétel
+<code>blockIdx.x == 0</code>?</p>
+<p><strong>Válasz:</strong> az első esetben a feltétel a szál indexétől
+függ, így a warp divergens: az <code>if</code> ág a 0–15. szálakra, az
+<code>else</code> ág a 16–31. szálakra fut, tehát két ág. A második
+esetben a feltétel minden szálra ugyanaz, mert a <code>blockIdx.x</code>
+a blokk minden szálára azonos, így nincs divergencia, a warp egyetlen
+ágat hajt végre. A blokk többi warpjában (<code>threadIdx.x ≥ 32</code>)
+a <code>threadIdx.x &lt; 16</code> feltétel minden szálra hamis, ott
+nincs divergencia.</p>
 <p>Összefoglalva: a warp a GPU végrehajtás alapegysége; a warp-on belüli
 elágazás divergenciához vezet, amely soros végrehajtást eredményez, és
 teljesítménycsökkenéssel jár. A predikáció és a feltétel átszervezése
@@ -429,5 +450,5 @@ eredményt.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu014.html">← 5.1 Thread, block, grid és a hardverre képezés</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu016.html">5.3 Launch bounds, blockméret és gridméret →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

@@ -84,8 +84,9 @@ pontosan ez az egyik leggyakoribb hibalehetőség a Roofline-elemzések
 során. A legfontosabb szabályok:</p>
 <ol type="1">
 <li><strong>Egy összeadás = 1 FLOP, egy szorzás = 1 FLOP.</strong> A
-kivonás és az ellentett előjel is összeadásként számít, a negatív
-előjelet nem tekintjük plusz műveletnek.</li>
+kivonás összeadásként (1 FLOP) számít; az előjelváltást (negálást) nem
+számoljuk külön FLOP-nak, mert a GPU-n jellemzően az operandus
+módosítójaként, külön utasítás nélkül valósul meg.</li>
 <li><strong>Egy fuzionált szorzás-összeadás (FMA) = 2 FLOP</strong>,
 noha gépi utasításszinten egyetlen instrukcióról van szó. Az NVIDIA
 specifikációs lapokon szereplő csúcs FLOPS értékek ezen a konvención
@@ -115,11 +116,14 @@ utasításokhoz képest.</p>
 összeadás éppúgy 1 FLOP, mint egy FP32-es vagy FP16-os. A gyakorlatban a
 pontosság határozza meg a megvalósítható csúcs FLOPS-t. Az FP64-es
 egységek a fogyasztói GPU-kon sokkal lassabbak, mint az FP32-es egységek
-(például 1:64 arány az Ampere generáció fogyasztói sorozatában), míg a
-professzionális és HPC-kártyákon az arány 1:2 vagy 1:1. Az FP16, TF32 és
-BF16 egységek tovább növelik a csúcs FLOPS-t, de a numerikus pontosság
-csökken, amit a numerikus pontosságról szóló későbbi fejezetben
-tárgyalunk részletesen.</p>
+(például 1:64 arány az Ampere generáció fogyasztói sorozatában), míg az
+adatközponti HPC-gyorsítókon (pl. A100, H100) az arány 1:2; a fogyasztói
+chipre épülő munkaállomás-kártyákon (pl. RTX A6000) a fogyasztói arány
+(CC 8.6/8.9: 1:64) érvényes. Az A100/H100 tenzormagos FP64-csúcsa ettől
+eltérő, külön tető (az adatokat az adatlappal egyeztessük). Az FP16,
+TF32 és BF16 egységek tovább növelik a csúcs FLOPS-t, de a numerikus
+pontosság csökken, amit a numerikus pontosságról szóló későbbi
+fejezetben tárgyalunk részletesen.</p>
 <h3 data-number="13.3.3"
 id="byte-számolás-melyik-memóriaszint-forgalmát-számoljuk"><span
 class="header-section-number">13.3.3</span> Byte-számolás: melyik
@@ -407,7 +411,7 @@ kötelező hibakezelést, a warm-up protokollt és a mérési naplót.</p>
 #include &lt;algorithm&gt;
 #include &lt;cuda_runtime.h&gt;
 
-#define CHECK_CUDA(call)                                            \
+#define CUDA_CHECK(call)                                            \
     do {                                                             \
         cudaError_t _err = (call);                                   \
         if (_err != cudaSuccess) {                                   \
@@ -418,7 +422,7 @@ kötelező hibakezelést, a warm-up protokollt és a mérési naplót.</p>
     } while (0)
 
 constexpr int WARMUP = 5;
-constexpr int REP = 10;
+constexpr int REP = 20;
 constexpr int FMA_ITER = 256;   // láncolatonkénti FMA-k száma
 
 // 1. kernel: SAXPY, y[i] = a*x[i] + y[i]
@@ -462,46 +466,43 @@ __global__ void fma_kernel(const float* __restrict__ x,
     if (idx &lt; n) y[idx] = fma_chain(x[idx], a);
 }
 
-// Mérési protokoll: warm-up + REP mérés, átlag és szórás. A launch tetszőleges
+// Mérési protokoll: warm-up + REP mérés, medián és IQR. A launch tetszőleges
 // hívható objektum (lambda is lehet), ezért sablonparaméter, nem függvénymutató.
 template &lt;typename Launch&gt;
 void run_and_measure(const char* name, Launch&amp;&amp; launch,
                      size_t moved_bytes, double flop_count) {
     cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&amp;start));
-    CHECK_CUDA(cudaEventCreate(&amp;stop));
+    CUDA_CHECK(cudaEventCreate(&amp;start));
+    CUDA_CHECK(cudaEventCreate(&amp;stop));
 
     for (int i = 0; i &lt; WARMUP; ++i) launch();
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     double times[REP];
     for (int i = 0; i &lt; REP; ++i) {
-        CHECK_CUDA(cudaEventRecord(start));
+        CUDA_CHECK(cudaEventRecord(start));
         launch();
-        CHECK_CUDA(cudaEventRecord(stop));
-        CHECK_CUDA(cudaEventSynchronize(stop));
-        CHECK_CUDA(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaGetLastError());
         float ms = 0.0f;
-        CHECK_CUDA(cudaEventElapsedTime(&amp;ms, start, stop));
+        CUDA_CHECK(cudaEventElapsedTime(&amp;ms, start, stop));
         times[i] = (double)ms * 1e-3; // másodperc
     }
 
-    double avg = 0.0;
-    for (int i = 0; i &lt; REP; ++i) avg += times[i];
-    avg /= REP;
-    double var = 0.0;
-    for (int i = 0; i &lt; REP; ++i) var += (times[i] - avg) * (times[i] - avg);
-    double std_dev = std::sqrt(var / (REP - 1));
+    std::sort(times, times + REP);
+    double med = times[REP / 2];
+    double iqr = times[(3 * REP) / 4] - times[REP / 4];
 
     printf(&quot;\n== %s ==\n&quot;, name);
-    printf(&quot;Futásidő átlag: %.4f ms (szórás %.4f ms)\n&quot;, avg * 1e3, std_dev * 1e3);
-    printf(&quot;Mért sávszélesség: %.2f GB/s\n&quot;, (double)moved_bytes / avg / 1e9);
-    printf(&quot;Mért teljesítmény: %.2f GFLOP/s\n&quot;, flop_count / avg / 1e9);
+    printf(&quot;Futásidő medián: %.4f ms (IQR %.4f ms)\n&quot;, med * 1e3, iqr * 1e3);
+    printf(&quot;Mért sávszélesség: %.2f GB/s\n&quot;, (double)moved_bytes / med / 1e9);
+    printf(&quot;Mért teljesítmény: %.2f GFLOP/s\n&quot;, flop_count / med / 1e9);
     printf(&quot;Intenzitás: %.3f FLOP/byte\n&quot;, flop_count / (double)moved_bytes);
 
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 }
 
 // FP32 mag/SM a compute capability alapján (NVIDIA CUDA Programming Guide táblázat); 0 = ismeretlen.
@@ -526,14 +527,15 @@ int main() {
 
     int dev = 0;
     cudaDeviceProp prop;
-    CHECK_CUDA(cudaGetDevice(&amp;dev));
-    CHECK_CUDA(cudaGetDeviceProperties(&amp;prop, dev));
+    CUDA_CHECK(cudaGetDevice(&amp;dev));
+    CUDA_CHECK(cudaGetDeviceProperties(&amp;prop, dev));
     int mem_clock_khz = 0, bus_bits = 0, clock_khz = 0;
-    CHECK_CUDA(cudaDeviceGetAttribute(&amp;mem_clock_khz, cudaDevAttrMemoryClockRate, dev));
-    CHECK_CUDA(cudaDeviceGetAttribute(&amp;bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev));
-    CHECK_CUDA(cudaDeviceGetAttribute(&amp;clock_khz, cudaDevAttrClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;mem_clock_khz, cudaDevAttrMemoryClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&amp;clock_khz, cudaDevAttrClockRate, dev));
     // DDR-jellegű memória (2 átvitel/órajel) feltételezésével; az adatlappal egyeztetni kell.
-    // A clockRate jellegű attribútumok a CUDA 13-ban elavultak lehetnek (CUDA 12.x-en használhatók).
+    // A cudaDevAttr...ClockRate attribútumok CUDA 13-ban is elérhetők (ellenőrzendő);
+    // a cudaDeviceProp clockRate/memoryClockRate mezői viszont megszűntek.
     const double beta_gbps = 2.0 * mem_clock_khz * 1e3 * (bus_bits / 8.0) / 1e9;
     const int cores = fp32_cores_per_sm(prop.major, prop.minor);
     const double pi_gflops = 2.0 * clock_khz * 1e3 * prop.multiProcessorCount * cores / 1e9;
@@ -549,20 +551,20 @@ int main() {
            N, saxpy_bytes / 1e6, horner_bytes / 1e6, fma_bytes / 1e6);
 
     float *d_x = nullptr, *d_y = nullptr;     // d_y: kernelenként újratöltve
-    CHECK_CUDA(cudaMalloc(&amp;d_x, bytes_in));
-    CHECK_CUDA(cudaMalloc(&amp;d_y, bytes_out));
+    CUDA_CHECK(cudaMalloc(&amp;d_x, bytes_in));
+    CUDA_CHECK(cudaMalloc(&amp;d_y, bytes_out));
     float* h_x = (float*)malloc(bytes_in);
     float* h_y = (float*)malloc(bytes_out);
     if (!h_x || !h_y) { fprintf(stderr, &quot;malloc hiba\n&quot;); return EXIT_FAILURE; }
     for (int i = 0; i &lt; N; ++i) h_x[i] = (float)(i % 17) * 0.1f;
-    CHECK_CUDA(cudaMemcpy(d_x, h_x, bytes_in, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_x, h_x, bytes_in, cudaMemcpyHostToDevice));
 
     const int block_size = 256;
     const dim3 block(block_size);
     const dim3 grid((N + block_size - 1) / block_size);
     auto reset_y = [&amp;]() {
         for (int i = 0; i &lt; N; ++i) h_y[i] = 1.0f;
-        CHECK_CUDA(cudaMemcpy(d_y, h_y, bytes_out, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_y, h_y, bytes_out, cudaMemcpyHostToDevice));
     };
     double max_err = 0.0;
 
@@ -572,7 +574,7 @@ int main() {
     run_and_measure(&quot;SAXPY (I = 1/6 FLOP/byte)&quot;,
         [&amp;]() { saxpy_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_x, d_y, sa, N); },
         saxpy_bytes, saxpy_flops);
-    CHECK_CUDA(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
     // Összesen WARMUP + REP indítás, mindegyik +a*x: y = 1 + (WARMUP+REP)*a*x
     for (int i = 0; i &lt; N; ++i) {
         double ref = 1.0 + (WARMUP + REP) * (double)sa * h_x[i];
@@ -585,7 +587,7 @@ int main() {
     run_and_measure(&quot;Horner-polinom (I = 0,75 FLOP/byte)&quot;,
         [&amp;]() { horner_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_x, d_y, 0.5f, 1.0f, 2.0f, -0.5f, N); },
         horner_bytes, horner_flops);
-    CHECK_CUDA(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
     max_err = 0.0;
     for (int i = 0; i &lt; N; ++i) {
         float x0 = h_x[i];
@@ -599,7 +601,7 @@ int main() {
     run_and_measure(&quot;FMA-lánc (I = 256 FLOP/byte körül)&quot;,
         [&amp;]() { fma_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_x, d_y, 0.999f, N); },
         fma_bytes, fma_flops);
-    CHECK_CUDA(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_y, d_y, bytes_out, cudaMemcpyDeviceToHost));
     max_err = 0.0;
     for (int i = 0; i &lt; N; i += 4099) {   // minta: a host-lánc lassú
         float ref = fma_chain(h_x[i], 0.999f);
@@ -609,15 +611,15 @@ int main() {
     if (!(max_err &lt; 1e-4)) return EXIT_FAILURE;
 
     free(h_x); free(h_y);
-    CHECK_CUDA(cudaFree(d_x));
-    CHECK_CUDA(cudaFree(d_y));
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_y));
     return 0;
 }</code></pre>
 <p><strong>Fordítás és futtatás:</strong></p>
 <div class="sourceCode" id="cb3"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">nvcc</span> <span class="at">-O3</span> <span class="at">-arch</span><span class="op">=</span>sm_86 <span class="at">-o</span> labor_gpu048 labor_gpu048.cu</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./labor_gpu048</span></span></code></pre></div>
-<p>A kimenet rögzítse a GPU adatait, a futásidő átlagát és szórását, a
+<p>A kimenet rögzítse a GPU adatait, a futásidő mediánját és IQR-ját, a
 mért sávszélességet és GFLOP/s-t. A mérési naplóban ezeket jelölje
 <strong>mért</strong> értékként; a programot a könyv írásakor nem
 futtattuk, ezért a laborjegyzőkönyvbe csak a saját méréseredmények
@@ -652,6 +654,19 @@ tehát <strong>memória-korlátos</strong>; a harmadik, FMA-láncos kernel
 <strong>számítás-korlátos</strong>, és a mért GFLOP/s-értéke a
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mi>π</mi><annotation encoding="application/x-tex">\pi</annotation></semantics></math>
 közelébe kell, hogy kerüljön.</p>
+<figure id="fig-gpu048-classification">
+<div class="fig-interactive"><iframe src="figures/html/gpu048-classification.html" title="A SAXPY és a Horner-kernel a memóriaágon, a ridge pont bal oldalán van; az FMA-lánc-kernel a jobb oldalon, a vízszintes számítási tető alatt." loading="lazy" style="width:100%;border:0;height:820px"></iframe><noscript><img src="figures/img/gpu048-classification.png" style="width:85.0%"
+alt="A SAXPY és a Horner-kernel a memóriaágon, a ridge pont bal oldalán van; az FMA-lánc-kernel a jobb oldalon, a vízszintes számítási tető alatt." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu048-classification.png" style="width:85.0%"
+alt="A SAXPY és a Horner-kernel a memóriaágon, a ridge pont bal oldalán van; az FMA-lánc-kernel a jobb oldalon, a vízszintes számítási tető alatt." /></details></div>
+<figcaption>A SAXPY, a Horner- és az FMA-lánc-kernel várt helye a
+Roofline-on egy példa-GPU-n
+(<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>β</mi><mo>=</mo><mn>900</mn></mrow><annotation encoding="application/x-tex">\beta = 900</annotation></semantics></math>
+GB/s,
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>π</mi><mo>=</mo><mn>12</mn></mrow><annotation encoding="application/x-tex">\pi = 12</annotation></semantics></math>
+TFLOPS): a két memória-korlátos pont a ridge pont bal oldalán, a ferde
+ágon, az FMA-lánc a vízszintes tető alatt; az üres jelölő a saját mérés
+helye (várt értékek, nem mérés)</figcaption>
+</figure>
 <p><strong>A labor eredménye.</strong> Önellenőrzésként írja be a
 jegyzőkönyvbe:</p>
 <ol type="1">
@@ -695,11 +710,11 @@ vagy egyéb device-oldali időzítővel mérjük. A host-oldali
 költséget és a szinkronizációt.</p>
 <p><strong>5. A warm-up elhagyása.</strong> Az első kernel-indítás
 magában foglalja a driver-betöltést, a hőkezelést és az esetleges
-laphibákat. A mérési protokoll mindig 5–10 warm-up iterációt írjon
-elő.</p>
+laphibákat. A mérési protokoll legalább 5 warm-up iterációt írjon elő (a
+könyv mérési protokollja szerint).</p>
 <p><strong>6. A szórás elhallgatása.</strong> Az átlagidő önmagában nem
-elég. A mérési jegyzőkönyvben a szórást vagy percentilist is közölni
-kell, különben a mérés nem tekinthető reprodukálhatónak.</p>
+elég. A mérési jegyzőkönyvben a mediánt és az IQR-t (vagy a szórást)
+kell közölni, különben a mérés nem tekinthető reprodukálhatónak.</p>
 <h3 data-number="13.3.9" id="összefoglalás-és-ellenőrző-kérdések"><span
 class="header-section-number">13.3.9</span> Összefoglalás és ellenőrző
 kérdések</h3>
@@ -784,5 +799,5 @@ memória-korlátos tartományból a számítás-korlátos felé.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu047.html">← 13.2 Memóriateljesítmény és sávszélesség</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu049.html">13.4 Roofline-alapú optimalizálás →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

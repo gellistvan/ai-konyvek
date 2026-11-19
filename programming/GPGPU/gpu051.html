@@ -40,7 +40,7 @@ előtt. Az NVIDIA az Ampere architektúrával (Compute Capability 8.0 és
 aszinkron másolást, röviden <code>cp.async</code>.</p>
 <p>Ez a fejezet a <code>cp.async</code> alapvető működését, a hozzá
 tartozó commit/wait szinkronizációs modellt, valamint a gyakorlati
-alkalmazását mutatja be egy ellenőrzött laborpéldán keresztül.</p>
+alkalmazását mutatja be egy laborpéldán keresztül.</p>
 <figure>
 <img src="assets/gpu051-diagram-1.png"
 alt="cp.async adatút - A cp.async közvetlenül a globális memóriából a shared memóriába másol; a commit és wait után a shared adat a számító szálak számára látható." />
@@ -60,8 +60,8 @@ memory-ba másoljanak adatot anélkül, hogy az adat átmenetileg a
 regiszterfájlban tárolódna. Ezzel az adatút lerövidül: az adat a
 globális memóriából a memóriarendszeren (L2 cache, illetve opcionálisan
 L1) keresztül az SM-en belüli shared memory-ba kerül, kikerülve a
-regisztereket és a load-store egységek hagyományos tranzakciós
-útját.</p>
+regiszterfájlt (a <code>.cg</code> változat az L1-et sem tölti fel); az
+utasítás a load-store egységen és az L1TEX egységen keresztül fut.</p>
 <p>A hardvertámogatás kulcsfontosságú itt. A <code>cp.async</code> nem
 egy szoftveres trükk, hanem egy valódi aszinkron memóriaművelet. A PTX
 ISA-ban két fő változata van:</p>
@@ -124,8 +124,26 @@ wait mechanizmus.</p>
 <code>__pipeline_commit()</code> hívással lezárják az összes addig
 kiadott, befejezetlen <code>cp.async</code> műveletet egy csoportba. Ezt
 követően a <code>__pipeline_wait_prior(N)</code> hívással a szál
-megvárja, amíg a legfeljebb <code>N</code> számú korábbi csoport be nem
-fejeződik.</p>
+megvárja, amíg az általa commitált csoportok közül legfeljebb a
+legutóbbi <code>N</code> van még folyamatban, azaz a legutóbbi
+<code>N</code> kivételével minden korábbi csoport befejeződött.
+<code>N = 0</code>: minden csoport kész; <code>N = 1</code>: a legutolsó
+commitált csoport még futhat (ez a double buffering alapja, 14.3).</p>
+<figure id="fig-gpu051-commit-wait">
+<div class="fig-interactive"><iframe src="figures/html/gpu051-commit-wait.html" title="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/gpu051-commit-wait.png" style="width:100.0%"
+alt="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/gpu051-commit-wait.png" style="width:100.0%"
+alt="Idővonal: három commitált csoport; wait_prior(1) után a két régebbi kész, a legújabb még fut; alatta két szál, a másik szál adatához __syncthreads kell." /></details></div>
+<figcaption>A <code>cp.async</code> csoportok, a
+<code>__pipeline_wait_prior(N)</code> és a blokkszintű szinkron
+(sematikus, nem mért időzítés;
+<math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>c</mi><mi>c</mi><mo>≥</mo><mn>8</mn><mo>,</mo><mn>0</mn></mrow><annotation encoding="application/x-tex">cc \ge 8{,}0</annotation></semantics></math>).
+(a) Egy szál három csoportot commitál; a <code>wait_prior(1)</code>
+akkor tér vissza, amikor a legutóbbi egy csoport (G2) kivételével minden
+korábbi csoport kész, a <code>wait_prior(0)</code> akkor, amikor mind.
+(b) A wait csak a hívó szál saját másolataira vonatkozik: a B szál a
+<code>__syncthreads()</code> nélkül az A szál még meg nem érkezett
+elemét olvashatja.</figcaption>
+</figure>
 <p>A legegyszerűbb helyes minta a következő:</p>
 <ol type="1">
 <li>Kiadjuk az összes szükséges <code>__pipeline_memcpy_async</code>
@@ -155,16 +173,17 @@ class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#c
 <div class="sourceCode" id="cb3"><pre
 class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="pp">#include </span><span class="im">&lt;cuda_pipeline.h&gt;</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Aszinkron betöltés: global -&gt; shared (a `__align__(16)` tile miatt 4 B-os másolás is igazított)</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> TILE_DIM<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> i<span class="op">;</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx<span class="op">;</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> dst <span class="op">=</span> <span class="op">&amp;</span>tile<span class="op">[</span>i<span class="op">][</span>tx<span class="op">];</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> src <span class="op">=</span> <span class="op">&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">];</span></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    __pipeline_memcpy_async<span class="op">(</span>dst<span class="op">,</span> src<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">));</span></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Aszinkron betöltés: global -&gt; shared (a `__align__(16)` tile miatt 4 B-os másolás is</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// igazított)</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">(</span><span class="dt">int</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> TILE_DIM<span class="op">;</span> <span class="op">++</span>i<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> i<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">float</span><span class="op">*</span> dst <span class="op">=</span> <span class="op">&amp;</span>tile<span class="op">[</span>i<span class="op">][</span>tx<span class="op">];</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="at">const</span> <span class="dt">float</span><span class="op">*</span> src <span class="op">=</span> <span class="op">&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">];</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    __pipeline_memcpy_async<span class="op">(</span>dst<span class="op">,</span> src<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span><span class="dt">float</span><span class="op">));</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
 <p>Ebben a példában a <code>sizeof(float)</code> 4 bájtot jelent, ami
 megfelel a minimális <code>cp.async</code> méretnek. Ennél hatékonyabb,
 ha vektorizáljuk a betöltést. Például <code>float4</code> típus
@@ -174,11 +193,13 @@ class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#c
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Feltételezve, hogy N osztható 4-gyel, a tile `__align__(16)`, és a bemenet 16 B-ra igazított</span></span>
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> col <span class="op">=</span> bx <span class="op">*</span> TILE_DIM <span class="op">+</span> tx <span class="op">*</span> <span class="dv">4</span><span class="op">;</span>   <span class="co">// blokk-eltolással</span></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>float4<span class="op">*</span> dst4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>float4<span class="op">*&gt;(&amp;</span>tile<span class="op">[</span>i<span class="op">][</span>tx <span class="op">*</span> <span class="dv">4</span><span class="op">]);</span></span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> float4<span class="op">*</span> src4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> float4<span class="op">*&gt;(&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">]);</span></span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(</span>dst4<span class="op">,</span> src4<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>float4<span class="op">));</span></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// blokk: (TILE_DIM/4) x TILE_DIM szál; egy szál egy sor 4 elemét tölti</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="dt">int</span> row <span class="op">=</span> by <span class="op">*</span> TILE_DIM <span class="op">+</span> ty<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>float4<span class="op">*</span> dst4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span>float4<span class="op">*&gt;(&amp;</span>tile<span class="op">[</span>ty<span class="op">][</span>tx <span class="op">*</span> <span class="dv">4</span><span class="op">]);</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="at">const</span> float4<span class="op">*</span> src4 <span class="op">=</span> <span class="kw">reinterpret_cast</span><span class="op">&lt;</span><span class="at">const</span> float4<span class="op">*&gt;(&amp;</span>global_in<span class="op">[</span>row <span class="op">*</span> N <span class="op">+</span> col<span class="op">]);</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>__pipeline_memcpy_async<span class="op">(</span>dst4<span class="op">,</span> src4<span class="op">,</span> <span class="kw">sizeof</span><span class="op">(</span>float4<span class="op">));</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>__pipeline_commit<span class="op">();</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>__pipeline_wait_prior<span class="op">(</span><span class="dv">0</span><span class="op">);</span></span></code></pre></div>
 <p>A <code>sizeof(float4)</code> értéke 16, így ez egyetlen 16 bájtos,
 maximális hatékonyságú aszinkron másolást eredményez. Fontos
 megjegyezni, hogy a cél- és forráscímeknek ebben az esetben 16 bájtra
@@ -203,8 +224,9 @@ vektorba. Valósítsa meg a betöltést kétféleképpen:</p>
 <li><strong>Optimalizált:</strong> <code>cp.async</code> használatával,
 <code>float4</code> vektorizált betöltéssel.</li>
 </ol>
-<h4 data-number="14.2.4.2" id="ellenőrzött-környezet"><span
-class="header-section-number">14.2.4.2</span> Ellenőrzött környezet</h4>
+<h4 data-number="14.2.4.2" id="mérési-környezet-kitöltendő"><span
+class="header-section-number">14.2.4.2</span> Mérési környezet
+(kitöltendő)</h4>
 <p>Minden méréshez rögzíteni kell a hardver- és szoftverkörnyezetet. Az
 alábbi táblázat egy sablon; a második oszlopban a ténylegesen használt
 laboratóriumi értékeket kell feltüntetni.</p>
@@ -361,8 +383,11 @@ void measure(const char* name, Launch&amp;&amp; launch, int warmup, int reps) {
     for (double x : t) mean += x;
     mean /= reps;
     for (double x : t) var += (x - mean) * (x - mean);
-    std::printf(&quot;%-6s: mean = %.4f ms, std = %.4f ms (n = %d)\n&quot;,
-                name, mean, std::sqrt(var / (reps - 1)), reps);
+    std::vector&lt;double&gt; s = t;
+    std::sort(s.begin(), s.end());
+    double med = (reps % 2) ? s[reps / 2] : 0.5 * (s[reps / 2 - 1] + s[reps / 2]);
+    std::printf(&quot;%-6s: median = %.4f ms, mean = %.4f ms, std = %.4f ms (n = %d)\n&quot;,
+                name, med, mean, std::sqrt(var / (reps - 1)), reps);
     CUDA_CHECK(cudaEventDestroy(a));
     CUDA_CHECK(cudaEventDestroy(b));
 }
@@ -384,11 +409,15 @@ int main() {
 
     dim3 block(BX, BY);
     dim3 grid(tiles, tiles);
-    measure(&quot;sync&quot;,  [&amp;]() { sync_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_sync, MATRIX_DIM); }, 5, 10);
-    measure(&quot;async&quot;, [&amp;]() { async_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_async, MATRIX_DIM); }, 5, 10);
+    measure(&quot;sync&quot;,  [&amp;]() { sync_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_sync,
+        MATRIX_DIM); }, 5, 20);
+    measure(&quot;async&quot;, [&amp;]() { async_tile_sum_kernel&lt;&lt;&lt;grid, block&gt;&gt;&gt;(d_in, d_async,
+        MATRIX_DIM); }, 5, 20);
 
-    CUDA_CHECK(cudaMemcpy(h_sync.data(), d_sync, h_sync.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_async.data(), d_async, h_async.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_sync.data(), d_sync, h_sync.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_async.data(), d_async, h_async.size() * sizeof(float),
+        cudaMemcpyDeviceToHost));
 
     // CPU-referencia (double): minden csempe összege
     double max_rel = 0.0;
@@ -399,9 +428,11 @@ int main() {
                 for (int c = 0; c &lt; TILE_DIM; ++c)
                     ref += h_in[(size_t)(by * TILE_DIM + r) * MATRIX_DIM + bx * TILE_DIM + c];
             size_t k = (size_t)by * tiles + bx;
-            max_rel = std::max({max_rel, std::fabs(h_sync[k] - ref) / ref, std::fabs(h_async[k] - ref) / ref});
+            max_rel = std::max({max_rel, std::fabs(h_sync[k] - ref) / ref,
+                std::fabs(h_async[k] - ref) / ref});
         }
-    std::printf(&quot;Validáció: max relatív hiba a CPU-referenciához képest = %.3e (küszöb 1e-4)\n&quot;, max_rel);
+    std::printf(&quot;Validáció: max relatív hiba a CPU-referenciához képest = %.3e &quot;
+                &quot;(küszöb 1e-4)\n&quot;, max_rel);
     const bool ok = max_rel &lt; 1e-4;
     std::printf(&quot;Eredmény: %s\n&quot;, ok ? &quot;OK&quot; : &quot;HIBA&quot;);
 
@@ -418,8 +449,9 @@ gyorsulást, mivel a kernel nem tartalmaz számítási fázist, amivel az
 adatmozgást átfedhetnénk (ez a 14.3 alfejezet témája). A lehetséges
 nyereség forrása a regiszternyomás csökkenése és a kevesebb
 load-utasítás; ennek mértékét a mérés dönti el, nem a becslés.</p>
-<p>A kernel 4096×4096 FP32 elemet (64 MiB) olvas, és csak 16 KiB-ot ír,
-ezért a futásidő alsó korlátja a DRAM-sávszélességből számolható:
+<p>A kernel 4096×4096 FP32 elemet (64 MiB) olvas, és csak 16 384
+<code>float</code>-ot (64 KiB) ír, ezért a futásidő alsó korlátja a
+DRAM-sávszélességből számolható:
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mi>min</mi></msub><mo>≈</mo><mn>64</mn><mspace width="0.222em"></mspace><mtext mathvariant="normal">MiB</mtext><mi>/</mi><msub><mi>B</mi><mtext mathvariant="normal">peak</mtext></msub></mrow><annotation encoding="application/x-tex">t_{\min} \approx 64\ \text{MiB} / B_{\text{peak}}</annotation></semantics></math>.
 Példa (adatlapi érték, nem mért): egy ~504 GB/s sávszélességű GPU-n
 <math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><msub><mi>t</mi><mi>min</mi></msub><mo>≈</mo><mn>0</mn><mo>,</mo><mn>13</mn></mrow><annotation encoding="application/x-tex">t_{\min} \approx 0{,}13</annotation></semantics></math>
@@ -439,16 +471,16 @@ ms; ennél gyorsabb mért idő L2-találatra vagy mérési hibára utal.</p>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Baseline futásidő ±
-szórás</strong></td>
+<td style="text-align: left;"><strong>Baseline futásidő (medián ±
+szórás)</strong></td>
 <td
 style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≥</mo><msub><mi>t</mi><mi>min</mi></msub></mrow><annotation encoding="application/x-tex">\geq t_{\min}</annotation></semantics></math></td>
 <td
 style="text-align: left;"><code>&lt;mért – kitöltendő&gt;</code></td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong><code>cp.async</code> futásidő ±
-szórás</strong></td>
+<td style="text-align: left;"><strong><code>cp.async</code> futásidő
+(medián ± szórás)</strong></td>
 <td
 style="text-align: left;"><math display="inline" xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo>≥</mo><msub><mi>t</mi><mi>min</mi></msub></mrow><annotation encoding="application/x-tex">\geq t_{\min}</annotation></semantics></math>,
 a baseline-hoz hasonló vagy kissé jobb</td>
@@ -549,9 +581,9 @@ továbblépés</h3>
 alapjait, a globális memóriából a shared memory-ba történő közvetlen,
 regisztereket elkerülő aszinkron másolást. Részleteztük a commit és wait
 mechanizmust, amely elengedhetetlen a műveletek helyes
-szinkronizálásához. A laborfeladatban egy ellenőrzött környezetben
-összehasonlítottuk a hagyományos szinkron betöltést a
-<code>cp.async</code>-alapú megoldással.</p>
+szinkronizálásához. A laborfeladat a hagyományos szinkron betöltés és a
+<code>cp.async</code>-alapú megoldás összehasonlítását készíti elő; a
+mérést az olvasó végzi el a saját GPU-ján.</p>
 <p>Az itt bemutatott minta még nem használja ki az aszinkronitásban
 rejlő legnagyobb lehetőséget, a memóriaműveletek és a számítások
 átfedését. A <code>__pipeline_wait_prior(0)</code> hívás ugyanis
@@ -595,5 +627,5 @@ DRAM-sávszélesség korlátozza.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="gpu050.html">← 14.1 Shared memory tiling</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="gpu052.html">14.3 Double buffering és pipeline →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>
