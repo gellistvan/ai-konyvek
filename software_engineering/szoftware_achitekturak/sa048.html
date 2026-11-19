@@ -107,7 +107,12 @@ csatolási pontot jelent, és ha nem gondoskodunk a magas rendelkezésre
 állásáról, maga is SPOF lehet.</p>
 <p>Az alábbi Mermaid szekvenciadiagram egy orchestrált saga
 egyszerűsített példáját mutatja, ahol a rendelési folyamat koordinátora
-a lépéseket vezérli:</p>
+a lépéseket vezérli. A példában a fizetés a pivot: előtte minden lépés
+olcsón kompenzálható (rendelés <code>Pending</code> állapota,
+időkorláttal felszabadítható készletfoglalás), utána a rendelés
+megerősítése és a szállítás csak újrapróbálással haladhat. A fizetés
+utáni visszatérítés mint kompenzáció a ritka esetre marad, amikor a
+hiány a fizetés után derül ki.</p>
 <pre class="mermaid"><code>sequenceDiagram
     participant Koord as Saga orchestrator
     participant Ren as Rendelés szolg.
@@ -115,15 +120,26 @@ a lépéseket vezérli:</p>
     participant Kes as Készlet szolg.
 
     Koord-&gt;&gt;Ren: Rendelés létrehozása (parancs)
-    Ren--&gt;&gt;Koord: Rendelés kész (esemény)
-    Koord-&gt;&gt;Fiz: Fizetés indítása (parancs)
-    Fiz--&gt;&gt;Koord: Fizetés sikeres (esemény)
-    Koord-&gt;&gt;Kes: Készletfoglalás (parancs)
-    Kes--&gt;&gt;Koord: Foglalás sikertelen (esemény)
-    Koord-&gt;&gt;Fiz: Visszafizetés (kompenzáló parancs)
-    Fiz--&gt;&gt;Koord: Visszafizetés kész (esemény)
-    Koord-&gt;&gt;Ren: Rendelés visszavonása (kompenzáló parancs)
-    Ren--&gt;&gt;Koord: Rendelés visszavonva (esemény)</code></pre>
+    Ren--&gt;&gt;Koord: Rendelés kész, Pending (esemény)
+    Koord-&gt;&gt;Kes: Készletfoglalás (kompenzálható lépés)
+    alt Foglalás sikertelen
+        Kes--&gt;&gt;Koord: Foglalás sikertelen (esemény)
+        Koord-&gt;&gt;Ren: Rendelés visszavonása (kompenzáló parancs)
+        Ren--&gt;&gt;Koord: Rendelés visszavonva (esemény)
+    else Foglalás sikeres
+        Kes--&gt;&gt;Koord: Foglalás sikeres (esemény)
+        Koord-&gt;&gt;Fiz: Fizetés terhelése (pivot lépés)
+        alt Fizetés sikertelen
+            Fiz--&gt;&gt;Koord: Fizetés sikertelen (esemény)
+            Koord-&gt;&gt;Kes: Foglalás felszabadítása (kompenzáló parancs)
+            Kes--&gt;&gt;Koord: Foglalás felszabadítva (esemény)
+            Koord-&gt;&gt;Ren: Rendelés visszavonása (kompenzáló parancs)
+            Ren--&gt;&gt;Koord: Rendelés visszavonva (esemény)
+        else Fizetés sikeres
+            Fiz--&gt;&gt;Koord: Fizetés sikeres (esemény)
+            Koord-&gt;&gt;Ren: Rendelés megerősítése (ismételhető lépés)
+        end
+    end</code></pre>
 <p>A saga nem garantál atomitást, hanem <strong>végső
 konzisztenciát</strong> céloz: a lépések közötti időben az egyes
 szolgáltatások állapota eltérhet, és a kompenzációk lefutása után a
@@ -246,6 +262,15 @@ kimegy – ezért a fogadó oldali idempotencia nem hagyható el. Rögzíteni
 kell továbbá az outbox rekordok megőrzési idejét (mennyi ideig maradnak
 a <code>SENT</code> rekordok a táblában), a retry-szabályt, a riasztási
 küszöböt és az újrafeldolgozás módját.</p>
+<figure id="fig-sa048-saga-outbox">
+<div class="fig-interactive"><iframe src="figures/html/sa048-saga-outbox.html" title="A pivot előtt kompenzáció, utána újrapróbálás; az outbox relé összeomlása legfeljebb duplikált kiküldést okoz, elvesztést nem." loading="lazy" style="width:100%;border:0;height:720px"></iframe><noscript><img src="figures/img/sa048-saga-outbox.png" style="width:95.0%"
+alt="A pivot előtt kompenzáció, utána újrapróbálás; az outbox relé összeomlása legfeljebb duplikált kiküldést okoz, elvesztést nem." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/sa048-saga-outbox.png" style="width:95.0%"
+alt="A pivot előtt kompenzáció, utána újrapróbálás; az outbox relé összeomlása legfeljebb duplikált kiküldést okoz, elvesztést nem." /></details></div>
+<figcaption>Saga-állapotgép pivot ponttal és az outbox összeomlási
+ablakai: a pivot előtt kompenzáció, utána újrapróbálás; az outbox-relé
+összeomlása legfeljebb duplikált kiküldést okoz, elvesztést
+nem</figcaption>
+</figure>
 <p>Az outbox tábla tipikus szerkezete:</p>
 <table>
 <colgroup>
@@ -296,6 +321,16 @@ küszöböt és az újrafeldolgozás módját.</p>
 <td>enum</td>
 <td><code>PENDING</code>, <code>SENT</code>, <code>FAILED</code></td>
 </tr>
+<tr>
+<td><code>idempotency_key</code></td>
+<td>string</td>
+<td>Egyedi kulcs a fogyasztói deduplikációhoz</td>
+</tr>
+<tr>
+<td><code>attempts</code></td>
+<td>int</td>
+<td>A kiküldési kísérletek száma (a retry-korláthoz)</td>
+</tr>
 </tbody>
 </table>
 <p>Az outbox relé megvalósítása lehet egy külön komponens, egy
@@ -331,21 +366,26 @@ Enélkül az esemény feldolgozása és a parancs kiküldése között
 <p>Tekintsük a rendelés–fizetés–készlet példát orchestrált sagával és
 outboxszal:</p>
 <ol type="1">
-<li>A <strong>Rendelés szolgáltatás</strong> létrehozza a rendelést, és
-az outbox táblába írja az <code>OrderCreated</code> eseményt. A
-koordinátor figyeli ezt az eseményt.</li>
-<li>A koordinátor parancsot küld a <strong>Fizetés
-szolgáltatásnak</strong>. A fizetési szolgáltatás végrehajtja a
-terhelést, és saját outboxába írja a <code>PaymentSucceeded</code>
-eseményt (vagy <code>PaymentFailed</code> eseményt hiba esetén).</li>
-<li>A koordinátor a <code>PaymentSucceeded</code> eseményre reagálva
-parancsot küld a <strong>Készlet szolgáltatásnak</strong> a
-foglalásra.</li>
-<li>Ha a készletfoglalás sikertelen, a koordinátor kompenzáló
-parancsokat küld: visszafizetés a Fizetés szolgáltatásnak, a rendelés
-visszavonása (a rendelés <code>Cancelled</code> állapotba állítása, nem
-fizikai törlés) a Rendelés szolgáltatásnak. Mindkét kompenzáló művelet
-saját outboxán keresztül értesít a végrehajtásról.</li>
+<li>A koordinátor <code>CreateOrder</code> paranccsal indítja a sagát: a
+<strong>Rendelés szolgáltatás</strong> <code>Pending</code> állapotú
+rendelést hoz létre, és az outbox táblába írja az
+<code>OrderCreated</code> eseményt.</li>
+<li>A koordinátor az <code>OrderCreated</code> eseményre parancsot küld
+a <strong>Készlet szolgáltatásnak</strong> a foglalásra (időkorláttal
+felszabadítható); az eredmény <code>InventoryReserved</code> vagy
+<code>InventoryReservationFailed</code>, a készlet saját outboxán
+át.</li>
+<li>Sikeres foglalás után a koordinátor parancsot küld a <strong>Fizetés
+szolgáltatásnak</strong> (pivot lépés): a fizetési szolgáltatás
+végrehajtja a terhelést, és saját outboxába írja a
+<code>PaymentSucceeded</code> eseményt (vagy <code>PaymentFailed</code>
+eseményt hiba esetén). <code>PaymentSucceeded</code> után a rendelés
+megerősítése és a szállítás ismételhető, idempotens lépés.</li>
+<li>Ha a készletfoglalás sikertelen, a koordinátor a rendelést
+visszavonja (<code>Cancelled</code> állapot, nem fizikai törlés),
+fizetés nélkül. Ha a fizetés sikertelen, a koordinátor felszabadítja a
+foglalást, majd visszavonja a rendelést. Minden kompenzáló művelet saját
+outboxán keresztül értesít a végrehajtásról.</li>
 </ol>
 <p>Ebben a folyamatban minden szolgáltatás saját adatbázisával és saját
 outboxával rendelkezik. A koordinátor maga is lehet állapotmentes, ha a
@@ -366,10 +406,10 @@ egy új rendelést.<br />
 message broker elérhető.<br />
 <strong>Válasz:</strong> Az outbox relé 100 ms-on belül kiküldi az
 <code>OrderCreated</code> eseményt a megfelelő témába.<br />
-<strong>Mérőszám:</strong> A kiküldés sikeressége 99,9% 1 órás mérési
-ablakban; a fennmaradó 0,1%-ot a relé a rögzített retry-szabály szerint
-próbálja újra feldolgozni, és a tartósan sikertelen rekordokra riasztás
-vonatkozik.</p>
+<strong>Mérőszám:</strong> 1 órás ablakban a commit és a broker-nyugta
+közötti késleltetés p99 ≤ 100 ms (polling-periódus 50 ms vagy CDC); az
+első kísérlet sikeressége ≥ 99,9%, a kiküldetlen (<code>PENDING</code>)
+rekordok kora ≤ 60 s, ennél régebbire riasztás; elveszett esemény 0.</p>
 </blockquote>
 <h3 data-number="13.3.7" id="gyakorlati-hibák-és-elkerülésük"><span
 class="header-section-number">13.3.7</span> Gyakorlati hibák és
@@ -379,7 +419,7 @@ elő. Ezek felismerése és tudatos kezelése elengedhetetlen a helyes
 megoldáshoz.</p>
 <p><strong>Nem idempotens fogyasztó.</strong> Ha a fogyasztó nem kezeli
 a duplikált üzeneteket, a saga lépései többször is lefuthatnak. Ha a
-koordinátor a duplikált <code>PaymentSucceeded</code> eseményre kétszer
+koordinátor a duplikált <code>OrderCreated</code> eseményre kétszer
 küldi el a készletfoglalás parancsát, a készlet kétszer foglalódhat le
 ugyanarra a rendelésre. A duplaterhelés forrása viszont jellemzően a
 fizetésindítási parancs duplikálódása: ha a koordinátor újraindulás vagy
@@ -389,13 +429,14 @@ kulccsal kell kivédenie a második terhelést. Megoldás: minden fogyasztó
 dolgozzon idempotencia kulccsal, és tárolja a feldolgozott kulcsokat; a
 parancskibocsátás is legyen idempotens.</p>
 <p><strong>Hiányzó vagy nem teljes kompenzáló művelet.</strong> Ha egy
-saga lépéshez nem definiálunk kompenzáló műveletet, akkor a hiba esetén
-a rendszer nem tud helyreállni. A kompenzáló műveleteknek is
+pivot előtti lépéshez nem definiálunk kompenzáló műveletet, akkor a hiba
+esetén a rendszer nem tud helyreállni. A kompenzáló műveleteknek is
 idempotensnek kell lenniük.</p>
-<p><strong>Outbox relé egyszeri futtatása.</strong> Ha az outbox relé
-egyetlen példányban fut, és az összeomlik, az üzenetek felhalmozódnak,
-és a saga elakad. A relét magas rendelkezésre állással kell üzemeltetni,
-vagy több példányban, megfelelő elosztott zárolással.</p>
+<p><strong>Egyetlen példányban futó outbox relé.</strong> Ha az outbox
+relé egyetlen példányban fut, és az összeomlik, az üzenetek
+felhalmozódnak, és a saga elakad. A relét magas rendelkezésre állással
+kell üzemeltetni, vagy több példányban, megfelelő elosztott
+zárolással.</p>
 <p><strong>Sorrendi problémák.</strong> Az outbox relé által kiküldött
 üzenetek sorrendje nem mindig garantált, különösen ha több példány fut.
 Ha az üzleti logika sorrendfüggő, akkor ezt a fogyasztónál kell kezelni
@@ -430,16 +471,18 @@ keresztül történik (például Apache Kafka). A rendelési folyamat a
 következő lépésekből áll:</p>
 <ol type="1">
 <li><code>order-service</code>: rendelés létrehozása
-(<code>OrderCreated</code> esemény)</li>
-<li><code>payment-service</code>: fizetés végrehajtása
-(<code>PaymentSucceeded</code> vagy <code>PaymentFailed</code>)</li>
-<li><code>inventory-service</code>: készletfoglalás
-(<code>InventoryReserved</code> vagy
+<code>Pending</code> állapotban (<code>OrderCreated</code> esemény)</li>
+<li><code>inventory-service</code>: készletfoglalás, időkorláttal
+felszabadítható (<code>InventoryReserved</code> vagy
 <code>InventoryReservationFailed</code>)</li>
-<li>Hiba esetén kompenzáló műveletek: visszafizetés
-(<code>RefundPayment</code>) és a rendelés visszavonása
-(<code>CancelOrder</code>, a rendelés <code>Cancelled</code> állapotba
-kerül, naplózott állapotátmenettel).</li>
+<li><code>payment-service</code>: fizetés végrehajtása, ez a pivot lépés
+(<code>PaymentSucceeded</code> vagy <code>PaymentFailed</code>); utána a
+rendelés megerősítése ismételhető lépés</li>
+<li>Hiba esetén kompenzáló műveletek: a foglalás felszabadítása és a
+rendelés visszavonása (<code>CancelOrder</code>, a rendelés
+<code>Cancelled</code> állapotba kerül, naplózott állapotátmenettel);
+visszatérítés (<code>RefundPayment</code>) csak a fizetés utáni, ritka
+hiány esetére.</li>
 </ol>
 <p><strong>Feladatok:</strong></p>
 <ol type="1">
@@ -514,8 +557,10 @@ outbox használatához</h3>
 <ul class="task-list">
 <li><label><input type="checkbox" />A saga minden lépése lokális
 tranzakcióban fut, saját adatbázisban.</label></li>
-<li><label><input type="checkbox" />Minden lépéshez definiált kompenzáló
-művelet.</label></li>
+<li><label><input type="checkbox" />A pivot előtti minden lépéshez
+definiált, idempotens kompenzáló művelet tartozik; a pivot utáni lépések
+újrapróbálhatók (idempotensek), és tartós hibájuk kézi/reconciliation
+eljárást indít.</label></li>
 <li><label><input type="checkbox" />A kompenzáló műveletek
 idempotensek.</label></li>
 <li><label><input type="checkbox" />Minden fogyasztó idempotencia
@@ -555,9 +600,10 @@ anélkül, hogy a 2PC blokkolását és törékenységét elfogadnánk. A
 következő alfejezet (<a href="sa049.html">Streaming platformok és
 event-driven minták</a>) ezekre az alapokra építve a streaming
 platformok és az eseményvezérelt minták szélesebb körét tárgyalja,
-beleértve a Kafka-alapú feldolgozást és a stream-joinokat.</p>
+beleértve a partíciókat, az offseteket, a fogyasztói késleltetést és a
+visszajátszást.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="sa047.html">← 13.2 CQRS és Event Sourcing</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="sa049.html">13.4 Streaming platformok és event-driven minták →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>
