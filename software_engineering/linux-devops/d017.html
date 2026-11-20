@@ -69,6 +69,16 @@ regiszteren keresztül. Ha ez a sorrend sérül, az eszköz friss adat
 helyett félkész descriptor-t olvashat. A C++ fejlesztő által ismert
 acquire/release fogalom itt hardveres és I/O-szintű szinkronizációval
 párosul, de a user-space lockok itt nem alkalmazhatók.</p>
+<p>Az alábbi ábra egy 4 KiB-os NVMe-olvasás teljes életútját mutatja, és
+azt, hogy az egyes lépésekben kié a puffer.</p>
+<figure id="fig-d017-nvme-dma">
+<div class="fig-interactive"><iframe src="figures/html/d017-nvme-dma.html" title="Nyolc panel: 1. dma_map_sg, IOMMU-bejegyzés, a lap device-owned; 2. SQE írása; 3. memória-sorompó; 4. doorbell; 5. a vezérlő DMA-val olvassa az SQE-t és az IOMMU-n át írja a lapot; 6. CQE és MSI-X; 7. dma_unmap_sg, a lap CPU-owned; 8. a folyamat felébred." loading="lazy" style="width:100%;border:0;height:600px"></iframe><noscript><img src="figures/img/d017-nvme-dma.png" style="width:95.0%"
+alt="Nyolc panel: 1. dma_map_sg, IOMMU-bejegyzés, a lap device-owned; 2. SQE írása; 3. memória-sorompó; 4. doorbell; 5. a vezérlő DMA-val olvassa az SQE-t és az IOMMU-n át írja a lapot; 6. CQE és MSI-X; 7. dma_unmap_sg, a lap CPU-owned; 8. a folyamat felébred." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d017-nvme-dma.png" style="width:95.0%"
+alt="Nyolc panel: 1. dma_map_sg, IOMMU-bejegyzés, a lap device-owned; 2. SQE írása; 3. memória-sorompó; 4. doorbell; 5. a vezérlő DMA-val olvassa az SQE-t és az IOMMU-n át írja a lapot; 6. CQE és MSI-X; 7. dma_unmap_sg, a lap CPU-owned; 8. a folyamat felébred." /></details></div>
+<figcaption>Egy NVMe-olvasás DMA-, IOMMU- és interrupt-útja (az IOVA és
+a fizikai cím illusztratív; a <code>dma_unmap_sg</code> a folyamat
+felébresztése előtt fut)</figcaption>
+</figure>
 <h4 data-number="4.2.2.2" id="interrupt-és-msimsi-x"><span
 class="header-section-number">4.2.2.2</span> Interrupt és MSI/MSI-X</h4>
 <p>Amikor a DMA befejeződött, vagy hiba történt, az eszköznek jeleznie
@@ -80,16 +90,42 @@ vektoros változata. Egy NVMe vezérlő például külön interruptvektorokat
 használhat az adminisztrációs sorhoz és az I/O queue-khoz, így a magok
 párhuzamosan, kisebb lock-kontencióval dolgozhatják fel az egyes sorok
 befejezéseit.</p>
-<p>A Linux az egyes eszközökhöz egy IRQ-számot rendel; az IRQ-hoz
-tartozó <em>affinity</em> határozza meg, hogy a kernel melyik CPU-n
-futtathatja a <em>hardirq</em> és a következő <em>softirq</em>
-feldolgozást. Az NTB-hez hasonló nagy sávszélességű hálózati kártyáknál
-a tiszta interrupt-terhelés olyan magas lehet, hogy a kernel
-<em>NAPI</em> polling üzemmódra vált: ideiglenesen letiltja az
-interruptot, és a driver ütemezett pollinggal üríti a sorokat. Az
-interrupt <em>coalescing</em> ugyanezt a tradeoffot szolgálja
-hardverben: ritkább interrupt, kisebb CPU-terhelés, de nagyobb átlagos
-várakozási idő.</p>
+<p>A Linux az egyes interruptvektorokhoz egy IRQ-számot rendel; az
+IRQ-hoz tartozó <em>affinity</em> határozza meg, hogy a kernel melyik
+CPU-n futtatja a <em>hardirq</em> kezelőt. A további feldolgozás ettől
+eltérő CPU-n is történhet, ezért a fogalmakat érdemes
+szétválasztani:</p>
+<ul>
+<li><strong>Hardirq:</strong> a megszakításkezelő, azon a CPU-n fut,
+amelyet az IRQ affinity (és a vektor tényleges, <em>effective</em>
+affinityje) kijelöl; a számlálója a <code>/proc/interrupts</code>-ban
+látszik.</li>
+<li><strong>NAPI poll:</strong> egy nagy sávszélességű (például 25 vagy
+100 GbE) hálózati kártya drivere az első interrupt után ideiglenesen
+letiltja a sor interruptját, és softirq-ban (<code>NET_RX</code>)
+pollinggal üríti a sort. Ez jellemzően ugyanazon a CPU-n indul, ahol a
+hardirq futott.</li>
+<li><strong>ksoftirqd:</strong> ha a softirq-munka túl sok, a kernel a
+CPU-nkénti <code>ksoftirqd/N</code> szálba tolja; ez már ütemezett
+szál.</li>
+<li><strong>RPS/RFS</strong> (Receive Packet/Flow Steering): szoftveres
+elosztás, amely a csomagfeldolgozást a hardirq CPU-jától <em>eltérő</em>
+CPU-ra (például az alkalmazás szálának CPU-jára) teheti; beállítása
+<code>/sys/class/net/&lt;if&gt;/queues/rx-N/rps_cpus</code>.</li>
+<li><strong>Threaded IRQ:</strong> egyes driverek vagy a
+<code>threadirqs</code> kernelparaméter mellett a kezelő egy
+<code>irq/N-…</code> kernelszálban fut, amelynek CPU-ja külön
+ütemezett.</li>
+</ul>
+<p>A softirq-számlálók CPU-nként a <code>/proc/softirqs</code>-ban
+(<code>NET_RX</code>, <code>BLOCK</code> sorok) olvashatók. Ha a
+<code>/proc/interrupts</code> egy NIC-sor IRQ-ját a CPU2 oszlopban
+növeli, miközben RPS miatt a <code>/proc/softirqs</code>
+<code>NET_RX</code> sora a CPU3 oszlopban is nő, az épp egy eltérő
+hardirq/softirq-hozzárendelés megfigyelése (a pontos számlálók
+kernelverzió- és driverfüggők). Az interrupt <em>coalescing</em>
+ugyanezt a tradeoffot szolgálja hardverben: ritkább interrupt, kisebb
+CPU-terhelés, de nagyobb átlagos várakozási idő.</p>
 <h4 data-number="4.2.2.3" id="iommu-címfordítás-és-izoláció"><span
 class="header-section-number">4.2.2.3</span> IOMMU: címfordítás és
 izoláció</h4>
@@ -148,55 +184,79 @@ IRQ affinity-ját. A példa <em>illusztratív kimenet</em>, nem ténylegesen
 futtatott laberedmény. A célhost <code>lab-vm-1</code>, az eszköz
 PCIe-címe <code>0000:01:00.0</code>, a lab 4 vCPU-val (0–3) rendelkezik.
 Az NVMe eszköz itt egy virtuális, QEMU által emulált vezérlő, így a
-hardveres IOMMU tényleges hatása korlátozott lehet; a sysfs-útvonalak
-ennek ellenére bemutatják a topológiát.</p>
+hardveres IOMMU tényleges hatása korlátozott; IOMMU-csoport a vendégben
+csak akkor látszik, ha a VM virtuális IOMMU-t (vIOMMU, libvirtben
+<code>&lt;iommu model='intel'/&gt;</code>) kapott, különben az
+<code>iommu_group</code> link hiányzik. Előfeltétel a módosító részhez:
+<code>nvme-cli</code> csomag.</p>
 <div class="sourceCode" id="cb1"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, UID 1000, read-only</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="at">-nn</span> <span class="at">-vvv</span> <span class="at">-s</span> 0000:01:00.0 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;Interrupt|MSI-X|Capabilities&#39;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">lspci</span> <span class="at">-nn</span> <span class="at">-vvv</span> <span class="at">-s</span> 0000:01:00.0 <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;MSI-X:&#39;</span></span>
 <span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /sys/bus/pci/devices/0000:01:00.0/numa_node</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> /sys/bus/pci/devices/0000:01:00.0/iommu_group<span class="va">)</span><span class="st">&quot;</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> /sys/bus/pci/devices/0000:01:00.0/iommu_group</span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;nvme|IRQ&#39;</span> /proc/interrupts</span></code></pre></div>
-<p>A várható, illusztratív kimenet egy ilyen szerkezet:</p>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> /sys/bus/pci/devices/0000:01:00.0/iommu_group</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-E</span> <span class="st">&#39;CPU|nvme&#39;</span> /proc/interrupts</span></code></pre></div>
+<p>A várható, illusztratív kimenet (a <code>/proc/interrupts</code>
+oszlopai a jobb olvashatóság kedvéért rövidítve):</p>
 <pre class="text"><code>MSI-X: Enable+ Count=9 Masked-
-Interrupt: pin A routed to IRQ 34
-0
-12
+-1
 ../../../../kernel/iommu_groups/12
- 34:      12345      12301      12599      12488   PCI-MSI-0000:01:00.0  edge      nvme0q0
- 35:         0          0          0          0   PCI-MSI-0000:01:00.0  edge      nvme0q1</code></pre>
+     CPU0   CPU1   CPU2   CPU3
+24:    38      0      0      0  PCI-MSIX-0000:01:00.0  0-edge  nvme0q0
+25:  9120      0      0      0  PCI-MSIX-0000:01:00.0  1-edge  nvme0q1
+26:     0   8874      0      0  PCI-MSIX-0000:01:00.0  2-edge  nvme0q2
+27:     0      0   9311      0  PCI-MSIX-0000:01:00.0  3-edge  nvme0q3
+28:     0      0      0   8702  PCI-MSIX-0000:01:00.0  4-edge  nvme0q4</code></pre>
 <p>Az <code>MSI-X: Enable+ Count=9 Masked-</code> azt mutatja, hogy a
-vezérlő MSI-X-et használ és lát kilenc vektort; ebből a kernel legalább
-egy admin- és több I/O-vektort oszthat ki. A <code>numa_node=0</code> a
-lokális memória-node-ot mutatja. Az IOMMU-csoport <code>12</code>, tehát
-a sysfs-útvonal <code>../../../../kernel/iommu_groups/12</code>. A
-<code>/proc/interrupts</code> sorban a <code>nvme0q0</code>-hoz tartozó
-IRQ 34-es; az oszlopok a CPU-nkénti interruptszámlálót mutatják.</p>
-<p>A módosító részben állítsuk be a 34-es IRQ affinity-ját a 2-es
-CPU-ra, majd állítsuk vissza az eredeti <code>0-3</code> értékre. Ehhez
-UID 0 szükséges. A parancs előtt mentsük el az eredeti értéket, és a
-<code>tee</code> segítségével írjuk a procfs-fájlt.</p>
+vezérlő MSI-X-et használ és kilenc vektort kínál; ebből a kernel itt
+ötöt használ. A <code>nvme0q0</code> az <strong>admin-sor</strong>
+vektora: adminisztratív parancsokat (például SMART-lekérdezés,
+névtérkezelés) szolgál ki, ezért I/O-forgalomnál a számlálója alig nő.
+Az olvasások és írások befejezései az <strong>I/O-sorok</strong>
+(<code>nvme0q1</code>–<code>nvme0q4</code>) vektorain érkeznek,
+soronként más CPU-n. A <code>numa_node</code> értéke <code>-1</code>,
+ami azt jelenti, hogy a platform nem ad NUMA-információt (egycsomópontos
+VM); fizikai többfoglalatos hoston itt a lokális node száma áll. Az
+IOMMU-csoport <code>12</code>. (Az <code>lspci</code>
+<code>Interrupt: pin A routed to IRQ …</code> sora a legacy INTx-vonalra
+vonatkozik; MSI-X használatakor nem azonos a fenti vektorok
+IRQ-számaival.)</p>
+<p>Az I/O-sorok IRQ-affinityjét a kernel kezeli (<em>managed IRQ</em>):
+a driver a vektorokat úgy kéri, hogy a kernel sorokként szétossza őket a
+CPU-k között. Ezeknél a <code>/proc/irq/N/smp_affinity_list</code> írása
+<code>Input/output error</code> hibával elutasításra kerül; a
+hozzárendelést csak olvasni lehet
+(<code>cat /proc/irq/25/effective_affinity_list</code>). Az admin-sor
+vektora nem managed, ezért a mechanizmust ezen mutatjuk be. A
+módosításhoz UID 0 szükséges; mentsük el az eredeti értéket és az
+<code>irqbalance</code> állapotát, mert a démon felülírhatja a
+beállítást.</p>
 <div class="sourceCode" id="cb3"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, user lab-admin -&gt; sudo UID 0</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># előfeltétel: az IRQ 34 létezik és az nvme0q0-hoz tartozik,</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">#              irqbalance aktív lehet, ezért a lépés lehet időleges</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="va">orig_affinity</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /proc/irq/34/smp_affinity_list<span class="va">)</span>   <span class="co"># pl. 0-3</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;original affinity for IRQ 34: </span><span class="va">$orig_affinity</span><span class="st">&quot;</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/34/smp_affinity_list</span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/irq/34/smp_affinity_list                     <span class="co"># várt: 2</span></span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co"># ellenőrzés: a számláló a következő NVMe-forgalomnál a 2-es CPU oszlopban nő</span></span>
-<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n1</span> <span class="st">&quot;grep nvme0q0 /proc/interrupts&quot;</span></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback</span></span>
-<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$orig_affinity</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/34/smp_affinity_list</span></code></pre></div>
-<p>Ez a beállítás nem old meg önmagában egy teljesítményproblémát, de
-alkalmas arra, hogy egy méréssorozatban kizárjuk az IRQ-affinity mint
-változót. Ha az <code>irqbalance</code> szolgáltatás fut, akkor a
-beállítást felülírhatja; ezt ilyenkor explicit service-állapottal kell a
-laborban kezelni, nem pedig a démont indokolatlanul letiltani éles
-rendszeren.</p>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co"># előfeltétel: az IRQ 24 létezik és az nvme0q0-hoz (admin-sor) tartozik</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="va">irq</span><span class="op">=</span>24</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="va">orig_affinity</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /proc/irq/<span class="va">$irq</span>/smp_affinity_list<span class="va">)</span>   <span class="co"># pl. 0-3</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="va">irqb_state</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> is-active irqbalance<span class="va">)</span>            <span class="co"># active/inactive</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;IRQ </span><span class="va">$irq</span><span class="st">: </span><span class="va">$orig_affinity</span><span class="st">, irqbalance: </span><span class="va">$irqb_state</span><span class="st">&quot;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="st">&quot;</span><span class="va">$irqb_state</span><span class="st">&quot;</span> <span class="ot">=</span> active <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl stop irqbalance</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/<span class="va">$irq</span>/smp_affinity_list</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/irq/<span class="va">$irq</span>/smp_affinity_list                     <span class="co"># várt: 2</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co"># ellenőrzés: admin-parancs (SMART-lekérdezés) a 2-es CPU oszlopot növeli</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvme smart-log /dev/nvme0 <span class="op">&gt;</span> /dev/null</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> nvme0q0 /proc/interrupts</span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$orig_affinity</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/<span class="va">$irq</span>/smp_affinity_list</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="st">&quot;</span><span class="va">$irqb_state</span><span class="st">&quot;</span> <span class="ot">=</span> active <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl start irqbalance</span></code></pre></div>
+<p>Ugyanez egy I/O-sor IRQ-jára (például <code>irq=25</code>)
+<code>tee: /proc/irq/25/smp_affinity_list: Input/output error</code>
+üzenettel áll meg. Ez a beállítás nem old meg önmagában egy
+teljesítményproblémát, de alkalmas arra, hogy egy méréssorozatban
+kizárjuk az IRQ-affinity mint változót. Az <code>irqbalance</code>
+leállítása csak a labor idejére szól, és a rollback visszaállítja a
+mentett állapotot; éles rendszeren a démont nem tiltjuk le
+indokolatlanul.</p>
 <h3 data-number="4.2.4" id="hibák-és-ellenpróbák"><span
 class="header-section-number">4.2.4</span> Hibák és ellenpróbák</h3>
 <p>A DMA/interrupt/IOMMU réteghibák ritkán okoznak kényelmes, azonnali
@@ -217,34 +277,43 @@ reprodukálható terhelés után a checksum-hiba megszűnik, és az
 id="tünet-magas-si-interrupt-terhelés-egyetlen-cpu-n"><span
 class="header-section-number">4.2.4.2</span> Tünet: magas
 <code>si</code> interrupt-terhelés egyetlen CPU-n</h4>
-<p>A <code>vmstat 1</code> a <code>si</code> oszlopban mutatja a
-software interruptokra fordított CPU-időt; a
-<code>/proc/interrupts</code> egy soron tornyosuló számlálója pedig az
-oszlopon mutatja, hogy minden interrupt ugyanarra a CPU-ra megy.
-Hipotézis: az IRQ-affinity egyetlen magra lett szűkítve, vagy az
+<p>Az <code>mpstat -P ALL 1</code> <code>%soft</code> oszlopa (vagy a
+<code>top</code> <code>si</code> mezője) mutatja CPU-nként a softirq-ra
+fordított időt; a <code>vmstat</code> <code>si</code> oszlopa ezzel
+szemben a swap-in, nem ez. A hardirq-számlálók a
+<code>/proc/interrupts</code>-ban, a softirq-számlálók a
+<code>/proc/softirqs</code>-ban CPU-nként olvashatók; a
+<code>/proc/interrupts</code> egy soron tornyosuló számlálója azt
+mutatja, hogy minden interrupt ugyanarra a CPU-ra megy. Hipotézis: az
+IRQ-affinity egyetlen magra lett szűkítve, vagy az
 <code>irqbalance</code> döntése rossz a NUMA-topológiához képest.
 Ellenpróba: mérjük meg az adott IRQ <code>smp_affinity_list</code>
 értékét és egy feszített forgalomterhelés melletti percíz CPU-kiosztást.
 Egy változtatásként állítsuk át a forgalmas queue IRQ-ját a lokális
-NUMA-node több magjára, vagy hagyjuk aktívan az
-<code>irqbalance</code>-t, ha a policy szerint engedélyezett. A
-<code>grep nvme /proc/interrupts</code> emelkedése oszoljon el.</p>
+NUMA-node több magjára (ha az IRQ nem managed; az NVMe I/O-sorainál ez
+nem állítható), vagy hagyjuk aktívan az <code>irqbalance</code>-t, ha a
+policy szerint engedélyezett. A <code>grep nvme /proc/interrupts</code>
+emelkedése oszoljon el.</p>
 <h4 data-number="4.2.4.3"
 id="tünet-vfio-passthrough-hibát-jelez-group-...-not-viable"><span
 class="header-section-number">4.2.4.3</span> Tünet: VFIO passthrough
 hibát jelez, <code>group ... not viable</code></h4>
-<p>A <code>/dev/vfio/&lt;N&gt;</code> nem hozható létre, vagy a
-VM-indítás <code>Cannot allocate memory</code> hibával tér vissza.
-Hipotézis: a kiválasztott eszköz IOMMU-csoportja más eszközt is
-tartalmaz, tehát a csoport nem izolált. Adatgyűjtés:
-<code>for d in /sys/kernel/iommu_groups/*/devices/*; do echo "$d -&gt; $(readlink $d)"; done</code>
-segítségével feltérképezzük a csoportokat. Ha például egy NIC és egy
-USB-controller ugyanabba a csoportba tartozik, akkor a VFIO csak a
-teljes csoportot engedheti át. A helyes változtatás általában nem a
-kernel védelmének kikapcsolása, hanem a PCIe slot cseréje, ACS-képes
-platform használata, vagy a teljes IOMMU-csoport hozzárendelése. A
-d169-ben ezt a csoport-problémát a tényleges passthrough-lab
-részletezi.</p>
+<p>A <code>/dev/vfio/&lt;N&gt;</code> nem használható, a hibaüzenet
+<code>group ... not viable</code>. Hipotézis: a kiválasztott eszköz
+IOMMU-csoportja más eszközt is tartalmaz, amely nincs a
+<code>vfio-pci</code> driverhez kötve, tehát a csoport nem izolált.
+Adatgyűjtés a <strong>fizikai hoston</strong> (a hypervisoron): a
+csoport tagjait és azok driverét a 3. feladat megoldásának ciklusa
+listázza. Külön tünet a VM-indítás <code>Cannot allocate memory</code>
+hibája: ez tipikusan memóriazárolási korlát (<code>ulimit -l</code>,
+libvirtben <code>&lt;memoryBacking&gt;&lt;locked/&gt;</code>), nem
+csoport-izolációs probléma. Ha például egy NIC és egy USB-controller
+ugyanabba a csoportba tartozik, akkor a VFIO csak a teljes csoportot
+engedheti át. A helyes változtatás általában nem a kernel védelmének
+kikapcsolása, hanem a PCIe slot cseréje, ACS-képes platform használata,
+vagy a teljes IOMMU-csoport hozzárendelése. A <a
+href="d169.html">Virtio, passthrough, SR-IOV és IOMMU</a> alfejezetben
+ezt a csoport-problémát a tényleges passthrough-lab részletezi.</p>
 <h3 data-number="4.2.5" id="feladatok"><span
 class="header-section-number">4.2.5</span> Feladatok</h3>
 <h4 data-number="4.2.5.1"
@@ -259,12 +328,15 @@ Fogalmazza meg, hogy ki birtokolja a puffert az egyes fázisokban.</p>
 id="feladat-adminisztrációs-irq-affinity-beállítása-a-lab-nvme-hez"><span
 class="header-section-number">4.2.5.2</span> 2. feladat –
 Adminisztrációs: IRQ affinity beállítása a lab NVMe-hez</h4>
-<p>A lab host <code>lab-vm-1</code>-en azonosítson egy NVMe-msix
-interruptot a <code>/proc/interrupts</code>-ból, olvassa le az
-IRQ-számát, az eredeti affinity-t, majd állítsa be egyetlen CPU-ra, és
-ellenőrizze a sysfs-fájl tartalmát. Végezzen terhelést vagy nézzen
-<code>watch</code>-csal a számlálókat, végül állítsa vissza az eredeti
-affinity-t. A módosító lépéshez root kell.</p>
+<p>A lab host <code>lab-vm-1</code>-en azonosítsa a
+<code>/proc/interrupts</code>-ból az NVMe admin-sorának
+(<code>nvme0q0</code>) és I/O-sorainak (<code>nvme0q1</code>…) MSI-X
+interruptjait, olvassa le az IRQ-számokat és az eredeti affinity-t. Az
+admin-sor IRQ-ját állítsa be egyetlen CPU-ra, ellenőrizze a procfs-fájl
+tartalmát, váltson ki egy admin-parancsot, végül állítsa vissza az
+eredeti affinity-t és az <code>irqbalance</code> állapotát. Próbálja ki,
+mi történik, ha egy I/O-sor IRQ-jára írna. A módosító lépéshez root
+kell.</p>
 <h4 data-number="4.2.5.3"
 id="feladat-diagnosztikai-iommu-csoport-és-vfio-hiba"><span
 class="header-section-number">4.2.5.3</span> 3. feladat – Diagnosztikai:
@@ -282,65 +354,90 @@ védelmet.</p>
 class="header-section-number">4.2.6</span> Megoldások</h3>
 <h4 data-number="4.2.6.1" id="feladat"><span
 class="header-section-number">4.2.6.1</span> 1. feladat</h4>
-<p>Az NVMe-read adatút a következő fázisokra bontható:</p>
+<p>Az NVMe-read adatút a következő fázisokra bontható (vesd össze a
+DMA-adatútnál közölt lépésenkénti ábrával):</p>
 <ol type="1">
-<li>A driver lefoglal egy DMA-puffert, és <code>dma_map_single()</code>
-hívással IOVA-t kér a busz felé. Az IOMMU ezt a címet lefordítja a
-fizikai lapokra.</li>
+<li>A blokkréteg átadja a kérés lapjait (buffered olvasásnál page
+cache-lapokat, O_DIRECT esetén a felhasználói puffer rögzített lapjait);
+a driver ezeket scatter-gather listaként <code>dma_map_sg()</code>
+hívással képezi le, és IOVA-kat kap. Az IOMMU ezeket a címeket a fizikai
+lapokra fordítja.</li>
 <li>A driver felépíti a submission queue entry-t (SQE), beírja a
-parancsot, a DPTR-t (data pointer) és a hosszt. A puffer ekkor
-<strong>device-owned</strong> állapotú.</li>
+parancsot, a DPTR-t (data pointer, PRP- vagy SGL-lista) és a hosszt. A
+puffer ekkor <strong>device-owned</strong> állapotú.</li>
 <li>A driver memória-sorompót alkalmaz, majd megírja a doorbell
 regisztert.</li>
 <li>Az NVMe vezérlő bus mastering DMA-val kiolvassa a command
 descriptor-t, majd a kért LBA-kat DMA-val beírja a pufferbe.</li>
 <li>Befejezéskor a vezérlő completion queue entry-t (CQE) ír, és MSI-X
 interruptot küld.</li>
-<li>A kernel a hozzárendelt IRQ-n futtatja a handler-t; a driver
-felébreszti a várakozó user-space folyamatot.</li>
-<li>A driver <code>dma_unmap_single()</code>-t hív; innen a puffer
-<strong>CPU-owned</strong>, a user-space olvashatja.</li>
+<li>A kernel a hozzárendelt I/O-sor IRQ-ján futtatja a completion
+handlert; a driver <code>dma_unmap_sg()</code>-t hív, innen a lapok
+<strong>CPU-owned</strong> állapotúak.</li>
+<li>A driver befejezi a kérést, a blokkréteg felébreszti a várakozó
+user-space folyamatot.</li>
 </ol>
-<p>CPU-másolás a preparálás és a befejezés környékén van, például a
-felhasználói adat beemelésekor. Maga az NVMe adatmozgás DMA, nincs
-CPU-utasításokon alapuló byte-másolás. Posztfeltétel: a leírás explicit
-módon tartalmazza a device-owned és CPU-owned fázisok közti
-átmenetet.</p>
+<p>A sorrend lényeges: a tulajdonjog visszaadása (unmap/sync) a
+felébresztés előtt történik, különben a folyamat még device-owned
+pufferhez férne hozzá. CPU-másolás buffered olvasásnál van: a page
+cache-ből a felhasználói pufferbe történő <code>copy_to_user</code>
+CPU-munka; O_DIRECT-nél nincs ilyen másolás. Maga az NVMe adatmozgás
+DMA, nincs CPU-utasításokon alapuló byte-másolás. Posztfeltétel: a
+leírás explicit módon tartalmazza a device-owned és CPU-owned fázisok
+közti átmenetet.</p>
 <h4 data-number="4.2.6.2" id="feladat-1"><span
 class="header-section-number">4.2.6.2</span> 2. feladat</h4>
-<p>Feltevések: a labhoston az NVMe-IRQ <code>34</code>, az eredeti
-affinity <code>0-3</code>. Parancssor:</p>
+<p>Feltevések: a labhoston az admin-sor (<code>nvme0q0</code>) IRQ-ja
+<code>24</code>, az I/O-sorok IRQ-ja <code>25</code>–<code>28</code>, az
+eredeti affinity <code>0-3</code>. Parancssor:</p>
 <div class="sourceCode" id="cb5"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, sudo UID 0</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="va">orig_affinity</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /proc/irq/34/smp_affinity_list<span class="va">)</span></span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;original: </span><span class="va">$orig_affinity</span><span class="st">&quot;</span></span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/34/smp_affinity_list</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/irq/34/smp_affinity_list   <span class="co"># várt: 2</span></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co"># terhelés alatt ellenőrzés</span></span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="ex">watch</span> <span class="at">-n1</span> <span class="st">&quot;grep nvme /proc/interrupts&quot;</span></span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback</span></span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$orig_affinity</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/34/smp_affinity_list</span></code></pre></div>
-<p>Az ellenőrzés akkor sikeres, ha a <code>smp_affinity_list</code>
-tartalma <code>2</code>, és a terhelés során a
-<code>/proc/interrupts</code> megfelelő oszlopában növekszik a számláló.
-Posztfeltétel: a lab végén az eredeti <code>0-3</code> affinity
-visszaállítva. Ha az <code>irqbalance</code> fut, a pontos labunkban ezt
-a szolgáltatást először le kell állítani vagy kizárni az adott IRQ-ra
-vonatkozó labor idejére.</p>
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, sudo UID 0; előfeltétel: nvme-cli</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> nvme /proc/interrupts</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="va">irq</span><span class="op">=</span>24                                   <span class="co"># nvme0q0, admin-sor</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="va">orig_affinity</span><span class="op">=</span><span class="va">$(</span><span class="fu">cat</span> /proc/irq/<span class="va">$irq</span>/smp_affinity_list<span class="va">)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="va">irqb_state</span><span class="op">=</span><span class="va">$(</span><span class="ex">systemctl</span> is-active irqbalance<span class="va">)</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;original: </span><span class="va">$orig_affinity</span><span class="st">, irqbalance: </span><span class="va">$irqb_state</span><span class="st">&quot;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="st">&quot;</span><span class="va">$irqb_state</span><span class="st">&quot;</span> <span class="ot">=</span> active <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl stop irqbalance</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/<span class="va">$irq</span>/smp_affinity_list</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/irq/<span class="va">$irq</span>/smp_affinity_list    <span class="co"># várt: 2</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co"># admin-parancs, majd ellenőrzés</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="fu">sudo</span> nvme smart-log /dev/nvme0 <span class="op">&gt;</span> /dev/null</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> nvme0q0 /proc/interrupts</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="co"># I/O-sor: managed IRQ, az írás hibát ad (várt: Input/output error)</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> 2 <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/25/smp_affinity_list</span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span> /proc/irq/25/effective_affinity_list</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="co"># rollback</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$orig_affinity</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">sudo</span> tee /proc/irq/<span class="va">$irq</span>/smp_affinity_list</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a><span class="bu">[</span> <span class="st">&quot;</span><span class="va">$irqb_state</span><span class="st">&quot;</span> <span class="ot">=</span> active <span class="bu">]</span> <span class="kw">&amp;&amp;</span> <span class="fu">sudo</span> systemctl start irqbalance</span></code></pre></div>
+<p>Az ellenőrzés akkor sikeres, ha az admin-sor
+<code>smp_affinity_list</code> tartalma <code>2</code>, és az
+admin-parancs után a <code>/proc/interrupts</code> <code>nvme0q0</code>
+sorában a CPU2 oszlop nő; az I/O-sor IRQ-jára írás
+<code>Input/output error</code>-ral elutasításra kerül, mert a kernel
+kezeli. Posztfeltétel: a lab végén az eredeti <code>0-3</code> affinity
+és az <code>irqbalance</code> eredeti állapota visszaállítva.</p>
 <h4 data-number="4.2.6.3" id="feladat-2"><span
 class="header-section-number">4.2.6.3</span> 3. feladat</h4>
 <p>A hibaüzenet szerint a 02:00.0-s eszköz nincs a <code>vfio-pci</code>
-driverhez kötve, és a VFIO csoportja sem viable. A csoport
-felderítése:</p>
+driverhez kötve, és a VFIO csoportja sem viable. A passthrough a
+<strong>fizikai host</strong> IOMMU-csoportjaira vonatkozik (a
+vendégben, vIOMMU nélkül, a <code>/sys/kernel/iommu_groups</code>
+jellemzően üres), ezért a felderítés a hypervisoron fut. A csoport
+tagjai és azok drivere:</p>
 <div class="sourceCode" id="cb6"><pre
-class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: lab-vm-1, read-only</span></span>
-<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">readlink</span> /sys/bus/pci/devices/0000:02:00.0/iommu_group</span>
-<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /sys/kernel/iommu_groups/<span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> /sys/bus/pci/devices/0000:02:00.0/iommu_group<span class="va">)</span><span class="st">&quot;</span><span class="va">)</span>/devices/<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span></span>
-<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st"> -&gt; </span><span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span><span class="va">)</span><span class="st">&quot;</span></span>
-<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># target: fizikai labhost (hypervisor), labuser; read-only</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="va">bdf</span><span class="op">=</span>0000:02:00.0</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="va">g</span><span class="op">=</span><span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> /sys/bus/pci/devices/<span class="va">$bdf</span>/iommu_group<span class="va">)</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="bu">echo</span> <span class="st">&quot;IOMMU group: </span><span class="va">$g</span><span class="st">&quot;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> dev <span class="kw">in</span> /sys/kernel/iommu_groups/<span class="st">&quot;</span><span class="va">$g</span><span class="st">&quot;</span>/devices/<span class="pp">*</span><span class="kw">;</span> <span class="cf">do</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="va">b</span><span class="op">=</span><span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">&quot;</span><span class="va">)</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>  <span class="va">drv</span><span class="op">=</span><span class="va">$(</span><span class="fu">basename</span> <span class="st">&quot;</span><span class="va">$(</span><span class="fu">readlink</span> <span class="at">-f</span> <span class="st">&quot;</span><span class="va">$dev</span><span class="st">/driver&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="va">)</span><span class="st">&quot;</span> <span class="dv">2</span><span class="op">&gt;</span>/dev/null<span class="va">)</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>  <span class="bu">echo</span> <span class="st">&quot;</span><span class="va">$b</span><span class="st"> driver=</span><span class="va">${drv</span><span class="op">:-</span>none<span class="va">}</span><span class="st"> </span><span class="va">$(</span><span class="ex">lspci</span> <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$b</span><span class="st">&quot;</span> <span class="kw">|</span> <span class="fu">cut</span> <span class="at">-d</span><span class="st">&#39; &#39;</span> <span class="at">-f2-</span><span class="va">)</span><span class="st">&quot;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="cf">done</span></span></code></pre></div>
 <p>Ha a csoport több PCI-funkciót tartalmaz, például
 <code>0000:02:00.0</code> mellett egy <code>0000:02:00.1</code> is ott
 van, akkor az IOMMU-csoport nem egyetlen eszközt, hanem egy
@@ -363,8 +460,8 @@ esetleges hibát. A DMA-puffer nem C++ pointer, hanem a driver által
 leképezett IOVA-című tartomány, amelynek tulajdonosi állapota határozza
 meg, mikor olvashatja a CPU. Az MSI-X több interruptvektort ad, és az
 IRQ-affinity szabályozza, hogy melyik mag szolgálja ki az eszközt. Az
-IOMMU az MMPU analógiájára az I/O-címeket lapozza, és izolációs határt
-von az eszközök közé; az IOMMU-csoport a passthrough biztonsági
+IOMMU a CPU MMU-jának analógiájára az I/O-címeket lapozza, és izolációs
+határt von az eszközök közé; az IOMMU-csoport a passthrough biztonsági
 alapja.</p>
 <p>Definíciók: <strong>DMA bus mastering</strong> – a periféria CPU-n
 kívüli közvetlen memória-hozzáférése. <strong>MSI-X</strong> – több,
@@ -379,7 +476,24 @@ használata nélkül; az alábbi linkek kiindulópontok, nem tekinthetők
 olvasott vagy ellenőrzött bizonyítéknak:</p>
 <ul>
 <li><a href="https://docs.kernel.org/core-api/dma-api.html">Linux kernel
-DMA-API dokumentáció</a></li>
+DMA-API dokumentáció</a> — <code>dma_map_sg</code>,
+<code>dma_unmap_sg</code>, a tulajdonjog-átadás szabályai.</li>
+<li><a
+href="https://docs.kernel.org/core-api/irq/irq-affinity.html">Kernel:
+IRQ affinity</a> — <code>smp_affinity_list</code>,
+<code>effective_affinity_list</code>.</li>
+<li><a href="https://docs.kernel.org/networking/scaling.html">Kernel:
+Scaling in the Linux Networking Stack</a> — RSS, RPS, RFS, XPS.</li>
+<li><a href="https://docs.kernel.org/driver-api/vfio.html">Kernel:
+VFIO</a> — IOMMU-csoportok és a „viable” csoport fogalma.</li>
+<li><a
+href="https://man7.org/linux/man-pages/man1/mpstat.1.html">mpstat(1)</a>
+(<code>%soft</code>) és <a
+href="https://man7.org/linux/man-pages/man8/vmstat.8.html">vmstat(8)</a>
+(<code>si</code> = swap-in).</li>
+<li>A laborprofil: Ubuntu Server 24.04 LTS, 6.8-as kernel; a
+docs.kernel.org a legfrissebb kernelt írja le, a managed IRQ viselkedés
+verziófüggése ellenőrzendő.</li>
 <li><a
 href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel
 Software Developer Manual</a></li>
@@ -393,9 +507,11 @@ kernelben látható DMA-API-viselkedést, az NVMe MSI-X kiosztást, az
 IOMMU-csoportok tényleges sysfs-útvonalát és a VFIO-hibaüzenetek pontos
 formáját a cél-labon ellenőrizni kell. A hardveres IOMMU- és
 SR-IOV-képességek platform, firmware és kernelparaméter-függők, ezért a
-d169 előtt ezt a labhost-inventárban rögzíteni kell.</p>
+<a href="d169.html">Virtio, passthrough, SR-IOV és IOMMU</a> alfejezet
+előtt ezt a labhost-inventárban rögzíteni kell. A példák laborban
+ellenőrizendők, dátumozott futtatási napló még nincs.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="d016.html">← 4.1 PCIe, lane, topológia és effektív átviteli út</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d018.html">4.3 USB, SATA/SAS, CXL és platformcsatornák →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>

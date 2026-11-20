@@ -84,8 +84,11 @@ code) kell lefutnia, mielőtt a normál <code>spec.containers</code>
 elindulna. Init konténerek olyan előkészületre valók, mint a
 konfiguráció letöltése, jogosultságellenőrzés vagy adatbázis migráció.
 Az init konténer mountolhatja ugyanazokat a volume-okat, de nem fut a
-normál konténerekkel egy időben; saját restart policy-ja nincs, a Pod
-<code>restartPolicy</code>-ja érvényes rájuk.</li>
+normál konténerekkel egy időben. A klasszikus init konténerre a Pod
+<code>restartPolicy</code>-ja hat (<code>Always</code> esetén
+<code>OnFailure</code>-ként viselkedik: hiba után újrapróbálja); kivétel
+a konténerszintű <code>restartPolicy: Always</code>, amely az init
+konténert sidecarrá teszi (lásd alább).</li>
 <li><strong>Sidecar container:</strong> A Kubernetes újabb verzióiban (a
 pontos feature gate-et és támogatási szintet a lab cluster support
 matrixában ellenőrizni kell) a <code>restartPolicy: Always</code> init
@@ -98,9 +101,10 @@ alatt fut.</li>
 újraindítását: <code>Always</code> (alapértelmezett),
 <code>OnFailure</code>, <code>Never</code>. A kubelet a konténer exit
 code-jától függően dönt. A Pod fázisa akkor válik
-<code>Failed</code>-ré, ha a restart policy nem állítja helyre a
-konténert, azaz például <code>Never</code> esetén bármelyik konténer nem
-0 exit code-dal lép ki.</p>
+<code>Failed</code>-ré, ha minden konténere befejeződött, és legalább
+egy nem 0 exit code-dal (és a restart policy nem indítja újra, például
+<code>Never</code> esetén). Egy hibával kilépett és egy még futó
+konténer mellett a Pod <code>Running</code> marad.</p>
 <h3 data-number="39.4.4"
 id="configmap-és-secret-mint-konfigurációs-input"><span
 class="header-section-number">39.4.4</span> ConfigMap és Secret mint
@@ -134,12 +138,15 @@ limit</h3>
 <p>A <code>resources</code> mező a konténer specifikációban adja meg a
 resource contract-ot:</p>
 <ul>
-<li><code>requests</code>: a scheduler által garantált erőforrások. A
-kubelet a node allocatable kapacitásából vonja le a requestek összegét,
-és csak akkor ütemezi a Podot a Node-ra, ha a requestek kielégíthetők. A
-request a cgroup v2-ben <code>cpu.weight</code> és
-<code>memory.min</code> jellegű garantált minimumot állít be (a pontos
-implementáció a runtime-tól függ).</li>
+<li><code>requests</code>: a scheduler által lefoglalt (ütemezési)
+erőforrások. A scheduler a node allocatable kapacitásából vonja le a
+requestek összegét, és csak akkor köti a Podot a Node-ra, ha a requestek
+kielégíthetők. A CPU-request a cgroup v2-ben <code>cpu.weight</code>-re
+képeződik (relatív részesedés versengéskor); a memória-request
+alapértelmezésben nem kerül a cgroupba –
+<code>memory.min</code>/<code>memory.low</code> beállítás csak az alfa
+MemoryQoS feature gate mellett történik –, így az ütemezési és
+eviction-szempont, nem kernelgarancia.</li>
 <li><code>limits</code>: a fogyasztás felső korlátja. A CPU-nál a cgroup
 v2 <code>cpu.max</code> throttlingot okoz, ha a konténer többet próbál
 fogyasztani, mint a limit; a memóriánál a <code>memory.max</code>
@@ -148,18 +155,34 @@ processzt, csak lassítja; a memória-limit hard kill.</li>
 </ul>
 <p>A QoS osztályt a requestek és limitek viszonya határozza meg:</p>
 <ul>
-<li><code>Guaranteed</code>: minden konténerben minden erőforrástípusra
-a request és limit azonos.</li>
-<li><code>Burstable</code>: van request, de nem teljesül a Guaranteed
+<li><code>Guaranteed</code>: minden konténerben CPU-ra és memóriára is
+van limit, és a request azonos vele. (Ha csak limit van megadva, a
+request alapértelmezésben a limit értékét kapja.)</li>
+<li><code>Burstable</code>: legalább egy konténernek van CPU- vagy
+memória-requestje vagy -limitje, de nem teljesül a Guaranteed
 feltétel.</li>
-<li><code>BestEffort</code>: nincs request vagy limit.</li>
+<li><code>BestEffort</code>: egyik konténernek sincs sem requestje, sem
+limitje.</li>
 </ul>
-<p>A QoS befolyásolja a node nyomás esetén alkalmazott eviction
-prioritást: a kubelet először a BestEffort, majd Burstable, végül
-Guaranteed podokat evictál.</p>
+<p>Node-nyomásnál a kubelet az eviction-sorrendet nem a QoS osztályból
+számítja, hanem (1) abból, hogy a Pod használata meghaladja-e a
+requestjét, (2) a Pod prioritásából, (3) a requesthez viszonyított
+használatból. A QoS osztály az OOM-killer pontozását
+(<code>oom_score_adj</code>) befolyásolja. A BestEffort Pod requestje 0,
+ezért bármilyen használata meghaladja azt, így a gyakorlatban az elsők
+között kerül sorra.</p>
 <h3 data-number="39.4.6" id="probe-ok-és-readiness-szerződés"><span
 class="header-section-number">39.4.6</span> Probe-ok és readiness
 szerződés</h3>
+<figure id="fig-d194-pod-eletciklus">
+<div class="fig-interactive"><iframe src="figures/html/d194-pod-eletciklus.html" title="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." loading="lazy" style="width:100%;border:0;height:560px"></iframe><noscript><img src="figures/img/d194-pod-eletciklus.png" style="width:100.0%"
+alt="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." /></noscript><details class="fig-static"><summary>Statikus változat (mint a PDF-ben)</summary><img src="figures/img/d194-pod-eletciklus.png" style="width:100.0%"
+alt="(a) 0–30 s: az init-check 0–2 s között fut, config ok, exit 0; az api konténer 2 s-tól Running. A startup probe 2 s-onként fut, 2, 4, 6 s-kor sikertelen, 8 s-kor sikeres. A readiness ezután 9, 14, 19, 24, 29 s-kor fut és sikeres, a liveness első futása 12 s-kor, majd 22 s-kor. A Pod Ready 9 s-tól True, ettől a Pod IP-je az EndpointSlice-ban van. (b) Törlés T-kor: deletionTimestamp, az EndpointSlice-ból kivezetés késleltetve, a preStop sleep 3 T és T+3 között fut, T+3-kor SIGTERM, a drain után T+5-kor kilépés; ha az alkalmazás nem lép ki, T+30-kor SIGKILL. A 30 s-os grace keret a preStopot és a drain-t is tartalmazza." /></details></div>
+<figcaption>A lab-cpp-api Pod életciklusa a kidolgozott példa
+probe-paramétereivel: (a) indulás, (b) leállítás – a preStop a SIGTERM
+előtt fut, a 30 s-os keret mindkettőt tartalmazza (modell, nem
+mérés)</figcaption>
+</figure>
 <p>A kubelet háromféle probe-ot futtathat a konténeren:</p>
 <ul>
 <li><strong>startup probe:</strong> A konténer indulásakor fut, amíg
@@ -197,25 +220,35 @@ workload shutdown</h3>
 node drain), a kubelet a következő leállítási szekvenciát hajtja
 végre:</p>
 <ol type="1">
-<li>A Pod állapota <code>Terminating</code> lesz, a Service azonnal
-kiveszi a forgalomból (endpoint eltávolítás).</li>
-<li>A kubelet <code>SIGTERM</code>-et küld a konténer fő processzének
-(PID 1). Az alkalmazásnak ezt el kell kapnia, és el kell kezdenie a
-graceful shutdown-t: új kéréseket már nem fogad, a függőben lévőket
-befejezi, erőforrásokat felszabadít.</li>
-<li>Ha definiált, a <code>lifecycle.preStop</code> hook lefut, mielőtt a
-SIGTERM elküldésre kerül. A preStop tipikusan rövid várakozásra vagy
-drain jelzésre használható.</li>
-<li>A kubelet vár <code>terminationGracePeriodSeconds</code> ideig
-(alapértelmezés 30 másodperc). Ha a processz addig nem áll le,
-<code>SIGKILL</code>-t küld.</li>
+<li>A Pod <code>deletionTimestamp</code>-ot kap
+(<code>Terminating</code>). Ezzel párhuzamosan, de késleltetéssel (az
+EndpointSlice-frissítés és a kube-proxy/ingress szabályfrissítés néhány
+száz ms – néhány s alatt terjed szét) a végpontvezérlő kivezeti a Pod
+endpointját; a forgalom tehát nem szűnik meg azonnal.</li>
+<li>Ha definiált, a kubelet lefuttatja a <code>lifecycle.preStop</code>
+hookot. A preStop tipikusan rövid várakozásra (<code>sleep</code>) való,
+hogy az endpoint-kivezetés a SIGTERM előtt szétterjedjen, vagy drain
+jelzésre.</li>
+<li>Ezután a kubelet <code>SIGTERM</code>-et küld a konténer fő
+processzének (PID 1). Az alkalmazásnak ezt el kell kapnia, és el kell
+kezdenie a graceful shutdown-t: új kéréseket már nem fogad, a függőben
+lévőket befejezi, erőforrásokat felszabadít.</li>
+<li>A preStop és a leállás együtt legfeljebb
+<code>terminationGracePeriodSeconds</code> ideig (alapértelmezés 30
+másodperc) tarthat; ha a preStop túllépi, a kubelet egyszer 2 s
+hosszabbítást ad. Ha a processz addig nem áll le, <code>SIGKILL</code>-t
+küld.</li>
 </ol>
 <p>A C++ fejlesztő felelőssége: a signal handler
-(<code>std::signal</code> vagy platformfüggő epoll) kezelje a
-<code>SIGTERM</code>-et, és indítson le a szolgáltatást a tranzakciók
-befejezése után. Ha a program csak a default handlerre támaszkodik, a
-SIGTERM azonnali kilépést okoz, ami adatvesztéshez vezethet. A
-<code>terminationGracePeriodSeconds</code> értékét úgy kell
+(<code>std::signal</code>, vagy
+<code>signalfd</code>/<code>sigwait</code> alapú eseményhurok) kezelje a
+<code>SIGTERM</code>-et, és állítsa le a szolgáltatást a tranzakciók
+befejezése után. Handler nélkül a viselkedés attól függ, hogy a processz
+PID 1-e (vö. <a href="d187.html">d187</a>): PID 1-ként a handler nélküli
+SIGTERM hatástalan, a processz a grace végéig fut, majd a SIGKILL öli
+meg (exit 137); ha nem PID 1 (például init folyamat alatt fut), azonnal
+kilép (exit 143). Egyik sem graceful, mindkettő adatvesztéshez vezethet.
+A <code>terminationGracePeriodSeconds</code> értékét úgy kell
 megválasztani, hogy nagyobb legyen, mint a leglassabb in-flight kérés
 befejezési ideje.</p>
 <h3 data-number="39.4.8" id="kidolgozott-példa"><span
@@ -223,11 +256,15 @@ class="header-section-number">39.4.8</span> Kidolgozott példa</h3>
 <p>A következő példa egy lab környezetben definiál egy C++ HTTP API
 Podot ConfigMap-pel, Secret-tel, resource request/limit-tel, probe-okkal
 és graceful shutdown-nal. Feltételezzük, hogy a
-<code>lab-cpp-api:1.2.3</code> image már elérhető a lab registry-ben, és
-az alkalmazás a <code>/startup</code>, <code>/ready</code>,
-<code>/live</code> endpointokat szolgálja ki a 8080-as porton. A lab
-target: <code>lab-cluster</code> context, <code>lab-d194</code>
-namespace. Módosítás előtti állapot: a namespace már létezik.</p>
+<code>registry.lab.example/cpp-api:1.2.3</code> image már elérhető a lab
+registry-ben, tartalmaz <code>/bin/sh</code>-t (a preStop hook miatt;
+shell nélküli minimális image-nél a Kubernetes 1.30+
+<code>preStop: sleep: {seconds: 3}</code> akciója használható,
+verziófüggő), és az alkalmazás a <code>/startup</code>,
+<code>/ready</code>, <code>/live</code> endpointokat szolgálja ki a
+8080-as porton. A lab target: <code>lab-cluster</code> context,
+<code>lab-d194</code> namespace. Módosítás előtti állapot: a namespace
+már létezik.</p>
 <p>Először a ConfigMap és Secret:</p>
 <div class="sourceCode" id="cb1"><pre
 class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">apiVersion</span><span class="kw">:</span><span class="at"> v1</span></span>
@@ -329,12 +366,14 @@ class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="
 <span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> sh</span></span>
 <span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a><span class="at">          </span><span class="kw">-</span><span class="at"> -c</span></span>
 <span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a><span class="kw">          - </span><span class="ch">|</span></span>
-<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>            echo &quot;preStop: draining&quot;</span>
-<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>            sleep 3</span>
-<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
-<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
-<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">configMap</span><span class="kw">:</span></span>
-<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-config</span></span></code></pre></div>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>            # a hook kimenete nem kerül a konténernaplóba, ezért</span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>            # a fő processz stdoutjára írunk</span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>            echo &quot;preStop: draining&quot; &gt; /proc/1/fd/1</span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>            sleep 3</span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">volumes</span><span class="kw">:</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> </span><span class="fu">name</span><span class="kw">:</span><span class="at"> config-volume</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="fu">configMap</span><span class="kw">:</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">name</span><span class="kw">:</span><span class="at"> lab-cpp-config</span></span></code></pre></div>
 <p>Alkalmazás és ellenőrzés:</p>
 <div class="sourceCode" id="cb4"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> <span class="at">--context</span> lab-cluster <span class="at">-n</span> lab-d194 apply <span class="at">-f</span> pod.yaml</span>
@@ -353,10 +392,15 @@ mutatja.</p>
 tartalmazza, ha a readiness probe sikeres. A liveness hiba esetén a
 <code>kubectl describe pod</code> a <code>Liveness probe failed</code>
 eseményt és a restart count növekedését jelzi. A termination tesztelése:
-<code>kubectl delete pod lab-cpp-api</code>, a Pod
-<code>Terminating</code> állapotba kerül, a
-<code>kubectl logs lab-cpp-api</code> a preStop üzenetet mutatja, és a
-processz 30 mp-en belül leáll.</p>
+egy másik terminálban <code>kubectl logs -f lab-cpp-api -c api</code>,
+majd <code>kubectl delete pod lab-cpp-api</code>. A Pod
+<code>Terminating</code> állapotba kerül; a naplóban a preStop által a
+fő processz stdoutjára írt <code>preStop: draining</code> sor, majd az
+alkalmazás saját leállási üzenete (például <code>graceful exit</code>)
+jelenik meg, és a processz 30 mp-en belül leáll. Az <code>exec</code>
+típusú hook saját kimenetét a kubelet nem írja a konténer naplójába; a
+hook hibája csak eseményként (<code>FailedPreStopHook</code>) látszik:
+<code>kubectl get events --field-selector involvedObject.name=lab-cpp-api</code>.</p>
 <h3 data-number="39.4.9" id="hibák-és-ellenpróbák"><span
 class="header-section-number">39.4.9</span> Hibák és ellenpróbák</h3>
 <p><strong>Readiness probe hiánya vagy rossz endpoint.</strong> Ha nincs
@@ -379,13 +423,18 @@ indítási ablak ne számítson liveness hibának.
 readiness-től, hogy az alkalmazás lassú, de működő állapota ne indítson
 restartot.</p>
 <p><strong>Request/limit összekeverése.</strong> Ha a
-<code>requests</code> nincs megadva, csak <code>limits</code>, a QoS
-BestEffort vagy Burstable lesz, és a Node nyomás alatt evictálhatja a
-Podot. Tünet: a Pod hirtelen <code>Evicted</code> lesz egy látszólag
-üres Node-on. Hipotézis: a <code>kubectl describe pod</code> mutatja a
-QoS osztályt és az eviction reason-t. Javítás: minden konténerre
-explicit request és limit, lehetőleg azonos értékek Guaranteed
-QoS-hez.</p>
+<code>requests</code> nincs megadva, csak <code>limits</code>, a request
+a limit értékét örökli: ha minden konténer minden erőforrására van
+limit, a Pod <code>Guaranteed</code>, ha csak részben,
+<code>Burstable</code>. BestEffort csak request és limit nélkül lesz. A
+fordított hiba a gyakori: túl alacsony request mellett a Pod használata
+meghaladja a requestjét, és node-nyomásnál ez teszi az eviction
+elsődleges jelöltjévé. Tünet: a Pod hirtelen <code>Evicted</code> lesz.
+Hipotézis: a <code>kubectl describe pod</code> mutatja a QoS osztályt és
+az eviction reason-t (melyik erőforrás, mennyi a használat a requesthez
+képest). Javítás: minden konténerre a valós használathoz igazított
+explicit request és limit; kritikus workloadnál azonos értékek
+(Guaranteed QoS) és megfelelő <code>priorityClassName</code>.</p>
 <p><strong>ConfigMap frissítés nem terjed.</strong> A mountolt ConfigMap
 file frissítése akár perceket is késhet, és az alkalmazás nem figyeli a
 fájlváltozást. Tünet: a konfiguráció módosítása után a Pod régi értéket
@@ -395,12 +444,12 @@ rollout-lal (pl. Deployment rolling update).
 <strong>Ellenpróba:</strong> env-ként beadott ConfigMap érték soha nem
 frissül, ezt csak Pod újraindítással lehet változtatni.</p>
 <p><strong>Graceful shutdown hiánya.</strong> A C++ processz nem kezeli
-a SIGTERM-et, ezért a kubelet azonnali kill-t alkalmaz a grace lejárta
-után. Tünet: a rollout közben a kliensek connection reset hibát kapnak,
-adatvesztés. Hipotézis: a <code>kubectl logs</code> nem mutat leállási
-logot. Javítás: signal handler a C++ kódban, és
-<code>terminationGracePeriodSeconds</code> beállítás a leghosszabb kérés
-lefutásánál nagyobbra.</p>
+a SIGTERM-et, ezért PID 1-ként a grace lejártáig fut, majd a kubelet
+SIGKILL-lel öli meg (exit 137). Tünet: a rollout közben a kliensek
+connection reset hibát kapnak, adatvesztés. Hipotézis: a
+<code>kubectl logs</code> nem mutat leállási logot. Javítás: signal
+handler a C++ kódban, és <code>terminationGracePeriodSeconds</code>
+beállítás a leghosszabb kérés lefutásánál nagyobbra.</p>
 <h3 data-number="39.4.10" id="feladatok"><span
 class="header-section-number">39.4.10</span> Feladatok</h3>
 <ol type="1">
@@ -490,21 +539,32 @@ limitek helyesek.</p>
 okoz CrashLoopBackOff-ot, mert a <code>failureThreshold</code> elérése
 után a kubelet újraindítja a konténert. A <code>/live</code> 500-as
 válasza valószínűleg alkalmazáshiba (pl. a health check kód nem a valós
-állapotot adja vissza, hanem egy hibás állapotot). A javítás lépései:
-először a liveness endpointot külön kell választani a readiness-től, és
-a liveness probe-ot átmenetileg le kell tiltani, vagy a
-<code>failureThreshold</code>-et növelni (pl. 10-re), hogy az állandó
-restart megszűnjön. Ezután a C++ kódban meg kell javítani a
+állapotot adja vissza, hanem egy hibás állapotot). A
+<code>lab-cpp-api</code> csupasz Pod: a Pod spec probe-mezői
+immutable-ek, ezért a liveness letiltása vagy a
+<code>failureThreshold</code> növelése <code>kubectl apply</code>-jal
+<code>pod updates may not change fields other than ...</code> hibával
+elutasítódna. A javítás lépései: a C++ kódban meg kell javítani a
 <code>/live</code> endpoint logikáját, hogy 200-at adjon, ha a processz
-él. A rollout során fokozatosan visszaállni az eredeti liveness
-beállításra. <strong>Ellenpróba:</strong> a liveness probe letiltása nem
-lehet tartós megoldás, mert akkor a beállt processz nem indul újra.
-Helyes diagnózis: a liveness a processz létét, nem a szolgáltatás
-tranzakciós képességét ellenőrzi; a <code>/live</code> 200 kell legyen,
-ha a processz fut, a <code>/ready</code> pedig akkor, ha a forgalmat
-fogadni tudja. Postcondition: a Pod Ready <code>1/1</code>, a restart
-count nem nő, a readiness továbbra is a <code>/ready</code>-t
-ellenőrzi.</p>
+él (a liveness különváljon a readiness-től), új image-et kell építeni,
+és a Podot a módosított <code>pod.yaml</code>-lal újra létrehozni:
+<code>kubectl delete pod lab-cpp-api -n lab-d194</code>, majd
+<code>kubectl apply -f pod.yaml</code> (vagy
+<code>kubectl replace --force -f pod.yaml</code>). Ha a kódjavításig
+átmeneti enyhítés kell, a magasabb <code>failureThreshold</code> is csak
+újralétrehozással vihető be. Éles workloadnál a Pod template a
+Deploymentben él, ott a módosítás rolling update-et indít (<a
+href="d196.html">d196</a>). Recovery-ellenőrzés:
+<code>kubectl get pod lab-cpp-api -n lab-d194 -o jsonpath='{.status.containerStatuses[0].restartCount}'</code>
+két, egymást pár perccel követő lekérdezésben azonos, és a
+<code>READY</code> oszlop <code>1/1</code>. <strong>Ellenpróba:</strong>
+a liveness probe letiltása nem lehet tartós megoldás, mert akkor a
+beállt processz nem indul újra. Helyes diagnózis: a liveness a processz
+létét, nem a szolgáltatás tranzakciós képességét ellenőrzi; a
+<code>/live</code> 200 kell legyen, ha a processz fut, a
+<code>/ready</code> pedig akkor, ha a forgalmat fogadni tudja.
+Postcondition: a Pod Ready <code>1/1</code>, a restart count nem nő, a
+readiness továbbra is a <code>/ready</code>-t ellenőrzi.</p>
 <h3 data-number="39.4.12" id="rövid-összefoglaló"><span
 class="header-section-number">39.4.12</span> Rövid összefoglaló</h3>
 <p>A Pod a Kubernetes lifecycle alapegysége: a benne lévő konténerek
@@ -555,6 +615,34 @@ Pod Lifecycle documentation</a></li>
 href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Kubernetes
 Probes documentation</a></li>
 </ul>
+<p>További állításonkénti normatív források (verzióprofil: a labor
+Kubernetes stabil minor verziója, containerd és cgroup v2 Ubuntu 24.04
+LTS node-okon; a <code>kubectl version</code> kimenetével
+rögzítendő):</p>
+<ul>
+<li>Pod termination sorrend (preStop → SIGTERM → SIGKILL, a grace a
+preStopot is tartalmazza): a fenti Pod Lifecycle oldal „Termination of
+Pods” szakasza</li>
+<li>Container lifecycle hooks (a hook kimenete,
+<code>FailedPreStopHook</code>, <code>sleep</code> akció): <a
+href="https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/"
+class="uri">https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/</a></li>
+<li>Sidecar konténerek (konténerszintű
+<code>restartPolicy: Always</code>): <a
+href="https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/"
+class="uri">https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/</a></li>
+<li>QoS osztályok: <a
+href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/"
+class="uri">https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/</a></li>
+<li>Node-pressure eviction (a sorrend nem QoS-alapú): <a
+href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/"
+class="uri">https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/</a></li>
+<li>Erőforrás-kezelés (request/limit, cgroup-leképezés): <a
+href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
+class="uri">https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/</a></li>
+</ul>
+<p>A példák laborclusterben ellenőrizendők; dátumozott futtatási napló
+még nem készült.</p>
 <p><strong>Ellenőrzési hiányok:</strong> A sidecar konténeres
 <code>restartPolicy: Always</code> init elem pontos stabil támogatása
 verziófüggő; a lab cluster aktuális Kubernetes minor verziójában
@@ -567,5 +655,5 @@ futtatva.</p>
 <nav class="pagenav bottom" aria-label="Lapozás">
 <div class="links"><a class="prev" rel="prev" href="d193.html">← 39.3 kubectl, context, namespace és diagnosztika</a><a class="home" href="index.html">Tartalomjegyzék</a><a class="next" rel="next" href="d195.html">39.5 Első Kubernetes service és state diagnosztika →</a></div>
 </nav>
-</body>
+<script>addEventListener("message",function(e){var d=e.data;if(!d||typeof d.figResize!=="number"||d.figResize<20)return;document.querySelectorAll(".fig-interactive iframe").forEach(function(f){if(f.contentWindow===e.source)f.style.height=(d.figResize+4)+"px"})})</script></body>
 </html>
